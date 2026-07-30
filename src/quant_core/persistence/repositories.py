@@ -5,18 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
+from typing import Never
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
-from quant_core.data.quality.models import QualityIssue, QualityRunSpec
+from quant_core.data.quality.models import (
+    QualityIssue,
+    QualityRunSpec,
+    thaw_json,
+)
 from quant_core.domain.enums import DatasetKind, Severity, SnapshotStatus
 from quant_core.domain.identifiers import (
     DatasetVersionId,
@@ -25,6 +31,7 @@ from quant_core.domain.identifiers import (
 )
 from quant_core.errors import ErrorDetail, QuantError
 from quant_core.persistence.orm import (
+    AuditLogORM,
     DatasetPartitionORM,
     DatasetVersionORM,
     QualityIssueORM,
@@ -120,15 +127,23 @@ class SnapshotRecord:
     published_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotWriteSpec:
+    id: SnapshotId
+    publication_fingerprint: str
+    as_of: datetime
+    manifest_path: Path
+    manifest_hash: str
+    quality_run_id: QualityRunId
+    dataset_versions: Mapping[str, DatasetVersionId]
+    created_at: datetime
+
+
 class MetadataRepository:
     """Own metadata transactions without leaking mapped SQLAlchemy objects."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
-
-    @property
-    def engine(self) -> Engine:
-        return self._engine
 
     def register_dataset_version(
         self, spec: DatasetVersionSpec
@@ -142,9 +157,9 @@ class MetadataRepository:
             )
         )
         with Session(self._engine) as session, session.begin():
-            existing = session.get(DatasetVersionORM, str(identifier))
-            if existing is None:
-                existing = DatasetVersionORM(
+            insert_result = session.execute(
+                sqlite_insert(DatasetVersionORM)
+                .values(
                     id=str(identifier),
                     dataset=spec.dataset.value,
                     fingerprint=fingerprint,
@@ -155,8 +170,10 @@ class MetadataRepository:
                     created_run_id=spec.created_run_id,
                     created_at=_timestamp(datetime.now(UTC)),
                 )
-                session.add(existing)
-                session.flush()
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+            inserted = getattr(insert_result, "rowcount", 0)
+            if inserted:
                 for ordinal, partition in enumerate(
                     _sorted_partitions(spec.partitions)
                 ):
@@ -171,9 +188,13 @@ class MetadataRepository:
                         )
                     )
                 session.flush()
-                existing.status = SnapshotStatus.PUBLISHED.value
-                session.flush()
-            elif (
+                session.execute(
+                    update(DatasetVersionORM)
+                    .where(DatasetVersionORM.id == str(identifier))
+                    .values(status=SnapshotStatus.PUBLISHED.value)
+                )
+            existing = session.get(DatasetVersionORM, str(identifier))
+            if existing is None or (
                 existing.dataset != spec.dataset.value
                 or existing.fingerprint != fingerprint
                 or existing.status != SnapshotStatus.PUBLISHED.value
@@ -265,11 +286,151 @@ class MetadataRepository:
         with Session(self._engine) as session:
             return session.scalar(select(func.count()).select_from(SnapshotORM)) or 0
 
-    def delete_draft_snapshot(self, identifier: SnapshotId) -> None:
+    def publish_snapshot(
+        self,
+        spec: SnapshotWriteSpec,
+        install_manifest: Callable[[], None],
+    ) -> SnapshotRecord:
+        """Commit the quality gate, manifest install, and catalog publish as one UoW."""
+        with Session(self._engine) as session, session.begin():
+            normalized = self._validate_version_mapping(session, spec.dataset_versions)
+            _validate_snapshot_quality_gate(session, normalized, spec.quality_run_id)
+            insert_result = session.execute(
+                sqlite_insert(SnapshotORM)
+                .values(
+                    id=str(spec.id),
+                    publication_fingerprint=spec.publication_fingerprint,
+                    as_of=_timestamp(spec.as_of),
+                    status=SnapshotStatus.DRAFT.value,
+                    manifest_path=spec.manifest_path.as_posix(),
+                    manifest_hash=spec.manifest_hash,
+                    quality_run_id=str(spec.quality_run_id),
+                    created_at=_timestamp(spec.created_at),
+                    published_at=None,
+                )
+                .on_conflict_do_nothing(index_elements=["publication_fingerprint"])
+            )
+            inserted = getattr(insert_result, "rowcount", 0)
+            if inserted:
+                for dataset, version_id in normalized.items():
+                    session.add(
+                        SnapshotDatasetORM(
+                            snapshot_id=str(spec.id),
+                            dataset=dataset,
+                            dataset_version_id=str(version_id),
+                        )
+                    )
+                session.flush()
+                install_manifest()
+                session.execute(
+                    update(SnapshotORM)
+                    .where(SnapshotORM.id == str(spec.id))
+                    .values(
+                        status=SnapshotStatus.PUBLISHED.value,
+                        published_at=_timestamp(spec.created_at),
+                    )
+                )
+                self._add_audit(
+                    session,
+                    "SNAPSHOT_PUBLISHED",
+                    spec.id,
+                    {"manifest_hash": spec.manifest_hash},
+                    spec.created_at,
+                )
+                identifier = str(spec.id)
+            else:
+                row = session.scalar(
+                    select(SnapshotORM).where(
+                        SnapshotORM.publication_fingerprint
+                        == spec.publication_fingerprint
+                    )
+                )
+                if row is None or row.status != SnapshotStatus.PUBLISHED.value:
+                    _raise_repository_conflict("snapshot publication collision")
+                identifier = row.id
+            session.flush()
+            return self._snapshot_record(session, identifier)
+
+    def recover_draft_snapshot(
+        self,
+        identifier: SnapshotId,
+        install_manifest: Callable[[], None],
+        published_at: datetime,
+    ) -> str:
+        """Re-run the quality gate and reconcile one DRAFT in one transaction."""
+        with Session(self._engine) as session, session.begin():
+            row = session.get(SnapshotORM, str(identifier))
+            if row is None:
+                return "ABSENT"
+            if row.status == SnapshotStatus.PUBLISHED.value:
+                return "PUBLISHED"
+            versions = {
+                item.dataset: DatasetVersionId.parse(item.dataset_version_id)
+                for item in session.scalars(
+                    select(SnapshotDatasetORM).where(
+                        SnapshotDatasetORM.snapshot_id == str(identifier)
+                    )
+                )
+            }
+            try:
+                _validate_snapshot_quality_gate(
+                    session, versions, QualityRunId.parse(row.quality_run_id)
+                )
+            except QuantError as error:
+                self._add_audit(
+                    session,
+                    "SNAPSHOT_RECOVERY_DISCARDED",
+                    identifier,
+                    {"reason": error.detail.code},
+                    published_at,
+                )
+                session.delete(row)
+                return "DISCARDED"
+            install_manifest()
+            row.status = SnapshotStatus.PUBLISHED.value
+            row.published_at = _timestamp(published_at)
+            self._add_audit(
+                session,
+                "SNAPSHOT_RECOVERED",
+                identifier,
+                {"manifest_hash": row.manifest_hash},
+                published_at,
+            )
+            session.flush()
+            return "RECOVERED"
+
+    def discard_draft_snapshot(
+        self, identifier: SnapshotId, reason: str, discarded_at: datetime
+    ) -> None:
         with Session(self._engine) as session, session.begin():
             row = session.get(SnapshotORM, str(identifier))
             if row is not None and row.status == SnapshotStatus.DRAFT.value:
+                self._add_audit(
+                    session,
+                    "SNAPSHOT_RECOVERY_DISCARDED",
+                    identifier,
+                    {"reason": reason},
+                    discarded_at,
+                )
                 session.delete(row)
+
+    def _add_audit(
+        self,
+        session: Session,
+        action: str,
+        identifier: SnapshotId,
+        details: JsonValue,
+        created_at: datetime,
+    ) -> None:
+        session.add(
+            AuditLogORM(
+                action=action,
+                object_type="snapshot",
+                object_id=str(identifier),
+                details_json=canonical_json_bytes(details).decode("utf-8"),
+                created_at=_timestamp(created_at),
+            )
+        )
 
     def _validate_version_mapping(
         self,
@@ -467,12 +628,62 @@ def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value is not None else None
 
 
-def _json_text(value: JsonValue) -> str:
-    normalized = dict(value) if isinstance(value, Mapping) else value
-    return canonical_json_bytes(normalized).decode("utf-8")
+def _json_text(value: object) -> str:
+    return canonical_json_bytes(thaw_json(value)).decode("utf-8")
 
 
-def _raise_repository_conflict(message: str) -> None:
+def _validate_snapshot_quality_gate(
+    session: Session,
+    dataset_versions: Mapping[str, DatasetVersionId],
+    quality_run_id: QualityRunId,
+) -> None:
+    run = session.get(QualityRunORM, str(quality_run_id))
+    if run is None:
+        raise KeyError(f"quality run does not exist: {quality_run_id}")
+    checked = {
+        row.dataset: DatasetVersionId.parse(row.dataset_version_id)
+        for row in session.scalars(
+            select(QualityRunDatasetORM).where(
+                QualityRunDatasetORM.quality_run_id == str(quality_run_id)
+            )
+        )
+    }
+    if run.status != "COMPLETED":
+        _raise_snapshot_gate_error(
+            "SNAP_QUALITY_INCOMPLETE", "quality run is not complete"
+        )
+    if checked != dict(dataset_versions):
+        _raise_snapshot_gate_error(
+            "SNAP_QUALITY_SCOPE_MISMATCH",
+            "quality run does not cover the exact snapshot version set",
+        )
+    blocking = session.scalar(
+        select(QualityIssueORM.id).where(
+            QualityIssueORM.quality_run_id == str(quality_run_id),
+            QualityIssueORM.severity.in_([Severity.SEVERE.value, Severity.FATAL.value]),
+        )
+    )
+    if blocking is not None:
+        _raise_snapshot_gate_error(
+            "SNAP_QUALITY_BLOCKED",
+            "blocking quality issues prevent snapshot publication",
+        )
+
+
+def _raise_snapshot_gate_error(code: str, message: str) -> Never:
+    raise QuantError(
+        ErrorDetail(
+            code=code,
+            severity=Severity.FATAL,
+            message=message,
+            context={},
+            remediation="inspect quality metadata before retrying",
+            retryable=False,
+        )
+    )
+
+
+def _raise_repository_conflict(message: str) -> Never:
     raise QuantError(
         ErrorDetail(
             code="DATA_CATALOG_CONFLICT",

@@ -157,9 +157,14 @@ def upgrade() -> None:
         """
         CREATE TRIGGER dataset_partition_no_update
         BEFORE UPDATE ON dataset_partition
-        WHEN EXISTS (
+        WHEN OLD.dataset_version_id != NEW.dataset_version_id
+        OR EXISTS (
           SELECT 1 FROM dataset_version
           WHERE id = OLD.dataset_version_id AND status = 'PUBLISHED'
+        )
+        OR EXISTS (
+          SELECT 1 FROM dataset_version
+          WHERE id = NEW.dataset_version_id AND status = 'PUBLISHED'
         )
         BEGIN
           SELECT RAISE(ABORT, 'dataset partitions are immutable');
@@ -230,9 +235,14 @@ def upgrade() -> None:
             f"""
             CREATE TRIGGER {table}_completed_no_update
             BEFORE UPDATE ON {table}
-            WHEN EXISTS (
+            WHEN OLD.quality_run_id != NEW.quality_run_id
+            OR EXISTS (
               SELECT 1 FROM quality_run
               WHERE id = OLD.quality_run_id AND status = 'COMPLETED'
+            )
+            OR EXISTS (
+              SELECT 1 FROM quality_run
+              WHERE id = NEW.quality_run_id AND status = 'COMPLETED'
             )
             BEGIN
               SELECT RAISE(ABORT, 'completed quality runs are immutable');
@@ -289,9 +299,14 @@ def upgrade() -> None:
         """
         CREATE TRIGGER snapshot_dataset_published_no_update
         BEFORE UPDATE ON snapshot_dataset
-        WHEN EXISTS (
+        WHEN OLD.snapshot_id != NEW.snapshot_id
+        OR EXISTS (
           SELECT 1 FROM snapshot
           WHERE id = OLD.snapshot_id AND status = 'PUBLISHED'
+        )
+        OR EXISTS (
+          SELECT 1 FROM snapshot
+          WHERE id = NEW.snapshot_id AND status = 'PUBLISHED'
         )
         BEGIN
           SELECT RAISE(ABORT, 'published snapshot datasets are immutable');

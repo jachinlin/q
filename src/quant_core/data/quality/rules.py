@@ -189,9 +189,8 @@ def coverage_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         trading_dates = set(
             calendar.filter(pl.col("is_trading_day")).get_column("trade_date").to_list()
         )
-        missing_dates = (
-            set(bars.get_column("trade_date").drop_nulls().to_list()) - trading_dates
-        )
+        observed_dates = set(bars.get_column("trade_date").drop_nulls().to_list())
+        missing_dates = trading_dates - observed_dates
         if missing_dates:
             issues.append(
                 _issue(
@@ -232,7 +231,8 @@ def financial_availability_issues(inputs: CanonicalPartitions) -> list[QualityIs
     invalid = frame.filter(
         pl.col("pit_usable")
         & (
-            pl.col("available_at").is_null()
+            pl.col("announced_at").is_null()
+            | pl.col("available_at").is_null()
             | (
                 pl.col("announced_at").is_not_null()
                 & (pl.col("announced_at") > pl.col("available_at"))
