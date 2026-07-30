@@ -43,7 +43,7 @@
 | `src/quant_core/data/pipelines/*` | 采集、映射、校验、发布编排 |
 | `src/quant_core/cli.py` | 数据初始化、更新、校验、发布命令 |
 
-### 任务 1：项目骨架与类型化配置
+### Task 1（任务）：项目骨架与类型化配置
 
 **文件：**
 - 新建：`.gitignore`
@@ -104,7 +104,7 @@ git add .gitignore .env.example pyproject.toml uv.lock configs/base.yaml src/qua
 git commit -m "chore: bootstrap quant research project"
 ```
 
-### 任务 2：领域标识、枚举与结构化错误
+### Task 2（任务）：领域标识、枚举与结构化错误
 
 **文件：**
 - 新建：`src/quant_core/domain/__init__.py`
@@ -147,7 +147,7 @@ git add src/quant_core/domain src/quant_core/errors.py tests/unit/domain tests/u
 git commit -m "feat: add domain identifiers and structured errors"
 ```
 
-### 任务 3：数据源契约与 Raw 原子发布
+### Task 3（任务）：数据源契约与 Raw 原子发布
 
 **文件：**
 - 新建：`src/quant_core/data/__init__.py`
@@ -208,7 +208,7 @@ git add src/quant_core/data tests/unit/data
 git commit -m "feat: define source contracts and atomic raw storage"
 ```
 
-### 任务 4：BaoStock 采集器与全市场语义
+### Task 4（任务）：BaoStock 采集器与全市场语义
 
 **文件：**
 - 新建：`src/quant_core/data/sources/__init__.py`
@@ -249,7 +249,7 @@ git add src/quant_core/data/sources tests/unit/data/sources tests/integration/te
 git commit -m "feat: ingest chunked BaoStock raw data"
 ```
 
-### 任务 5：规范映射与 Curated 数据集
+### Task 5（任务）：规范映射与 Curated 数据集
 
 **文件：**
 - 新建：`src/quant_core/data/schemas.py`
@@ -285,7 +285,7 @@ git add src/quant_core/data/schemas.py src/quant_core/data/mappers tests/unit/da
 git commit -m "feat: map BaoStock raw data to canonical datasets"
 ```
 
-### 任务 6：SQLite 元数据、质量检查与快照
+### Task 6（任务）：SQLite 元数据、质量检查与快照
 
 **文件：**
 - 新建：`src/quant_core/persistence/database.py`
@@ -333,7 +333,7 @@ git add src/quant_core/persistence src/quant_core/data/quality src/quant_core/da
 git commit -m "feat: publish quality-gated immutable snapshots"
 ```
 
-### 任务 7：数据管道、CLI 与端到端验收
+### Task 7（任务）：数据管道、CLI 与端到端验收
 
 **文件：**
 - 新建：`src/quant_core/data/pipelines/__init__.py`
