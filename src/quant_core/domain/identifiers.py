@@ -1,6 +1,8 @@
 """Vendor-neutral identifiers for domain entities."""
 
 from dataclasses import dataclass
+from typing import Self
+from uuid import UUID, uuid4
 
 from quant_core.domain.enums import Exchange
 
@@ -38,3 +40,81 @@ class InstrumentId:
     def canonical(self) -> str:
         """Return the identifier in canonical ``EXCHANGE:SYMBOL`` form."""
         return f"{self.exchange}:{self.symbol}"
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetVersionId:
+    """Stable UUID identity for one immutable canonical dataset version."""
+
+    value: UUID
+
+    def __post_init__(self) -> None:
+        _require_uuid(self.value)
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        return cls(_parse_canonical_uuid(value))
+
+    @classmethod
+    def new(cls) -> Self:
+        return cls(uuid4())
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(frozen=True, slots=True)
+class QualityRunId:
+    """UUID identity for one persisted quality evaluation."""
+
+    value: UUID
+
+    def __post_init__(self) -> None:
+        _require_uuid(self.value)
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        return cls(_parse_canonical_uuid(value))
+
+    @classmethod
+    def new(cls) -> Self:
+        return cls(uuid4())
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotId:
+    """Stable UUID identity for one immutable published snapshot."""
+
+    value: UUID
+
+    def __post_init__(self) -> None:
+        _require_uuid(self.value)
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        return cls(_parse_canonical_uuid(value))
+
+    @classmethod
+    def new(cls) -> Self:
+        return cls(uuid4())
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+def _parse_canonical_uuid(value: str) -> UUID:
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("identifier must be a canonical UUID") from error
+    if str(parsed) != value:
+        raise ValueError("identifier must be a canonical UUID")
+    return parsed
+
+
+def _require_uuid(value: object) -> None:
+    if not isinstance(value, UUID):
+        raise TypeError("identifier value must be a UUID")

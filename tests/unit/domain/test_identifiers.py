@@ -5,7 +5,12 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from quant_core.domain.enums import Exchange
-from quant_core.domain.identifiers import InstrumentId
+from quant_core.domain.identifiers import (
+    DatasetVersionId,
+    InstrumentId,
+    QualityRunId,
+    SnapshotId,
+)
 
 
 def test_instrument_id_round_trip() -> None:
@@ -41,3 +46,47 @@ def test_instrument_id_rejects_invalid_direct_symbol() -> None:
     """Direct construction cannot bypass the six-digit symbol invariant."""
     with pytest.raises(ValueError, match="six ASCII digits"):
         InstrumentId(exchange=Exchange.SSE, symbol="60000A")
+
+
+@pytest.mark.parametrize(
+    "identifier_type",
+    [DatasetVersionId, QualityRunId, SnapshotId],
+)
+def test_uuid_identifiers_round_trip_and_reject_noncanonical_values(
+    identifier_type: type[DatasetVersionId] | type[QualityRunId] | type[SnapshotId],
+) -> None:
+    """Metadata IDs accept canonical UUID text without accepting arbitrary strings."""
+    value = "12345678-1234-5678-9234-567812345678"
+
+    assert str(identifier_type.parse(value)) == value
+    with pytest.raises(ValueError, match="canonical UUID"):
+        identifier_type.parse("not-a-uuid")
+
+
+@pytest.mark.parametrize(
+    "identifier_type",
+    [DatasetVersionId, QualityRunId, SnapshotId],
+)
+def test_new_uuid_identifiers_are_distinct_and_immutable(
+    identifier_type: type[DatasetVersionId] | type[QualityRunId] | type[SnapshotId],
+) -> None:
+    """New metadata IDs are real UUID values and cannot be mutated."""
+    first = identifier_type.new()
+    second = identifier_type.new()
+
+    assert first != second
+    assert identifier_type.parse(str(first)) == first
+    with pytest.raises(FrozenInstanceError):
+        first.value = str(second)  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "identifier_type",
+    [DatasetVersionId, QualityRunId, SnapshotId],
+)
+def test_uuid_identifier_direct_construction_cannot_bypass_validation(
+    identifier_type: type[DatasetVersionId] | type[QualityRunId] | type[SnapshotId],
+) -> None:
+    """Direct construction rejects values that are not UUID objects."""
+    with pytest.raises(TypeError, match="UUID"):
+        identifier_type("not-a-uuid")  # type: ignore[arg-type]
