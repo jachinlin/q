@@ -3,7 +3,7 @@
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -59,6 +59,7 @@ class RawBatch:
         """Reject timestamps or requests that cannot be reproduced."""
         if self.retrieved_at.tzinfo is None or self.retrieved_at.utcoffset() is None:
             raise ValueError("retrieved_at must be timezone-aware")
+        object.__setattr__(self, "retrieved_at", self.retrieved_at.astimezone(UTC))
         canonical_json_bytes(self.request)
 
 

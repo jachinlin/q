@@ -1,6 +1,6 @@
 """Tests for vendor-neutral source data contracts."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -34,3 +34,20 @@ def test_raw_batch_accepts_timezone_aware_retrieval_timestamp() -> None:
     )
 
     assert batch.retrieved_at == retrieved_at
+
+
+def test_raw_batch_normalizes_aware_timestamp_to_utc() -> None:
+    """Equivalent source offsets collapse to one UTC storage timestamp."""
+    source_time = datetime(2026, 7, 31, 17, 0, tzinfo=timezone(timedelta(hours=8)))
+
+    batch = RawBatch(
+        provider="example",
+        dataset="daily_bars",
+        request={"symbol": "SSE:600000"},
+        retrieved_at=source_time,
+        schema=("symbol",),
+        rows=({"symbol": "SSE:600000"},),
+    )
+
+    assert batch.retrieved_at == datetime(2026, 7, 31, 9, 0, tzinfo=UTC)
+    assert batch.retrieved_at.tzinfo is UTC
