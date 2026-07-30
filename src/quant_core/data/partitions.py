@@ -50,21 +50,27 @@ class _PartitionLock:
         """Acquire the lock, recovering only a demonstrably dead stale owner."""
         deadline = time.monotonic() + self._timeout_seconds
         while True:
+            temporary_path = self._path.parent / f".locktmp-{uuid.uuid4().hex}"
             try:
-                self._path.mkdir()
+                temporary_path.mkdir()
+                self._owner_path_for(temporary_path).write_text(
+                    json.dumps({"pid": os.getpid()}), encoding="utf-8"
+                )
+            except Exception:
+                self._remove_owned_lock_directory(temporary_path)
+                raise
+            try:
+                temporary_path.rename(self._path)
             except FileExistsError:
+                self._remove_owned_lock_directory(temporary_path)
                 self._reclaim_stale_lock()
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for partition lock: {self._path}")
                 time.sleep(self._poll_seconds)
+            except Exception:
+                self._remove_owned_lock_directory(temporary_path)
+                raise
             else:
-                try:
-                    self._owner_path.write_text(
-                        json.dumps({"pid": os.getpid()}), encoding="utf-8"
-                    )
-                except Exception:
-                    self._path.rmdir()
-                    raise
                 self._owned = True
                 return self
 
@@ -80,26 +86,36 @@ class _PartitionLock:
 
     @property
     def _owner_path(self) -> Path:
-        return self._path / self._OWNER_FILE
+        return self._owner_path_for(self._path)
+
+    def _owner_path_for(self, directory: Path) -> Path:
+        return directory / self._OWNER_FILE
 
     def _reclaim_stale_lock(self) -> None:
         """Remove a lock only after its age and dead owner make it safe to reclaim."""
         try:
-            age_seconds = time.time() - self._path.stat().st_mtime
-        except FileNotFoundError:
-            return
-        if age_seconds < self._stale_after_seconds:
-            return
-        try:
             owner = json.loads(self._owner_path.read_text(encoding="utf-8"))
             process_id = owner["pid"]
         except (KeyError, OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            self._remove_owned_lock_directory(self._path)
             return
-        if not isinstance(process_id, int) or self._process_is_alive(process_id):
+        if not isinstance(process_id, int):
+            self._remove_owned_lock_directory(self._path)
             return
         try:
-            self._owner_path.unlink()
-            self._path.rmdir()
+            age_seconds = time.time() - self._path.stat().st_mtime
+        except FileNotFoundError:
+            return
+        if age_seconds < self._stale_after_seconds or self._process_is_alive(process_id):
+            return
+        self._remove_owned_lock_directory(self._path)
+
+    @staticmethod
+    def _remove_owned_lock_directory(path: Path) -> None:
+        """Remove only a lock directory containing this protocol's owner file."""
+        try:
+            (path / _PartitionLock._OWNER_FILE).unlink(missing_ok=True)
+            path.rmdir()
         except FileNotFoundError:
             return
         except OSError:

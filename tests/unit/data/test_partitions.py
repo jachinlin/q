@@ -337,3 +337,60 @@ def test_partition_lock_reclaims_a_dead_owner_lock(tmp_path: Path) -> None:
         assert (lock_path / "owner.json").exists()
 
     assert not lock_path.exists()
+
+
+def test_publish_recovers_an_ownerless_lock_left_by_interrupted_install(
+    tmp_path: Path,
+) -> None:
+    """A process dying before owner creation cannot block the next publisher forever."""
+    request_hash = hashlib.sha256(
+        b'{"end":"2026-07-31","start":"2026-07-31"}'
+    ).hexdigest()
+    partition_dir = (
+        tmp_path
+        / "provider=example"
+        / "dataset=daily_bars"
+        / "ingest_date=2026-07-31"
+        / "run_id=run-1"
+    )
+    partition_dir.mkdir(parents=True)
+    lock_path = partition_dir / f".{request_hash}.lock"
+    lock_path.mkdir()
+    published = RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1")
+
+    assert published.manifest_path.exists()
+    assert not lock_path.exists()
+
+
+def test_partial_owner_write_leaves_no_lock_and_next_publish_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An owner write failure cleans only this acquire attempt's temporary lock state."""
+    request_hash = hashlib.sha256(
+        b'{"end":"2026-07-31","start":"2026-07-31"}'
+    ).hexdigest()
+    partition_dir = (
+        tmp_path
+        / "provider=example"
+        / "dataset=daily_bars"
+        / "ingest_date=2026-07-31"
+        / "run_id=run-1"
+    )
+    lock_path = partition_dir / f".{request_hash}.lock"
+    write_text = Path.write_text
+
+    def write_partially_then_fail(path: Path, text: str, **kwargs: object) -> int:
+        if path.name == "owner.json":
+            path.write_bytes(b"{")
+            raise OSError("injected owner write failure")
+        return write_text(path, text, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_partially_then_fail)
+
+    with pytest.raises(OSError, match="injected owner write failure"):
+        RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1")
+
+    assert not lock_path.exists()
+    monkeypatch.undo()
+    assert RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1").manifest_path.exists()
