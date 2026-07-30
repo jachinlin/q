@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Never
@@ -19,8 +20,10 @@ from sqlalchemy.orm import Session
 
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.data.quality.models import (
+    FrozenJsonValue,
     QualityIssue,
     QualityRunSpec,
+    freeze_json,
     thaw_json,
 )
 from quant_core.domain.enums import DatasetKind, Severity, SnapshotStatus
@@ -34,6 +37,8 @@ from quant_core.persistence.orm import (
     AuditLogORM,
     DatasetPartitionORM,
     DatasetVersionORM,
+    PipelineRunORM,
+    PipelineStageORM,
     QualityIssueORM,
     QualityRunDatasetORM,
     QualityRunORM,
@@ -42,6 +47,67 @@ from quant_core.persistence.orm import (
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class PipelineStageName(StrEnum):
+    """The fixed, durable order of the foundation data pipeline."""
+
+    INGEST_RAW = "INGEST_RAW"
+    CURATE = "CURATE"
+    VALIDATE = "VALIDATE"
+    PUBLISH_SNAPSHOT = "PUBLISH_SNAPSHOT"
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineRunSpec:
+    mode: str
+    provider: str
+    request_hash: str
+    requested_start: date | None
+    requested_end: date | None
+    resolved_start: date
+    resolved_end: date
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"BOOTSTRAP", "UPDATE"}:
+            raise ValueError("pipeline mode must be BOOTSTRAP or UPDATE")
+        if not self.provider:
+            raise ValueError("provider must not be empty")
+        _validate_hash(self.request_hash, "request_hash")
+        if (self.requested_start is None) != (self.requested_end is None):
+            raise ValueError("requested dates must be supplied together")
+        if self.resolved_start > self.resolved_end:
+            raise ValueError("resolved_start must not follow resolved_end")
+        object.__setattr__(self, "created_at", _utc_datetime(self.created_at))
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineRunRecord:
+    id: str
+    mode: str
+    provider: str
+    request_hash: str
+    requested_start: date | None
+    requested_end: date | None
+    resolved_start: date
+    resolved_end: date
+    status: str
+    created_at: datetime
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineStageRecord:
+    run_id: str
+    stage: PipelineStageName
+    status: str
+    input_hash: str
+    output_hash: str | None
+    output: FrozenJsonValue | None
+    started_at: datetime
+    completed_at: datetime | None
+    error: FrozenJsonValue | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +210,220 @@ class MetadataRepository:
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    def register_pipeline_run(self, spec: PipelineRunSpec) -> PipelineRunRecord:
+        """Create or return the stable run identified by its canonical request."""
+        identifier = str(
+            uuid5(NAMESPACE_URL, f"quant:pipeline-run:{spec.request_hash}")
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(
+                sqlite_insert(PipelineRunORM)
+                .values(
+                    id=identifier,
+                    mode=spec.mode,
+                    provider=spec.provider,
+                    request_hash=spec.request_hash,
+                    requested_start=_date_text(spec.requested_start),
+                    requested_end=_date_text(spec.requested_end),
+                    resolved_start=spec.resolved_start.isoformat(),
+                    resolved_end=spec.resolved_end.isoformat(),
+                    status="CREATED",
+                    created_at=_timestamp(spec.created_at),
+                    completed_at=None,
+                )
+                .on_conflict_do_nothing(index_elements=["request_hash"])
+            )
+            row = session.scalar(
+                select(PipelineRunORM).where(
+                    PipelineRunORM.request_hash == spec.request_hash
+                )
+            )
+            if row is None or row.id != identifier:
+                _raise_repository_conflict("pipeline run request hash collision")
+            expected = (
+                spec.mode,
+                spec.provider,
+                _date_text(spec.requested_start),
+                _date_text(spec.requested_end),
+                spec.resolved_start.isoformat(),
+                spec.resolved_end.isoformat(),
+            )
+            actual = (
+                row.mode,
+                row.provider,
+                row.requested_start,
+                row.requested_end,
+                row.resolved_start,
+                row.resolved_end,
+            )
+            if actual != expected:
+                _raise_repository_conflict("pipeline run metadata differs")
+            return self._pipeline_run_record(row)
+
+    def start_pipeline_stage(
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        *,
+        input_hash: str,
+        started_at: datetime,
+    ) -> PipelineStageRecord:
+        """Start or restart a non-successful stage under the same input hash."""
+        _validate_hash(input_hash, "input_hash")
+        with Session(self._engine) as session, session.begin():
+            run = session.get(PipelineRunORM, run_id)
+            if run is None:
+                raise KeyError(f"pipeline run does not exist: {run_id}")
+            row = session.get(PipelineStageORM, (run_id, stage.value))
+            if row is not None and row.status == "SUCCEEDED":
+                if row.input_hash != input_hash:
+                    raise ValueError("successful pipeline stage input hash differs")
+                return self._pipeline_stage_record(row)
+            values = {
+                "run_id": run_id,
+                "stage": stage.value,
+                "status": "RUNNING",
+                "input_hash": input_hash,
+                "output_hash": None,
+                "output_json": None,
+                "started_at": _timestamp(started_at),
+                "completed_at": None,
+                "error_json": None,
+            }
+            if row is None:
+                session.add(PipelineStageORM(**values))
+            else:
+                for key, value in values.items():
+                    setattr(row, key, value)
+            run.status = "RUNNING"
+            session.flush()
+            return self._pipeline_stage_record(
+                session.get_one(PipelineStageORM, (run_id, stage.value))
+            )
+
+    def complete_pipeline_stage(
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        *,
+        input_hash: str,
+        output_hash: str,
+        output: JsonValue,
+        completed_at: datetime,
+    ) -> PipelineStageRecord:
+        """Seal one stage checkpoint; successful rows are immutable afterwards."""
+        _validate_hash(input_hash, "input_hash")
+        _validate_hash(output_hash, "output_hash")
+        output_json = canonical_json_bytes(output).decode("utf-8")
+        with Session(self._engine) as session, session.begin():
+            row = session.get(PipelineStageORM, (run_id, stage.value))
+            if row is None or row.status != "RUNNING" or row.input_hash != input_hash:
+                raise ValueError("pipeline stage is not running with this input hash")
+            row.status = "SUCCEEDED"
+            row.output_hash = output_hash
+            row.output_json = output_json
+            row.completed_at = _timestamp(completed_at)
+            row.error_json = None
+            session.flush()
+            return self._pipeline_stage_record(row)
+
+    def get_pipeline_stage(
+        self, run_id: str, stage: PipelineStageName
+    ) -> PipelineStageRecord:
+        with Session(self._engine) as session:
+            row = session.get(PipelineStageORM, (run_id, stage.value))
+            if row is None:
+                raise KeyError(f"pipeline stage does not exist: {run_id}/{stage.value}")
+            return self._pipeline_stage_record(row)
+
+    def fail_pipeline_stage(
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        *,
+        input_hash: str,
+        error: JsonValue,
+        completed_at: datetime,
+        blocked: bool = False,
+    ) -> PipelineStageRecord:
+        """Persist a structured stage failure so another process can resume it."""
+        with Session(self._engine) as session, session.begin():
+            row = session.get(PipelineStageORM, (run_id, stage.value))
+            run = session.get(PipelineRunORM, run_id)
+            if row is None or run is None or row.input_hash != input_hash:
+                raise ValueError("pipeline stage is not running with this input hash")
+            row.status = "BLOCKED" if blocked else "FAILED"
+            row.completed_at = _timestamp(completed_at)
+            row.error_json = canonical_json_bytes(error).decode("utf-8")
+            run.status = row.status
+            session.flush()
+            return self._pipeline_stage_record(row)
+
+    def complete_pipeline_run(self, run_id: str, completed_at: datetime) -> None:
+        with Session(self._engine) as session, session.begin():
+            row = session.get(PipelineRunORM, run_id)
+            if row is None:
+                raise KeyError(f"pipeline run does not exist: {run_id}")
+            row.status = "SUCCEEDED"
+            row.completed_at = _timestamp(completed_at)
+
+    def get_pipeline_run(self, run_id: str) -> PipelineRunRecord:
+        with Session(self._engine) as session:
+            row = session.get(PipelineRunORM, run_id)
+            if row is None:
+                raise KeyError(f"pipeline run does not exist: {run_id}")
+            return self._pipeline_run_record(row)
+
+    def latest_recoverable_pipeline_run(
+        self, provider: str | None = None
+    ) -> PipelineRunRecord | None:
+        with Session(self._engine) as session:
+            query = select(PipelineRunORM).where(PipelineRunORM.status != "SUCCEEDED")
+            if provider is not None:
+                query = query.where(PipelineRunORM.provider == provider)
+            row = session.scalar(query.order_by(PipelineRunORM.created_at.desc()))
+            return None if row is None else self._pipeline_run_record(row)
+
+    @staticmethod
+    def _pipeline_run_record(row: PipelineRunORM) -> PipelineRunRecord:
+        return PipelineRunRecord(
+            id=row.id,
+            mode=row.mode,
+            provider=row.provider,
+            request_hash=row.request_hash,
+            requested_start=_parse_date(row.requested_start),
+            requested_end=_parse_date(row.requested_end),
+            resolved_start=date.fromisoformat(row.resolved_start),
+            resolved_end=date.fromisoformat(row.resolved_end),
+            status=row.status,
+            created_at=_parse_timestamp(row.created_at),
+            completed_at=(
+                _parse_timestamp(row.completed_at)
+                if row.completed_at is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _pipeline_stage_record(row: PipelineStageORM) -> PipelineStageRecord:
+        return PipelineStageRecord(
+            run_id=row.run_id,
+            stage=PipelineStageName(row.stage),
+            status=row.status,
+            input_hash=row.input_hash,
+            output_hash=row.output_hash,
+            output=(
+                freeze_json(json.loads(row.output_json)) if row.output_json else None
+            ),
+            started_at=_parse_timestamp(row.started_at),
+            completed_at=(
+                _parse_timestamp(row.completed_at)
+                if row.completed_at is not None
+                else None
+            ),
+            error=(freeze_json(json.loads(row.error_json)) if row.error_json else None),
+        )
 
     def register_dataset_version(
         self, spec: DatasetVersionSpec
@@ -281,6 +561,15 @@ class MetadataRepository:
                 select(SnapshotORM.id).order_by(SnapshotORM.id)
             )
             return tuple(self._snapshot_record(session, value) for value in identifiers)
+
+    def latest_snapshot(self) -> SnapshotRecord | None:
+        with Session(self._engine) as session:
+            row = session.scalar(
+                select(SnapshotORM)
+                .where(SnapshotORM.status == SnapshotStatus.PUBLISHED.value)
+                .order_by(SnapshotORM.published_at.desc())
+            )
+            return None if row is None else self._snapshot_record(session, row.id)
 
     def count_snapshots(self) -> int:
         with Session(self._engine) as session:
@@ -611,6 +900,12 @@ def _timestamp(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
     return value.astimezone(UTC).isoformat()
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _parse_timestamp(value: str) -> datetime:

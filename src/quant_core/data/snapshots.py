@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -298,13 +299,15 @@ class SnapshotPublisher:
     ) -> tuple[Path, Path]:
         directory = self._snapshot_root / f"snapshot_id={identifier}"
         final_path = directory / "manifest.json"
+        resolved_directory = _normalized_resolved_path(directory.resolve(strict=False))
         try:
-            directory.resolve(strict=False).relative_to(self._snapshot_root)
+            resolved_directory.relative_to(self._snapshot_root)
         except (OSError, ValueError):
             self._raise_path_error(identifier)
-        if directory.resolve(strict=False) != directory:
+        if resolved_directory != directory:
             self._raise_path_error(identifier)
-        if final_path.is_symlink() or final_path.resolve(strict=False) != final_path:
+        resolved_final = _normalized_resolved_path(final_path.resolve(strict=False))
+        if final_path.is_symlink() or resolved_final != final_path:
             self._raise_path_error(identifier)
         if recorded_path is not None and recorded_path.absolute() != final_path:
             self._raise_path_error(identifier)
@@ -352,6 +355,18 @@ def _publication_fingerprint(
         "quality_run_id": str(quality_run_id),
     }
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _normalized_resolved_path(path: Path) -> Path:
+    """Normalize Windows' equivalent extended path spelling after resolution."""
+    if os.name != "nt":
+        return path
+    value = str(path)
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
 
 
 def _validate_quality_gate(

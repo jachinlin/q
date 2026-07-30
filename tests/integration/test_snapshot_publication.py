@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import threading
 import uuid
@@ -1335,6 +1336,35 @@ def test_concurrent_snapshot_publication_is_idempotent(
     assert hashlib.sha256(snapshot.manifest_path.read_bytes()).hexdigest() == (
         snapshot.manifest_hash
     )
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows extended paths are platform-specific"
+)
+def test_snapshot_path_guard_accepts_equivalent_windows_extended_path(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient extended-path spelling is not mistaken for a reparse escape."""
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    original_resolve = Path.resolve
+
+    def extended_missing_manifest(path: Path, strict: bool = False) -> Path:
+        resolved = original_resolve(path, strict=strict)
+        if path.name == "manifest.json" and not path.exists():
+            return Path("\\\\?\\" + str(resolved))
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", extended_missing_manifest)
+
+    snapshot_id = SnapshotPublisher(repository, tmp_path / "snapshots").publish(
+        versions, quality_run_id
+    )
+
+    assert repository.get_snapshot(snapshot_id).status is SnapshotStatus.PUBLISHED
 
 
 def test_relation_rows_cannot_be_reparented_into_sealed_parents(

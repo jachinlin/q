@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Protocol, cast
+from zoneinfo import ZoneInfo
 
 from quant_core.data.contracts import JsonValue, RawBatch
 from quant_core.domain.enums import Exchange, Severity
@@ -38,6 +39,8 @@ DAILY_BAR_FIELDS = (
     "pcfNcfTTM",
     "isST",
 )
+INSTRUMENT_FIELDS = ("code", "code_name", "ipoDate", "outDate", "type", "status")
+TRADE_CALENDAR_FIELDS = ("calendar_date", "is_trading_day")
 _DAILY_BAR_FIELD_ARGUMENT = ",".join(DAILY_BAR_FIELDS)
 _BAOSTOCK_CODE = re.compile(r"(sh|sz)\.([0-9]{6})\Z")
 
@@ -82,6 +85,12 @@ class BaoStockGateway(Protocol):
     ) -> BaoStockCursor:
         """Query one provider code over one closed date interval."""
 
+    def query_stock_basic(self, *, code: str, code_name: str) -> BaoStockCursor:
+        """Query the provider-native historical security directory."""
+
+    def query_trade_dates(self, *, start_date: str, end_date: str) -> BaoStockCursor:
+        """Query the provider-native exchange calendar."""
+
 
 class _BaoStockSdk(Protocol):
     """Structural type for the imported external SDK module."""
@@ -103,6 +112,12 @@ class _BaoStockSdk(Protocol):
         adjustflag: str,
     ) -> BaoStockCursor:
         """Query one provider code over one closed date interval."""
+
+    def query_stock_basic(self, *, code: str, code_name: str) -> BaoStockCursor:
+        """Query security master data."""
+
+    def query_trade_dates(self, *, start_date: str, end_date: str) -> BaoStockCursor:
+        """Query exchange open dates."""
 
 
 class BaoStockSdkGateway:
@@ -136,6 +151,12 @@ class BaoStockSdkGateway:
             adjustflag=adjustflag,
         )
 
+    def query_stock_basic(self, *, code: str, code_name: str) -> BaoStockCursor:
+        return self._sdk.query_stock_basic(code=code, code_name=code_name)
+
+    def query_trade_dates(self, *, start_date: str, end_date: str) -> BaoStockCursor:
+        return self._sdk.query_trade_dates(start_date=start_date, end_date=end_date)
+
 
 @dataclass(frozen=True, slots=True)
 class InstrumentListing:
@@ -151,6 +172,42 @@ class InstrumentCatalog(Protocol):
 
     def list_instruments(self) -> Sequence[InstrumentListing]:
         """Return historical listings, including delisted instruments."""
+
+
+@dataclass(frozen=True, slots=True)
+class BaoStockHistoricalCatalog:
+    """Reusable historical listing catalog reconstructed from immutable raw rows."""
+
+    listings: tuple[InstrumentListing, ...]
+
+    @classmethod
+    def from_raw_rows(
+        cls, rows: Sequence[dict[str, JsonValue]]
+    ) -> BaoStockHistoricalCatalog:
+        listings: list[InstrumentListing] = []
+        for row in rows:
+            code = row.get("code")
+            list_text = row.get("ipoDate")
+            delist_text = row.get("outDate")
+            if not isinstance(code, str) or not isinstance(list_text, str):
+                raise TypeError("instrument raw rows require string code and ipoDate")
+            if not isinstance(delist_text, str):
+                raise TypeError("instrument raw outDate must be a string")
+            listings.append(
+                InstrumentListing(
+                    instrument_id=from_baostock_code(code),
+                    list_date=date.fromisoformat(list_text),
+                    delist_date=(
+                        date.fromisoformat(delist_text) if delist_text else None
+                    ),
+                )
+            )
+        return cls(
+            tuple(sorted(listings, key=lambda item: item.instrument_id.canonical()))
+        )
+
+    def list_instruments(self) -> Sequence[InstrumentListing]:
+        return self.listings
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +268,7 @@ class BaoStockClient:
     def __init__(
         self,
         gateway: BaoStockGateway,
-        catalog: InstrumentCatalog,
+        catalog: InstrumentCatalog | None,
         config: BaoStockConfig,
         *,
         clock: Callable[[], datetime] = _utc_now,
@@ -225,6 +282,10 @@ class BaoStockClient:
         self._sleep = sleep
         self._logger = logger or logging.getLogger(__name__)
         self._logged_in = False
+
+    @property
+    def provider(self) -> str:
+        return "baostock"
 
     def login(self) -> None:
         """Establish the provider session once."""
@@ -309,6 +370,51 @@ class BaoStockClient:
                     rows=tuple(rows),
                 )
 
+    def fetch_instruments(self) -> Iterable[RawBatch]:
+        """Yield the complete provider-native instrument directory once."""
+        if not self._logged_in:
+            raise self._state_error("fetch_instruments")
+        rows = self._read_cursor(
+            "query_stock_basic",
+            lambda: self._gateway.query_stock_basic(code="", code_name=""),
+            INSTRUMENT_FIELDS,
+        )
+        self._catalog = BaoStockHistoricalCatalog.from_raw_rows(rows)
+        yield RawBatch(
+            provider=self.provider,
+            dataset="instruments",
+            request={"code": "", "code_name": "", "scope": "ALL_HISTORICAL"},
+            retrieved_at=self._clock(),
+            schema=INSTRUMENT_FIELDS,
+            rows=tuple(rows),
+        )
+
+    def fetch_trade_calendar(self, start: date, end: date) -> Iterable[RawBatch]:
+        """Yield provider-native calendar rows for one closed date interval."""
+        if not self._logged_in:
+            raise self._state_error("fetch_trade_calendar")
+        rows = self._read_cursor(
+            "query_trade_dates",
+            lambda: self._gateway.query_trade_dates(
+                start_date=start.isoformat(), end_date=end.isoformat()
+            ),
+            TRADE_CALENDAR_FIELDS,
+        )
+        yield RawBatch(
+            provider=self.provider,
+            dataset="trade_calendar",
+            request={"start_date": start.isoformat(), "end_date": end.isoformat()},
+            retrieved_at=self._clock(),
+            schema=TRADE_CALENDAR_FIELDS,
+            rows=tuple(rows),
+        )
+
+    def fetch_range(self, start: date, end: date) -> Iterable[RawBatch]:
+        """Emit every production-supported Raw dataset in dependency order."""
+        yield from self.fetch_instruments()
+        yield from self.fetch_trade_calendar(start, end)
+        yield from self.fetch_daily_bars(start, end, None)
+
     def _resolve_instruments(
         self,
         start: date,
@@ -321,6 +427,9 @@ class BaoStockClient:
                 extra={"event": "empty_instruments_resolved_as_all", "scope": "ALL"},
             )
         if instruments is None or len(instruments) == 0:
+            if self._catalog is None:
+                tuple(self.fetch_instruments())
+            assert self._catalog is not None
             candidates = (
                 listing.instrument_id
                 for listing in self._catalog.list_instruments()
@@ -389,6 +498,38 @@ class BaoStockClient:
                 rows.append(dict(zip(DAILY_BAR_FIELDS, values, strict=True)))
 
         return self._retry("query_history_k_data_plus", perform_query)
+
+    def _read_cursor(
+        self,
+        operation: str,
+        query: Callable[[], BaoStockCursor],
+        fields: tuple[str, ...],
+    ) -> list[dict[str, JsonValue]]:
+        def perform_query() -> list[dict[str, JsonValue]]:
+            cursor = query()
+            self._raise_provider_error(cursor, operation=operation)
+            if tuple(cursor.fields) != fields:
+                raise self._schema_error(
+                    f"cursor fields do not match the fixed {operation} schema",
+                    expected=list(fields),
+                    actual=list(cursor.fields),
+                )
+            rows: list[dict[str, JsonValue]] = []
+            while True:
+                has_row = cursor.next()
+                self._raise_provider_error(cursor, operation=operation)
+                if not has_row:
+                    return rows
+                values = tuple(cursor.get_row_data())
+                if len(values) != len(fields):
+                    raise self._schema_error(
+                        f"cursor row length does not match the fixed {operation} schema",
+                        expected=len(fields),
+                        actual=len(values),
+                    )
+                rows.append(dict(zip(fields, values, strict=True)))
+
+        return self._retry(operation, perform_query)
 
     def _retry[T](self, operation: str, function: Callable[[], T]) -> T:
         for attempt in range(self._config.max_attempts):
@@ -476,3 +617,77 @@ class BaoStockClient:
                 retryable=True,
             )
         )
+
+
+class BaoStockCalendarPolicy:
+    """Resolve accurate trading windows through provider calendar evidence."""
+
+    def __init__(
+        self,
+        client: BaoStockClient,
+        *,
+        clock: Callable[[], datetime] = _utc_now,
+        completion_hour: int = 18,
+    ) -> None:
+        self._client = client
+        self._clock = clock
+        self._completion_hour = completion_hour
+        self._timezone = ZoneInfo("Asia/Shanghai")
+
+    def bootstrap_window(self, years: int) -> tuple[date, date]:
+        if years <= 0:
+            raise ValueError("years must be positive")
+        end = self.latest_complete_day()
+        try:
+            target = end.replace(year=end.year - years)
+        except ValueError:
+            target = end.replace(year=end.year - years, day=28)
+        candidates = self._open_dates(target, target + timedelta(days=31))
+        if not candidates:
+            raise ValueError("provider calendar has no bootstrap start day")
+        return candidates[0], end
+
+    def latest_complete_day(self) -> date:
+        local_now = self._clock().astimezone(self._timezone)
+        candidate = local_now.date()
+        if local_now.hour < self._completion_hour:
+            candidate -= timedelta(days=1)
+        candidates = self._open_dates(candidate - timedelta(days=31), candidate)
+        if not candidates:
+            raise ValueError("provider calendar has no latest complete trading day")
+        return candidates[-1]
+
+    def explicit_window(self, start: date, end: date) -> tuple[date, date]:
+        if start > end:
+            raise ValueError("start must not follow end")
+        candidates = self._open_dates(start, end)
+        if not candidates:
+            raise ValueError("requested range contains no trading day")
+        return candidates[0], candidates[-1]
+
+    def update_window(self, watermark: date, overlap_days: int) -> tuple[date, date]:
+        if overlap_days < 0:
+            raise ValueError("overlap_days must be non-negative")
+        end = self.latest_complete_day()
+        candidates = self._open_dates(watermark - timedelta(days=45), end)
+        at_or_before = [item for item in candidates if item <= watermark]
+        if not at_or_before:
+            raise ValueError("provider calendar does not cover the snapshot watermark")
+        index = max(0, len(at_or_before) - overlap_days - 1)
+        return at_or_before[index], end
+
+    def _open_dates(self, start: date, end: date) -> list[date]:
+        self._client.login()
+        try:
+            batches = tuple(self._client.fetch_trade_calendar(start, end))
+        finally:
+            self._client.close()
+        dates: list[date] = []
+        for batch in batches:
+            for row in batch.rows:
+                if row.get("is_trading_day") == "1":
+                    value = row.get("calendar_date")
+                    if not isinstance(value, str):
+                        raise ValueError("calendar_date must be a provider string")
+                    dates.append(date.fromisoformat(value))
+        return sorted(set(dates))

@@ -118,3 +118,35 @@ class AuditLogORM(Base):
     object_id: Mapped[str] = mapped_column(String(128), nullable=False)
     details_json: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class PipelineRunORM(Base):
+    __tablename__ = "pipeline_run"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    requested_start: Mapped[str | None] = mapped_column(String(10))
+    requested_end: Mapped[str | None] = mapped_column(String(10))
+    resolved_start: Mapped[str] = mapped_column(String(10), nullable=False)
+    resolved_end: Mapped[str] = mapped_column(String(10), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    completed_at: Mapped[str | None] = mapped_column(String(32))
+
+
+class PipelineStageORM(Base):
+    __tablename__ = "pipeline_stage"
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("pipeline_run.id", ondelete="CASCADE"), primary_key=True
+    )
+    stage: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_hash: Mapped[str | None] = mapped_column(String(64))
+    output_json: Mapped[str | None] = mapped_column(String)
+    started_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    completed_at: Mapped[str | None] = mapped_column(String(32))
+    error_json: Mapped[str | None] = mapped_column(String)

@@ -7,12 +7,15 @@ from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from typing import ClassVar
 
 import pytest
 
 from quant_core.data.sources.baostock import (
+    BaoStockCalendarPolicy,
     BaoStockClient,
     BaoStockConfig,
+    BaoStockHistoricalCatalog,
     BaoStockSdkGateway,
     InstrumentListing,
     from_baostock_code,
@@ -104,6 +107,19 @@ class FakeGateway:
         self.login_outcomes: deque[FakeResponse | Exception] = deque()
         self.logout_outcomes: deque[FakeResponse | Exception] = deque()
         self.query_outcomes: dict[tuple[str, str, str], deque[QueryOutcome]] = {}
+        self.stock_basic_cursor = FakeCursor(
+            [
+                [
+                    ("sh.600000", "浦发银行", "1999-11-10", "", "1", "1"),
+                    ("sz.000001", "平安银行", "1991-04-03", "", "1", "1"),
+                ]
+            ],
+            fields=("code", "code_name", "ipoDate", "outDate", "type", "status"),
+        )
+        self.trade_dates_cursor = FakeCursor(
+            [[("2026-01-02", "1"), ("2026-01-03", "0")]],
+            fields=("calendar_date", "is_trading_day"),
+        )
 
     def login(self) -> FakeResponse:
         self.login_calls += 1
@@ -151,6 +167,15 @@ class FakeGateway:
                 raise outcome
             return outcome
         return FakeCursor([[make_row(start_date, code)]])
+
+    def query_stock_basic(self, *, code: str, code_name: str) -> FakeCursor:
+        assert code == ""
+        assert code_name == ""
+        return self.stock_basic_cursor
+
+    def query_trade_dates(self, *, start_date: str, end_date: str) -> FakeCursor:
+        assert start_date <= end_date
+        return self.trade_dates_cursor
 
     def queue_query(
         self,
@@ -235,6 +260,114 @@ def make_client(
         clock=lambda: FIXED_TIME,
         sleep=sleep_function,
         logger=logger,
+    )
+
+
+def test_client_emits_provider_native_instrument_and_calendar_raw() -> None:
+    """Dropping either SDK query would leave the default pipeline incomplete."""
+    gateway = FakeGateway()
+    client = BaoStockClient(
+        gateway,
+        None,
+        config(),
+        clock=lambda: FIXED_TIME,
+        sleep=lambda _: None,
+    )
+    client.login()
+
+    instruments = tuple(client.fetch_instruments())
+    calendar = tuple(client.fetch_trade_calendar(date(2026, 1, 2), date(2026, 1, 3)))
+
+    assert instruments[0].dataset == "instruments"
+    assert instruments[0].schema == (
+        "code",
+        "code_name",
+        "ipoDate",
+        "outDate",
+        "type",
+        "status",
+    )
+    assert instruments[0].rows[0]["code"] == "sh.600000"
+    assert calendar[0].dataset == "trade_calendar"
+    assert calendar[0].rows == (
+        {"calendar_date": "2026-01-02", "is_trading_day": "1"},
+        {"calendar_date": "2026-01-03", "is_trading_day": "0"},
+    )
+
+
+def test_historical_catalog_reuses_instrument_raw_without_second_sdk_query() -> None:
+    """A second provider query would break reproducible full-market resolution."""
+    rows = (
+        {
+            "code": "sh.600000",
+            "code_name": "浦发银行",
+            "ipoDate": "1999-11-10",
+            "outDate": "",
+            "type": "1",
+            "status": "1",
+        },
+        {
+            "code": "sz.000001",
+            "code_name": "平安银行",
+            "ipoDate": "1991-04-03",
+            "outDate": "2020-12-31",
+            "type": "1",
+            "status": "0",
+        },
+    )
+
+    catalog = BaoStockHistoricalCatalog.from_raw_rows(rows)
+
+    assert catalog.list_instruments() == (
+        InstrumentListing(instrument(Exchange.SSE, "600000"), date(1999, 11, 10), None),
+        InstrumentListing(
+            instrument(Exchange.SZSE, "000001"),
+            date(1991, 4, 3),
+            date(2020, 12, 31),
+        ),
+    )
+
+
+def test_calendar_policy_resolves_complete_bootstrap_explicit_and_overlap_windows() -> (
+    None
+):
+    class CalendarGateway(FakeGateway):
+        open_dates: ClassVar[set[date]] = {
+            date(2006, 1, 5),
+            date(2025, 12, 26),
+            date(2025, 12, 29),
+            date(2025, 12, 30),
+            date(2025, 12, 31),
+            date(2026, 1, 2),
+            date(2026, 1, 5),
+        }
+
+        def query_trade_dates(self, *, start_date: str, end_date: str) -> FakeCursor:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+            rows = [
+                (item.isoformat(), "1")
+                for item in sorted(self.open_dates)
+                if start <= item <= end
+            ]
+            return FakeCursor([[*rows]], fields=("calendar_date", "is_trading_day"))
+
+    gateway = CalendarGateway()
+    client = BaoStockClient(
+        gateway, None, config(), clock=lambda: FIXED_TIME, sleep=lambda _: None
+    )
+    policy = BaoStockCalendarPolicy(
+        client, clock=lambda: datetime(2026, 1, 6, 2, tzinfo=UTC)
+    )
+
+    assert policy.bootstrap_window(20) == (date(2006, 1, 5), date(2026, 1, 5))
+    assert policy.explicit_window(date(2026, 1, 3), date(2026, 1, 5)) == (
+        date(2026, 1, 5),
+        date(2026, 1, 5),
+    )
+    assert policy.update_window(date(2026, 1, 5), 5) == (
+        date(2025, 12, 26),
+        date(2026, 1, 5),
     )
 
 
