@@ -272,6 +272,9 @@ def test_vendor_code_parser_rejects_noncanonical_baostock_codes(
         {"max_attempts": 0},
         {"max_attempts": 2, "retry_backoff_seconds": ()},
         {"max_attempts": 2, "retry_backoff_seconds": (-0.1,)},
+        {"max_attempts": 2, "retry_backoff_seconds": (float("nan"),)},
+        {"max_attempts": 2, "retry_backoff_seconds": (float("inf"),)},
+        {"max_attempts": 2, "retry_backoff_seconds": (float("-inf"),)},
     ],
 )
 def test_config_rejects_invalid_explicit_batch_and_retry_limits(

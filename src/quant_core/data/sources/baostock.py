@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import logging
+import math
 import re
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -172,8 +173,11 @@ class BaoStockConfig:
             raise ValueError("batch limits and max_attempts must be positive integers")
         if len(self.retry_backoff_seconds) != self.max_attempts - 1:
             raise ValueError("retry_backoff_seconds must contain one delay per retry")
-        if any(delay < 0 for delay in self.retry_backoff_seconds):
-            raise ValueError("retry backoff seconds must be non-negative")
+        if any(
+            not math.isfinite(delay) or delay < 0
+            for delay in self.retry_backoff_seconds
+        ):
+            raise ValueError("retry backoff seconds must be finite and non-negative")
 
 
 def to_baostock_code(instrument_id: InstrumentId) -> str:
