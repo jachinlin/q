@@ -1029,6 +1029,176 @@ def test_recovery_rejects_snapshot_directory_links_without_touching_target(
     assert victim.read_text(encoding="utf-8") == "linked victim"
 
 
+def test_recovery_rejects_a_published_manifest_file_link(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    publisher = SnapshotPublisher(repository, tmp_path / "snapshots")
+    snapshot_id = publisher.publish(versions, quality_run_id)
+    manifest_path = repository.get_snapshot(snapshot_id).manifest_path
+    manifest_bytes = manifest_path.read_bytes()
+    victim = tmp_path / "outside-final-manifest.json"
+    victim.write_bytes(manifest_bytes)
+    manifest_path.unlink()
+    try:
+        manifest_path.symlink_to(victim)
+    except OSError:
+        manifest_path.write_bytes(manifest_bytes)
+        original_is_symlink = Path.is_symlink
+        monkeypatch.setattr(
+            Path,
+            "is_symlink",
+            lambda path: path == manifest_path or original_is_symlink(path),
+        )
+
+    with pytest.raises(QuantError) as raised:
+        publisher.recover()
+
+    assert raised.value.detail.code == "SNAP_PATH_INVALID"
+    assert victim.read_bytes() == manifest_bytes
+
+
+def test_recovery_never_reads_or_publishes_a_linked_protocol_temp(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    snapshot_id = SnapshotId.parse("44345678-1234-5678-9234-567812345678")
+    snapshot_dir = tmp_path / "snapshots" / f"snapshot_id={snapshot_id}"
+    final_path = snapshot_dir / "manifest.json"
+    linked_temp = snapshot_dir / f".{uuid.uuid4().hex}.manifest.tmp"
+    payload = _manifest_bytes(
+        snapshot_id, quality_run_id, {DatasetKind.DAILY_BAR.value: version}
+    )
+    snapshot_dir.mkdir(parents=True)
+    victim = tmp_path / "outside-temp-manifest.json"
+    victim.write_bytes(payload)
+    using_real_symlink = True
+    try:
+        linked_temp.symlink_to(victim)
+    except OSError:
+        using_real_symlink = False
+        linked_temp.write_bytes(payload)
+    _insert_draft_snapshot(
+        tmp_path, snapshot_id, quality_run_id, final_path, payload, versions
+    )
+    original_is_symlink = Path.is_symlink
+    original_read_bytes = Path.read_bytes
+    if not using_real_symlink:
+        monkeypatch.setattr(
+            Path,
+            "is_symlink",
+            lambda path: path == linked_temp or original_is_symlink(path),
+        )
+
+    def reject_link_read(path: Path) -> bytes:
+        if path == linked_temp:
+            raise AssertionError("linked protocol temp must not be read")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_link_read)
+
+    with pytest.raises(QuantError) as raised:
+        SnapshotPublisher(repository, tmp_path / "snapshots").recover()
+
+    assert raised.value.detail.code == "SNAP_PATH_INVALID"
+    assert repository.get_snapshot(snapshot_id).status is SnapshotStatus.DRAFT
+    assert linked_temp.exists()
+    assert not final_path.exists()
+    assert victim.read_bytes() == payload
+
+
+def test_publish_structures_temporary_manifest_hash_mismatch(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    original_read_bytes = Path.read_bytes
+
+    def corrupt_temp_readback(path: Path) -> bytes:
+        if path.name.endswith(".manifest.tmp"):
+            return b"corrupt readback"
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", corrupt_temp_readback)
+
+    with pytest.raises(QuantError) as raised:
+        SnapshotPublisher(repository, tmp_path / "snapshots").publish(
+            versions, quality_run_id
+        )
+
+    assert raised.value.detail.code == "SNAP_MANIFEST_MISMATCH"
+    assert repository.count_snapshots() == 0
+
+
+def test_publish_structures_temporary_manifest_read_failure(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    original_read_bytes = Path.read_bytes
+
+    def fail_temp_readback(path: Path) -> bytes:
+        if path.name.endswith(".manifest.tmp"):
+            raise PermissionError("injected temporary manifest read failure")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_temp_readback)
+
+    with pytest.raises(QuantError) as raised:
+        SnapshotPublisher(repository, tmp_path / "snapshots").publish(
+            versions, quality_run_id
+        )
+
+    assert raised.value.detail.code == "SNAP_MANIFEST_MISMATCH"
+    assert repository.count_snapshots() == 0
+    assert list((tmp_path / "snapshots").rglob("*.manifest.tmp")) == []
+
+
+def test_publish_structures_and_cleans_temporary_manifest_write_failure(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    original_open = Path.open
+    original_write_bytes = Path.write_bytes
+
+    def fail_after_partial_write(
+        path: Path, mode: str = "r", *args: Any, **kwargs: Any
+    ) -> Any:
+        if path.name.endswith(".manifest.tmp") and mode == "xb":
+            original_write_bytes(path, b"partial")
+            raise PermissionError("injected temporary manifest write failure")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_after_partial_write)
+
+    with pytest.raises(QuantError) as raised:
+        SnapshotPublisher(repository, tmp_path / "snapshots").publish(
+            versions, quality_run_id
+        )
+
+    assert raised.value.detail.code == "SNAP_MANIFEST_MISMATCH"
+    assert repository.count_snapshots() == 0
+    assert list((tmp_path / "snapshots").rglob("*.manifest.tmp")) == []
+
+
 def test_draft_recovery_discards_quality_scope_mismatch_with_audit(
     repository: MetadataRepository,
     tmp_path: Path,

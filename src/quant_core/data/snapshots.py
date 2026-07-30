@@ -99,10 +99,35 @@ class SnapshotPublisher:
         directory, final_path = self._snapshot_paths(identifier)
         temporary_path = directory / f".{uuid.uuid4().hex}.manifest.tmp"
         directory.mkdir(parents=True, exist_ok=True)
-        temporary_path.write_bytes(manifest_bytes)
-        if hashlib.sha256(temporary_path.read_bytes()).hexdigest() != manifest_hash:
-            temporary_path.unlink(missing_ok=True)
-            raise OSError("temporary snapshot manifest failed integrity verification")
+        try:
+            with temporary_path.open("xb") as temporary_file:
+                temporary_file.write(manifest_bytes)
+        except OSError:
+            _remove_temporary_manifest(temporary_path)
+            _raise_snapshot_error(
+                "SNAP_MANIFEST_MISMATCH",
+                Severity.FATAL,
+                "temporary snapshot manifest cannot be written",
+                {"snapshot_id": str(identifier)},
+            )
+        try:
+            readback_hash = hashlib.sha256(temporary_path.read_bytes()).hexdigest()
+        except OSError:
+            _remove_temporary_manifest(temporary_path)
+            _raise_snapshot_error(
+                "SNAP_MANIFEST_MISMATCH",
+                Severity.FATAL,
+                "temporary snapshot manifest cannot be verified",
+                {"snapshot_id": str(identifier)},
+            )
+        if temporary_path.is_symlink() or readback_hash != manifest_hash:
+            _remove_temporary_manifest(temporary_path)
+            _raise_snapshot_error(
+                "SNAP_MANIFEST_MISMATCH",
+                Severity.FATAL,
+                "temporary snapshot manifest failed integrity verification",
+                {"snapshot_id": str(identifier)},
+            )
 
         def install_manifest() -> None:
             temporary_path.replace(final_path)
@@ -152,14 +177,14 @@ class SnapshotPublisher:
                     continue
                 _, final_path = self._snapshot_paths(identifier)
                 final_path.unlink(missing_ok=True)
-                for temporary_path in self._temporary_manifests(directory):
+                for temporary_path in self._temporary_manifests(directory, identifier):
                     temporary_path.unlink(missing_ok=True)
 
     def _recover_draft(self, snapshot: SnapshotRecord) -> None:
         directory, final_path = self._snapshot_paths(
             snapshot.id, snapshot.manifest_path
         )
-        candidates = [final_path, *self._temporary_manifests(directory)]
+        candidates = [final_path, *self._temporary_manifests(directory, snapshot.id)]
         valid = next(
             (
                 candidate
@@ -186,7 +211,7 @@ class SnapshotPublisher:
         )
         if outcome == "DISCARDED":
             final_path.unlink(missing_ok=True)
-        for candidate in self._temporary_manifests(directory):
+        for candidate in self._temporary_manifests(directory, snapshot.id):
             candidate.unlink(missing_ok=True)
 
     def _verify_published(self, snapshot: SnapshotRecord) -> None:
@@ -279,21 +304,31 @@ class SnapshotPublisher:
             self._raise_path_error(identifier)
         if directory.resolve(strict=False) != directory:
             self._raise_path_error(identifier)
+        if final_path.is_symlink() or final_path.resolve(strict=False) != final_path:
+            self._raise_path_error(identifier)
         if recorded_path is not None and recorded_path.absolute() != final_path:
             self._raise_path_error(identifier)
         return directory, final_path
 
-    @staticmethod
-    def _temporary_manifests(directory: Path) -> tuple[Path, ...]:
+    def _temporary_manifests(
+        self, directory: Path, identifier: SnapshotId
+    ) -> tuple[Path, ...]:
         if not directory.is_dir():
             return ()
-        return tuple(
+        temporary_paths = tuple(
             sorted(
                 path
                 for path in directory.iterdir()
-                if path.is_file() and _TEMP_MANIFEST.fullmatch(path.name)
+                if _TEMP_MANIFEST.fullmatch(path.name)
+                and (path.is_file() or path.is_symlink())
             )
         )
+        if any(
+            path.is_symlink() or path.resolve(strict=False) != path
+            for path in temporary_paths
+        ):
+            self._raise_path_error(identifier)
+        return temporary_paths
 
     @staticmethod
     def _raise_path_error(identifier: SnapshotId) -> Never:
@@ -357,6 +392,13 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("snapshot clock must return a timezone-aware timestamp")
     return value.astimezone(UTC)
+
+
+def _remove_temporary_manifest(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _raise_snapshot_error(

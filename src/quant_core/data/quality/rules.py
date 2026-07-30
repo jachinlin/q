@@ -199,8 +199,8 @@ def coverage_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
                     DatasetKind.DAILY_BAR,
                     actual=len(missing_dates),
                     threshold=0,
-                    message="daily bars contain dates absent from the trading calendar",
-                    remediation="refresh or repair the trading calendar version",
+                    message="open trading dates are missing from daily bars",
+                    remediation="refresh or repair the daily bar version",
                 )
             )
     instruments = _compatible_frame(inputs.get(DatasetKind.INSTRUMENT, ()))
