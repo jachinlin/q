@@ -125,7 +125,7 @@ def test_published_raw_rebuilds_canonical_after_gateway_is_disabled(
         DatasetKind.SECURITY_STATUS,
     ]
     assert batches[0].frame.select("instrument_id", "trade_date", "close").row(0) == (
-        "SSE.600000",
+        "SSE:600000",
         date(2026, 1, 2),
         10.5,
     )

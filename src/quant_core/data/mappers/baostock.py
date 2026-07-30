@@ -116,9 +116,11 @@ def _validated_table(
     integrity_matches = (
         manifest.get("provider") == partition.provider
         and manifest.get("dataset") == partition.dataset
+        and manifest.get("request_hash") == partition.request_hash
         and manifest.get("content_hash") == partition.content_hash
         and manifest.get("schema_fingerprint") == partition.schema_fingerprint
         and manifest.get("row_count") == partition.row_count
+        and manifest.get("retrieved_at") == partition.retrieved_at.isoformat()
         and _content_hash(table) == partition.content_hash
         and _schema_fingerprint(table.schema) == partition.schema_fingerprint
         and table.num_rows == partition.row_count
@@ -375,11 +377,7 @@ def _identity(
         and instrument.symbol.startswith(("300", "301"))
         else "MAIN"
     )
-    return (
-        f"{instrument.exchange.value}.{instrument.symbol}",
-        instrument.exchange,
-        board,
-    )
+    return instrument.canonical(), instrument.exchange, board
 
 
 def _raw_availability(partition: PublishedPartition) -> dict[str, object | None]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 from quant_core.data.contracts import JsonValue, PublishedPartition, RawBatch
 from quant_core.data.partitions import RawPartitionStore
 from quant_core.domain.enums import DatasetKind
+from quant_core.domain.identifiers import InstrumentId
 from quant_core.errors import QuantError
 
 RETRIEVED_AT = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
@@ -157,13 +159,47 @@ def test_instruments_map_codes_types_boards_null_dates_and_sorting(
         "list_date",
         "delist_date",
     ).rows() == [
-        ("SSE.688001", "SSE", "STAR", "ETF", "DELISTED", None, date(2026, 1, 2)),
-        ("SZSE.300001", "SZSE", "CHINEXT", "STOCK", "LISTED", date(2009, 10, 30), None),
+        ("SSE:688001", "SSE", "STAR", "ETF", "DELISTED", None, date(2026, 1, 2)),
+        ("SZSE:300001", "SZSE", "CHINEXT", "STOCK", "LISTED", date(2009, 10, 30), None),
     ]
     assert frame["available_at"].to_list() == [RETRIEVED_AT, RETRIEVED_AT]
     assert frame["availability_source"].to_list() == ["RAW_RETRIEVED_AT"] * 2
     assert frame["pit_usable"].to_list() == [True, True]
     _assert_audit_columns(frame, partition)
+
+
+def test_mapped_instrument_ids_round_trip_through_the_domain_contract(
+    tmp_path: Path,
+) -> None:
+    partition = _publish(
+        tmp_path,
+        "instruments",
+        INSTRUMENT_FIELDS,
+        [
+            {
+                "code": "sh.600000",
+                "code_name": "浦发银行",
+                "ipoDate": "1999-11-10",
+                "outDate": "",
+                "type": "1",
+                "status": "1",
+            },
+            {
+                "code": "sz.000001",
+                "code_name": "平安银行",
+                "ipoDate": "1991-04-03",
+                "outDate": "",
+                "type": "1",
+                "status": "1",
+            },
+        ],
+    )
+
+    mapped_ids = _normalize(partition)[DatasetKind.INSTRUMENT]["instrument_id"]
+
+    assert [
+        InstrumentId.parse(value).canonical() for value in mapped_ids
+    ] == mapped_ids.to_list()
 
 
 def test_trade_calendar_maps_strict_flags_and_sorts(tmp_path: Path) -> None:
@@ -242,8 +278,8 @@ def test_daily_raw_yields_typed_bars_and_security_status(tmp_path: Path) -> None
     assert set(outputs) == {DatasetKind.DAILY_BAR, DatasetKind.SECURITY_STATUS}
     bars = outputs[DatasetKind.DAILY_BAR]
     assert bars.select("instrument_id", "trade_date", "close", "volume").rows() == [
-        ("SSE.600000", date(2026, 1, 1), 10.5, 123400),
-        ("SZSE.300001", date(2026, 1, 2), None, 123400),
+        ("SSE:600000", date(2026, 1, 1), 10.5, 123400),
+        ("SZSE:300001", date(2026, 1, 2), None, 123400),
     ]
     for column in (
         "open",
@@ -272,9 +308,9 @@ def test_daily_raw_yields_typed_bars_and_security_status(tmp_path: Path) -> None
         "price_limit_rule_id",
         "tradable_reason",
     ).rows() == [
-        ("SSE.600000", True, False, False, "MAIN", "UNRESOLVED", "NORMAL"),
+        ("SSE:600000", True, False, False, "MAIN", "UNRESOLVED", "NORMAL"),
         (
-            "SZSE.300001",
+            "SZSE:300001",
             True,
             True,
             True,
@@ -326,7 +362,7 @@ def test_financials_preserve_unknown_announcement_and_assign_revisions(
         "pit_usable",
     ).rows() == [
         (
-            "SSE.600000",
+            "SSE:600000",
             date(2026, 3, 31),
             "roe_avg",
             8.25,
@@ -337,7 +373,7 @@ def test_financials_preserve_unknown_announcement_and_assign_revisions(
             True,
         ),
         (
-            "SSE.600000",
+            "SSE:600000",
             date(2026, 3, 31),
             "roe_avg",
             None,
@@ -412,7 +448,7 @@ def test_corporate_actions_use_only_plan_announcement_for_availability(
         "pit_usable",
     ).rows() == [
         (
-            "SSE.600000",
+            "SSE:600000",
             "DIVIDEND",
             date(2026, 6, 1),
             date(2026, 6, 2),
@@ -425,7 +461,7 @@ def test_corporate_actions_use_only_plan_announcement_for_availability(
             False,
         ),
         (
-            "SZSE.000001",
+            "SZSE:000001",
             "DIVIDEND",
             date(2026, 5, 1),
             date(2026, 5, 2),
@@ -477,6 +513,40 @@ def test_non_object_manifest_is_a_structured_schema_mismatch(tmp_path: Path) -> 
 
     assert caught.value.detail.code == "DATA_SCHEMA_MISMATCH"
     assert caught.value.detail.context["data_path"] == str(partition.data_path)
+    assert caught.value.detail.context["dataset"] == "trade_calendar"
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("request_hash", "remove"),
+        ("request_hash", "replace"),
+        ("retrieved_at", "remove"),
+        ("retrieved_at", "replace"),
+    ],
+)
+def test_manifest_requires_matching_request_identity_and_retrieval_time(
+    tmp_path: Path,
+    field: str,
+    mutation: str,
+) -> None:
+    partition = _publish(
+        tmp_path,
+        "trade_calendar",
+        CALENDAR_FIELDS,
+        [{"calendar_date": "2026-01-01", "is_trading_day": "1"}],
+    )
+    manifest = json.loads(partition.manifest_path.read_text(encoding="utf-8"))
+    if mutation == "remove":
+        del manifest[field]
+    else:
+        manifest[field] = "tampered"
+    partition.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(QuantError) as caught:
+        _normalize(partition)
+
+    assert caught.value.detail.code == "DATA_SCHEMA_MISMATCH"
     assert caught.value.detail.context["dataset"] == "trade_calendar"
 
 
