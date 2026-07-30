@@ -114,7 +114,7 @@ git commit -m "chore: bootstrap quant research project"
 - 新建：`tests/unit/domain/test_identifiers.py`
 - 新建：`tests/unit/test_errors.py`
 
-**接口：** `InstrumentId.parse()`、`InstrumentId.canonical()`、`InstrumentId.to_baostock()`、`ErrorDetail`、`QuantError`。
+**接口：** `InstrumentId.parse()`、`InstrumentId.canonical()`、`ErrorDetail`、`QuantError`。领域对象不提供任何供应商代码转换方法。
 
 - [ ] **步骤 1：先写标识符往返和错误保真测试**
 
@@ -122,7 +122,8 @@ git commit -m "chore: bootstrap quant research project"
 def test_instrument_id_round_trip() -> None:
     instrument = InstrumentId.parse("SSE:600000")
     assert instrument.canonical() == "SSE:600000"
-    assert instrument.to_baostock() == "sh.600000"
+    assert instrument.exchange is Exchange.SSE
+    assert instrument.symbol == "600000"
 
 def test_quant_error_preserves_detail() -> None:
     detail = ErrorDetail(code="DATA_SCHEMA_MISMATCH", severity=Severity.SEVERE, message="schema mismatch", context={"dataset": "daily_bar"}, remediation="inspect raw schema", retryable=False)
@@ -136,7 +137,7 @@ def test_quant_error_preserves_detail() -> None:
 
 - [ ] **步骤 3：实现领域类型**
 
-实现 `Exchange`、`Board`、`Severity`、`DatasetKind`、`SnapshotStatus`。`InstrumentId` 必须是不可变值对象，严格校验六位代码和交易所；供应商代码转换只能位于数据边界。`ErrorDetail` 必须包含错误码、严重度、消息、上下文、修复建议和是否可重试。
+实现 `Exchange`、`Board`、`Severity`、`DatasetKind`、`SnapshotStatus`。`InstrumentId` 必须是不可变值对象，严格校验六位代码和交易所；不得包含 `to_baostock()`、`to_tushare()` 等供应商方法，供应商代码转换只能位于数据边界。`ErrorDetail` 必须包含错误码、严重度、消息、上下文、修复建议和是否可重试。
 
 - [ ] **步骤 4：测试并提交**
 
@@ -228,13 +229,15 @@ assert collect(client.fetch_daily_bars(start, end, None)) == collect(client.fetc
 
 全量证券必须来自历史 `instrument` 清单，筛选条件为 `list_date <= end` 且 `delist_date is null or delist_date >= start`，不能只取请求结束日仍上市的证券。
 
+同时在 BaoStock 适配器边界测试 `InstrumentId(exchange=Exchange.SSE, symbol="600000") ↔ "sh.600000"` 和深交所往返转换；领域层不得出现这些供应商代码规则。
+
 - [ ] **步骤 2：运行单测并确认失败**
 
 运行：`uv run pytest tests/unit/data/sources/test_baostock.py -v`
 
 - [ ] **步骤 3：实现客户端**
 
-封装 BaoStock SDK，通过注入网关实现可测试性；按配置限制单批证券数和日期跨度；每批请求记录规范化参数与全量范围哈希。采集阶段不得调用 `CanonicalMapper`。
+封装 BaoStock SDK，通过注入网关实现可测试性；在该适配器内实现内部 `InstrumentId` 与 BaoStock 代码的双向转换；按配置限制单批证券数和日期跨度；每批请求记录规范化参数与全量范围哈希。采集阶段不得调用 `CanonicalMapper`。
 
 - [ ] **步骤 4：执行离线集成测试**
 
