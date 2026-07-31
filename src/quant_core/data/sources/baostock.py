@@ -474,27 +474,16 @@ class BaoStockClient:
         """Yield provider-native calendar rows for one closed date interval."""
         if not self._logged_in:
             raise self._state_error("fetch_trade_calendar")
-        rows = self._read_cursor(
-            "query_trade_dates",
-            lambda: self._gateway.query_trade_dates(
-                start_date=start.isoformat(), end_date=end.isoformat()
-            ),
-            TRADE_CALENDAR_FIELDS,
-        )
-        yield RawBatch(
-            provider=self.provider,
-            dataset="trade_calendar",
-            request={"start_date": start.isoformat(), "end_date": end.isoformat()},
-            retrieved_at=self._clock(),
-            schema=TRADE_CALENDAR_FIELDS,
-            rows=tuple(rows),
-        )
+        batch, _ = self._load_trade_calendar(start, end)
+        yield batch
 
     def fetch_range(self, start: date, end: date) -> Iterable[RawBatch]:
         """Emit every production-supported Raw dataset in dependency order."""
         yield from self.fetch_instruments()
-        yield from self.fetch_trade_calendar(start, end)
-        yield from self.fetch_daily_bars(start, end, None)
+        calendar_batch, open_dates = self._load_trade_calendar(start, end)
+        yield calendar_batch
+        _, catalog_instruments = self._resolve_instruments(start, end, None)
+        yield from self._fetch_all_market_daily_bars(open_dates, catalog_instruments)
 
     def _resolve_instruments(
         self,
@@ -518,7 +507,7 @@ class BaoStockClient:
 
     def _load_trade_calendar(
         self, start: date, end: date
-    ) -> tuple[tuple[dict[str, JsonValue], ...], tuple[date, ...]]:
+    ) -> tuple[RawBatch, tuple[date, ...]]:
         rows = self._read_cursor(
             "query_trade_dates",
             lambda: self._gateway.query_trade_dates(
@@ -531,7 +520,15 @@ class BaoStockClient:
             for row in rows
             if row["is_trading_day"] == "1"
         )
-        return tuple(rows), open_dates
+        batch = RawBatch(
+            provider=self.provider,
+            dataset="trade_calendar",
+            request={"start_date": start.isoformat(), "end_date": end.isoformat()},
+            retrieved_at=self._clock(),
+            schema=TRADE_CALENDAR_FIELDS,
+            rows=tuple(rows),
+        )
+        return batch, open_dates
 
     @staticmethod
     def _sorted_unique(
