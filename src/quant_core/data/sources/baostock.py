@@ -176,6 +176,7 @@ class InstrumentListing:
     instrument_id: InstrumentId
     list_date: date
     delist_date: date | None
+    provider_type: str = "1"
 
 
 class InstrumentCatalog(Protocol):
@@ -200,10 +201,13 @@ class BaoStockHistoricalCatalog:
             code = row.get("code")
             list_text = row.get("ipoDate")
             delist_text = row.get("outDate")
+            provider_type = row.get("type")
             if not isinstance(code, str) or not isinstance(list_text, str):
                 raise TypeError("instrument raw rows require string code and ipoDate")
             if not isinstance(delist_text, str):
                 raise TypeError("instrument raw outDate must be a string")
+            if not isinstance(provider_type, str):
+                raise TypeError("instrument raw type must be a string")
             listings.append(
                 InstrumentListing(
                     instrument_id=from_baostock_code(code),
@@ -211,6 +215,7 @@ class BaoStockHistoricalCatalog:
                     delist_date=(
                         date.fromisoformat(delist_text) if delist_text else None
                     ),
+                    provider_type=provider_type,
                 )
             )
         return cls(
@@ -328,9 +333,32 @@ class BaoStockClient:
         end: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> Iterable[RawBatch]:
-        """Yield stable instrument-block by date-block provider-native batches."""
+        """Yield selected ranges or one all-market batch per open trading day."""
         if not self._logged_in:
             raise self._state_error("fetch_daily_bars")
+        if start > end:
+            raise ValueError("start must not follow end")
+        if instruments is None or len(instruments) == 0:
+            if instruments is not None:
+                self._logger.info(
+                    "empty instrument selection resolved as all-market daily route",
+                    extra={"event": "empty_instruments_resolved_as_all", "scope": "ALL"},
+                )
+            _, catalog_instruments = self._resolve_instruments(start, end, instruments)
+            _, open_dates = self._load_trade_calendar(start, end)
+            yield from self._fetch_all_market_daily_bars(
+                open_dates, catalog_instruments
+            )
+            return
+        yield from self._fetch_selected_daily_bars(start, end, instruments)
+
+    def _fetch_selected_daily_bars(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId],
+    ) -> Iterable[RawBatch]:
+        """Yield the existing instrument-range batches for explicit selections."""
 
         scope, resolved = self._resolve_instruments(start, end, instruments)
         canonical_ids = tuple(item.canonical() for item in resolved)
@@ -380,6 +408,48 @@ class BaoStockClient:
                     schema=DAILY_BAR_FIELDS,
                     rows=tuple(rows),
                 )
+
+    def _fetch_all_market_daily_bars(
+        self,
+        open_dates: Sequence[date],
+        catalog_instruments: Sequence[InstrumentId],
+    ) -> Iterable[RawBatch]:
+        """Yield one validated all-market response for each exchange-open date."""
+        catalog_ids = sorted(item.canonical() for item in catalog_instruments)
+        catalog_hash = hashlib.sha256("\n".join(catalog_ids).encode()).hexdigest()
+        for index, trading_day in enumerate(open_dates, start=1):
+            rows = self._fetch_all_market_rows(trading_day)
+            codes = sorted(str(row["code"]) for row in rows)
+            request: dict[str, JsonValue] = {
+                "api": "query_daily_history_k_AStock",
+                "scope": "ALL",
+                "date": trading_day.isoformat(),
+                "frequency": "d",
+                "catalog_instrument_count": len(catalog_ids),
+                "catalog_instruments_sha256": catalog_hash,
+                "response_instrument_count": len(codes),
+                "response_instruments_sha256": hashlib.sha256(
+                    "\n".join(codes).encode()
+                ).hexdigest(),
+            }
+            self._logger.info(
+                "BaoStock all-market daily date completed",
+                extra={
+                    "event": "baostock_all_market_daily_progress",
+                    "date": trading_day.isoformat(),
+                    "completed_dates": index,
+                    "total_dates": len(open_dates),
+                    "response_rows": len(rows),
+                },
+            )
+            yield RawBatch(
+                provider=self.provider,
+                dataset="daily_bars",
+                request=request,
+                retrieved_at=self._clock(),
+                schema=DAILY_BAR_FIELDS,
+                rows=tuple(rows),
+            )
 
     def fetch_instruments(self) -> Iterable[RawBatch]:
         """Yield the complete provider-native instrument directory once."""
@@ -432,11 +502,6 @@ class BaoStockClient:
         end: date,
         instruments: Sequence[InstrumentId] | None,
     ) -> tuple[str, tuple[InstrumentId, ...]]:
-        if instruments is not None and len(instruments) == 0:
-            self._logger.info(
-                "empty instrument selection resolved as full historical market",
-                extra={"event": "empty_instruments_resolved_as_all", "scope": "ALL"},
-            )
         if instruments is None or len(instruments) == 0:
             if self._catalog is None:
                 tuple(self.fetch_instruments())
@@ -444,11 +509,29 @@ class BaoStockClient:
             candidates = (
                 listing.instrument_id
                 for listing in self._catalog.list_instruments()
-                if listing.list_date <= end
+                if listing.provider_type == "1"
+                and listing.list_date <= end
                 and (listing.delist_date is None or listing.delist_date >= start)
             )
             return "ALL", self._sorted_unique(candidates)
         return "SELECTED", self._sorted_unique(instruments)
+
+    def _load_trade_calendar(
+        self, start: date, end: date
+    ) -> tuple[tuple[dict[str, JsonValue], ...], tuple[date, ...]]:
+        rows = self._read_cursor(
+            "query_trade_dates",
+            lambda: self._gateway.query_trade_dates(
+                start_date=start.isoformat(), end_date=end.isoformat()
+            ),
+            TRADE_CALENDAR_FIELDS,
+        )
+        open_dates = tuple(
+            date.fromisoformat(str(row["calendar_date"]))
+            for row in rows
+            if row["is_trading_day"] == "1"
+        )
+        return tuple(rows), open_dates
 
     @staticmethod
     def _sorted_unique(
@@ -476,39 +559,43 @@ class BaoStockClient:
         start: date,
         end: date,
     ) -> list[dict[str, JsonValue]]:
-        def perform_query() -> list[dict[str, JsonValue]]:
-            cursor = self._gateway.query_history_k_data_plus(
+        return self._read_cursor(
+            "query_history_k_data_plus",
+            lambda: self._gateway.query_history_k_data_plus(
                 to_baostock_code(instrument_id),
                 _DAILY_BAR_FIELD_ARGUMENT,
                 start_date=start.isoformat(),
                 end_date=end.isoformat(),
                 frequency="d",
                 adjustflag="3",
-            )
-            operation = "query_history_k_data_plus"
-            self._raise_provider_error(cursor, operation=operation)
-            if tuple(cursor.fields) != DAILY_BAR_FIELDS:
-                raise self._schema_error(
-                    "cursor fields do not match the fixed daily-bar schema",
-                    expected=list(DAILY_BAR_FIELDS),
-                    actual=list(cursor.fields),
-                )
-            rows: list[dict[str, JsonValue]] = []
-            while True:
-                has_row = cursor.next()
-                self._raise_provider_error(cursor, operation=operation)
-                if not has_row:
-                    return rows
-                values = tuple(cursor.get_row_data())
-                if len(values) != len(DAILY_BAR_FIELDS):
-                    raise self._schema_error(
-                        "cursor row length does not match the fixed daily-bar schema",
-                        expected=len(DAILY_BAR_FIELDS),
-                        actual=len(values),
-                    )
-                rows.append(dict(zip(DAILY_BAR_FIELDS, values, strict=True)))
+            ),
+            DAILY_BAR_FIELDS,
+        )
 
-        return self._retry("query_history_k_data_plus", perform_query)
+    def _fetch_all_market_rows(self, trading_day: date) -> list[dict[str, JsonValue]]:
+        operation = "query_daily_history_k_AStock"
+
+        def perform_query() -> list[dict[str, JsonValue]]:
+            rows = self._consume_cursor(
+                operation,
+                self._gateway.query_daily_history_k_AStock(trading_day.isoformat()),
+                DAILY_BAR_FIELDS,
+            )
+            if not rows:
+                raise self._empty_open_day_error(trading_day)
+            invalid_adjustment = [
+                row.get("adjustflag") for row in rows if row.get("adjustflag") != "3"
+            ]
+            if invalid_adjustment:
+                raise self._schema_error(
+                    operation,
+                    "daily market response must use adjustflag 3",
+                    expected="3",
+                    actual=invalid_adjustment[0],
+                )
+            return rows
+
+        return self._retry(operation, perform_query)
 
     def _read_cursor(
         self,
@@ -517,30 +604,39 @@ class BaoStockClient:
         fields: tuple[str, ...],
     ) -> list[dict[str, JsonValue]]:
         def perform_query() -> list[dict[str, JsonValue]]:
-            cursor = query()
-            self._raise_provider_error(cursor, operation=operation)
-            if tuple(cursor.fields) != fields:
-                raise self._schema_error(
-                    f"cursor fields do not match the fixed {operation} schema",
-                    expected=list(fields),
-                    actual=list(cursor.fields),
-                )
-            rows: list[dict[str, JsonValue]] = []
-            while True:
-                has_row = cursor.next()
-                self._raise_provider_error(cursor, operation=operation)
-                if not has_row:
-                    return rows
-                values = tuple(cursor.get_row_data())
-                if len(values) != len(fields):
-                    raise self._schema_error(
-                        f"cursor row length does not match the fixed {operation} schema",
-                        expected=len(fields),
-                        actual=len(values),
-                    )
-                rows.append(dict(zip(fields, values, strict=True)))
+            return self._consume_cursor(operation, query(), fields)
 
         return self._retry(operation, perform_query)
+
+    def _consume_cursor(
+        self,
+        operation: str,
+        cursor: BaoStockCursor,
+        fields: tuple[str, ...],
+    ) -> list[dict[str, JsonValue]]:
+        self._raise_provider_error(cursor, operation=operation)
+        if tuple(cursor.fields) != fields:
+            raise self._schema_error(
+                operation,
+                f"cursor fields do not match the fixed {operation} schema",
+                expected=list(fields),
+                actual=list(cursor.fields),
+            )
+        rows: list[dict[str, JsonValue]] = []
+        while True:
+            has_row = cursor.next()
+            self._raise_provider_error(cursor, operation=operation)
+            if not has_row:
+                return rows
+            values = tuple(cursor.get_row_data())
+            if len(values) != len(fields):
+                raise self._schema_error(
+                    operation,
+                    f"cursor row length does not match the fixed {operation} schema",
+                    expected=len(fields),
+                    actual=len(values),
+                )
+            rows.append(dict(zip(fields, values, strict=True)))
 
     def _retry[T](self, operation: str, function: Callable[[], T]) -> T:
         for attempt in range(self._config.max_attempts):
@@ -596,19 +692,37 @@ class BaoStockClient:
         )
 
     @staticmethod
-    def _schema_error(message: str, *, expected: object, actual: object) -> QuantError:
+    def _schema_error(
+        operation: str, message: str, *, expected: object, actual: object
+    ) -> QuantError:
         return QuantError(
             ErrorDetail(
                 code="DATA_PROVIDER_BAOSTOCK_SCHEMA",
                 severity=Severity.SEVERE,
                 message=message,
                 context={
-                    "operation": "query_history_k_data_plus",
+                    "operation": operation,
                     "expected": expected,
                     "actual": actual,
                 },
                 remediation="inspect the provider schema before accepting raw data",
                 retryable=False,
+            )
+        )
+
+    @staticmethod
+    def _empty_open_day_error(trading_day: date) -> QuantError:
+        return QuantError(
+            ErrorDetail(
+                code="DATA_PROVIDER_BAOSTOCK_EMPTY_OPEN_DAY",
+                severity=Severity.FATAL,
+                message="BaoStock returned no A-share daily bars for an open trading day",
+                context={
+                    "operation": "query_daily_history_k_AStock",
+                    "date": trading_day.isoformat(),
+                },
+                remediation="retry the date or inspect BaoStock completeness",
+                retryable=True,
             )
         )
 

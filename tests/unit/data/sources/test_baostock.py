@@ -12,12 +12,12 @@ from typing import ClassVar
 import pytest
 
 from quant_core.data.sources.baostock import (
+    DAILY_BAR_FIELDS,
     BaoStockCalendarPolicy,
     BaoStockClient,
     BaoStockConfig,
     BaoStockHistoricalCatalog,
     BaoStockSdkGateway,
-    DAILY_BAR_FIELDS,
     InstrumentListing,
     from_baostock_code,
     to_baostock_code,
@@ -105,9 +105,11 @@ class FakeGateway:
         self.login_calls = 0
         self.logout_calls = 0
         self.query_calls: list[dict[str, str]] = []
+        self.daily_market_calls: list[str] = []
         self.login_outcomes: deque[FakeResponse | Exception] = deque()
         self.logout_outcomes: deque[FakeResponse | Exception] = deque()
         self.query_outcomes: dict[tuple[str, str, str], deque[QueryOutcome]] = {}
+        self.daily_market_outcomes: dict[str, deque[QueryOutcome]] = {}
         self.stock_basic_cursor = FakeCursor(
             [
                 [
@@ -169,6 +171,16 @@ class FakeGateway:
             return outcome
         return FakeCursor([[make_row(start_date, code)]])
 
+    def query_daily_history_k_AStock(self, date: str = "") -> FakeCursor:
+        self.daily_market_calls.append(date)
+        outcomes = self.daily_market_outcomes.get(date)
+        if outcomes:
+            outcome = outcomes.popleft()
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return FakeCursor([[make_row(date, "sh.600000")]])
+
     def query_stock_basic(self, *, code: str, code_name: str) -> FakeCursor:
         assert code == ""
         assert code_name == ""
@@ -176,7 +188,12 @@ class FakeGateway:
 
     def query_trade_dates(self, *, start_date: str, end_date: str) -> FakeCursor:
         assert start_date <= end_date
-        return self.trade_dates_cursor
+        return FakeCursor(
+            self.trade_dates_cursor._pages,
+            fields=self.trade_dates_cursor.fields,
+            error_code=self.trade_dates_cursor.error_code,
+            error_msg=self.trade_dates_cursor.error_msg,
+        )
 
     def queue_query(
         self,
@@ -329,6 +346,24 @@ def test_historical_catalog_reuses_instrument_raw_without_second_sdk_query() -> 
     )
 
 
+def test_historical_catalog_preserves_provider_type() -> None:
+    """Defaulting every raw directory row to stock would include indexes in ALL."""
+    catalog = BaoStockHistoricalCatalog.from_raw_rows(
+        [
+            {
+                "code": "sh.000300",
+                "code_name": "index",
+                "ipoDate": "2005-04-08",
+                "outDate": "",
+                "type": "2",
+                "status": "1",
+            }
+        ]
+    )
+
+    assert catalog.list_instruments()[0].provider_type == "2"
+
+
 def test_calendar_policy_resolves_complete_bootstrap_explicit_and_overlap_windows() -> (
     None
 ):
@@ -456,6 +491,171 @@ def test_fetch_rejects_use_before_login_with_structured_state_error() -> None:
     assert error.value.detail.context["operation"] == "fetch_daily_bars"
 
 
+@pytest.mark.parametrize("selection", [None, []])
+def test_all_market_selection_uses_daily_api_only(selection: object) -> None:
+    """Routing all-market collection through range queries would be incomplete."""
+    gateway = FakeGateway()
+    client = make_client(gateway)
+    client.login()
+
+    batches = tuple(
+        client.fetch_daily_bars(
+            date(2026, 1, 2), date(2026, 1, 3), selection  # type: ignore[arg-type]
+        )
+    )
+
+    assert gateway.daily_market_calls == ["2026-01-02"]
+    assert gateway.query_calls == []
+    assert [batch.request["api"] for batch in batches] == [
+        "query_daily_history_k_AStock"
+    ]
+
+
+def test_selected_instruments_keep_range_api_only() -> None:
+    """Routing selected instruments to the market endpoint loses caller selection."""
+    gateway = FakeGateway()
+    client = make_client(gateway)
+    client.login()
+
+    tuple(
+        client.fetch_daily_bars(
+            date(2026, 1, 2),
+            date(2026, 1, 2),
+            [instrument(Exchange.SSE, "600000")],
+        )
+    )
+
+    assert gateway.daily_market_calls == []
+    assert [call["code"] for call in gateway.query_calls] == ["sh.600000"]
+
+
+def test_all_market_batch_records_response_scope_hash() -> None:
+    """Dropping all-market response or catalog evidence makes a batch unverifiable."""
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque(
+        [
+            FakeCursor(
+                [
+                    [
+                        make_row("2026-01-02", "sz.000001"),
+                        make_row("2026-01-02", "sh.600000"),
+                    ]
+                ]
+            )
+        ]
+    )
+    catalog = FakeCatalog(
+        [
+            InstrumentListing(
+                instrument(Exchange.SZSE, "000001"), date(1991, 4, 3), None
+            ),
+        InstrumentListing(
+            instrument(Exchange.SSE, "600000"), date(1999, 11, 10), None
+        ),
+        InstrumentListing(
+            instrument(Exchange.SSE, "000300"), date(2005, 4, 8), None, "2"
+        ),
+        ]
+    )
+    client = make_client(gateway, catalog)
+    client.login()
+
+    batch = next(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 3), None))
+
+    assert batch.request["scope"] == "ALL"
+    assert batch.request["date"] == "2026-01-02"
+    assert batch.request["response_instrument_count"] == 2
+    assert len(str(batch.request["response_instruments_sha256"])) == 64
+    assert batch.request["catalog_instrument_count"] == 2
+    assert len(str(batch.request["catalog_instruments_sha256"])) == 64
+    assert batch.schema == DAILY_BAR_FIELDS
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        FakeCursor([[make_row("2026-01-02", "sh.600000")]], fields=RAW_FIELDS[:-1]),
+        FakeCursor([[make_row("2026-01-02", "sh.600000")[:-1]]]),
+    ],
+)
+def test_all_market_schema_drift_is_structured_and_nonretryable(
+    cursor: FakeCursor,
+) -> None:
+    """Accepting changed daily-market shapes corrupts the raw schema contract."""
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque([cursor])
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["operation"] == "query_daily_history_k_AStock"
+    assert error.value.detail.retryable is False
+
+
+def test_all_market_rejects_non_post_adjusted_rows() -> None:
+    """Accepting adjustment modes other than 3 violates the daily raw contract."""
+    bad_row = list(make_row("2026-01-02", "sh.600000"))
+    bad_row[9] = "2"
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque([FakeCursor([[bad_row]])])
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["operation"] == "query_daily_history_k_AStock"
+    assert error.value.detail.context["expected"] == "3"
+    assert error.value.detail.context["actual"] == "2"
+
+
+def test_all_market_empty_open_day_retries_and_preserves_fatal_error() -> None:
+    """Treating an empty open-day response as success silently loses the market."""
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque([FakeCursor([]), FakeCursor([])])
+    sleeps: list[float] = []
+    client = make_client(
+        gateway,
+        source_config=config(max_attempts=2, retry_backoff_seconds=(0.25,)),
+        sleep=sleeps.append,
+    )
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert gateway.daily_market_calls == ["2026-01-02", "2026-01-02"]
+    assert sleeps == [0.25]
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_EMPTY_OPEN_DAY"
+    assert error.value.detail.severity.name == "FATAL"
+    assert error.value.detail.retryable is True
+
+
+def test_all_market_retries_the_same_date_after_transport_failure() -> None:
+    """Retrying a different date after failure would leave the failed day uncovered."""
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque(
+        [TimeoutError("timed out"), FakeCursor([[make_row("2026-01-02", "sh.600000")]])]
+    )
+    sleeps: list[float] = []
+    client = make_client(
+        gateway,
+        source_config=config(max_attempts=2, retry_backoff_seconds=(0.25,)),
+        sleep=sleeps.append,
+    )
+    client.login()
+
+    batches = tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert len(batches) == 1
+    assert gateway.daily_market_calls == ["2026-01-02", "2026-01-02"]
+    assert sleeps == [0.25]
+
+
 def test_none_and_empty_selection_resolve_the_same_historical_market_scope(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -500,30 +700,79 @@ def test_none_and_empty_selection_resolve_the_same_historical_market_scope(
 
     assert from_empty == from_none
     assert len(from_none) == 1
-    assert from_none[0].request == {
-        "scope": "ALL",
-        "resolved_instrument_count": 2,
-        "resolved_instruments_sha256": (
-            "c16cda1e120ab0ef00a0df55e5ea93ffc7f80fbd6beb179f63e31ed7949397ee"
-        ),
-        "instrument_chunk_index": 1,
-        "instrument_chunk_count": 1,
-        "date_chunk_index": 1,
-        "date_chunk_count": 1,
-        "batch_index": 1,
-        "batch_count": 1,
-        "start_date": "2026-01-01",
-        "end_date": "2026-01-31",
-        "instruments": ["SSE:600000", "SZSE:000001"],
-        "frequency": "d",
-        "adjustflag": "3",
-    }
+    assert from_none[0].request["scope"] == "ALL"
+    assert from_none[0].request["catalog_instrument_count"] == 2
+    assert from_none[0].request["catalog_instruments_sha256"] == (
+        "c16cda1e120ab0ef00a0df55e5ea93ffc7f80fbd6beb179f63e31ed7949397ee"
+    )
     assert catalog.calls == 2
     assert any(
         record.levelno == logging.INFO
         and getattr(record, "event", None) == "empty_instruments_resolved_as_all"
         for record in caplog.records
     )
+
+
+def test_all_market_catalog_evidence_is_stable_per_open_date(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Resolving catalog membership per day would make range evidence unstable."""
+
+    class TwoDayCalendarGateway(FakeGateway):
+        def query_trade_dates(self, *, start_date: str, end_date: str) -> FakeCursor:
+            return FakeCursor(
+                [[("2026-01-02", "1"), ("2026-01-03", "1")]],
+                fields=("calendar_date", "is_trading_day"),
+            )
+
+    gateway = TwoDayCalendarGateway()
+    catalog = FakeCatalog(
+        [
+            InstrumentListing(
+                instrument(Exchange.SSE, "600000"), date(1999, 11, 10), None
+            ),
+            InstrumentListing(
+                instrument(Exchange.SZSE, "000001"), date(1991, 4, 3), None
+            ),
+            InstrumentListing(
+                instrument(Exchange.SSE, "000300"), date(2005, 4, 8), None, "2"
+            ),
+        ]
+    )
+    logger = logging.getLogger("tests.baostock.all_market_progress")
+    client = make_client(gateway, catalog, logger=logger)
+    client.login()
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    batches = tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 3)))
+
+    assert gateway.daily_market_calls == ["2026-01-02", "2026-01-03"]
+    assert [batch.request["catalog_instrument_count"] for batch in batches] == [2, 2]
+    assert [batch.request["catalog_instruments_sha256"] for batch in batches] == [
+        "c16cda1e120ab0ef00a0df55e5ea93ffc7f80fbd6beb179f63e31ed7949397ee",
+        "c16cda1e120ab0ef00a0df55e5ea93ffc7f80fbd6beb179f63e31ed7949397ee",
+    ]
+    progress = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "baostock_all_market_daily_progress"
+    ]
+    assert [record.date for record in progress] == [
+        "2026-01-02",
+        "2026-01-03",
+    ]
+    assert [record.completed_dates for record in progress] == [1, 2]
+    assert [record.total_dates for record in progress] == [2, 2]
+    assert [record.response_rows for record in progress] == [1, 1]
+
+
+def test_daily_bars_rejects_reversed_date_range() -> None:
+    """Silently yielding no batches for a reversed range hides caller mistakes."""
+    client = make_client(FakeGateway())
+    client.login()
+
+    with pytest.raises(ValueError, match="start must not follow end"):
+        tuple(client.fetch_daily_bars(date(2026, 1, 3), date(2026, 1, 2)))
 
 
 def test_selected_scope_is_sorted_deduplicated_and_not_catalog_filtered() -> None:
