@@ -615,6 +615,58 @@ def test_all_market_rejects_non_post_adjusted_rows() -> None:
     assert error.value.detail.context["actual"] == "2"
 
 
+def test_all_market_rejects_noncanonical_baostock_code() -> None:
+    """Publishing an unparseable vendor code would corrupt Raw identity semantics."""
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque(
+        [FakeCursor([[make_row("2026-01-02", "SH.600000")]])]
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["operation"] == "query_daily_history_k_AStock"
+    assert error.value.detail.retryable is False
+    assert gateway.daily_market_calls == ["2026-01-02"]
+
+
+def test_all_market_rejects_row_from_a_different_trading_day() -> None:
+    """A daily-market response for another date must not enter the requested batch."""
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque(
+        [FakeCursor([[make_row("2026-01-01", "sh.600000")]])]
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["expected"] == "2026-01-02"
+    assert error.value.detail.context["actual"] == "2026-01-01"
+    assert error.value.detail.retryable is False
+
+
+def test_all_market_rejects_duplicate_date_code_rows() -> None:
+    """Duplicate provider primary keys must fail before an all-market Raw batch exists."""
+    row = make_row("2026-01-02", "sh.600000")
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque([FakeCursor([[row, row]])])
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["actual"] == ["2026-01-02", "sh.600000"]
+    assert error.value.detail.retryable is False
+
+
 @pytest.mark.parametrize(("field", "index"), [("open", 2), ("code", 1)])
 def test_all_market_rejects_non_string_cursor_values(field: str, index: int) -> None:
     """Accepting provider scalars would break the raw-string schema contract."""
@@ -902,6 +954,116 @@ def test_cursor_pages_are_fully_consumed_and_raw_strings_are_not_normalized() ->
     assert gateway.query_calls[0]["fields"] == ",".join(RAW_FIELDS)
     assert gateway.query_calls[0]["frequency"] == "d"
     assert gateway.query_calls[0]["adjustflag"] == "3"
+
+
+def test_selected_rows_reject_a_different_security() -> None:
+    """A selected query must not publish rows belonging to another security."""
+    gateway = FakeGateway()
+    gateway.queue_query(
+        "sh.600000",
+        "2026-01-01",
+        "2026-01-02",
+        FakeCursor([[make_row("2026-01-01", "sz.000001")]]),
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(
+            client.fetch_daily_bars(
+                date(2026, 1, 1),
+                date(2026, 1, 2),
+                [instrument(Exchange.SSE, "600000")],
+            )
+        )
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["expected"] == "sh.600000"
+    assert error.value.detail.context["actual"] == "sz.000001"
+    assert error.value.detail.retryable is False
+
+
+def test_selected_rows_reject_a_date_outside_the_closed_chunk() -> None:
+    """A selected response outside its closed request interval must not be published."""
+    gateway = FakeGateway()
+    gateway.queue_query(
+        "sh.600000",
+        "2026-01-01",
+        "2026-01-02",
+        FakeCursor([[make_row("2026-01-03", "sh.600000")]]),
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(
+            client.fetch_daily_bars(
+                date(2026, 1, 1),
+                date(2026, 1, 2),
+                [instrument(Exchange.SSE, "600000")],
+            )
+        )
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["expected"] == ["2026-01-01", "2026-01-02"]
+    assert error.value.detail.context["actual"] == "2026-01-03"
+    assert error.value.detail.retryable is False
+
+
+def test_selected_rows_reject_non_post_adjusted_data() -> None:
+    """The selected route must enforce the same unadjusted Raw contract as ALL."""
+    bad_row = list(make_row("2026-01-01", "sh.600000"))
+    bad_row[9] = "2"
+    gateway = FakeGateway()
+    gateway.queue_query(
+        "sh.600000",
+        "2026-01-01",
+        "2026-01-01",
+        FakeCursor([[bad_row]]),
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(
+            client.fetch_daily_bars(
+                date(2026, 1, 1),
+                date(2026, 1, 1),
+                [instrument(Exchange.SSE, "600000")],
+            )
+        )
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["expected"] == "3"
+    assert error.value.detail.context["actual"] == "2"
+    assert error.value.detail.retryable is False
+
+
+def test_selected_rows_reject_duplicate_date_code_rows() -> None:
+    """Duplicate selected primary keys must fail before RawBatch construction."""
+    row = make_row("2026-01-01", "sh.600000")
+    gateway = FakeGateway()
+    gateway.queue_query(
+        "sh.600000",
+        "2026-01-01",
+        "2026-01-01",
+        FakeCursor([[row, row]]),
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(
+            client.fetch_daily_bars(
+                date(2026, 1, 1),
+                date(2026, 1, 1),
+                [instrument(Exchange.SSE, "600000")],
+            )
+        )
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["actual"] == ["2026-01-01", "sh.600000"]
+    assert error.value.detail.retryable is False
 
 
 @pytest.mark.parametrize(

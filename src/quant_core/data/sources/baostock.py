@@ -559,18 +559,31 @@ class BaoStockClient:
         start: date,
         end: date,
     ) -> list[dict[str, JsonValue]]:
-        return self._read_cursor(
-            "query_history_k_data_plus",
-            lambda: self._gateway.query_history_k_data_plus(
-                to_baostock_code(instrument_id),
-                _DAILY_BAR_FIELD_ARGUMENT,
-                start_date=start.isoformat(),
-                end_date=end.isoformat(),
-                frequency="d",
-                adjustflag="3",
-            ),
-            DAILY_BAR_FIELDS,
-        )
+        operation = "query_history_k_data_plus"
+        expected_code = to_baostock_code(instrument_id)
+
+        def perform_query() -> list[dict[str, JsonValue]]:
+            rows = self._consume_cursor(
+                operation,
+                self._gateway.query_history_k_data_plus(
+                    expected_code,
+                    _DAILY_BAR_FIELD_ARGUMENT,
+                    start_date=start.isoformat(),
+                    end_date=end.isoformat(),
+                    frequency="d",
+                    adjustflag="3",
+                ),
+                DAILY_BAR_FIELDS,
+            )
+            self._validate_daily_bar_rows(
+                operation,
+                rows,
+                expected_code=expected_code,
+                expected_dates=(start, end),
+            )
+            return rows
+
+        return self._retry(operation, perform_query)
 
     def _fetch_all_market_rows(self, trading_day: date) -> list[dict[str, JsonValue]]:
         operation = "query_daily_history_k_AStock"
@@ -583,16 +596,11 @@ class BaoStockClient:
             )
             if not rows:
                 raise self._empty_open_day_error(trading_day)
-            invalid_adjustment = [
-                row.get("adjustflag") for row in rows if row.get("adjustflag") != "3"
-            ]
-            if invalid_adjustment:
-                raise self._schema_error(
-                    operation,
-                    "daily market response must use adjustflag 3",
-                    expected="3",
-                    actual=invalid_adjustment[0],
-                )
+            self._validate_daily_bar_rows(
+                operation,
+                rows,
+                expected_dates=trading_day,
+            )
             return rows
 
         return self._retry(operation, perform_query)
@@ -645,6 +653,90 @@ class BaoStockClient:
                         actual=type(value).__name__,
                     )
             rows.append(dict(zip(fields, values, strict=True)))
+
+    def _validate_daily_bar_rows(
+        self,
+        operation: str,
+        rows: Sequence[dict[str, JsonValue]],
+        *,
+        expected_dates: date | tuple[date, date],
+        expected_code: str | None = None,
+    ) -> None:
+        seen_keys: set[tuple[str, str]] = set()
+        for row in rows:
+            raw_date = cast(str, row["date"])
+            raw_code = cast(str, row["code"])
+            try:
+                parsed_code = from_baostock_code(raw_code)
+            except ValueError as error:
+                raise self._schema_error(
+                    operation,
+                    "daily bar code is not a canonical BaoStock security code",
+                    expected="sh. or sz. followed by six ASCII digits",
+                    actual=raw_code,
+                ) from error
+            if (
+                expected_code is not None
+                and to_baostock_code(parsed_code) != expected_code
+            ):
+                raise self._schema_error(
+                    operation,
+                    "selected daily bar code does not match the queried security",
+                    expected=expected_code,
+                    actual=raw_code,
+                )
+
+            try:
+                parsed_date = date.fromisoformat(raw_date)
+            except ValueError as error:
+                raise self._schema_error(
+                    operation,
+                    "daily bar date is not a valid ISO calendar date",
+                    expected="YYYY-MM-DD",
+                    actual=raw_date,
+                ) from error
+            if parsed_date.isoformat() != raw_date:
+                raise self._schema_error(
+                    operation,
+                    "daily bar date is not in canonical ISO format",
+                    expected=parsed_date.isoformat(),
+                    actual=raw_date,
+                )
+            if isinstance(expected_dates, date):
+                if parsed_date != expected_dates:
+                    raise self._schema_error(
+                        operation,
+                        "all-market daily bar date does not match the requested date",
+                        expected=expected_dates.isoformat(),
+                        actual=raw_date,
+                    )
+            else:
+                start, end = expected_dates
+                if not start <= parsed_date <= end:
+                    raise self._schema_error(
+                        operation,
+                        "selected daily bar date falls outside the requested chunk",
+                        expected=[start.isoformat(), end.isoformat()],
+                        actual=raw_date,
+                    )
+
+            if row["adjustflag"] != "3":
+                raise self._schema_error(
+                    operation,
+                    "daily bar response must use adjustflag 3",
+                    expected="3",
+                    actual=row["adjustflag"],
+                )
+
+            primary_key = (raw_date, raw_code)
+            if primary_key in seen_keys:
+                raise self._schema_error(
+                    operation,
+                    "daily bar response contains a duplicate date and code",
+                    expected="unique (date, code)",
+                    actual=list(primary_key),
+                )
+            seen_keys.add(primary_key)
 
     def _retry[T](self, operation: str, function: Callable[[], T]) -> T:
         for attempt in range(self._config.max_attempts):
