@@ -336,7 +336,10 @@ class MetadataRepository:
                 .where(
                     PipelineStageORM.run_id == run_id,
                     PipelineStageORM.stage == stage.value,
-                    PipelineStageORM.status != "SUCCEEDED",
+                    PipelineStageORM.status == row.status,
+                    PipelineStageORM.owner_id == row.owner_id,
+                    PipelineStageORM.lease_expires_at == row.lease_expires_at,
+                    PipelineStageORM.attempt == row.attempt,
                 )
                 .values(
                     **{key: value for key, value in values.items() if key != "attempt"},
@@ -360,28 +363,40 @@ class MetadataRepository:
         output_hash: str,
         output: JsonValue,
         completed_at: datetime,
-        owner_id: str | None = None,
+        owner_id: str,
+        attempt: int,
     ) -> PipelineStageRecord:
-        """Seal one stage checkpoint; successful rows are immutable afterwards."""
+        """Seal a checkpoint with an atomic owner/attempt fencing update."""
         _validate_hash(input_hash, "input_hash")
         _validate_hash(output_hash, "output_hash")
         output_json = canonical_json_bytes(output).decode("utf-8")
         with Session(self._engine) as session, session.begin():
-            row = session.get(PipelineStageORM, (run_id, stage.value))
-            if (
-                row is None
-                or row.status != "RUNNING"
-                or row.input_hash != input_hash
-                or (owner_id is not None and row.owner_id != owner_id)
-            ):
-                raise ValueError("pipeline stage is not running with this input hash")
-            row.status = "SUCCEEDED"
-            row.output_hash = output_hash
-            row.output_json = output_json
-            row.completed_at = _timestamp(completed_at)
-            row.error_json = None
-            session.flush()
-            return self._pipeline_stage_record(row)
+            completed = session.execute(
+                update(PipelineStageORM)
+                .where(
+                    PipelineStageORM.run_id == run_id,
+                    PipelineStageORM.stage == stage.value,
+                    PipelineStageORM.status == "RUNNING",
+                    PipelineStageORM.input_hash == input_hash,
+                    PipelineStageORM.owner_id == owner_id,
+                    PipelineStageORM.attempt == attempt,
+                )
+                .values(
+                    status="SUCCEEDED",
+                    output_hash=output_hash,
+                    output_json=output_json,
+                    completed_at=_timestamp(completed_at),
+                    error_json=None,
+                )
+            )
+            if getattr(completed, "rowcount", 0) != 1:
+                current = session.get(PipelineStageORM, (run_id, stage.value))
+                _raise_pipeline_busy(
+                    run_id, stage, None if current is None else current.owner_id
+                )
+            return self._pipeline_stage_record(
+                session.get_one(PipelineStageORM, (run_id, stage.value))
+            )
 
     def get_pipeline_stage(
         self, run_id: str, stage: PipelineStageName
@@ -400,27 +415,79 @@ class MetadataRepository:
         input_hash: str,
         error: JsonValue,
         completed_at: datetime,
+        owner_id: str,
+        attempt: int,
         blocked: bool = False,
-        owner_id: str | None = None,
     ) -> PipelineStageRecord:
-        """Persist a structured stage failure so another process can resume it."""
+        """Persist failure only while the caller still owns the fenced attempt."""
+        error_json = canonical_json_bytes(error).decode("utf-8")
         with Session(self._engine) as session, session.begin():
-            row = session.get(PipelineStageORM, (run_id, stage.value))
             run = session.get(PipelineRunORM, run_id)
-            if (
-                row is None
-                or run is None
-                or row.input_hash != input_hash
-                or row.status != "RUNNING"
-                or (owner_id is not None and row.owner_id != owner_id)
-            ):
-                raise ValueError("pipeline stage is not running with this input hash")
-            row.status = "BLOCKED" if blocked else "FAILED"
-            row.completed_at = _timestamp(completed_at)
-            row.error_json = canonical_json_bytes(error).decode("utf-8")
-            run.status = row.status
+            if run is None:
+                raise KeyError(f"pipeline run does not exist: {run_id}")
+            status = "BLOCKED" if blocked else "FAILED"
+            failed = session.execute(
+                update(PipelineStageORM)
+                .where(
+                    PipelineStageORM.run_id == run_id,
+                    PipelineStageORM.stage == stage.value,
+                    PipelineStageORM.status == "RUNNING",
+                    PipelineStageORM.input_hash == input_hash,
+                    PipelineStageORM.owner_id == owner_id,
+                    PipelineStageORM.attempt == attempt,
+                )
+                .values(
+                    status=status,
+                    completed_at=_timestamp(completed_at),
+                    error_json=error_json,
+                )
+            )
+            if getattr(failed, "rowcount", 0) != 1:
+                current = session.get(PipelineStageORM, (run_id, stage.value))
+                _raise_pipeline_busy(
+                    run_id, stage, None if current is None else current.owner_id
+                )
+            run.status = status
             session.flush()
-            return self._pipeline_stage_record(row)
+            return self._pipeline_stage_record(
+                session.get_one(PipelineStageORM, (run_id, stage.value))
+            )
+
+    def renew_pipeline_stage_lease(
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        *,
+        owner_id: str,
+        attempt: int,
+        renewed_at: datetime,
+        lease_expires_at: datetime,
+    ) -> PipelineStageRecord:
+        """Extend a running lease if the caller still owns its fenced attempt."""
+        renewed_at = _utc_datetime(renewed_at)
+        lease_expires_at = _utc_datetime(lease_expires_at)
+        if not owner_id or attempt < 1 or lease_expires_at <= renewed_at:
+            raise ValueError("stage owner, attempt, and future lease are required")
+        with Session(self._engine) as session, session.begin():
+            renewed = session.execute(
+                update(PipelineStageORM)
+                .where(
+                    PipelineStageORM.run_id == run_id,
+                    PipelineStageORM.stage == stage.value,
+                    PipelineStageORM.status == "RUNNING",
+                    PipelineStageORM.owner_id == owner_id,
+                    PipelineStageORM.attempt == attempt,
+                )
+                .values(lease_expires_at=_timestamp(lease_expires_at))
+            )
+            if getattr(renewed, "rowcount", 0) != 1:
+                current = session.get(PipelineStageORM, (run_id, stage.value))
+                _raise_pipeline_busy(
+                    run_id, stage, None if current is None else current.owner_id
+                )
+            return self._pipeline_stage_record(
+                session.get_one(PipelineStageORM, (run_id, stage.value))
+            )
 
     def complete_pipeline_run(self, run_id: str, completed_at: datetime) -> None:
         with Session(self._engine) as session, session.begin():

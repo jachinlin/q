@@ -6,7 +6,7 @@ import hashlib
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -57,20 +57,24 @@ class CuratedPartitionStore:
         start: date,
         end: date,
         repository: MetadataRepository,
+        heartbeat: Callable[[], None] = lambda: None,
     ) -> CuratedResult:
         grouped: dict[DatasetKind, dict[str, list[pl.DataFrame]]] = defaultdict(
             lambda: defaultdict(list)
         )
         seen_datasets: set[DatasetKind] = set()
         for batch in batches:
+            heartbeat()
             seen_datasets.add(batch.dataset)
             for key, frame in self._partition(batch.dataset, batch.frame):
                 grouped[batch.dataset][key].append(frame)
         new_partitions: dict[DatasetKind, dict[str, pl.DataFrame]] = {}
         for dataset, partitions in grouped.items():
+            heartbeat()
             definition = CANONICAL_SCHEMAS[dataset]
             new_partitions[dataset] = {}
             for key, frames in partitions.items():
+                heartbeat()
                 added = pl.concat(frames, how="vertical").cast(definition.columns)
                 duplicate_count = (
                     added.group_by(list(definition.primary_key))
@@ -101,6 +105,7 @@ class CuratedPartitionStore:
         versions: dict[str, DatasetVersionId] = {}
         frames_by_dataset: dict[DatasetKind, tuple[pl.LazyFrame, ...]] = {}
         for dataset in sorted(all_datasets, key=lambda item: item.value):
+            heartbeat()
             previous = previous_versions.get(dataset.value)
             additions = new_partitions.get(dataset, {})
             if not additions and previous is not None:
@@ -127,6 +132,7 @@ class CuratedPartitionStore:
                 if key not in additions
             }
             for key, added in additions.items():
+                heartbeat()
                 frames = [added]
                 old = previous_by_key.get(key)
                 if old is not None:
@@ -167,6 +173,7 @@ class CuratedPartitionStore:
             frames_by_dataset[dataset] = tuple(
                 pl.scan_parquet(spec.path) for spec in specs
             )
+        heartbeat()
         return CuratedResult(versions, frames_by_dataset)
 
     def read_version(self, record: DatasetVersionRecord) -> tuple[pl.DataFrame, ...]:

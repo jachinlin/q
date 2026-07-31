@@ -25,7 +25,12 @@ from quant_core.data.pipelines import curate as curate_module
 from quant_core.data.pipelines import publish as pipeline_module
 from quant_core.data.pipelines.curate import CuratedPartitionStore
 from quant_core.data.pipelines.ingest import partition_from_json, partition_to_json
-from quant_core.data.pipelines.publish import DataPipeline, PipelineResult
+from quant_core.data.pipelines.publish import (
+    DataPipeline,
+    PipelineResult,
+    PipelineVersions,
+)
+from quant_core.data.quality.rules import QUALITY_RULE_SET_VERSION
 from quant_core.data.quality.runner import QualityRunner
 from quant_core.data.snapshots import SnapshotPublisher
 from quant_core.domain.enums import SnapshotStatus
@@ -76,7 +81,7 @@ def test_pipeline_checkpoint_survives_process_restart(tmp_path: Path) -> None:
             created_at=datetime(2026, 1, 6, tzinfo=UTC),
         )
     )
-    repository.start_pipeline_stage(
+    claim = repository.start_pipeline_stage(
         created.id,
         PipelineStageName.INGEST_RAW,
         input_hash="2" * 64,
@@ -89,6 +94,8 @@ def test_pipeline_checkpoint_survives_process_restart(tmp_path: Path) -> None:
         output_hash="3" * 64,
         output={"manifest_paths": ["C:/runtime/raw/one.manifest.json"]},
         completed_at=datetime(2026, 1, 6, 0, 2, tzinfo=UTC),
+        owner_id="legacy-owner",
+        attempt=claim.attempt,
     )
     engine.dispose()
 
@@ -125,7 +132,7 @@ def test_pipeline_stage_cannot_replace_successful_checkpoint(tmp_path: Path) -> 
             created_at=datetime(2026, 1, 6, tzinfo=UTC),
         )
     )
-    repository.start_pipeline_stage(
+    claim = repository.start_pipeline_stage(
         run.id,
         PipelineStageName.CURATE,
         input_hash="5" * 64,
@@ -138,6 +145,8 @@ def test_pipeline_stage_cannot_replace_successful_checkpoint(tmp_path: Path) -> 
         output_hash="6" * 64,
         output={"dataset_versions": {"daily_bar": "v1"}},
         completed_at=datetime(2026, 1, 6, 0, 2, tzinfo=UTC),
+        owner_id="legacy-owner",
+        attempt=claim.attempt,
     )
 
     try:
@@ -327,11 +336,11 @@ class FailOnceQualityRunner:
         self._delegate = QualityRunner()
         self.calls = 0
 
-    def evaluate(self, inputs: object) -> object:
+    def evaluate(self, inputs: object, **kwargs: object) -> object:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("simulated quality crash")
-        return self._delegate.evaluate(inputs)  # type: ignore[arg-type]
+        return self._delegate.evaluate(inputs, **kwargs)  # type: ignore[arg-type]
 
 
 class FailOnceSnapshotPublisher:
@@ -780,14 +789,14 @@ class ObservingCuratedStore:
 
 
 class LazyAssertingQualityRunner:
-    def evaluate(self, inputs: object) -> object:
+    def evaluate(self, inputs: object, **kwargs: object) -> object:
         assert isinstance(inputs, Mapping)
         assert all(
             isinstance(frame, pl.LazyFrame)
             for partitions in inputs.values()
             for frame in partitions
         )
-        return QualityRunner().evaluate(inputs)  # type: ignore[arg-type]
+        return QualityRunner().evaluate(inputs, **kwargs)  # type: ignore[arg-type]
 
 
 def test_pipeline_streams_mapper_batches_and_quality_uses_lazy_partitions(
@@ -854,6 +863,134 @@ def test_stage_claim_uses_owner_and_lease_cas(tmp_path: Path) -> None:
     assert taken.owner_id == "owner-b"
 
 
+def test_stale_stage_owner_cannot_complete_or_fail_after_takeover(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    repository = MetadataRepository(create_sqlite_engine(database))
+    now = datetime(2026, 1, 6, tzinfo=UTC)
+    run = repository.register_pipeline_run(
+        PipelineRunSpec(
+            mode="BOOTSTRAP",
+            provider="baostock",
+            request_hash="8" * 64,
+            requested_start=None,
+            requested_end=None,
+            resolved_start=date(2006, 1, 4),
+            resolved_end=date(2026, 1, 5),
+            created_at=now,
+        )
+    )
+    old = repository.start_pipeline_stage(
+        run.id,
+        PipelineStageName.INGEST_RAW,
+        input_hash="9" * 64,
+        started_at=now,
+        owner_id="owner-old",
+        lease_expires_at=now + timedelta(minutes=1),
+    )
+    new = repository.start_pipeline_stage(
+        run.id,
+        PipelineStageName.INGEST_RAW,
+        input_hash="9" * 64,
+        started_at=now + timedelta(minutes=2),
+        owner_id="owner-new",
+        lease_expires_at=now + timedelta(minutes=3),
+    )
+
+    with pytest.raises(QuantError) as completing:
+        repository.complete_pipeline_stage(
+            run.id,
+            PipelineStageName.INGEST_RAW,
+            input_hash="9" * 64,
+            output_hash="a" * 64,
+            output={"owner": "old"},
+            completed_at=now + timedelta(minutes=2),
+            owner_id="owner-old",
+            attempt=old.attempt,
+        )
+    with pytest.raises(QuantError) as failing:
+        repository.fail_pipeline_stage(
+            run.id,
+            PipelineStageName.INGEST_RAW,
+            input_hash="9" * 64,
+            error={"owner": "old"},
+            completed_at=now + timedelta(minutes=2),
+            owner_id="owner-old",
+            attempt=old.attempt,
+        )
+
+    current = repository.get_pipeline_stage(run.id, PipelineStageName.INGEST_RAW)
+    assert completing.value.detail.code == "DATA_PIPELINE_BUSY"
+    assert failing.value.detail.code == "DATA_PIPELINE_BUSY"
+    assert current.status == "RUNNING"
+    assert current.owner_id == "owner-new"
+    assert current.attempt == new.attempt == old.attempt + 1
+
+
+def test_stage_lease_renewal_is_fenced_by_owner_and_attempt(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    repository = MetadataRepository(create_sqlite_engine(database))
+    now = datetime(2026, 1, 6, tzinfo=UTC)
+    run = repository.register_pipeline_run(
+        PipelineRunSpec(
+            mode="BOOTSTRAP",
+            provider="baostock",
+            request_hash="b" * 64,
+            requested_start=None,
+            requested_end=None,
+            resolved_start=date(2006, 1, 4),
+            resolved_end=date(2026, 1, 5),
+            created_at=now,
+        )
+    )
+    claim = repository.start_pipeline_stage(
+        run.id,
+        PipelineStageName.CURATE,
+        input_hash="c" * 64,
+        started_at=now,
+        owner_id="owner-a",
+        lease_expires_at=now + timedelta(minutes=1),
+    )
+
+    renewed = repository.renew_pipeline_stage_lease(
+        run.id,
+        PipelineStageName.CURATE,
+        owner_id="owner-a",
+        attempt=claim.attempt,
+        renewed_at=now + timedelta(seconds=30),
+        lease_expires_at=now + timedelta(minutes=3),
+    )
+    with pytest.raises(QuantError) as stale:
+        repository.renew_pipeline_stage_lease(
+            run.id,
+            PipelineStageName.CURATE,
+            owner_id="owner-a",
+            attempt=claim.attempt + 1,
+            renewed_at=now + timedelta(seconds=40),
+            lease_expires_at=now + timedelta(minutes=4),
+        )
+    with pytest.raises(QuantError) as busy:
+        repository.start_pipeline_stage(
+            run.id,
+            PipelineStageName.CURATE,
+            input_hash="c" * 64,
+            started_at=now + timedelta(minutes=2),
+            owner_id="owner-b",
+            lease_expires_at=now + timedelta(minutes=4),
+        )
+
+    assert renewed.lease_expires_at == now + timedelta(minutes=3)
+    assert stale.value.detail.code == "DATA_PIPELINE_BUSY"
+    assert busy.value.detail.code == "DATA_PIPELINE_BUSY"
+
+
+def test_default_pipeline_versions_track_actual_quality_rule_set() -> None:
+    assert PipelineVersions().quality_rules == QUALITY_RULE_SET_VERSION
+
+
 def _register_newer_failed_ingest(
     repository: MetadataRepository,
     *,
@@ -874,7 +1011,7 @@ def _register_newer_failed_ingest(
             pipeline_fingerprint=pipeline_fingerprint,
         )
     )
-    repository.start_pipeline_stage(
+    claim = repository.start_pipeline_stage(
         run.id,
         PipelineStageName.INGEST_RAW,
         input_hash="c" * 64,
@@ -886,6 +1023,8 @@ def _register_newer_failed_ingest(
         input_hash="c" * 64,
         error={"code": "newer-ingest-failed"},
         completed_at=created_at,
+        owner_id="legacy-owner",
+        attempt=claim.attempt,
     )
 
 
@@ -994,6 +1133,28 @@ def test_concurrent_identical_request_has_one_collector_and_busy_follower(
     assert captured.value.detail.code == "DATA_PIPELINE_BUSY"
     assert isinstance(result.snapshot_id, SnapshotId)
     assert source.fetch_calls == 1
+
+
+def test_pipeline_renews_every_long_running_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline, repository = make_pipeline(tmp_path, OfflineBaoStockSource())
+    original = repository.renew_pipeline_stage_lease
+    renewed_stages: list[PipelineStageName] = []
+
+    def observe_renewal(
+        run_id: str, stage: PipelineStageName, **kwargs: object
+    ) -> object:
+        renewed_stages.append(stage)
+        return original(run_id, stage, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repository, "renew_pipeline_stage_lease", observe_renewal)
+
+    pipeline.bootstrap()
+
+    assert set(renewed_stages) == set(PipelineStageName)
+    assert renewed_stages.count(PipelineStageName.INGEST_RAW) >= 3
+    assert renewed_stages.count(PipelineStageName.VALIDATE) >= 6
 
 
 class FakeCliPipeline:

@@ -22,9 +22,13 @@ from quant_core.data.partitions import RawPartitionStore
 from quant_core.data.pipelines.curate import CuratedPartitionStore, CuratedResult
 from quant_core.data.pipelines.ingest import partition_from_json, partition_to_json
 from quant_core.data.quality.models import QualityRunSpec, thaw_json
-from quant_core.data.quality.rules import required_dataset_issues
+from quant_core.data.quality.rules import (
+    QUALITY_RULE_SET_VERSION,
+    required_dataset_issues,
+)
 from quant_core.data.quality.runner import QualityRunner
-from quant_core.data.snapshots import SnapshotPublisher
+from quant_core.data.schemas import CANONICAL_SCHEMA_VERSION
+from quant_core.data.snapshots import SNAPSHOT_MANIFEST_VERSION, SnapshotPublisher
 from quant_core.domain.enums import DatasetKind, Severity
 from quant_core.domain.identifiers import DatasetVersionId, QualityRunId, SnapshotId
 from quant_core.errors import ErrorDetail, QuantError
@@ -72,9 +76,9 @@ class PipelineVersions:
     source_adapter: str = "pipeline-source-contract-v1"
     fetch_config: str = "pipeline-fetch-config-v1"
     mapper: str = "canonical-mapper-v1"
-    canonical_schema: str = "canonical-schema-v1"
-    quality_rules: str = "foundation-quality-rules-v1"
-    snapshot_manifest: str = "snapshot-manifest-v1"
+    canonical_schema: str = CANONICAL_SCHEMA_VERSION
+    quality_rules: str = QUALITY_RULE_SET_VERSION
+    snapshot_manifest: str = SNAPSHOT_MANIFEST_VERSION
 
     def __post_init__(self) -> None:
         if any(not value for value in self.as_json().values()):
@@ -107,6 +111,7 @@ class DataPipeline:
         snapshot_publisher: SnapshotPublisher,
         versions: PipelineVersions | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        lease_duration: timedelta = timedelta(minutes=30),
     ) -> None:
         self._source = source
         self._mapper = mapper
@@ -119,6 +124,9 @@ class DataPipeline:
         self._versions = versions or PipelineVersions()
         self._pipeline_fingerprint = _hash(self._versions.as_json())
         self._clock = clock
+        if lease_duration <= timedelta(0):
+            raise ValueError("pipeline lease duration must be positive")
+        self._lease_duration = lease_duration
 
     def bootstrap(self) -> PipelineResult:
         try:
@@ -364,7 +372,7 @@ class DataPipeline:
         )
         if checkpoint is not None:
             return cast(tuple[PublishedPartition, ...], checkpoint)
-        self._repository.start_pipeline_stage(
+        claim = self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.INGEST_RAW,
             input_hash=input_hash,
@@ -375,10 +383,16 @@ class DataPipeline:
         try:
             self._source.login()
             try:
-                partitions = tuple(
-                    self._raw_store.publish(batch, run_id=run_id)
-                    for batch in self._source.fetch_range(start, end)
-                )
+                published: list[PublishedPartition] = []
+                for batch in self._source.fetch_range(start, end):
+                    self._heartbeat(
+                        run_id, PipelineStageName.INGEST_RAW, owner_id, claim.attempt
+                    )
+                    published.append(self._raw_store.publish(batch, run_id=run_id))
+                    self._heartbeat(
+                        run_id, PipelineStageName.INGEST_RAW, owner_id, claim.attempt
+                    )
+                partitions = tuple(published)
             finally:
                 self._source.close()
             output: JsonValue = {
@@ -392,11 +406,17 @@ class DataPipeline:
                 output=output,
                 completed_at=self._now(),
                 owner_id=owner_id,
+                attempt=claim.attempt,
             )
             return partitions
         except Exception as error:
             self._fail(
-                run_id, PipelineStageName.INGEST_RAW, input_hash, error, owner_id
+                run_id,
+                PipelineStageName.INGEST_RAW,
+                input_hash,
+                error,
+                owner_id,
+                claim.attempt,
             )
             raise
 
@@ -418,7 +438,7 @@ class DataPipeline:
         )
         if checkpoint is not None:
             return cast(CuratedResult, checkpoint)
-        self._repository.start_pipeline_stage(
+        claim = self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.CURATE,
             input_hash=input_hash,
@@ -440,6 +460,9 @@ class DataPipeline:
                 start=start,
                 end=end,
                 repository=self._repository,
+                heartbeat=lambda: self._heartbeat(
+                    run_id, PipelineStageName.CURATE, owner_id, claim.attempt
+                ),
             )
             output: JsonValue = {
                 "dataset_versions": {
@@ -455,10 +478,18 @@ class DataPipeline:
                 output=output,
                 completed_at=self._now(),
                 owner_id=owner_id,
+                attempt=claim.attempt,
             )
             return result
         except Exception as error:
-            self._fail(run_id, PipelineStageName.CURATE, input_hash, error, owner_id)
+            self._fail(
+                run_id,
+                PipelineStageName.CURATE,
+                input_hash,
+                error,
+                owner_id,
+                claim.attempt,
+            )
             raise
 
     def _validate(
@@ -476,7 +507,7 @@ class DataPipeline:
         )
         if checkpoint is not None:
             return cast(QualityRunId, checkpoint)
-        self._repository.start_pipeline_stage(
+        claim = self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.VALIDATE,
             input_hash=input_hash,
@@ -486,10 +517,21 @@ class DataPipeline:
         )
         try:
             started = self._now()
+            heartbeat: Callable[[], None] = lambda: self._heartbeat(
+                run_id, PipelineStageName.VALIDATE, owner_id, claim.attempt
+            )
             issues = (
-                *self._quality_runner.evaluate(curated.frames),
+                *self._quality_runner.evaluate(
+                    curated.frames,
+                    heartbeat=heartbeat,
+                ),
+            )
+            heartbeat()
+            issues = (
+                *issues,
                 *required_dataset_issues(curated.frames),
             )
+            heartbeat()
             quality = self._repository.register_quality_run(
                 QualityRunSpec(
                     dataset_versions=curated.dataset_versions,
@@ -507,10 +549,18 @@ class DataPipeline:
                 output=output,
                 completed_at=self._now(),
                 owner_id=owner_id,
+                attempt=claim.attempt,
             )
             return quality.id
         except Exception as error:
-            self._fail(run_id, PipelineStageName.VALIDATE, input_hash, error, owner_id)
+            self._fail(
+                run_id,
+                PipelineStageName.VALIDATE,
+                input_hash,
+                error,
+                owner_id,
+                claim.attempt,
+            )
             raise
 
     def _publish(
@@ -531,7 +581,7 @@ class DataPipeline:
         )
         if checkpoint is not None:
             return cast(SnapshotId, checkpoint)
-        self._repository.start_pipeline_stage(
+        claim = self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.PUBLISH_SNAPSHOT,
             input_hash=input_hash,
@@ -540,8 +590,14 @@ class DataPipeline:
             lease_expires_at=self._lease_expires_at(),
         )
         try:
+            self._heartbeat(
+                run_id, PipelineStageName.PUBLISH_SNAPSHOT, owner_id, claim.attempt
+            )
             identifier = self._snapshot_publisher.publish(
                 curated.dataset_versions, quality_id
+            )
+            self._heartbeat(
+                run_id, PipelineStageName.PUBLISH_SNAPSHOT, owner_id, claim.attempt
             )
             output: JsonValue = {"snapshot_id": str(identifier)}
             self._repository.complete_pipeline_stage(
@@ -552,6 +608,7 @@ class DataPipeline:
                 output=output,
                 completed_at=self._now(),
                 owner_id=owner_id,
+                attempt=claim.attempt,
             )
             return identifier
         except Exception as error:
@@ -561,6 +618,7 @@ class DataPipeline:
                 input_hash,
                 error,
                 owner_id,
+                claim.attempt,
                 blocked=isinstance(error, QuantError)
                 and error.detail.code == "SNAP_QUALITY_BLOCKED",
             )
@@ -718,6 +776,7 @@ class DataPipeline:
         input_hash: str,
         error: Exception,
         owner_id: str,
+        attempt: int,
         *,
         blocked: bool = False,
     ) -> None:
@@ -740,15 +799,20 @@ class DataPipeline:
                 "remediation": "fix the stage error and resume the same run",
                 "retryable": False,
             }
-        self._repository.fail_pipeline_stage(
-            run_id,
-            stage,
-            input_hash=input_hash,
-            error=detail,
-            completed_at=self._now(),
-            blocked=blocked,
-            owner_id=owner_id,
-        )
+        try:
+            self._repository.fail_pipeline_stage(
+                run_id,
+                stage,
+                input_hash=input_hash,
+                error=detail,
+                completed_at=self._now(),
+                owner_id=owner_id,
+                attempt=attempt,
+                blocked=blocked,
+            )
+        except QuantError as failure:
+            if failure.detail.code != "DATA_PIPELINE_BUSY":
+                raise
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -757,7 +821,24 @@ class DataPipeline:
         return value.astimezone(UTC)
 
     def _lease_expires_at(self) -> datetime:
-        return self._now() + timedelta(minutes=30)
+        return self._now() + self._lease_duration
+
+    def _heartbeat(
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        owner_id: str,
+        attempt: int,
+    ) -> None:
+        now = self._now()
+        self._repository.renew_pipeline_stage_lease(
+            run_id,
+            stage,
+            owner_id=owner_id,
+            attempt=attempt,
+            renewed_at=now,
+            lease_expires_at=now + self._lease_duration,
+        )
 
     @staticmethod
     def _raise_checkpoint(stage: PipelineStageName, cause: Exception) -> Never:
