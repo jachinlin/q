@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from quant_core.data.contracts import canonical_json_bytes
+from quant_core.persistence.repositories import PipelineStageName
 from tests.integration.test_data_pipeline import OfflineBaoStockSource, make_pipeline
 
 
@@ -34,6 +36,32 @@ def test_offline_snapshot_matches_reviewed_semantic_golden(tmp_path: Path) -> No
         },
     }
     semantic_hash = hashlib.sha256(canonical_json_bytes(semantic)).hexdigest()
+    raw_checkpoint = repository.get_pipeline_stage(
+        result.run_id, PipelineStageName.INGEST_RAW
+    )
+    assert isinstance(raw_checkpoint.output, Mapping)
+    raw_partitions = raw_checkpoint.output["partitions"]
+    assert isinstance(raw_partitions, tuple)
+    daily_partition = next(
+        partition
+        for partition in raw_partitions
+        if isinstance(partition, Mapping) and partition["dataset"] == "daily_bars"
+    )
+
+    assert daily_partition["request"] == {
+        "api": "query_daily_history_k_AStock",
+        "scope": "ALL",
+        "date": "2026-01-05",
+        "frequency": "d",
+        "catalog_instrument_count": 1,
+        "catalog_instruments_sha256": (
+            "4ce2319dba32d78a0d8f387c01dfda93b89ecfc1429822803da3709d75ec5e98"
+        ),
+        "response_instrument_count": 1,
+        "response_instruments_sha256": (
+            "0b65e0880c3c56b781009d8686a77a5473246a7a0fcb74ab6c7d6f5410ed7b6b"
+        ),
+    }
 
     assert semantic == {
         "format_version": 1,

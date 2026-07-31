@@ -19,7 +19,7 @@ from quant_core.domain.enums import Exchange, Severity
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.errors import ErrorDetail, QuantError
 
-BAOSTOCK_SOURCE_ADAPTER_VERSION = "baostock-source-adapter-v1"
+BAOSTOCK_SOURCE_ADAPTER_VERSION = "baostock-source-adapter-v2"
 
 DAILY_BAR_FIELDS = (
     "date",
@@ -342,7 +342,10 @@ class BaoStockClient:
             if instruments is not None:
                 self._logger.info(
                     "empty instrument selection resolved as all-market daily route",
-                    extra={"event": "empty_instruments_resolved_as_all", "scope": "ALL"},
+                    extra={
+                        "event": "empty_instruments_resolved_as_all",
+                        "scope": "ALL",
+                    },
                 )
             _, catalog_instruments = self._resolve_instruments(start, end, instruments)
             _, open_dates = self._load_trade_calendar(start, end)

@@ -395,15 +395,18 @@ class CanonicalMapper(Protocol):
 
 “全部证券”定义为：证券上市区间与 `[start, end]` 存在交集，并且交易所、证券类型和板块属于当前数据源配置允许范围的全部历史证券。它不能只使用请求结束日仍然上市的证券，否则会产生幸存者偏差。
 
-全量模式必须先解析并冻结证券范围，在每个 `RawBatch.request` 中记录：
+BaoStock 日线采用固定的混合路由语义，详见 [BaoStock 全市场日线混合路由设计](../superpowers/specs/2026-07-31-baostock-daily-market-route-design.md)：
 
-- `scope="ALL"`。
-- 解析后的证券数量。
-- 排序后证券列表的 SHA-256。
-- 当前分批序号和总批次数。
-- 请求日期范围。
+- `None` 或空序列：先解析交易日历，再按每个开市日调用 `query_daily_history_k_AStock`；每个开市日生成一个 `RawBatch`，休市日不调用日线 API。
+- 非空序列：按证券块和日期块调用 `query_history_k_data_plus`，只采集指定的内部证券标识。
 
-方法返回 `Iterable[RawBatch]`，由采集客户端按供应商限制分批产出。调用方逐批写入 Raw 临时分区并登记检查点，不得把全部证券的 20 年行情合并为一个内存 `DataFrame`。空序列触发全量模式时必须写入一条结构化信息日志，使意外传入空筛选条件可以被审计。
+全市场模式必须先解析并冻结请求窗口内的完整历史 A 股目录；每个 `RawBatch.request` 记录 `scope="ALL"`、开市日期、目录证券数量及其排序后 SHA-256、当日响应证券数量及其排序后 SHA-256。空序列触发全市场模式时必须写入结构化信息日志，使意外传入空筛选条件可以被审计。`max_instruments_per_batch` 与 `max_days_per_batch` 分块配置只作用于非空证券列表的定向路径，不影响按开市日调用的全市场路径。
+
+方法返回 `Iterable[RawBatch]`，调用方逐批写入 Raw 临时分区并登记检查点，不得把全部证券的 20 年行情合并为一个内存 `DataFrame`。Raw 仍先于映射落地，Mapper 保持后置，公共流程不变：
+
+```text
+BaoStock -> Raw Parquet -> CanonicalMapper -> Curated Parquet -> Snapshot
+```
 
 调用示例：
 

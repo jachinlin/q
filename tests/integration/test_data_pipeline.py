@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -17,8 +18,14 @@ import polars as pl
 import pytest
 from typer.testing import CliRunner
 
+from quant_core import cli as cli_module
 from quant_core.cli import ApplicationServices, create_app
-from quant_core.data.contracts import CanonicalBatch, PublishedPartition, RawBatch
+from quant_core.data.contracts import (
+    CanonicalBatch,
+    PublishedPartition,
+    RawBatch,
+    canonical_json_bytes,
+)
 from quant_core.data.mappers.baostock import BaoStockMapper
 from quant_core.data.partitions import RawPartitionStore
 from quant_core.data.pipelines import curate as curate_module
@@ -33,6 +40,10 @@ from quant_core.data.pipelines.publish import (
 from quant_core.data.quality.rules import QUALITY_RULE_SET_VERSION
 from quant_core.data.quality.runner import QualityRunner
 from quant_core.data.snapshots import SnapshotPublisher
+from quant_core.data.sources.baostock import (
+    BAOSTOCK_SOURCE_ADAPTER_VERSION,
+    BaoStockConfig,
+)
 from quant_core.domain.enums import SnapshotStatus
 from quant_core.domain.identifiers import DatasetVersionId, QualityRunId, SnapshotId
 from quant_core.errors import QuantError
@@ -194,6 +205,8 @@ class OfflineBaoStockSource:
         self.volume = volume
         self.bar_date = bar_date
         self.close_price = close_price
+        self.daily_market_calls: list[date] = []
+        self.selected_calls = 0
 
     def login(self) -> None:
         self.login_calls += 1
@@ -229,10 +242,28 @@ class OfflineBaoStockSource:
             schema=("calendar_date", "is_trading_day"),
             rows=(({"calendar_date": self.bar_date, "is_trading_day": "1"}),),
         )
+        daily_rows = self.query_daily_history_k_AStock(
+            date.fromisoformat(self.bar_date)
+        )
+        catalog_ids = ["SSE:600000"]
+        response_codes = sorted(str(row["code"]) for row in daily_rows)
         yield RawBatch(
             provider=self.provider,
             dataset="daily_bars",
-            request={"start_date": start.isoformat(), "end_date": end.isoformat()},
+            request={
+                "api": "query_daily_history_k_AStock",
+                "scope": "ALL",
+                "date": self.bar_date,
+                "frequency": "d",
+                "catalog_instrument_count": len(catalog_ids),
+                "catalog_instruments_sha256": hashlib.sha256(
+                    "\n".join(catalog_ids).encode()
+                ).hexdigest(),
+                "response_instrument_count": len(response_codes),
+                "response_instruments_sha256": hashlib.sha256(
+                    "\n".join(response_codes).encode()
+                ).hexdigest(),
+            },
             retrieved_at=retrieved,
             schema=(
                 "date",
@@ -254,29 +285,43 @@ class OfflineBaoStockSource:
                 "pcfNcfTTM",
                 "isST",
             ),
-            rows=(
-                {
-                    "date": self.bar_date,
-                    "code": "sh.600000",
-                    "open": "10.00",
-                    "high": "10.80",
-                    "low": "9.90",
-                    "close": self.close_price,
-                    "preclose": "9.95",
-                    "volume": self.volume,
-                    "amount": "1050.00",
-                    "adjustflag": "3",
-                    "turn": "0.42",
-                    "tradestatus": "1",
-                    "pctChg": "5.53",
-                    "peTTM": "8.10",
-                    "pbMRQ": "1.20",
-                    "psTTM": "2.30",
-                    "pcfNcfTTM": "4.50",
-                    "isST": "0",
-                },
-            ),
+            rows=daily_rows,
         )
+
+    def query_daily_history_k_AStock(
+        self, trading_day: date
+    ) -> tuple[dict[str, str], ...]:
+        self.daily_market_calls.append(trading_day)
+        return (
+            {
+                "date": trading_day.isoformat(),
+                "code": "sh.600000",
+                "open": "10.00",
+                "high": "10.80",
+                "low": "9.90",
+                "close": self.close_price,
+                "preclose": "9.95",
+                "volume": self.volume,
+                "amount": "1050.00",
+                "adjustflag": "3",
+                "turn": "0.42",
+                "tradestatus": "1",
+                "pctChg": "5.53",
+                "peTTM": "8.10",
+                "pbMRQ": "1.20",
+                "psTTM": "2.30",
+                "pcfNcfTTM": "4.50",
+                "isST": "0",
+            },
+        )
+
+    def query_history_k_data_plus(self) -> tuple[dict[str, str], ...]:
+        self.selected_calls += 1
+        return ()
+
+
+class OfflineDailyMarketBaoStockSource(OfflineBaoStockSource):
+    """Named fixture documenting that pipeline bootstrap uses the daily route."""
 
 
 class FailOnceMapper:
@@ -615,6 +660,76 @@ def test_publish_checkpoint_revalidates_manifest_content(tmp_path: Path) -> None
 
     assert captured.value.detail.code == "DATA_CHECKPOINT_INVALID"
     assert captured.value.detail.context["stage"] == "PUBLISH_SNAPSHOT"
+
+
+def test_daily_market_route_has_new_source_adapter_version() -> None:
+    assert BAOSTOCK_SOURCE_ADAPTER_VERSION == "baostock-source-adapter-v2"
+
+
+def test_cli_fetch_config_fingerprints_both_routes_and_selected_limits() -> None:
+    config = BaoStockConfig(
+        max_instruments_per_batch=17,
+        max_days_per_batch=31,
+        max_attempts=3,
+        retry_backoff_seconds=(0.25, 0.5),
+        retryable_error_codes=frozenset({"-1", "10002007"}),
+    )
+    fingerprint = getattr(cli_module, "_baostock_fetch_config_fingerprint", None)
+    assert fingerprint is not None
+    expected = {
+        "all_market_route": "query_daily_history_k_AStock-per-open-date-v1",
+        "selected_route": "query_history_k_data_plus-v1",
+        "selected_max_days_per_batch": 31,
+        "selected_max_instruments_per_batch": 17,
+        "max_attempts": 3,
+        "retry_backoff_seconds": [0.25, 0.5],
+        "retryable_error_codes": ["-1", "10002007"],
+    }
+
+    assert (
+        fingerprint(config)
+        == hashlib.sha256(canonical_json_bytes(expected)).hexdigest()
+    )
+
+
+def test_bootstrap_all_market_source_never_uses_selected_api(tmp_path: Path) -> None:
+    source = OfflineDailyMarketBaoStockSource()
+    pipeline, _ = make_pipeline(tmp_path, source)
+
+    result = pipeline.bootstrap()
+
+    assert isinstance(result.snapshot_id, SnapshotId)
+    assert source.daily_market_calls == [date(2026, 1, 5)]
+    assert source.selected_calls == 0
+
+
+def test_source_adapter_component_version_change_does_not_reuse_ingest_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source = OfflineDailyMarketBaoStockSource()
+    v1 = PipelineVersions(source_adapter="baostock-source-adapter-v1")
+    first_pipeline, repository = make_pipeline(tmp_path, source, versions=v1)
+    first = first_pipeline.bootstrap()
+    v2 = replace(v1, source_adapter="baostock-source-adapter-v2")
+    second_pipeline, _ = make_pipeline(tmp_path, source, versions=v2)
+
+    second = second_pipeline.bootstrap()
+
+    first_run = repository.get_pipeline_run(first.run_id)
+    second_run = repository.get_pipeline_run(second.run_id)
+    first_ingest = repository.get_pipeline_stage(
+        first.run_id, PipelineStageName.INGEST_RAW
+    )
+    second_ingest = repository.get_pipeline_stage(
+        second.run_id, PipelineStageName.INGEST_RAW
+    )
+    assert second.run_id != first.run_id
+    assert second_run.request_hash != first_run.request_hash
+    assert second_run.pipeline_fingerprint != first_run.pipeline_fingerprint
+    assert second_ingest.input_hash != first_ingest.input_hash
+    assert source.fetch_calls == 2
+    assert source.daily_market_calls == [date(2026, 1, 5), date(2026, 1, 5)]
+    assert source.selected_calls == 0
 
 
 @pytest.mark.parametrize(

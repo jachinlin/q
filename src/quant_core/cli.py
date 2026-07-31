@@ -197,6 +197,27 @@ def _parse_cli_date(value: str, field: str) -> date:
     return parsed
 
 
+def _baostock_fetch_config_fingerprint(config: BaoStockConfig) -> str:
+    retryable_error_codes = [
+        cast(JsonValue, code) for code in sorted(config.retryable_error_codes)
+    ]
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "all_market_route": ("query_daily_history_k_AStock-per-open-date-v1"),
+                "selected_route": "query_history_k_data_plus-v1",
+                "selected_max_days_per_batch": config.max_days_per_batch,
+                "selected_max_instruments_per_batch": (
+                    config.max_instruments_per_batch
+                ),
+                "max_attempts": config.max_attempts,
+                "retry_backoff_seconds": list(config.retry_backoff_seconds),
+                "retryable_error_codes": retryable_error_codes,
+            }
+        )
+    ).hexdigest()
+
+
 def build_default_services() -> ApplicationServices:
     """Wire the real local BaoStock-backed application from typed settings."""
     source_root = Path(__file__).resolve().parents[2]
@@ -231,20 +252,7 @@ def build_default_services() -> ApplicationServices:
     )
     source = BaoStockClient(source_gateway, None, source_config)
     calendar_client = BaoStockClient(calendar_gateway, None, source_config)
-    retryable_error_codes = [
-        cast(JsonValue, code) for code in sorted(source_config.retryable_error_codes)
-    ]
-    fetch_config_fingerprint = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "max_attempts": source_config.max_attempts,
-                "max_days_per_batch": source_config.max_days_per_batch,
-                "max_instruments_per_batch": source_config.max_instruments_per_batch,
-                "retry_backoff_seconds": list(source_config.retry_backoff_seconds),
-                "retryable_error_codes": retryable_error_codes,
-            }
-        )
-    ).hexdigest()
+    fetch_config_fingerprint = _baostock_fetch_config_fingerprint(source_config)
     pipeline = DataPipeline(
         source=source,
         mapper=BaoStockMapper(),
