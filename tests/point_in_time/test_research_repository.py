@@ -27,7 +27,7 @@ from quant_core.persistence.repositories import (
     DatasetVersionSpec,
     MetadataRepository,
 )
-from tests.fixtures.point_in_time import point_in_time_fixture
+from tests.fixtures.point_in_time import _write_dataset, point_in_time_fixture
 
 
 def test_financials_do_not_cross_snapshot_membership(tmp_path: Path) -> None:
@@ -115,6 +115,99 @@ def test_bars_are_snapshot_bound_range_reads_with_canonical_sort(
 
     assert result["trade_date"].to_list() == [date(2024, 4, 28), date(2024, 4, 29)]
     assert result.schema == CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR].columns
+
+
+def test_corporate_actions_as_of_excludes_actions_available_after_shanghai_close(
+    tmp_path: Path,
+) -> None:
+    """Removing available_at cutoff would leak an action not known by the research day."""
+    fixture = point_in_time_fixture(tmp_path)
+    actions = _write_dataset(
+        tmp_path,
+        "actions-late-availability",
+        DatasetKind.CORPORATE_ACTION,
+        [
+            _corporate_action_row(
+                action_type="late",
+                ex_date=date(2024, 4, 29),
+                available_at=datetime(2024, 4, 29, 16, tzinfo=UTC),
+            )
+        ],
+    )
+    snapshot_id = fixture.repository.bind_dataset(
+        fixture.early_snapshot_id, DatasetKind.CORPORATE_ACTION, actions
+    )
+
+    result = (
+        SnapshotResearchRepository(fixture.repository)
+        .corporate_actions_as_of(
+            snapshot_id, [InstrumentId.parse("SSE:600000")], date(2024, 4, 29)
+        )
+        .collect()
+    )
+
+    assert result.is_empty()
+    assert result.schema == CANONICAL_SCHEMAS[DatasetKind.CORPORATE_ACTION].columns
+
+
+def test_corporate_actions_as_of_excludes_future_ex_date(tmp_path: Path) -> None:
+    """A previously announced but not-yet-effective action is not current PIT input."""
+    fixture = point_in_time_fixture(tmp_path)
+    actions = _write_dataset(
+        tmp_path,
+        "actions-future-ex-date",
+        DatasetKind.CORPORATE_ACTION,
+        [
+            _corporate_action_row(
+                action_type="future",
+                ex_date=date(2024, 4, 30),
+                available_at=datetime(2024, 4, 28, tzinfo=UTC),
+            )
+        ],
+    )
+    snapshot_id = fixture.repository.bind_dataset(
+        fixture.early_snapshot_id, DatasetKind.CORPORATE_ACTION, actions
+    )
+
+    result = (
+        SnapshotResearchRepository(fixture.repository)
+        .corporate_actions_as_of(
+            snapshot_id, [InstrumentId.parse("SSE:600000")], date(2024, 4, 29)
+        )
+        .collect()
+    )
+
+    assert result.is_empty()
+
+
+def test_corporate_actions_as_of_excludes_null_ex_date(tmp_path: Path) -> None:
+    """A null ex-date must be excluded at the repository boundary, not deferred."""
+    fixture = point_in_time_fixture(tmp_path)
+    actions = _write_dataset(
+        tmp_path,
+        "actions-null-ex-date",
+        DatasetKind.CORPORATE_ACTION,
+        [
+            _corporate_action_row(
+                action_type="missing-ex-date",
+                ex_date=None,
+                available_at=datetime(2024, 4, 28, tzinfo=UTC),
+            )
+        ],
+    )
+    snapshot_id = fixture.repository.bind_dataset(
+        fixture.early_snapshot_id, DatasetKind.CORPORATE_ACTION, actions
+    )
+
+    result = (
+        SnapshotResearchRepository(fixture.repository)
+        .corporate_actions_as_of(
+            snapshot_id, [InstrumentId.parse("SSE:600000")], date(2024, 4, 29)
+        )
+        .collect()
+    )
+
+    assert result.is_empty()
 
 
 def test_security_status_filters_the_requested_as_of_date(tmp_path: Path) -> None:
@@ -238,6 +331,27 @@ def test_research_rejects_draft_snapshot_from_real_metadata_catalog(
         )
 
     assert captured.value.detail.code == "SNAP_NOT_PUBLISHED"
+
+
+def _corporate_action_row(
+    *, action_type: str, ex_date: date | None, available_at: datetime
+) -> dict[str, object]:
+    return {
+        "instrument_id": "SSE:600000",
+        "action_type": action_type,
+        "record_date": ex_date,
+        "ex_date": ex_date,
+        "pay_date": ex_date,
+        "cash_per_share": None,
+        "share_ratio": None,
+        "rights_price": None,
+        "source": "fixture",
+        "source_version": "v1",
+        "available_at": available_at,
+        "availability_source": "announcement",
+        "pit_usable": True,
+        "ingested_at": datetime(2024, 4, 30, tzinfo=UTC),
+    }
 
 
 def test_research_sorts_distinct_catalog_partitions_and_rejects_duplicates(

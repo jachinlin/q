@@ -160,9 +160,11 @@ class SnapshotResearchRepository:
                 "pit_usable = TRUE",
                 "available_at IS NOT NULL",
                 "available_at <= ?",
+                "ex_date IS NOT NULL",
+                "ex_date <= ?",
             )
         )
-        parameters.append(_shanghai_close_utc(as_of))
+        parameters.extend((_shanghai_close_utc(as_of), as_of))
         return self._read(
             snapshot_id,
             DatasetKind.CORPORATE_ACTION,

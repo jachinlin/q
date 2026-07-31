@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import polars as pl
 import pytest
 
 from quant_core.data.adjustments import AdjustmentMode, PriceAdjustmentService
@@ -93,9 +94,7 @@ def test_backward_adjustment_uses_only_actions_known_at_as_of(
     assert after_event["preclose"].to_list()[:3] == pytest.approx(
         [10.0 * price_factor, 11.0 * price_factor, 15.0 * price_factor]
     )
-    assert after_event["volume"].to_list()[:3] == pytest.approx(
-        [100 / price_factor, 110 / price_factor, 120 / price_factor]
-    )
+    assert after_event["volume"].to_list()[:3] == [125, 137, 150]
     assert after_event["amount"].to_list() == [1100.0, 1430.0, 2040.0, 2310.0, 3100.0]
     assert after_event["open"].to_list()[3:] == [18.0, 25.0]
     assert after_event["volume"].to_list()[3:] == [130, 140]
@@ -188,15 +187,194 @@ def test_backward_adjustment_composes_multiple_events_in_ex_date_order(
             25.0,
         ]
     )
-    assert result["volume"].to_list() == pytest.approx(
+    assert result["volume"].to_list() == [142, 157, 171, 149, 140]
+
+
+def test_backward_adjustment_aggregates_same_day_share_ratios_before_factoring(
+    tmp_path: Path,
+) -> None:
+    """Multiplying two same-day split factors uses one preclose twice and is wrong."""
+    fixture = _adjustment_fixture(
+        tmp_path,
         [
-            100.0 / ((15.0 / 18.7) * (21.0 / 24.0)),
-            110.0 / ((15.0 / 18.7) * (21.0 / 24.0)),
-            120.0 / ((15.0 / 18.7) * (21.0 / 24.0)),
-            130.0 / (21.0 / 24.0),
-            140.0,
-        ]
+            _action_row(
+                action_type="bonus-a",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                share_ratio=0.1,
+            ),
+            _action_row(
+                action_type="bonus-b",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                share_ratio=0.2,
+            ),
+        ],
     )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+    assert result["open"].to_list()[:3] == pytest.approx(
+        [10.0 / 1.3, 12.0 / 1.3, 16.0 / 1.3]
+    )
+
+
+def test_backward_adjustment_aggregates_same_day_cash_and_bonus(
+    tmp_path: Path,
+) -> None:
+    """The cash and bonus components of one ex-date must share one daily factor."""
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="cash",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                cash_per_share=2.0,
+            ),
+            _action_row(
+                action_type="bonus",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                share_ratio=0.1,
+            ),
+        ],
+    )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+    assert result["open"].to_list()[:3] == pytest.approx(
+        [10.0 * 15.0 / 18.7, 12.0 * 15.0 / 18.7, 16.0 * 15.0 / 18.7]
+    )
+
+
+def test_backward_adjustment_rounds_volume_half_up_and_keeps_int64(
+    tmp_path: Path,
+) -> None:
+    """Float volume output would break the canonical daily-bar volume contract."""
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="cash-and-bonus",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                cash_per_share=2.0,
+                share_ratio=0.1,
+            )
+        ],
+    )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+    assert result.schema["volume"] == pl.Int64
+    assert result["volume"].to_list()[:3] == [125, 137, 150]
+
+
+def test_backward_adjustment_rejects_int64_volume_overflow(tmp_path: Path) -> None:
+    """A reciprocal factor must not silently wrap a canonical Int64 volume."""
+    overflow_rows = [
+        (*_BAR_VALUES[0][:5], 2**63 - 1, _BAR_VALUES[0][-1]),
+        *_BAR_VALUES[1:],
+    ]
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="bonus",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                share_ratio=0.1,
+            )
+        ],
+        bar_values=overflow_rows,
+    )
+
+    with pytest.raises(ValueError, match="adjusted volume exceeds Int64 range"):
+        _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+
+def test_backward_adjustment_uses_ex_date_after_requested_end(tmp_path: Path) -> None:
+    """Only loading through end would omit a known later ex-date factor."""
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="later-than-end",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                cash_per_share=2.0,
+                share_ratio=0.1,
+            )
+        ],
+    )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[2], _DAYS[3])
+
+    assert result["trade_date"].to_list() == _DAYS[:3]
+    assert result["open"].to_list() == pytest.approx(
+        [10.0 * 15.0 / 18.7, 12.0 * 15.0 / 18.7, 16.0 * 15.0 / 18.7]
+    )
+    assert result["adjustment_as_of"].to_list() == [_DAYS[3]] * 3
+
+
+def test_backward_adjustment_ignores_future_duplicate_actions_before_key_check(
+    tmp_path: Path,
+) -> None:
+    """A duplicate action after as_of must not corrupt the current usable set."""
+    future = _action_row(
+        action_type="future-duplicate",
+        ex_date=_DAYS[-1],
+        available_at=datetime(2024, 1, 4, tzinfo=UTC),
+        cash_per_share=2.0,
+    )
+    fixture = _adjustment_fixture(tmp_path, [future, future])
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[2], _DAYS[3])
+
+    assert result["open"].to_list() == [10.0, 12.0, 16.0]
+    assert result["adjustment_mode"].to_list() == ["BACKWARD"] * 3
+
+
+def test_backward_adjustment_empty_actions_preserves_schema_order_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """An empty action dataset must still return canonical raw bars plus metadata."""
+    fixture = _adjustment_fixture(tmp_path, [])
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+    assert result["trade_date"].to_list() == _DAYS
+    assert result.schema["volume"] == pl.Int64
+    assert result.schema["adjustment_mode"] == pl.String
+    assert result.schema["adjustment_as_of"] == pl.Date
+    assert result["adjustment_mode"].to_list() == ["BACKWARD"] * len(_DAYS)
+    assert result["adjustment_as_of"].to_list() == [_DAYS[-1]] * len(_DAYS)
+
+
+def test_backward_adjustment_empty_bars_preserves_schema_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """Empty instrument results must retain typed metadata rather than a schema-less frame."""
+    fixture = _adjustment_fixture(tmp_path, [])
+
+    result = (
+        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        .bars(
+            fixture.snapshot_id,
+            [InstrumentId.parse("SZSE:000001")],
+            _DAYS[0],
+            _DAYS[-1],
+            AdjustmentMode.BACKWARD,
+            _DAYS[-1],
+        )
+        .collect()
+    )
+
+    assert result.is_empty()
+    assert result.schema["volume"] == pl.Int64
+    assert result.schema["adjustment_mode"] == pl.String
+    assert result.schema["adjustment_as_of"] == pl.Date
 
 
 def test_backward_adjustment_rejects_nonpositive_event_factor(tmp_path: Path) -> None:
@@ -224,7 +402,7 @@ def test_backward_adjustment_rejects_nonpositive_event_factor(tmp_path: Path) ->
         )
 
 
-def test_backward_adjustment_rejects_rights_price_without_share_ratio(
+def test_backward_adjustment_rejects_rights_price_without_independent_ratio(
     tmp_path: Path,
 ) -> None:
     """Using a rights price without issued shares would silently discard its economics."""
@@ -240,9 +418,7 @@ def test_backward_adjustment_rejects_rights_price_without_share_ratio(
         ],
     )
 
-    with pytest.raises(
-        ValueError, match="rights_price requires a positive share_ratio"
-    ):
+    with pytest.raises(ValueError, match="rights_price is unsupported"):
         PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
@@ -251,6 +427,27 @@ def test_backward_adjustment_rejects_rights_price_without_share_ratio(
             AdjustmentMode.BACKWARD,
             _DAYS[-1],
         )
+
+
+def test_backward_adjustment_rejects_any_rights_price_without_rights_ratio(
+    tmp_path: Path,
+) -> None:
+    """Canonical share_ratio cannot safely stand in for a missing rights ratio."""
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="rights",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                share_ratio=0.1,
+                rights_price=8.0,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="rights_price is unsupported"):
+        _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
 
 
 def test_backward_adjustment_rejects_duplicate_action_primary_key(
@@ -301,14 +498,21 @@ def test_adjustment_request_rejects_invalid_time_bounds(
 
 
 def _adjustment_fixture(
-    tmp_path: Path, actions: list[dict[str, object]]
+    tmp_path: Path,
+    actions: list[dict[str, object]],
+    *,
+    bar_values: list[tuple[float, float, float, float, float, int, float]]
+    | None = None,
 ) -> AdjustmentFixture:
     base = point_in_time_fixture(tmp_path)
     bars = _write_dataset(
         tmp_path,
         "adjustment-bars",
         DatasetKind.DAILY_BAR,
-        [_bar_row(day, values) for day, values in zip(_DAYS, _BAR_VALUES, strict=True)],
+        [
+            _bar_row(day, values)
+            for day, values in zip(_DAYS, bar_values or _BAR_VALUES, strict=True)
+        ],
     )
     corporate_actions = _write_dataset(
         tmp_path,
@@ -323,6 +527,21 @@ def _adjustment_fixture(
         with_bars, DatasetKind.CORPORATE_ACTION, corporate_actions
     )
     return AdjustmentFixture(base.repository, snapshot_id)
+
+
+def _backward_bars(fixture: AdjustmentFixture, start: date, end: date, as_of: date):
+    return (
+        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        .bars(
+            fixture.snapshot_id,
+            [_INSTRUMENT],
+            start,
+            end,
+            AdjustmentMode.BACKWARD,
+            as_of,
+        )
+        .collect()
+    )
 
 
 _BAR_VALUES = [
