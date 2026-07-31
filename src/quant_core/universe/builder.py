@@ -26,6 +26,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _REASON_PRIORITY = (
     "AS_OF_NOT_TRADING_DAY",
     "INSTRUMENT_HISTORY_MISSING",
+    "INSTRUMENT_TYPE_NOT_ALLOWED",
     "NOT_LISTED_YET",
     "DELISTED",
     "INSUFFICIENT_LISTING_DAYS",
@@ -34,6 +35,7 @@ _REASON_PRIORITY = (
     "SUSPENDED",
     "BOARD_NOT_ALLOWED",
     "INSUFFICIENT_LIQUIDITY_HISTORY",
+    "MISSING_LIQUIDITY_OBSERVATIONS",
     "LIQUIDITY_AMOUNT_MISSING",
     "INSUFFICIENT_AVERAGE_AMOUNT",
 )
@@ -50,24 +52,31 @@ class UniverseBuilder:
     ) -> pl.DataFrame:
         """Return one row per snapshot instrument, sorted by ``instrument_id``."""
         instruments = self._repository.instruments(snapshot_id).collect()
+        instruments = _validated_instruments(instruments)
         calendar = self._repository.trade_calendar(
             snapshot_id, date.min, as_of
         ).collect()
+        _validate_calendar(calendar)
         identifiers = _instrument_ids(instruments)
         if not _is_trading_day(calendar, as_of):
             return _all_closed(identifiers, as_of, "AS_OF_NOT_TRADING_DAY")
 
-        statuses = _known_by_as_of(
-            self._repository.security_status(snapshot_id, as_of), as_of
-        ).collect()
-        bars = (
-            _known_by_as_of(
-                self._repository.bars(snapshot_id, identifiers, date.min, as_of), as_of
-            ).collect()
-            if identifiers
-            else pl.DataFrame()
-        )
         trading_days = _trading_days(calendar, as_of)
+        liquidity_window = trading_days[-20:]
+        if not identifiers:
+            return _empty_universe()
+
+        statuses = self._repository.security_status(snapshot_id, as_of).collect()
+        _validate_statuses(statuses, {item.canonical() for item in identifiers}, as_of)
+        statuses = _known_by_as_of(statuses.lazy(), as_of).collect()
+        bar_start = liquidity_window[0] if liquidity_window else as_of
+        bars = self._repository.bars(
+            snapshot_id, identifiers, bar_start, as_of
+        ).collect()
+        _validate_bars(
+            bars, {item.canonical() for item in identifiers}, liquidity_window
+        )
+        bars = _known_by_as_of(bars.lazy(), as_of).collect()
         status_by_instrument = {
             row["instrument_id"]: row for row in statuses.to_dicts()
         }
@@ -81,9 +90,58 @@ class UniverseBuilder:
                 status_by_instrument.get(instrument["instrument_id"]),
                 amounts_by_instrument.get(instrument["instrument_id"], {}),
             )
-            for instrument in instruments.sort("instrument_id").to_dicts()
+            for instrument in instruments.to_dicts()
         ]
         return pl.DataFrame(rows, schema=_OUTPUT_SCHEMA, strict=False)
+
+
+def _validated_instruments(instruments: pl.DataFrame) -> pl.DataFrame:
+    identifiers = instruments["instrument_id"].to_list()
+    if len(identifiers) != len(set(identifiers)):
+        _invalid("duplicate instrument_id")
+    try:
+        for identifier in identifiers:
+            InstrumentId.parse(identifier)
+    except (TypeError, ValueError) as error:
+        raise ValueError("UNIVERSE_INPUT_INVALID: invalid instrument_id") from error
+    return instruments.sort("instrument_id")
+
+
+def _validate_calendar(calendar: pl.DataFrame) -> None:
+    dates = calendar["trade_date"].to_list()
+    if len(dates) != len(set(dates)):
+        _invalid("duplicate trade_date")
+
+
+def _validate_statuses(
+    statuses: pl.DataFrame, identifiers: set[str], as_of: date
+) -> None:
+    keys: set[tuple[object, object]] = set()
+    for row in statuses.select("instrument_id", "trade_date").to_dicts():
+        key = (row["instrument_id"], row["trade_date"])
+        if key in keys:
+            _invalid("duplicate status primary key")
+        keys.add(key)
+        if key[0] not in identifiers or key[1] != as_of:
+            _invalid("unexpected status observation")
+
+
+def _validate_bars(
+    bars: pl.DataFrame, identifiers: set[str], window: list[date]
+) -> None:
+    keys: set[tuple[object, object]] = set()
+    expected_dates = set(window)
+    for row in bars.select("instrument_id", "trade_date").to_dicts():
+        key = (row["instrument_id"], row["trade_date"])
+        if key in keys:
+            _invalid("duplicate bar primary key")
+        keys.add(key)
+        if key[0] not in identifiers or key[1] not in expected_dates:
+            _invalid("unexpected bar observation")
+
+
+def _invalid(message: str) -> None:
+    raise ValueError("UNIVERSE_INPUT_INVALID: " + message)
 
 
 def _instrument_ids(instruments: pl.DataFrame) -> list[InstrumentId]:
@@ -143,6 +201,10 @@ def _all_closed(
     )
 
 
+def _empty_universe() -> pl.DataFrame:
+    return pl.DataFrame(schema=_OUTPUT_SCHEMA)
+
+
 def _eligibility_row(
     instrument: dict[str, object],
     as_of: date,
@@ -154,6 +216,8 @@ def _eligibility_row(
     reasons: set[str] = set()
     list_date = instrument["list_date"]
     delist_date = instrument["delist_date"]
+    if instrument["instrument_type"] != "STOCK":
+        reasons.add("INSTRUMENT_TYPE_NOT_ALLOWED")
     if not isinstance(list_date, date):
         reasons.add("INSTRUMENT_HISTORY_MISSING")
     elif list_date > as_of:
@@ -215,7 +279,7 @@ def _add_liquidity_reasons(
         reasons.add("INSUFFICIENT_LIQUIDITY_HISTORY")
         return
     if any(day not in amounts for day in window):
-        reasons.add("INSUFFICIENT_LIQUIDITY_HISTORY")
+        reasons.add("MISSING_LIQUIDITY_OBSERVATIONS")
         return
     values = [amounts[day] for day in window]
     if any(value is None or not isfinite(value) for value in values):

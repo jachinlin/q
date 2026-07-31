@@ -19,13 +19,30 @@ class UniverseRules:
     min_avg_amount_20d: float | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.min_listing_days, bool) or self.min_listing_days < 0:
+        if type(self.min_listing_days) is not int or self.min_listing_days < 0:
             raise ValueError("min_listing_days must be a nonnegative integer")
-        if not self.allowed_boards:
+        try:
+            allowed_boards = frozenset(self.allowed_boards)
+        except TypeError as error:
+            raise ValueError(
+                "allowed_boards must be an iterable of Board values"
+            ) from error
+        if not allowed_boards:
             raise ValueError("allowed_boards must not be empty")
-        if not all(isinstance(board, Board) for board in self.allowed_boards):
+        if not all(isinstance(board, Board) for board in allowed_boards):
             raise ValueError("allowed_boards must contain Board values")
+        if type(self.exclude_st) is not bool:
+            raise ValueError("exclude_st must be a bool")
+        if type(self.exclude_suspended) is not bool:
+            raise ValueError("exclude_suspended must be a bool")
         if self.min_avg_amount_20d is not None and (
-            not isfinite(self.min_avg_amount_20d) or self.min_avg_amount_20d < 0
+            type(self.min_avg_amount_20d) not in {int, float}
+            or not isfinite(self.min_avg_amount_20d)
+            or self.min_avg_amount_20d < 0
         ):
             raise ValueError("min_avg_amount_20d must be finite and nonnegative")
+        object.__setattr__(self, "allowed_boards", allowed_boards)
+        if self.min_avg_amount_20d is not None:
+            object.__setattr__(
+                self, "min_avg_amount_20d", float(self.min_avg_amount_20d)
+            )
