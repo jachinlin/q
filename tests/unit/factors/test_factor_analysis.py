@@ -46,6 +46,36 @@ def test_rank_ic_is_daily_spearman_and_rejects_nonfuture_windows() -> None:
         spearman_rank_ic(factors, bad)
 
 
+def test_null_future_window_boundaries_never_participate_in_diagnostics() -> None:
+    factors = _factors([(0, "A", 1.0, True), (0, "B", 2.0, True)])
+    future = pl.DataFrame(
+        {
+            "signal_date": [_day(0), _day(0)],
+            "instrument_id": ["A", "B"],
+            "return_start": [_day(1), None],
+            "return_end": [_day(2), _day(2)],
+            "future_return": [0.1, 0.9],
+        },
+        schema={
+            "signal_date": pl.Date,
+            "instrument_id": pl.String,
+            "return_start": pl.Date,
+            "return_end": pl.Date,
+            "future_return": pl.Float64,
+        },
+    )
+
+    rank_ic = spearman_rank_ic(factors, future)
+    quantiles = quantile_future_returns(factors, future, 2)
+
+    assert rank_ic.select("pair_count", "rank_ic", "is_valid").row(0) == (
+        1,
+        None,
+        False,
+    )
+    assert quantiles["count"].sum() == 1
+
+
 def test_constant_or_single_pair_rank_ic_is_invalid_not_zero() -> None:
     factors = _factors([(0, "A", 1.0, True), (0, "B", 1.0, True), (1, "A", 2.0, True)])
     result = spearman_rank_ic(
@@ -112,6 +142,52 @@ def test_factor_correlations_pair_same_security_within_each_date() -> None:
     cross = result.filter((pl.col("factor_x") == "f1") & (pl.col("factor_y") == "f2"))
     assert cross["correlation"].item() == pytest.approx(0.0)
     assert cross["pair_count"].item() == 4
+
+
+@pytest.mark.parametrize(
+    "operation", ["coverage", "rank_ic", "assign", "quantile_returns"]
+)
+def test_single_factor_diagnostics_reject_duplicate_signal_keys(operation: str) -> None:
+    factors = _factors([(0, "A", 1.0, True), (0, "A", 2.0, True)])
+    future = _future([(0, "A", 0.1)])
+    universe = pl.DataFrame(
+        {"signal_date": [_day(0)], "instrument_id": ["A"], "eligible": [True]}
+    )
+
+    with pytest.raises(ValueError, match="duplicate factors key"):
+        if operation == "coverage":
+            coverage_by_date(factors, universe)
+        elif operation == "rank_ic":
+            spearman_rank_ic(factors, future)
+        elif operation == "assign":
+            assign_quantiles(factors, 2)
+        else:
+            quantile_future_returns(factors, future, 2)
+
+
+def test_correlation_rejects_duplicate_factor_keys() -> None:
+    factors = _factors([(0, "A", 1.0, True), (0, "A", 2.0, True)]).with_columns(
+        pl.lit("f1").alias("factor_id")
+    )
+
+    with pytest.raises(ValueError, match="duplicate factor correlation key"):
+        factor_correlation_matrix(factors)
+
+
+def test_correlation_diagonal_is_invalid_for_only_single_or_constant_daily_sections() -> (
+    None
+):
+    factors = _factors(
+        [(0, "A", 1.0, True), (1, "A", 2.0, True), (1, "B", 2.0, True)]
+    ).with_columns(pl.lit("f1").alias("factor_id"))
+
+    result = factor_correlation_matrix(factors)
+
+    assert result.select("pair_count", "correlation", "is_valid").row(0) == (
+        3,
+        None,
+        False,
+    )
 
 
 def _day(offset: int) -> date:

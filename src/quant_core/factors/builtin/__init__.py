@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from typing import cast
 
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.factors.base import Factor
@@ -65,25 +64,31 @@ def register_stock_factors(
     financial_provider: FinancialProvider,
     instruments: Sequence[InstrumentId],
     *,
-    price_service: AdjustedBarService | None = None,
+    price_service: AdjustedBarService,
     shares_provider: PitValueProvider | None = None,
     industry_provider: PitValueProvider | None = None,
     min_abs_net_profit: float = 1e-12,
 ) -> None:
     """Register all Task 7 alpha and auxiliary identities exactly once."""
-    adjusted = price_service or cast(AdjustedBarService, bar_repository)
     factors: tuple[Factor, ...] = (
         EarningsYieldFactor(bar_repository, instruments),
         BookToPriceFactor(bar_repository, instruments),
         RoeAvgPitFactor(financial_provider, instruments),
         CfoToNetProfitFactor(financial_provider, instruments, min_abs_net_profit),
-        Momentum12020Factor(adjusted, instruments),
-        Volatility60dFactor(adjusted, instruments),
-        DownsideVolatility60dFactor(adjusted, instruments),
-        MaxDrawdown120dFactor(adjusted, instruments),
+        Momentum12020Factor(price_service, instruments),
+        Volatility60dFactor(price_service, instruments),
+        DownsideVolatility60dFactor(price_service, instruments),
+        MaxDrawdown120dFactor(price_service, instruments),
         AvgAmount20dFactor(bar_repository, instruments),
-        LogMarketCapFactor(bar_repository, instruments, shares_provider),
-        IndustryCodePitFactor(instruments, industry_provider),
+        LogMarketCapFactor(
+            bar_repository,
+            instruments,
+            shares_provider,
+            calendar_provider=financial_provider,
+        ),
+        IndustryCodePitFactor(
+            instruments, industry_provider, calendar_provider=financial_provider
+        ),
     )
     for factor in factors:
         try:

@@ -42,6 +42,7 @@ def spearman_rank_ic(
     factors: pl.DataFrame, future_returns: pl.DataFrame
 ) -> pl.DataFrame:
     """Compute one valid-pair Spearman correlation per signal date."""
+    _unique(factors, "factors")
     pairs = _aligned_pairs(factors, future_returns)
     rows = []
     dates = sorted(set(factors["signal_date"].to_list()))
@@ -73,6 +74,7 @@ def assign_quantiles(factors: pl.DataFrame, quantiles: int) -> pl.DataFrame:
     """Assign 1=lowest through Q=highest with stable instrument tie-breaking."""
     if type(quantiles) is not int or quantiles < 2:
         raise ValueError("quantiles must be an integer of at least 2")
+    _unique(factors, "factors")
     valid = _valid_factors(factors)
     rows = []
     for group in valid.partition_by("signal_date", maintain_order=False):
@@ -184,32 +186,25 @@ def factor_correlation_matrix(factors: pl.DataFrame) -> pl.DataFrame:
     for left in ids:
         for right in ids:
             daily: list[float] = []
-            pair_count = 0
-            if left == right:
-                pair_count = valid.filter(pl.col("factor_id") == left).height
-                correlation = 1.0 if pair_count else None
-            else:
-                left_frame = valid.filter(pl.col("factor_id") == left).select(
-                    "signal_date", "instrument_id", pl.col("value").alias("left")
+            left_frame = valid.filter(pl.col("factor_id") == left).select(
+                "signal_date", "instrument_id", pl.col("value").alias("left")
+            )
+            right_frame = valid.filter(pl.col("factor_id") == right).select(
+                "signal_date", "instrument_id", pl.col("value").alias("right")
+            )
+            paired = left_frame.join(
+                right_frame, on=["signal_date", "instrument_id"], how="inner"
+            )
+            pair_count = paired.height
+            for group in paired.partition_by("signal_date", maintain_order=False):
+                corr = (
+                    _correlation(group["left"].to_numpy(), group["right"].to_numpy())
+                    if group.height >= 2
+                    else None
                 )
-                right_frame = valid.filter(pl.col("factor_id") == right).select(
-                    "signal_date", "instrument_id", pl.col("value").alias("right")
-                )
-                paired = left_frame.join(
-                    right_frame, on=["signal_date", "instrument_id"], how="inner"
-                )
-                pair_count = paired.height
-                for group in paired.partition_by("signal_date", maintain_order=False):
-                    corr = (
-                        _correlation(
-                            group["left"].to_numpy(), group["right"].to_numpy()
-                        )
-                        if group.height >= 2
-                        else None
-                    )
-                    if corr is not None:
-                        daily.append(corr)
-                correlation = sum(daily) / len(daily) if daily else None
+                if corr is not None:
+                    daily.append(corr)
+            correlation = sum(daily) / len(daily) if daily else None
             rows.append((left, right, pair_count, correlation, correlation is not None))
     return pl.DataFrame(
         rows,
@@ -240,7 +235,7 @@ def _valid_factors(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _valid_returns(frame: pl.DataFrame) -> pl.DataFrame:
-    return frame.filter(
+    return _return_rows_with_boundaries(frame).filter(
         pl.col("future_return").is_not_null() & pl.col("future_return").is_finite()
     )
 
@@ -251,12 +246,22 @@ def _validate_future(frame: pl.DataFrame) -> None:
         {"signal_date", "instrument_id", "return_start", "return_end", "future_return"},
         "future returns",
     )
-    _unique(frame, "future returns")
-    if frame.filter(
+    bounded = _return_rows_with_boundaries(frame)
+    _unique(bounded, "future returns")
+    if bounded.filter(
         (pl.col("return_start") <= pl.col("signal_date"))
         | (pl.col("return_end") < pl.col("return_start"))
     ).height:
         raise ValueError("future return window must be strictly after signal date")
+
+
+def _return_rows_with_boundaries(frame: pl.DataFrame) -> pl.DataFrame:
+    return frame.filter(
+        pl.col("signal_date").is_not_null()
+        & pl.col("instrument_id").is_not_null()
+        & pl.col("return_start").is_not_null()
+        & pl.col("return_end").is_not_null()
+    )
 
 
 def _unique(frame: pl.DataFrame, name: str) -> None:

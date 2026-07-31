@@ -39,6 +39,7 @@ class BarService:
     def __init__(self, bars: pl.DataFrame) -> None:
         self.bars_frame = bars
         self.calls = 0
+        self.starts: list[date] = []
 
     def bars(
         self,
@@ -50,6 +51,7 @@ class BarService:
         as_of: date | None = None,
     ) -> pl.LazyFrame:
         self.calls += 1
+        self.starts.append(start)
         ids = [item.canonical() for item in instruments]
         result = self.bars_frame.filter(
             pl.col("instrument_id").is_in(ids)
@@ -72,10 +74,50 @@ class BarService:
         return result.lazy()
 
 
+class RawOnlyBars:
+    """Production-shaped raw repository without adjustment-service arguments."""
+
+    def __init__(self, bars: pl.DataFrame) -> None:
+        self.bars_frame = bars
+
+    def bars(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        return self.bars_frame.filter(
+            pl.col("instrument_id").is_in(
+                [instrument.canonical() for instrument in instruments]
+            )
+            & pl.col("trade_date").is_between(start, end, closed="both")
+        ).lazy()
+
+
 class Financials:
-    def __init__(self, frame: pl.DataFrame) -> None:
+    def __init__(
+        self, frame: pl.DataFrame, trading_days: Sequence[date] | None = None
+    ) -> None:
         self.frame = frame
         self.calls: list[date] = []
+        self.trading_days = tuple(trading_days) if trading_days is not None else None
+
+    def trade_calendar(
+        self, snapshot_id: SnapshotId, start: date, end: date
+    ) -> pl.LazyFrame:
+        days = self.trading_days or tuple(
+            start + timedelta(days=index)
+            for index in range((end - start).days + 1)
+            if (start + timedelta(days=index)).weekday() < 5
+        )
+        return pl.DataFrame(
+            {
+                "trade_date": [day for day in days if start <= day <= end],
+                "is_trading_day": [True for day in days if start <= day <= end],
+            },
+            schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
+        ).lazy()
 
     def financials_as_of(
         self,
@@ -159,6 +201,23 @@ def test_valuation_factors_use_positive_finite_snapshot_bar_multiples() -> None:
     )
     assert result["value"].to_list() == [None, None]
     assert result["is_valid"].to_list() == [False, False]
+
+
+def test_valuation_with_unknown_availability_is_invalid_without_fabricated_time() -> (
+    None
+):
+    bars = _bars([10.0], pe=[5.0]).with_columns(
+        pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias("available_at")
+    )
+    day = bars["trade_date"].item()
+
+    result = (
+        EarningsYieldFactor(BarService(bars), [_ID]).compute(_ctx(day, day)).collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["available_at"].item() is None
+    assert result["is_valid"].item() is False
 
 
 def test_financial_factors_query_each_signal_date_and_match_report_period() -> None:
@@ -275,6 +334,16 @@ def test_financial_factor_queries_each_signal_date_without_future_or_unknown_rev
     ]
 
 
+def test_pit_quality_uses_only_explicit_open_sessions() -> None:
+    friday, monday = date(2024, 4, 26), date(2024, 4, 29)
+    provider = Financials(_empty_financials(), [friday, monday])
+
+    result = RoeAvgPitFactor(provider, [_ID]).compute(_ctx(friday, monday)).collect()
+
+    assert provider.calls == [friday, monday]
+    assert result["trade_date"].to_list() == [friday, monday]
+
+
 def test_cfo_ratio_requires_finite_positive_threshold() -> None:
     provider = Financials(
         pl.DataFrame(
@@ -346,14 +415,35 @@ def test_auxiliary_factors_use_raw_close_pit_providers_and_cannot_form_alpha() -
         }
     )
     market_cap = (
-        LogMarketCapFactor(BarService(bars), [_ID], PitValues(values))
+        LogMarketCapFactor(
+            BarService(bars),
+            [_ID],
+            PitValues(values),
+            calendar_provider=Financials(_empty_financials(), [day]),
+        )
         .compute(ctx)
         .collect()
     )
     assert market_cap["value"].item() == pytest.approx(np.log(10_000.0))
-    missing = LogMarketCapFactor(BarService(bars), [_ID]).compute(ctx).collect()
+    missing = (
+        LogMarketCapFactor(
+            BarService(bars),
+            [_ID],
+            calendar_provider=Financials(_empty_financials(), [day]),
+        )
+        .compute(ctx)
+        .collect()
+    )
     assert missing["value"].item() is None and missing["is_valid"].item() is False
-    industry = IndustryCodePitFactor([_ID], PitValues(values)).compute(ctx).collect()
+    industry = (
+        IndustryCodePitFactor(
+            [_ID],
+            PitValues(values),
+            calendar_provider=Financials(_empty_financials(), [day]),
+        )
+        .compute(ctx)
+        .collect()
+    )
     assert industry["value"].item() == 1_000.0
     with pytest.raises(ValueError, match="auxiliary"):
         assert_alpha_eligible(
@@ -364,11 +454,143 @@ def test_auxiliary_factors_use_raw_close_pit_providers_and_cannot_form_alpha() -
         )
 
 
+def test_avg_amount_unknown_availability_invalidates_the_window() -> None:
+    bars = _bars([10.0] * 20, amounts=[float(index) for index in range(1, 21)])
+    bars = bars.with_columns(
+        pl.when(pl.col("trade_date") == bars["trade_date"][-1])
+        .then(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
+        .otherwise(pl.col("available_at"))
+        .alias("available_at")
+    )
+    day = bars["trade_date"][-1]
+
+    result = (
+        AvgAmount20dFactor(BarService(bars), [_ID]).compute(_ctx(day, day)).collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["available_at"].item() is None
+    assert result["is_valid"].item() is False
+
+
+def test_avg_amount_falls_back_to_full_history_across_long_suspensions() -> None:
+    days = [date(2023, 1, 1) + timedelta(days=index * 10) for index in range(20)]
+    bars = _bars(
+        [10.0] * 20, amounts=[float(index) for index in range(1, 21)]
+    ).with_columns(
+        pl.Series("trade_date", days, dtype=pl.Date),
+        pl.Series(
+            "available_at",
+            [datetime.combine(day, datetime.min.time(), UTC) for day in days],
+            dtype=pl.Datetime("us", "UTC"),
+        ),
+    )
+    service = BarService(bars)
+
+    result = (
+        AvgAmount20dFactor(service, [_ID]).compute(_ctx(days[-1], days[-1])).collect()
+    )
+
+    assert result["value"].item() == pytest.approx(10.5)
+    assert service.starts == [days[-1] - timedelta(days=60), date.min]
+
+
+def test_log_market_cap_rejects_duplicate_raw_bar_keys() -> None:
+    bars = pl.concat([_bars([10.0]), _bars([11.0])])
+    day = bars["trade_date"].item(0)
+    values = pl.DataFrame(
+        {
+            "signal_date": [day],
+            "instrument_id": [_ID.canonical()],
+            "value": [1_000.0],
+            "available_at": [datetime(2024, 1, 1, tzinfo=UTC)],
+        }
+    )
+
+    with pytest.raises(ValueError, match="duplicate raw market-cap bar key"):
+        LogMarketCapFactor(
+            BarService(bars),
+            [_ID],
+            PitValues(values),
+            calendar_provider=Financials(_empty_financials(), [day]),
+        ).compute(_ctx(day, day))
+
+
+def test_log_market_cap_uses_only_explicit_open_sessions() -> None:
+    friday, monday = date(2024, 4, 26), date(2024, 4, 29)
+    bars = _bars([10.0] * 4).with_columns(
+        pl.Series(
+            "trade_date",
+            [friday + timedelta(days=index) for index in range(4)],
+            dtype=pl.Date,
+        )
+    )
+    values = pl.DataFrame(
+        {
+            "signal_date": [friday + timedelta(days=index) for index in range(4)],
+            "instrument_id": [_ID.canonical()] * 4,
+            "value": [1_000.0] * 4,
+            "available_at": [datetime(2024, 4, 1, tzinfo=UTC)] * 4,
+        }
+    )
+
+    result = (
+        LogMarketCapFactor(
+            BarService(bars),
+            [_ID],
+            PitValues(values),
+            calendar_provider=Financials(_empty_financials(), [friday, monday]),
+        )
+        .compute(_ctx(friday, monday))
+        .collect()
+    )
+
+    assert result["trade_date"].to_list() == [friday, monday]
+
+
+def test_industry_codes_accept_finite_zero_and_negative_taxonomy_values() -> None:
+    days = [date(2024, 4, 26), date(2024, 4, 29)]
+    values = pl.DataFrame(
+        {
+            "signal_date": days,
+            "instrument_id": [_ID.canonical()] * 2,
+            "value": [0.0, -2.0],
+            "available_at": [datetime(2024, 4, 1, tzinfo=UTC)] * 2,
+        }
+    )
+
+    result = (
+        IndustryCodePitFactor(
+            [_ID],
+            PitValues(values),
+            calendar_provider=Financials(_empty_financials(), days),
+        )
+        .compute(_ctx(days[0], days[1]))
+        .collect()
+    )
+
+    assert result["value"].to_list() == [0.0, -2.0]
+    assert result["is_valid"].to_list() == [True, True]
+
+
+def test_stock_registration_requires_explicit_adjusted_price_service() -> None:
+    bars = _bars([10.0] * 121)
+
+    with pytest.raises(TypeError, match="price_service"):
+        register_stock_factors(
+            FactorRegistry(), RawOnlyBars(bars), Financials(_empty_financials()), [_ID]
+        )
+
+
 def test_all_stock_factors_register_once_with_alpha_metadata() -> None:
     bars = _bars([10.0] * 121)
     registry = FactorRegistry()
     register_stock_factors(
-        registry, BarService(bars), Financials(_empty_financials()), [_ID]
+        registry,
+        BarService(bars),
+        Financials(_empty_financials()),
+        [_ID],
+        price_service=BarService(bars),
     )
     expected = {
         "earnings_yield_ttm_v1",

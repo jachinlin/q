@@ -435,7 +435,6 @@ def _validated_frame(
         "instrument_id",
         "factor_id",
         "factor_version",
-        "available_at",
         "is_valid",
     )
     if any(frame.select(required_non_null).null_count().row(0)):
@@ -453,6 +452,8 @@ def _validated_frame(
     )
     if frame.filter(pl.col("is_valid") & invalid_value).height:
         raise ValueError("valid factor output value must be finite")
+    if frame.filter(pl.col("is_valid") & pl.col("available_at").is_null()).height:
+        raise ValueError("valid factor output available_at must not be null")
     return frame.sort(_PRIMARY_KEY, maintain_order=True)
 
 

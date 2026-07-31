@@ -101,13 +101,21 @@ class CountingFinancials:
             .lazy()
         )
 
+    def trade_calendar(
+        self, snapshot_id: SnapshotId, start: date, end: date
+    ) -> pl.LazyFrame:
+        return pl.DataFrame(
+            {"trade_date": [end], "is_trading_day": [True]},
+            schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
+        ).lazy()
+
 
 def test_second_identical_materialization_hits_cache_without_provider_or_rewrite(
     tmp_path: Path,
 ) -> None:
     bars, financials = CountingBars(), CountingFinancials()
     registry = FactorRegistry()
-    register_stock_factors(registry, bars, financials, [_ID])
+    register_stock_factors(registry, bars, financials, [_ID], price_service=bars)
     cache = FeatureCache(tmp_path / "features")
     engine = FactorEngine(registry, cache)
     day = bars.frame["trade_date"][-1]

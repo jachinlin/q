@@ -15,9 +15,11 @@ from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FactorContext, FactorSpec
 from quant_core.factors.builtin._stock_common import (
     BarRepository,
+    TradeCalendarProvider,
+    _known_availability,
     canonical_scope,
     output_frame,
-    signal_dates,
+    trading_signal_dates,
 )
 
 _VERSION = "1.0.0"
@@ -91,20 +93,9 @@ class AvgAmount20dFactor:
         from quant_core.factors.builtin.momentum import _expanded_history_start
 
         history_start = _expanded_history_start(ctx.start, 20)
-        frame = (
-            self._repository.bars(
-                ctx.snapshot_id, self._instruments, history_start, ctx.end
-            )
-            .collect()
-            .sort("instrument_id", "trade_date")
-        )
-        required = {"instrument_id", "trade_date", "amount", "available_at"}
-        if not required.issubset(frame.columns):
-            raise ValueError("amount bars missing required columns")
-        if frame.select(
-            pl.struct("instrument_id", "trade_date").is_duplicated().any()
-        ).item():
-            raise ValueError("duplicate amount bar key")
+        frame = self._load(ctx, history_start)
+        if history_start != date.min and _needs_amount_full_history(frame, ctx, 20):
+            frame = self._load(ctx, date.min)
         rows = []
         for group in frame.partition_by("instrument_id", maintain_order=True):
             data = group.to_dicts()
@@ -114,17 +105,29 @@ class AvgAmount20dFactor:
                     continue
                 window = data[max(0, index - 19) : index + 1]
                 amounts = [item["amount"] for item in window]
-                valid = len(window) == 20 and all(
-                    _nonnegative(item) for item in amounts
+                availability = [item["available_at"] for item in window]
+                valid = (
+                    len(window) == 20
+                    and all(_nonnegative(item) for item in amounts)
+                    and all(_known_availability(item) for item in availability)
                 )
                 value = sum(float(item) for item in amounts) / 20.0 if valid else None
-                available = (
-                    max((item["available_at"] for item in window), default=None)
-                    if valid
-                    else row["available_at"]
-                )
+                available = max(availability) if valid else None
                 rows.append((day, row["instrument_id"], value, available))
         return output_frame(self.spec, rows)
+
+    def _load(self, ctx: FactorContext, start: date) -> pl.DataFrame:
+        frame = self._repository.bars(
+            ctx.snapshot_id, self._instruments, start, ctx.end
+        ).collect()
+        required = {"instrument_id", "trade_date", "amount", "available_at"}
+        if not required.issubset(frame.columns):
+            raise ValueError("amount bars missing required columns")
+        if frame.select(
+            pl.struct("instrument_id", "trade_date").is_duplicated().any()
+        ).item():
+            raise ValueError("duplicate amount bar key")
+        return frame.sort("instrument_id", "trade_date")
 
 
 class LogMarketCapFactor:
@@ -133,10 +136,13 @@ class LogMarketCapFactor:
         raw_service: BarRepository,
         instruments: Sequence[InstrumentId],
         shares_provider: PitValueProvider | None = None,
+        *,
+        calendar_provider: TradeCalendarProvider,
     ) -> None:
         self._service = raw_service
         self._instruments = canonical_scope(instruments)
         self._provider = shares_provider
+        self._calendar = calendar_provider
         self._spec = _aux_spec(
             "log_market_cap_v1",
             0,
@@ -158,11 +164,17 @@ class LogMarketCapFactor:
         required = {"instrument_id", "trade_date", "close", "available_at"}
         if not required.issubset(bars.columns):
             raise ValueError("raw bars missing required columns")
+        if bars.select(
+            pl.struct("trade_date", "instrument_id").is_duplicated().any()
+        ).item():
+            raise ValueError("duplicate raw market-cap bar key")
         by_key = {
             (row["trade_date"], row["instrument_id"]): row for row in bars.to_dicts()
         }
         rows = []
-        for day in signal_dates(ctx.start, ctx.end):
+        for day in trading_signal_dates(
+            self._calendar, ctx.snapshot_id, ctx.start, ctx.end
+        ):
             supplied = _provider_values(
                 self._provider, ctx.snapshot_id, day, self._instruments
             )
@@ -177,6 +189,7 @@ class LogMarketCapFactor:
                     and item is not None
                     and _positive(bar["close"])
                     and _positive(item[0])
+                    and _known_availability(bar["available_at"])
                 ):
                     cap = float(bar["close"]) * item[0]
                     value = log(cap) if isfinite(cap) and cap > 0 else None
@@ -190,9 +203,12 @@ class IndustryCodePitFactor:
         self,
         instruments: Sequence[InstrumentId],
         provider: PitValueProvider | None = None,
+        *,
+        calendar_provider: TradeCalendarProvider,
     ) -> None:
         self._instruments = canonical_scope(instruments)
         self._provider = provider
+        self._calendar = calendar_provider
         self._spec = _aux_spec(
             "industry_code_pit_v1",
             0,
@@ -209,9 +225,15 @@ class IndustryCodePitFactor:
 
     def compute(self, ctx: FactorContext) -> pl.LazyFrame:
         rows = []
-        for day in signal_dates(ctx.start, ctx.end):
+        for day in trading_signal_dates(
+            self._calendar, ctx.snapshot_id, ctx.start, ctx.end
+        ):
             supplied = _provider_values(
-                self._provider, ctx.snapshot_id, day, self._instruments
+                self._provider,
+                ctx.snapshot_id,
+                day,
+                self._instruments,
+                require_positive=False,
             )
             for instrument in self._instruments:
                 item = supplied.get(instrument.canonical())
@@ -231,6 +253,8 @@ def _provider_values(
     snapshot_id: SnapshotId,
     day: date,
     instruments: Sequence[InstrumentId],
+    *,
+    require_positive: bool = True,
 ) -> dict[str, tuple[float, datetime]]:
     if provider is None:
         return {}
@@ -242,9 +266,27 @@ def _provider_values(
         raise ValueError("duplicate PIT provider instrument key")
     result = {}
     for row in frame.to_dicts():
-        if _positive(row["value"]) and isinstance(row["available_at"], datetime):
+        valid_value = (
+            _positive(row["value"])
+            if require_positive
+            else _finite_number(row["value"])
+        )
+        if valid_value and _known_availability(row["available_at"]):
             result[row["instrument_id"]] = (float(row["value"]), row["available_at"])
     return result
+
+
+def _needs_amount_full_history(
+    frame: pl.DataFrame, ctx: FactorContext, required_observations: int
+) -> bool:
+    for group in frame.partition_by("instrument_id", maintain_order=True):
+        dates = group["trade_date"].to_list()
+        for index, trade_date in enumerate(dates):
+            if ctx.start <= trade_date <= ctx.end:
+                if index + 1 < required_observations:
+                    return True
+                break
+    return False
 
 
 def _positive(value: object) -> bool:
@@ -253,6 +295,14 @@ def _positive(value: object) -> bool:
         and not isinstance(value, bool)
         and isfinite(value)
         and value > 0
+    )
+
+
+def _finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and isfinite(value)
     )
 
 

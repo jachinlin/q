@@ -12,16 +12,17 @@ import polars as pl
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FactorContext, FactorSpec
 from quant_core.factors.builtin._stock_common import (
+    TradeCalendarProvider,
     canonical_scope,
     output_frame,
-    signal_dates,
+    trading_signal_dates,
 )
 
 _VERSION = "1.0.0"
 type FinancialHistory = dict[date, dict[str, tuple[float, datetime]]]
 
 
-class FinancialProvider(Protocol):
+class FinancialProvider(TradeCalendarProvider, Protocol):
     def financials_as_of(
         self,
         snapshot_id: SnapshotId,
@@ -50,7 +51,9 @@ class _PitFinancialFactor:
 
     def compute(self, ctx: FactorContext) -> pl.LazyFrame:
         rows = []
-        for signal_date in signal_dates(ctx.start, ctx.end):
+        for signal_date in trading_signal_dates(
+            self._provider, ctx.snapshot_id, ctx.start, ctx.end
+        ):
             frame = self._provider.financials_as_of(
                 ctx.snapshot_id, self.fields, signal_date, self._instruments
             ).collect()
