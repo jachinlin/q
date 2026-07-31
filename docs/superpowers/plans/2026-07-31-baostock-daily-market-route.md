@@ -715,11 +715,11 @@ git commit -m "feat: migrate BaoStock bootstrap to daily market API"
 
 - [ ] **Step 1: 运行全量自动门禁**
 
-使用短 Windows 测试路径，避免长临时路径干扰 Raw lock 测试：
+使用极短 Windows 测试路径，避免本机 `LongPathsEnabled=0` 时 Raw manifest 的 64 位文件名触及 260 字符上限：
 
 ```powershell
-New-Item -ItemType Directory -Force C:\tmp | Out-Null
-uv run pytest -q --basetemp=C:\tmp\quant-baostock-v2
+New-Item -ItemType Directory -Force C:\t | Out-Null
+uv run pytest -q --basetemp=C:\t\q
 uv run ruff format --check .
 uv run ruff check src tests
 uv run mypy src
