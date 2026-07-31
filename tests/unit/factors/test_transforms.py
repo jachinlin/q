@@ -239,10 +239,12 @@ def test_neutralize_wls_matches_explicit_numpy_design_matrix_with_stable_baselin
             log_cap,
         ]
     )
-    weights = np.exp(log_cap)
+    weights = np.exp(log_cap - log_cap.max())
     weights /= weights.sum()
     beta = np.linalg.lstsq(
-        design * np.sqrt(weights)[:, None], response * np.sqrt(weights), rcond=None
+        design * np.sqrt(weights)[:, None],
+        response * np.sqrt(weights),
+        rcond=np.finfo(np.float64).eps * max(design.shape),
     )[0]
     expected = response - design @ beta
     assert np.linalg.matrix_rank(design) == design.shape[1]
@@ -286,14 +288,126 @@ def test_neutralize_wls_matches_input_order_numpy_reference_at_large_scale() -> 
             log_cap,
         ]
     )
-    weights = np.exp(log_cap)
+    weights = np.exp(log_cap - log_cap.max())
     weights /= weights.sum()
     beta = np.linalg.lstsq(
-        design * np.sqrt(weights)[:, None], response * np.sqrt(weights), rcond=None
+        design * np.sqrt(weights)[:, None],
+        response * np.sqrt(weights),
+        rcond=np.finfo(np.float64).eps * max(design.shape),
     )[0]
     np.testing.assert_allclose(
         result["value"].to_numpy(), response - design @ beta, rtol=0.0, atol=1e-12
     )
+
+
+def test_neutralize_wls_matches_max_shift_weight_reference() -> None:
+    """A common finite log-cap shift must not be treated as invalid weight."""
+    source = _frame(
+        industry=[
+            "Tech",
+            "Banks",
+            "Tech",
+            "Utilities",
+            "Banks",
+            "Utilities",
+            "Tech",
+            "Banks",
+        ],
+        log_cap=[1002.0, 1001.0, 1003.0, 1001.5, 1002.5, 1002.2, 1000.5, 1003.5],
+        value=[9.2, 2.5, 10.0, 6.5, 5.4, 7.9, 6.1, 8.4],
+    )
+
+    result = neutralize_wls(source, "value", "industry", "log_cap")
+
+    industries = np.asarray(source["industry"].to_list())
+    log_cap = np.asarray(source["log_cap"].to_list(), dtype=np.float64)
+    response = np.asarray(source["value"].to_list(), dtype=np.float64)
+    design = np.column_stack(
+        [
+            np.ones(response.size),
+            (industries == "Tech").astype(float),
+            (industries == "Utilities").astype(float),
+            log_cap,
+        ]
+    )
+    weights = np.exp(log_cap - log_cap.max())
+    weights /= weights.sum()
+    rcond = np.finfo(np.float64).eps * max(design.shape)
+    beta, _, rank, _ = np.linalg.lstsq(
+        design * np.sqrt(weights)[:, None], response * np.sqrt(weights), rcond=rcond
+    )
+    assert rank == design.shape[1]
+    np.testing.assert_allclose(
+        result["value"].to_numpy(), response - design @ beta, rtol=0.0, atol=1e-12
+    )
+    assert result["is_valid"].to_list() == [True] * source.height
+
+
+def test_neutralize_wls_invalidates_actual_underflowed_weight() -> None:
+    """A shifted exponent that is exactly zero must not enter weighted least squares."""
+    source = _frame(
+        industry=["Banks", "Tech", "Tech", "Banks"],
+        log_cap=[1000.0, 1.0, 2.0, 3.0],
+        value=[1.0, 2.0, 3.0, 4.0],
+    )
+
+    result = neutralize_wls(source, "value", "industry", "log_cap")
+
+    assert result["value"].to_list() == [None] * source.height
+    assert result["is_valid"].to_list() == [False] * source.height
+    assert result["invalid_reason"].to_list() == ["INVALID_WEIGHT"] * source.height
+
+
+def test_neutralize_wls_invalidates_weighted_rank_loss() -> None:
+    """Full rank before weighting cannot mask rank loss in sqrt(W) times X."""
+    source = _frame(
+        industry=["Banks", "Banks", "Tech", "Tech"],
+        log_cap=[0.0, -700.0, -700.0, -700.0],
+        value=[1.0, 2.0, 3.0, 4.0],
+    )
+    industries = np.asarray(source["industry"].to_list())
+    log_cap = np.asarray(source["log_cap"].to_list(), dtype=np.float64)
+    design = np.column_stack(
+        [np.ones(source.height), (industries == "Tech").astype(float), log_cap]
+    )
+    weights = np.exp(log_cap - log_cap.max())
+    weights /= weights.sum()
+    weighted_design = design * np.sqrt(weights)[:, None]
+    rcond = np.finfo(np.float64).eps * max(weighted_design.shape)
+    assert np.linalg.matrix_rank(design) == design.shape[1]
+    assert (
+        np.linalg.lstsq(weighted_design, np.arange(source.height), rcond=rcond)[2]
+        < design.shape[1]
+    )
+
+    result = neutralize_wls(source, "value", "industry", "log_cap")
+
+    assert result["value"].to_list() == [None] * source.height
+    assert result["is_valid"].to_list() == [False] * source.height
+    assert (
+        result["invalid_reason"].to_list() == ["RANK_DEFICIENT_DESIGN"] * source.height
+    )
+
+
+def test_winsorize_mad_uses_scaled_even_sample_median_and_bounds() -> None:
+    """Directly averaging same-sign finite extremes overflows the median and MAD bounds."""
+    source = _frame(
+        group=["a", "a", "a", "a"],
+        value=[1.5e308, 1.6e308, 1.7e308, 1.79e308],
+    )
+
+    result = winsorize_mad(source, "value", ["group"], n_mad=1.0)
+
+    values = np.asarray(source["value"].to_list(), dtype=np.float64)
+    scale = np.abs(values).max()
+    scaled = values / scale
+    median = np.median(scaled)
+    mad = np.median(np.abs(scaled - median))
+    expected = np.clip(scaled, median - mad, median + mad) * scale
+    np.testing.assert_allclose(
+        result["value"].to_numpy(), expected, rtol=0.0, atol=1e292
+    )
+    assert result["is_valid"].to_list() == [True] * source.height
 
 
 @pytest.mark.parametrize(
@@ -309,7 +423,6 @@ def test_neutralize_wls_matches_input_order_numpy_reference_at_large_scale() -> 
             [1.0, 1.0, 1.0, 1.0],
             "RANK_DEFICIENT_DESIGN",
         ),
-        (["Banks", "Tech", "Tech", "Banks"], [1000.0, 1.0, 2.0, 3.0], "INVALID_WEIGHT"),
     ],
 )
 def test_neutralize_wls_rejects_rank_deficiency_and_invalid_weights(
@@ -359,6 +472,33 @@ def test_transforms_reject_missing_or_duplicate_column_references(
     )
 
     with pytest.raises(ValueError, match="column|duplicate"):
+        function(source, *args)  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("function", "args"),
+    [
+        (winsorize_mad, ("value", ["is_valid"])),
+        (zscore, ("value", ["invalid_reason"])),
+        (neutralize_wls, ("value", "is_valid", "size")),
+        (neutralize_wls, ("value", "industry", "invalid_reason")),
+        (zscore, ("is_valid", ["group"])),
+    ],
+)
+def test_transforms_reject_reserved_audit_columns_as_semantic_inputs(
+    function: object, args: tuple[object, ...]
+) -> None:
+    """Audit output names cannot also select values, groups, industries, or sizes."""
+    source = _frame(
+        group=["a", "a", "a"],
+        industry=["I", "I", "I"],
+        size=[1.0, 2.0, 3.0],
+        value=[1.0, 2.0, 3.0],
+        is_valid=[True, True, True],
+        invalid_reason=[None, None, None],
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
         function(source, *args)  # type: ignore[operator]
 
 

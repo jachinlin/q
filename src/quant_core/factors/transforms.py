@@ -23,6 +23,7 @@ _NONFINITE_SIZE = "NONFINITE_SIZE"
 _INVALID_WEIGHT = "INVALID_WEIGHT"
 _SINGLE_MEMBER_INDUSTRY = "SINGLE_MEMBER_INDUSTRY"
 _RANK_DEFICIENT_DESIGN = "RANK_DEFICIENT_DESIGN"
+_AUDIT_COLUMNS = frozenset({"is_valid", "invalid_reason"})
 
 type _GroupKey = tuple[object, ...]
 
@@ -45,14 +46,19 @@ def winsorize_mad(
             _invalidate(state, indices, _INSUFFICIENT_CROSS_SECTION)
             continue
         values = [state.values[index] for index in indices]
-        median = _median(values)
-        mad = _median([abs(value - median) for value in values])
+        scale = max(abs(value) for value in values)
+        if scale == 0.0:
+            continue
+        scaled_values = [value / scale for value in values]
+        median = _median(scaled_values)
+        mad = _median([abs(value - median) for value in scaled_values])
         if mad == 0.0:
             continue
         lower = median - float(n_mad) * mad
         upper = median + float(n_mad) * mad
         for index in indices:
-            state.values[index] = min(max(state.values[index], lower), upper)
+            bounded = min(max(state.values[index] / scale, lower), upper)
+            state.values[index] = bounded * scale
     return _result(frame, value_col, state)
 
 
@@ -73,8 +79,6 @@ def neutralize_wls(
     sizes = frame[size_col].to_list()
     candidates = [index for index, valid in enumerate(state.valid) if valid]
     active: list[int] = []
-    weights: dict[int, float] = {}
-    invalid_weight_found = False
     for index in candidates:
         industry = industries[index]
         size = sizes[index]
@@ -88,21 +92,29 @@ def neutralize_wls(
         if not math.isfinite(numeric_size):
             _invalidate(state, [index], _NONFINITE_SIZE)
             continue
-        try:
-            weight = math.exp(numeric_size)
-        except OverflowError:
-            weight = math.inf
-        if not math.isfinite(weight) or weight <= 0.0:
-            _invalidate(state, [index], _INVALID_WEIGHT)
-            invalid_weight_found = True
-            continue
         active.append(index)
-        weights[index] = weight
 
-    if invalid_weight_found:
+    if not active:
+        return _result(frame, value_col, state)
+    ordered = active
+    log_market_caps = np.asarray(
+        [float(cast(int | float, sizes[index])) for index in ordered],
+        dtype=np.float64,
+    )
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        raw_weights = np.exp(log_market_caps - np.max(log_market_caps))
+    total_weight = float(raw_weights.sum())
+    if (
+        not math.isfinite(total_weight)
+        or total_weight <= 0.0
+        or not np.all(np.isfinite(raw_weights))
+        or np.any(raw_weights <= 0.0)
+    ):
         _invalidate(state, active, _INVALID_WEIGHT)
         return _result(frame, value_col, state)
-    if not active:
+    normalized_weights = raw_weights / total_weight
+    if not np.all(np.isfinite(normalized_weights)) or np.any(normalized_weights <= 0.0):
+        _invalidate(state, active, _INVALID_WEIGHT)
         return _result(frame, value_col, state)
     industry_counts: dict[str, int] = defaultdict(int)
     for index in active:
@@ -117,17 +129,6 @@ def neutralize_wls(
         _invalidate(state, active, _INSUFFICIENT_CROSS_SECTION)
         return _result(frame, value_col, state)
 
-    ordered = active
-    raw_weights = np.asarray([weights[index] for index in ordered], dtype=np.float64)
-    total_weight = float(raw_weights.sum())
-    if not math.isfinite(total_weight) or total_weight <= 0.0:
-        _invalidate(state, active, _INVALID_WEIGHT)
-        return _result(frame, value_col, state)
-    normalized_weights = raw_weights / total_weight
-    if not np.all(np.isfinite(normalized_weights)) or np.any(normalized_weights <= 0.0):
-        _invalidate(state, active, _INVALID_WEIGHT)
-        return _result(frame, value_col, state)
-
     baseline = industry_levels[0]
     design = np.column_stack(
         (
@@ -139,17 +140,19 @@ def neutralize_wls(
                 for level in industry_levels
                 if level != baseline
             ),
-            np.asarray([float(cast(int | float, sizes[index])) for index in ordered]),
+            log_market_caps,
         )
     )
-    if np.linalg.matrix_rank(design) != parameter_count:
-        _invalidate(state, active, _RANK_DEFICIENT_DESIGN)
-        return _result(frame, value_col, state)
     response = np.asarray([state.values[index] for index in ordered], dtype=np.float64)
     root_weights = np.sqrt(normalized_weights)
-    beta, _, _, _ = np.linalg.lstsq(
-        design * root_weights[:, None], response * root_weights, rcond=None
+    weighted_design = design * root_weights[:, None]
+    rcond = np.finfo(np.float64).eps * max(weighted_design.shape)
+    beta, _, rank, _ = np.linalg.lstsq(
+        weighted_design, response * root_weights, rcond=rcond
     )
+    if rank != parameter_count:
+        _invalidate(state, active, _RANK_DEFICIENT_DESIGN)
+        return _result(frame, value_col, state)
     residuals = response - design @ beta
     if not np.all(np.isfinite(residuals)):
         _invalidate(state, active, _RANK_DEFICIENT_DESIGN)
@@ -216,6 +219,10 @@ def _validate_columns(
         raise ValueError("column names must be nonempty strings")
     if len(set(names)) != len(names):
         raise ValueError("duplicate column reference")
+    if value_col in _AUDIT_COLUMNS:
+        raise ValueError("value column must not use a reserved audit column")
+    if any(name in _AUDIT_COLUMNS for name in other_cols):
+        raise ValueError("semantic columns must not use reserved audit columns")
     missing = [name for name in names if name not in frame.columns]
     if missing:
         raise ValueError(f"column does not exist: {missing[0]}")
