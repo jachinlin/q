@@ -9,7 +9,11 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from quant_core.data.adjustments import AdjustmentMode, PriceAdjustmentService
+from quant_core.data.adjustments import (
+    ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+    AdjustmentMode,
+    PriceAdjustmentService,
+)
 from quant_core.data.repository import SnapshotResearchRepository
 from quant_core.domain.enums import DatasetKind
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
@@ -348,8 +352,12 @@ def test_backward_adjustment_empty_actions_preserves_schema_order_and_metadata(
     assert result.schema["volume"] == pl.Int64
     assert result.schema["adjustment_mode"] == pl.String
     assert result.schema["adjustment_as_of"] == pl.Date
+    assert result.schema["adjustment_event_components"] == (
+        ADJUSTMENT_EVENT_COMPONENTS_DTYPE
+    )
     assert result["adjustment_mode"].to_list() == ["BACKWARD"] * len(_DAYS)
     assert result["adjustment_as_of"].to_list() == [_DAYS[-1]] * len(_DAYS)
+    assert result["adjustment_event_components"].to_list() == [[] for _ in _DAYS]
 
 
 def test_backward_adjustment_exposes_exact_event_factor_and_availability(
@@ -408,6 +416,48 @@ def test_backward_metadata_excludes_event_after_requested_rows(tmp_path: Path) -
     assert result["adjustment_factor"].to_list() == pytest.approx([15.0 / 18.7] * 3)
     assert result["adjustment_event_factor"].to_list() == [1.0] * 3
     assert result["adjustment_event_available_at"].to_list() == [None] * 3
+
+
+def test_backward_metadata_preserves_same_day_component_availability(
+    tmp_path: Path,
+) -> None:
+    """Collapsing component timestamps would hide the cash action known first."""
+    cash_available = datetime(2024, 1, 4, 8, tzinfo=UTC)
+    share_available = datetime(2024, 1, 5, 8, tzinfo=UTC)
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="cash",
+                ex_date=_DAYS[3],
+                available_at=cash_available,
+                cash_per_share=2.0,
+            ),
+            _action_row(
+                action_type="bonus",
+                ex_date=_DAYS[3],
+                available_at=share_available,
+                share_ratio=0.1,
+            ),
+        ],
+    )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+    assert result["adjustment_event_components"].to_list()[3] == [
+        {
+            "action_type": "bonus",
+            "cash_per_share": 0.0,
+            "share_ratio": 0.1,
+            "available_at": share_available,
+        },
+        {
+            "action_type": "cash",
+            "cash_per_share": 2.0,
+            "share_ratio": 0.0,
+            "available_at": cash_available,
+        },
+    ]
 
 
 def test_backward_adjustment_empty_bars_preserves_schema_and_metadata(

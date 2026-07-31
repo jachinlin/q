@@ -10,7 +10,10 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-from quant_core.data.adjustments import AdjustmentMode
+from quant_core.data.adjustments import (
+    ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+    AdjustmentMode,
+)
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorSpec
 
@@ -74,10 +77,12 @@ class _MarketFactor:
                 "trade_date",
                 "instrument_id",
                 "close",
+                "preclose",
                 "available_at",
                 "adjustment_factor",
                 "adjustment_event_factor",
                 "adjustment_event_available_at",
+                "adjustment_event_components",
             ).to_dicts()
             for index, row in enumerate(rows):
                 trade_date = row["trade_date"]
@@ -260,10 +265,12 @@ def _validate_adjusted_bars(frame: pl.DataFrame) -> None:
         "instrument_id": pl.String,
         "trade_date": pl.Date,
         "close": pl.Float64,
+        "preclose": pl.Float64,
         "available_at": pl.Datetime("us", "UTC"),
         "adjustment_factor": pl.Float64,
         "adjustment_event_factor": pl.Float64,
         "adjustment_event_available_at": pl.Datetime("us", "UTC"),
+        "adjustment_event_components": ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
     }
     missing = sorted(set(required) - set(frame.columns))
     if missing:
@@ -299,13 +306,15 @@ def _point_in_time_closes(
     cutoff = datetime.combine(signal_date, time.max, _SHANGHAI).astimezone(UTC)
     known_events: list[tuple[int, float, datetime]] = []
     for index, row in enumerate(window):
-        factor = float(cast(int | float, row["adjustment_event_factor"]))
-        available_at = row["adjustment_event_available_at"]
-        if factor == 1.0:
-            continue
-        if not isinstance(available_at, datetime) or available_at.tzinfo is None:
+        is_valid, event = _known_event(row, cutoff)
+        if not is_valid:
             return None, None
-        if available_at <= cutoff:
+        if event is None:
+            continue
+        factor, available_at = event
+        if not isfinite(factor) or factor <= 0:
+            return None, None
+        if factor != 1.0:
             known_events.append((index, factor, available_at))
 
     closes: list[float] = []
@@ -328,6 +337,79 @@ def _point_in_time_closes(
         available_at for event_index, _, available_at in known_events if event_index > 0
     ]
     return closes, max(used_available, default=None)
+
+
+def _known_event(
+    row: dict[str, object], cutoff: datetime
+) -> tuple[bool, tuple[float, datetime] | None]:
+    components = row["adjustment_event_components"]
+    if not isinstance(components, list):
+        return False, None
+    parsed: list[tuple[float, float, datetime]] = []
+    for component in components:
+        if not isinstance(component, dict):
+            return False, None
+        action_type = component.get("action_type")
+        cash = component.get("cash_per_share")
+        share = component.get("share_ratio")
+        available_at = component.get("available_at")
+        if not (
+            isinstance(action_type, str)
+            and action_type
+            and _valid_nonnegative_number(cash)
+            and _valid_nonnegative_number(share)
+            and isinstance(available_at, datetime)
+            and available_at.tzinfo is not None
+        ):
+            return False, None
+        parsed.append(
+            (
+                float(cast(int | float, cash)),
+                float(cast(int | float, share)),
+                available_at,
+            )
+        )
+    aggregate_factor = float(cast(int | float, row["adjustment_event_factor"]))
+    aggregate_available = row["adjustment_event_available_at"]
+    if not components:
+        return (aggregate_factor == 1.0 and aggregate_available is None), None
+    adjusted_preclose = row["preclose"]
+    global_factor = row["adjustment_factor"]
+    if not (
+        _valid_positive_prices([adjusted_preclose])
+        and _valid_positive_prices([global_factor])
+    ):
+        return False, None
+    preclose = float(cast(int | float, adjusted_preclose)) / float(
+        cast(int | float, global_factor)
+    )
+    all_factor = (preclose - sum(component[0] for component in parsed)) / (
+        preclose * (1.0 + sum(component[1] for component in parsed))
+    )
+    all_available = max(component[2] for component in parsed)
+    if not (
+        isfinite(all_factor)
+        and all_factor > 0
+        and isclose(aggregate_factor, all_factor, rel_tol=1e-12, abs_tol=0.0)
+        and aggregate_available == all_available
+    ):
+        return False, None
+    known = [component for component in parsed if component[2] <= cutoff]
+    if not known:
+        return True, None
+    cash = sum(component[0] for component in known)
+    share = sum(component[1] for component in known)
+    factor = (preclose - cash) / (preclose * (1.0 + share))
+    return True, (factor, max(component[2] for component in known))
+
+
+def _valid_nonnegative_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and isfinite(value)
+        and value >= 0
+    )
 
 
 def _max_available_at(left: datetime | None, right: datetime | None) -> datetime | None:

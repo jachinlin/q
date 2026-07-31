@@ -16,6 +16,16 @@ from quant_core.data.repository import ResearchDataRepository
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 
 _INT64_MAX = 2**63 - 1
+ADJUSTMENT_EVENT_COMPONENTS_DTYPE = pl.List(
+    pl.Struct(
+        {
+            "action_type": pl.String,
+            "cash_per_share": pl.Float64,
+            "share_ratio": pl.Float64,
+            "available_at": pl.Datetime("us", "UTC"),
+        }
+    )
+)
 
 
 class AdjustmentMode(StrEnum):
@@ -28,6 +38,7 @@ class AdjustmentMode(StrEnum):
 @dataclass(frozen=True, slots=True)
 class _DailyAction:
     instrument_id: str
+    action_type: str
     ex_date: date
     cash_per_share: float
     share_ratio: float
@@ -40,6 +51,7 @@ class _AdjustmentEvent:
     ex_date: date
     factor: float
     available_at: datetime
+    components: tuple[_DailyAction, ...]
 
 
 class PriceAdjustmentService:
@@ -131,7 +143,9 @@ def _with_metadata(
     normalized = frame.with_columns(
         pl.Series("adjustment_factor", factors, dtype=pl.Float64)
     ).sort("instrument_id", "trade_date")
-    event_factors, event_available = _event_metadata(normalized, events or {})
+    event_factors, event_available, event_components = _event_metadata(
+        normalized, events or {}
+    )
     return normalized.with_columns(
         pl.lit(mode.value, dtype=pl.String).alias("adjustment_mode"),
         pl.lit(as_of, dtype=pl.Date).alias("adjustment_as_of"),
@@ -140,6 +154,11 @@ def _with_metadata(
             "adjustment_event_available_at",
             event_available,
             dtype=pl.Datetime("us", "UTC"),
+        ),
+        pl.Series(
+            "adjustment_event_components",
+            event_components,
+            dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
         ),
     )
 
@@ -167,10 +186,13 @@ def _backward_factors(
     bars: pl.DataFrame, actions: Sequence[_DailyAction]
 ) -> dict[str, list[_AdjustmentEvent]]:
     factors: dict[str, list[_AdjustmentEvent]] = defaultdict(list)
+    grouped: dict[tuple[str, date], list[_DailyAction]] = defaultdict(list)
     for action in actions:
+        grouped[(action.instrument_id, action.ex_date)].append(action)
+    for (instrument_id, ex_date), components_list in grouped.items():
         preclose_rows = bars.filter(
-            (pl.col("instrument_id") == action.instrument_id)
-            & (pl.col("trade_date") == action.ex_date)
+            (pl.col("instrument_id") == instrument_id)
+            & (pl.col("trade_date") == ex_date)
         ).select("preclose")
         if preclose_rows.height != 1:
             raise ValueError("corporate action ex_date has no matching bar")
@@ -181,22 +203,29 @@ def _backward_factors(
             or preclose <= 0
         ):
             raise ValueError("corporate action requires a positive ex-date preclose")
-        factor = _event_factor(action, float(preclose))
-        factors[action.instrument_id].append(
+        components = tuple(components_list)
+        factor = _event_factor(
+            sum(component.cash_per_share for component in components),
+            sum(component.share_ratio for component in components),
+            float(preclose),
+        )
+        factors[instrument_id].append(
             _AdjustmentEvent(
-                action.instrument_id,
-                action.ex_date,
+                instrument_id,
+                ex_date,
                 factor,
-                action.available_at,
+                max(component.available_at for component in components),
+                components,
             )
         )
     return factors
 
 
 def _daily_actions(actions: Sequence[dict[str, object]]) -> list[_DailyAction]:
-    aggregated: dict[tuple[str, date], _DailyAction] = {}
+    daily_actions: list[_DailyAction] = []
     for action in actions:
         instrument = _required_string(action, "instrument_id")
+        action_type = _required_string(action, "action_type")
         ex_date = _required_date(action, "ex_date")
         cash = _nonnegative_number(action, "cash_per_share")
         share_ratio = _nonnegative_number(action, "share_ratio")
@@ -206,26 +235,22 @@ def _daily_actions(actions: Sequence[dict[str, object]]) -> list[_DailyAction]:
             raise ValueError(
                 "corporate action rights_price is unsupported without an independent rights ratio"
             )
-        key = (instrument, ex_date)
-        existing = aggregated.get(key)
-        if existing is None:
-            aggregated[key] = _DailyAction(
-                instrument, ex_date, cash, share_ratio, available_at
-            )
-        else:
-            aggregated[key] = _DailyAction(
+        daily_actions.append(
+            _DailyAction(
                 instrument,
+                action_type,
                 ex_date,
-                existing.cash_per_share + cash,
-                existing.share_ratio + share_ratio,
-                max(existing.available_at, available_at),
+                cash,
+                share_ratio,
+                available_at,
             )
-    return list(aggregated.values())
+        )
+    return daily_actions
 
 
-def _event_factor(action: _DailyAction, preclose: float) -> float:
-    numerator = preclose - action.cash_per_share
-    denominator = preclose * (1.0 + action.share_ratio)
+def _event_factor(cash_per_share: float, share_ratio: float, preclose: float) -> float:
+    numerator = preclose - cash_per_share
+    denominator = preclose * (1.0 + share_ratio)
     factor = numerator / denominator
     if not isfinite(factor) or factor <= 0:
         raise ValueError("corporate action adjustment factor must be positive")
@@ -282,7 +307,11 @@ def _combined_factor(
 
 def _event_metadata(
     frame: pl.DataFrame, events: dict[str, list[_AdjustmentEvent]]
-) -> tuple[list[float], list[datetime | None]]:
+) -> tuple[
+    list[float],
+    list[datetime | None],
+    list[list[dict[str, object]]],
+]:
     by_key = {
         (event.instrument_id, event.ex_date): event
         for instrument_events in events.values()
@@ -291,11 +320,25 @@ def _event_metadata(
     }
     event_factors: list[float] = []
     event_available: list[datetime | None] = []
+    event_components: list[list[dict[str, object]]] = []
     for row in frame.select("instrument_id", "trade_date").to_dicts():
         event = by_key.get((row["instrument_id"], row["trade_date"]))
         event_factors.append(event.factor if event is not None else 1.0)
         event_available.append(event.available_at if event is not None else None)
-    return event_factors, event_available
+        event_components.append(
+            [
+                {
+                    "action_type": component.action_type,
+                    "cash_per_share": component.cash_per_share,
+                    "share_ratio": component.share_ratio,
+                    "available_at": component.available_at,
+                }
+                for component in event.components
+            ]
+            if event is not None
+            else []
+        )
+    return event_factors, event_available, event_components
 
 
 def _adjusted_volumes(volumes: pl.Series, factors: Sequence[float]) -> pl.Series:

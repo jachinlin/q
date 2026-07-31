@@ -15,7 +15,7 @@ from quant_core.factors.builtin.momentum import (
 from quant_core.factors.builtin.risk import Volatility60dFactor
 from quant_core.factors.registry import FactorRegistry
 
-_IMPLEMENTATION_REVISION = "etf-market-factors:task6:v1.1:2026-08-01"
+_IMPLEMENTATION_REVISION = "etf-market-factors:task6:v1.2:2026-08-01"
 
 
 def register_etf_factors(

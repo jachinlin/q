@@ -10,7 +10,10 @@ import numpy as np
 import polars as pl
 import pytest
 
-from quant_core.data.adjustments import AdjustmentMode
+from quant_core.data.adjustments import (
+    ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+    AdjustmentMode,
+)
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorRegistry
 from quant_core.factors.builtin import register_etf_factors
@@ -56,10 +59,18 @@ class RecordingPriceService:
         )
         if "adjustment_factor" not in result.columns:
             result = result.with_columns(
+                pl.col("close")
+                .shift(1)
+                .over("instrument_id")
+                .fill_null(pl.col("close"))
+                .alias("preclose"),
                 pl.lit(1.0, dtype=pl.Float64).alias("adjustment_factor"),
                 pl.lit(1.0, dtype=pl.Float64).alias("adjustment_event_factor"),
                 pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
                     "adjustment_event_available_at"
+                ),
+                pl.lit([], dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE).alias(
+                    "adjustment_event_components"
                 ),
             )
         return result.lazy()
@@ -105,6 +116,7 @@ class ActionAwarePriceService:
             ).item()
             events = [action for action in applicable if action[0] == trade_date]
             row["close"] = float(row["close"]) * adjustment_factor
+            row["preclose"] = float(row["preclose"]) * adjustment_factor
             row["adjustment_factor"] = adjustment_factor
             row["adjustment_event_factor"] = (
                 np.prod([event[1] for event in events], dtype=np.float64).item()
@@ -114,14 +126,122 @@ class ActionAwarePriceService:
             row["adjustment_event_available_at"] = (
                 max(event[2] for event in events) if events else None
             )
+            row["adjustment_event_components"] = [
+                {
+                    "action_type": "synthetic",
+                    "cash_per_share": 0.0,
+                    "share_ratio": 1.0 / event[1] - 1.0,
+                    "available_at": event[2],
+                }
+                for event in events
+            ]
             rows.append(row)
         schema = {
             **self._raw_bars.schema,
             "adjustment_factor": pl.Float64,
             "adjustment_event_factor": pl.Float64,
             "adjustment_event_available_at": pl.Datetime("us", "UTC"),
+            "adjustment_event_components": ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
         }
         return pl.DataFrame(rows, schema=schema).lazy()
+
+
+class SameDayComponentPriceService:
+    """Produce aggregate prices while retaining independently timed components."""
+
+    def __init__(
+        self,
+        raw_bars: pl.DataFrame,
+        actions: Sequence[tuple[date, str, float, float, datetime]],
+    ) -> None:
+        self._raw_bars = raw_bars
+        self._actions = actions
+
+    def bars(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+        mode: AdjustmentMode,
+        as_of: date,
+    ) -> pl.LazyFrame:
+        assert mode is AdjustmentMode.BACKWARD
+        instrument_ids = [instrument.canonical() for instrument in instruments]
+        applicable = [
+            action
+            for action in self._actions
+            if action[0] <= as_of and action[4].date() <= as_of
+        ]
+        source = self._raw_bars.filter(
+            pl.col("instrument_id").is_in(instrument_ids)
+            & pl.col("trade_date").is_between(start, end, closed="both")
+        ).sort("instrument_id", "trade_date")
+        raw_rows = source.to_dicts()
+        previous_close: dict[str, float] = {}
+        rows: list[dict[str, object]] = []
+        for row in raw_rows:
+            trade_date = row["trade_date"]
+            instrument = row["instrument_id"]
+            assert isinstance(trade_date, date)
+            assert isinstance(instrument, str)
+            raw_close = float(row["close"])
+            preclose = previous_close.get(instrument, raw_close)
+            previous_close[instrument] = raw_close
+            event_components = [
+                action for action in applicable if action[0] == trade_date
+            ]
+            cash = sum(action[2] for action in event_components)
+            share = sum(action[3] for action in event_components)
+            event_factor = (preclose - cash) / (preclose * (1.0 + share))
+            future_components = [
+                action for action in applicable if trade_date < action[0]
+            ]
+            factor = 1.0
+            for ex_date in sorted({action[0] for action in future_components}):
+                ex_components = [
+                    action for action in future_components if action[0] == ex_date
+                ]
+                ex_row = next(
+                    item for item in raw_rows if item["trade_date"] == ex_date
+                )
+                ex_index = raw_rows.index(ex_row)
+                ex_preclose = float(raw_rows[ex_index - 1]["close"])
+                ex_cash = sum(action[2] for action in ex_components)
+                ex_share = sum(action[3] for action in ex_components)
+                factor *= (ex_preclose - ex_cash) / (ex_preclose * (1.0 + ex_share))
+            row["close"] = raw_close * factor
+            row["preclose"] = preclose * factor
+            row["adjustment_factor"] = factor
+            row["adjustment_event_factor"] = event_factor
+            row["adjustment_event_available_at"] = (
+                max(action[4] for action in event_components)
+                if event_components
+                else None
+            )
+            row["adjustment_event_components"] = [
+                {
+                    "action_type": action[1],
+                    "cash_per_share": action[2],
+                    "share_ratio": action[3],
+                    "available_at": action[4],
+                }
+                for action in event_components
+            ]
+            rows.append(row)
+        return (
+            pl.DataFrame(rows, infer_schema_length=None)
+            .with_columns(
+                pl.col("instrument_id").cast(pl.String),
+                pl.col("trade_date").cast(pl.Date),
+                pl.col("close", "preclose").cast(pl.Float64),
+                pl.col("available_at", "adjustment_event_available_at").cast(
+                    pl.Datetime("us", "UTC")
+                ),
+                pl.col("adjustment_factor", "adjustment_event_factor").cast(pl.Float64),
+            )
+            .lazy()
+        )
 
 
 def test_return_factors_use_exact_lagged_close_formula() -> None:
@@ -297,6 +417,7 @@ def test_long_trading_gap_falls_back_to_older_observed_sessions() -> None:
             "instrument_id": [_SSE.canonical()],
             "trade_date": [current_day],
             "close": [150.0],
+            "preclose": [119.0],
             "available_at": [datetime(2026, 1, 5, 8, tzinfo=UTC)],
         },
         schema=old.schema,
@@ -421,6 +542,153 @@ def test_actual_adjustment_action_availability_propagates_to_factor() -> None:
     assert result["available_at"].item() == action_available
 
 
+def test_same_day_partial_known_components_are_anchored_per_signal() -> None:
+    """A max timestamp must not hide the same-day cash component known earlier."""
+    closes = np.exp(3.0 + 0.002 * np.arange(125)).tolist()
+    bars = _bars(_SSE, closes).with_columns(
+        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
+    )
+    ex_date = bars["trade_date"][100]
+    early_signal = bars["trade_date"][119]
+    late_signal = bars["trade_date"][124]
+    cash_available = datetime.combine(
+        bars["trade_date"][90], datetime.min.time(), tzinfo=UTC
+    )
+    share_available = datetime.combine(
+        bars["trade_date"][120], datetime.min.time(), tzinfo=UTC
+    )
+    service = SameDayComponentPriceService(
+        bars,
+        [
+            (ex_date, "cash", 0.2, 0.0, cash_available),
+            (ex_date, "bonus", 0.0, 0.5, share_available),
+        ],
+    )
+
+    short = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(early_signal, early_signal))
+        .collect()
+    )
+    extended = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(early_signal, late_signal))
+        .collect()
+    )
+    extended_early = extended.filter(pl.col("trade_date") == early_signal)
+    extended_late = extended.filter(pl.col("trade_date") == late_signal)
+
+    assert extended_early["value"].item() == pytest.approx(short["value"].item())
+    assert extended_early["available_at"].item() == cash_available
+    assert short["available_at"].item() == cash_available
+    late_window = np.asarray(closes[5:125], dtype=np.float64)
+    preclose = closes[99]
+    combined_factor = (preclose - 0.2) / (preclose * 1.5)
+    late_window[:95] *= combined_factor
+    x = np.arange(120, dtype=np.float64)
+    y = np.log(late_window)
+    slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[0][1]
+    assert extended_late["value"].item() == pytest.approx(slope / np.mean(y))
+    assert extended_late["available_at"].item() == share_available
+
+
+def test_null_component_availability_invalidates_signal() -> None:
+    """Unknown component lineage must not be silently treated as no action."""
+    bars = _bars(_SSE, np.exp(2.0 + 0.003 * np.arange(120)).tolist())
+    signal_day = bars["trade_date"][-1]
+    components = [[] for _ in range(120)]
+    components[-1] = [
+        {
+            "action_type": "cash",
+            "cash_per_share": 0.2,
+            "share_ratio": 0.0,
+            "available_at": None,
+        }
+    ]
+    bars = bars.with_columns(
+        pl.lit(1.0).alias("adjustment_factor"),
+        pl.Series("adjustment_event_factor", [1.0] * 119 + [0.99], dtype=pl.Float64),
+        pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
+            "adjustment_event_available_at"
+        ),
+        pl.Series(
+            "adjustment_event_components",
+            components,
+            dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+        ),
+    )
+
+    result = (
+        Trend120dFactor(RecordingPriceService(bars), [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
+
+
+def test_same_day_components_with_same_availability_use_joint_factor() -> None:
+    """Multiplying component factors separately would double-use the event preclose."""
+    closes = np.exp(3.0 + 0.002 * np.arange(120)).tolist()
+    bars = _bars(_SSE, closes).with_columns(
+        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
+    )
+    ex_date = bars["trade_date"][100]
+    signal_day = bars["trade_date"][-1]
+    available = datetime.combine(
+        bars["trade_date"][90], datetime.min.time(), tzinfo=UTC
+    )
+    service = SameDayComponentPriceService(
+        bars,
+        [
+            (ex_date, "cash", 0.2, 0.0, available),
+            (ex_date, "bonus", 0.0, 0.5, available),
+        ],
+    )
+
+    result = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    expected_prices = np.asarray(closes, dtype=np.float64)
+    joint_factor = (closes[99] - 0.2) / (closes[99] * 1.5)
+    expected_prices[:100] *= joint_factor
+    x = np.arange(120, dtype=np.float64)
+    y = np.log(expected_prices)
+    slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[0][1]
+    assert result["value"].item() == pytest.approx(slope / np.mean(y))
+    assert result["available_at"].item() == available
+
+
+def test_event_on_first_window_row_does_not_pollute_value_or_lineage() -> None:
+    """An event at the earliest constituent adjusts no close inside the window."""
+    closes = np.exp(2.0 + 0.003 * np.arange(120)).tolist()
+    bars = _bars(_SSE, closes).with_columns(
+        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
+    )
+    signal_day = bars["trade_date"][-1]
+    action_available = datetime(2024, 1, 2, tzinfo=UTC)
+    service = SameDayComponentPriceService(
+        bars,
+        [(bars["trade_date"][0], "bonus", 0.0, 0.5, action_available)],
+    )
+
+    result = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    x = np.arange(120, dtype=np.float64)
+    y = np.log(np.asarray(closes, dtype=np.float64))
+    slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[0][1]
+    assert result["value"].item() == pytest.approx(slope / np.mean(y))
+    assert result["available_at"].item() == datetime(2024, 1, 1, tzinfo=UTC)
+
+
 def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
     """Dividing extremes before log can overflow although both logarithms are finite."""
     smallest = float.fromhex("0x0.0000000000001p-1022")
@@ -539,17 +807,20 @@ def _bars(instrument: InstrumentId, closes: Sequence[float | None]) -> pl.DataFr
         datetime.combine(day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=8)
         for day in days
     ]
+    precloses = list(closes[:1]) + list(closes[:-1])
     return pl.DataFrame(
         {
             "instrument_id": [instrument.canonical()] * len(closes),
             "trade_date": days,
             "close": closes,
+            "preclose": precloses,
             "available_at": available,
         },
         schema={
             "instrument_id": pl.String,
             "trade_date": pl.Date,
             "close": pl.Float64,
+            "preclose": pl.Float64,
             "available_at": pl.Datetime("us", "UTC"),
         },
     )
