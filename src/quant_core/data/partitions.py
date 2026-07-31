@@ -32,6 +32,7 @@ class _PartitionLock:
     """A Windows-compatible inter-process lock backed by atomic directory creation."""
 
     _OWNER_FILE = "owner.json"
+    _TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 
     def __init__(
         self,
@@ -46,84 +47,139 @@ class _PartitionLock:
         self._poll_seconds = poll_seconds
         self._stale_after_seconds = stale_after_seconds
         self._owned = False
+        self._token: str | None = None
 
     def __enter__(self) -> Self:
         """Acquire the lock, recovering only a demonstrably dead stale owner."""
+        if self._owned:
+            raise RuntimeError("partition lock is already owned")
+        token = uuid.uuid4().hex
         deadline = time.monotonic() + self._timeout_seconds
         while True:
-            temporary_path = self._path.parent / f".locktmp-{uuid.uuid4().hex}"
+            temporary_path = self._path.parent / f".locktmp-{token}-{uuid.uuid4().hex}"
             try:
                 temporary_path.mkdir()
                 self._owner_path_for(temporary_path).write_text(
-                    json.dumps({"pid": os.getpid()}), encoding="utf-8"
+                    json.dumps(
+                        {"pid": os.getpid(), "token": token},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
                 )
             except Exception:
-                self._remove_owned_lock_directory(temporary_path)
+                self._remove_private_directory(temporary_path)
                 raise
             try:
                 temporary_path.rename(self._path)
             except FileExistsError:
-                self._remove_owned_lock_directory(temporary_path)
-                self._reclaim_stale_lock()
+                self._remove_private_directory(temporary_path)
+                self._reclaim_stale_lock(token)
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"timed out waiting for partition lock: {self._path}"
                     )
                 time.sleep(self._poll_seconds)
             except Exception:
-                self._remove_owned_lock_directory(temporary_path)
+                self._remove_private_directory(temporary_path)
                 raise
             else:
                 self._owned = True
+                self._token = token
                 return self
 
     def __exit__(self, *_: object) -> None:
-        """Release only the lock directory created by this context."""
+        """Atomically detach and remove only this owner's tokenized directory."""
         if not self._owned:
             return
+        token = self._token
+        if token is None:
+            raise RuntimeError("partition lock ownership token is missing")
+        tombstone = self._path.parent / f"{self._path.name}.release-{token}"
         try:
-            self._owner_path.unlink(missing_ok=True)
-            self._path.rmdir()
+            owner = self._read_owner(self._path)
+            if owner != (os.getpid(), token):
+                raise RuntimeError("partition lock ownership changed before release")
+            self._path.rename(tombstone)
+            self._remove_token_directory(tombstone, token)
         finally:
             self._owned = False
-
-    @property
-    def _owner_path(self) -> Path:
-        return self._owner_path_for(self._path)
+            self._token = None
 
     def _owner_path_for(self, directory: Path) -> Path:
         return directory / self._OWNER_FILE
 
-    def _reclaim_stale_lock(self) -> None:
-        """Remove a lock only after its age and dead owner make it safe to reclaim."""
-        try:
-            owner = json.loads(self._owner_path.read_text(encoding="utf-8"))
-            process_id = owner["pid"]
-        except (KeyError, OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
-            self._remove_owned_lock_directory(self._path)
-            return
-        if not isinstance(process_id, int):
-            self._remove_owned_lock_directory(self._path)
-            return
+    def _reclaim_stale_lock(self, claimant_token: str) -> None:
+        """Atomically claim a stale dead/invalid lock before deleting its directory."""
         try:
             age_seconds = time.time() - self._path.stat().st_mtime
         except FileNotFoundError:
             return
-        if age_seconds < self._stale_after_seconds or self._process_is_alive(
-            process_id
-        ):
+        if age_seconds < self._stale_after_seconds:
             return
-        self._remove_owned_lock_directory(self._path)
-
-    @staticmethod
-    def _remove_owned_lock_directory(path: Path) -> None:
-        """Remove only a lock directory containing this protocol's owner file."""
+        owner = self._read_owner(self._path)
+        if owner is not None and self._process_is_alive(owner[0]):
+            return
+        tombstone = self._path.parent / (
+            f"{self._path.name}.stale-{claimant_token}-{uuid.uuid4().hex}"
+        )
         try:
-            (path / _PartitionLock._OWNER_FILE).unlink(missing_ok=True)
-            path.rmdir()
+            self._path.rename(tombstone)
         except FileNotFoundError:
             return
-        except OSError:
+        if owner is None:
+            self._remove_confirmed_stale_directory(tombstone)
+        else:
+            self._remove_token_directory(tombstone, owner[1])
+
+    @classmethod
+    def _read_owner(cls, directory: Path) -> tuple[int, str] | None:
+        try:
+            owner = json.loads(
+                (directory / cls._OWNER_FILE).read_text(encoding="utf-8")
+            )
+            if not isinstance(owner, Mapping) or set(owner) != {"pid", "token"}:
+                return None
+            process_id = owner["pid"]
+            token = owner["token"]
+            if (
+                type(process_id) is not int
+                or not isinstance(token, str)
+                or cls._TOKEN.fullmatch(token) is None
+            ):
+                return None
+            return process_id, token
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    @classmethod
+    def _remove_token_directory(cls, path: Path, expected_token: str) -> None:
+        """Delete a claimed directory only while its owner token still matches."""
+        owner = cls._read_owner(path)
+        if owner is None or owner[1] != expected_token:
+            raise RuntimeError("partition lock tombstone ownership changed")
+        children = tuple(path.iterdir())
+        if {child.name for child in children} != {cls._OWNER_FILE}:
+            raise RuntimeError("partition lock directory contains unexpected paths")
+        (path / cls._OWNER_FILE).unlink()
+        path.rmdir()
+
+    @classmethod
+    def _remove_confirmed_stale_directory(cls, path: Path) -> None:
+        """Delete only the malformed lock directory atomically claimed as stale."""
+        children = tuple(path.iterdir())
+        if {child.name for child in children} - {cls._OWNER_FILE}:
+            raise RuntimeError("stale partition lock contains unexpected paths")
+        (path / cls._OWNER_FILE).unlink(missing_ok=True)
+        path.rmdir()
+
+    @classmethod
+    def _remove_private_directory(cls, path: Path) -> None:
+        """Clean an unpublished temporary directory created by this acquisition."""
+        try:
+            (path / cls._OWNER_FILE).unlink(missing_ok=True)
+            path.rmdir()
+        except FileNotFoundError:
             return
 
     @staticmethod

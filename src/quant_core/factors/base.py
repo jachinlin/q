@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from math import isfinite
-from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
 
 import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
 
 from quant_core.data.contracts import JsonScalar, JsonValue, canonical_json_bytes
 from quant_core.data.schemas import PolarsDataType
@@ -106,13 +107,12 @@ class FactorArtifact:
     factor_ref: str
     cache_key: str
     content_hash: str
-    data_path: Path
-    manifest_path: Path
     row_count: int
     snapshot_id: SnapshotId
     universe_hash: str
     start: date
     end: date
+    table: pa.Table
 
     def __post_init__(self) -> None:
         canonical_factor_ref(self.factor_ref)
@@ -121,12 +121,27 @@ class FactorArtifact:
         validate_sha256(self.universe_hash, "universe_hash")
         if type(self.row_count) is not int or self.row_count < 0:
             raise ValueError("row_count must be a nonnegative integer")
+        if not isinstance(self.table, pa.Table):
+            raise TypeError("artifact table must be a pyarrow Table")
+        table = _owned_read_only_table(self.table)
+        if table.num_rows != self.row_count:
+            raise ValueError("artifact table row count does not match metadata")
+        frame = cast(pl.DataFrame, pl.from_arrow(table))
+        if frame.schema != FACTOR_OUTPUT_SCHEMA:
+            raise ValueError("artifact table schema is invalid")
+        if factor_table_content_hash(table) != self.content_hash:
+            raise ValueError("artifact table content hash does not match metadata")
         if not isinstance(self.snapshot_id, SnapshotId):
             raise TypeError("snapshot_id must be a SnapshotId")
         if type(self.start) is not date or type(self.end) is not date:
             raise TypeError("artifact start and end must be dates")
         if self.start > self.end:
             raise ValueError("artifact start must not follow end")
+        object.__setattr__(self, "table", table)
+
+    def lazy_frame(self) -> pl.LazyFrame:
+        """Return a lazy view over this artifact's owned immutable Arrow content."""
+        return cast(pl.DataFrame, pl.from_arrow(self.table)).lazy()
 
 
 class Factor(Protocol):
@@ -157,6 +172,25 @@ def validate_sha256(value: str, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise ValueError(f"{field} must be a 64-character lowercase SHA-256 hash")
     return value
+
+
+def factor_table_content_hash(table: pa.Table) -> str:
+    """Hash factor content after canonical Arrow chunk normalization."""
+    return hashlib.sha256(_factor_table_ipc_bytes(table)).hexdigest()
+
+
+def _factor_table_ipc_bytes(table: pa.Table) -> bytes:
+    canonical = table.combine_chunks()
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, canonical.schema) as writer:
+        writer.write_table(canonical)
+    return cast(bytes, sink.getvalue().to_pybytes())
+
+
+def _owned_read_only_table(table: pa.Table) -> pa.Table:
+    payload = _factor_table_ipc_bytes(table)
+    with pa.ipc.open_stream(pa.py_buffer(payload)) as reader:
+        return reader.read_all()
 
 
 def thaw_json(value: object) -> JsonValue:

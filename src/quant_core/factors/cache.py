@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import cast
@@ -26,6 +27,7 @@ from quant_core.factors.base import (
     FactorContext,
     FactorSpec,
     canonical_factor_ref,
+    factor_table_content_hash,
     thaw_json,
     validate_sha256,
 )
@@ -47,6 +49,31 @@ _MANIFEST_FIELDS = {
     "start",
     "universe_hash",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactMetadata:
+    factor_ref: str
+    cache_key: str
+    content_hash: str
+    row_count: int
+    snapshot_id: SnapshotId
+    universe_hash: str
+    start: date
+    end: date
+
+    def artifact(self, table: pa.Table) -> FactorArtifact:
+        return FactorArtifact(
+            factor_ref=self.factor_ref,
+            cache_key=self.cache_key,
+            content_hash=self.content_hash,
+            row_count=self.row_count,
+            snapshot_id=self.snapshot_id,
+            universe_hash=self.universe_hash,
+            start=self.start,
+            end=self.end,
+            table=table,
+        )
 
 
 def build_cache_key(
@@ -105,11 +132,9 @@ class FeatureCache:
             raise ValueError("feature cache manifest is not canonical JSON")
 
         try:
-            metadata = _parse_manifest(manifest, cache_key, entry_path)
+            metadata = _parse_manifest(manifest, cache_key)
         except (TypeError, ValueError) as error:
             raise ValueError("feature cache manifest is invalid") from error
-        if metadata.data_path != data_path or metadata.manifest_path != manifest_path:
-            raise ValueError("feature cache manifest path is invalid")
         try:
             table = pq.read_table(data_path)
             frame = cast(pl.DataFrame, pl.from_arrow(table))
@@ -136,7 +161,7 @@ class FeatureCache:
         ):
             raise ValueError("feature cache Parquet integrity metadata differs")
         self._validate_entry_paths(entry_path, data_path, manifest_path)
-        return metadata
+        return metadata.artifact(table)
 
     def publish(
         self,
@@ -268,6 +293,10 @@ class FeatureCache:
             raise ValueError("feature cache entry is not a directory")
         validate_storage_path(self._root, data_path, require_file=True)
         validate_storage_path(self._root, manifest_path, require_file=True)
+        if data_path.stat(follow_symlinks=False).st_nlink != 1:
+            raise ValueError("feature cache data file has an additional hard link")
+        if manifest_path.stat(follow_symlinks=False).st_nlink != 1:
+            raise ValueError("feature cache manifest file has an additional hard link")
 
 
 def _cache_key_payload(
@@ -330,8 +359,8 @@ def _manifest(
 
 
 def _parse_manifest(
-    manifest: Mapping[str, object], expected_key: str, entry_path: Path
-) -> FactorArtifact:
+    manifest: Mapping[str, object], expected_key: str
+) -> _ArtifactMetadata:
     cache_key = _manifest_string(manifest, "cache_key")
     if cache_key != expected_key:
         raise ValueError("feature cache manifest key does not match its path")
@@ -384,12 +413,10 @@ def _parse_manifest(
     derived_key = hashlib.sha256(canonical_json_bytes(key_payload)).hexdigest()
     if derived_key != cache_key:
         raise ValueError("feature cache manifest does not match its cache key")
-    return FactorArtifact(
+    return _ArtifactMetadata(
         factor_ref=f"{factor_id}@{factor_version}",
         cache_key=cache_key,
         content_hash=content_hash,
-        data_path=entry_path / "data.parquet",
-        manifest_path=entry_path / "manifest.json",
         row_count=row_count,
         snapshot_id=snapshot_id,
         universe_hash=universe_hash,
@@ -430,11 +457,7 @@ def _validated_frame(
 
 
 def _content_hash(table: pa.Table) -> str:
-    table = table.combine_chunks()
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+    return factor_table_content_hash(table)
 
 
 def _schema_fingerprint(schema: pa.Schema) -> str:

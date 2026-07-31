@@ -8,6 +8,8 @@ import math
 import os
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -110,6 +112,11 @@ def publish(cache: FeatureCache, frame: pl.LazyFrame | None = None) -> FactorArt
     )
 
 
+def entry_paths(cache: FeatureCache, artifact: FactorArtifact) -> tuple[Path, Path]:
+    entry = cache.root / artifact.cache_key
+    return entry / "data.parquet", entry / "manifest.json"
+
+
 def test_cache_key_is_canonical_across_mapping_order() -> None:
     """Equivalent parameter and dependency mappings must share one address."""
     first = make_spec(
@@ -204,18 +211,143 @@ def test_publish_sorts_validates_and_round_trips_an_immutable_artifact(
     assert artifact.snapshot_id == make_context().snapshot_id
     assert artifact.universe_hash == make_context().universe_hash
     assert artifact.row_count == 2
-    assert artifact.data_path.is_file()
-    assert artifact.manifest_path.is_file()
-    result = pl.read_parquet(artifact.data_path)
+    data_path, manifest_path = entry_paths(cache, artifact)
+    assert data_path.is_file()
+    assert manifest_path.is_file()
+    result = artifact.lazy_frame().collect()
     assert result.schema == FACTOR_OUTPUT_SCHEMA
     assert result.select("trade_date", "instrument_id").rows() == [
         (date(2025, 1, 2), "SSE:600000"),
         (date(2025, 1, 3), "SSE:600001"),
     ]
-    assert sorted(path.name for path in artifact.data_path.parent.iterdir()) == [
+    assert sorted(path.name for path in data_path.parent.iterdir()) == [
         "data.parquet",
         "manifest.json",
     ]
+
+
+def test_load_returns_owned_content_when_data_is_replaced_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verified artifact owns read bytes and cannot later follow a replaced path."""
+    from quant_core.factors import cache as cache_module
+
+    cache = FeatureCache(tmp_path / "cache")
+    published = publish(cache)
+    data_path, _ = entry_paths(cache, published)
+    read_table = cache_module.pq.read_table
+    replaced = False
+
+    def read_then_replace(path: Path) -> object:
+        nonlocal replaced
+        table = read_table(path)
+        if Path(path) == data_path and not replaced:
+            replacement = data_path.with_suffix(".replacement")
+            replacement.write_bytes(b"corrupt parquet")
+            replacement.replace(data_path)
+            replaced = True
+        return table
+
+    monkeypatch.setattr(cache_module.pq, "read_table", read_then_replace)
+
+    artifact = cache.load(published.cache_key)
+
+    assert artifact is not None
+    assert (
+        artifact.lazy_frame()
+        .collect()
+        .equals(
+            make_frame()
+            .collect()
+            .sort("trade_date", "instrument_id", "factor_id", "factor_version")
+        )
+    )
+    assert not hasattr(artifact, "data_path")
+    assert not hasattr(artifact, "manifest_path")
+    with pytest.raises(ValueError, match="Parquet"):
+        cache.load(published.cache_key)
+
+
+def test_artifact_owned_arrow_buffers_are_read_only(tmp_path: Path) -> None:
+    """Public artifact content cannot be mutated through Arrow buffer views."""
+    artifact = publish(FeatureCache(tmp_path))
+
+    buffers = [
+        buffer
+        for column in artifact.table.columns
+        for chunk in column.chunks
+        for buffer in chunk.buffers()
+        if buffer is not None
+    ]
+
+    assert buffers
+    assert all(not buffer.is_mutable for buffer in buffers)
+
+
+def test_load_returns_owned_content_when_manifest_is_replaced_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manifest replacement cannot retarget an already materialized artifact."""
+    cache = FeatureCache(tmp_path / "cache")
+    published = publish(cache)
+    _, manifest_path = entry_paths(cache, published)
+    read_bytes = Path.read_bytes
+    replaced = False
+
+    def read_then_replace(path: Path) -> bytes:
+        nonlocal replaced
+        contents = read_bytes(path)
+        if path == manifest_path and not replaced:
+            replacement = manifest_path.with_suffix(".replacement")
+            replacement.write_bytes(b"{}")
+            replacement.replace(manifest_path)
+            replaced = True
+        return contents
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_replace)
+
+    artifact = cache.load(published.cache_key)
+
+    assert artifact is not None
+    assert artifact.lazy_frame().collect().height == 2
+    assert not hasattr(artifact, "data_path")
+    assert not hasattr(artifact, "manifest_path")
+    with pytest.raises(ValueError, match="manifest"):
+        cache.load(published.cache_key)
+
+
+@pytest.mark.parametrize("filename", ["data.parquet", "manifest.json"])
+def test_load_rejects_cache_files_with_additional_hardlinks(
+    tmp_path: Path, filename: str
+) -> None:
+    """A cache file with another filesystem name is not immutable provenance."""
+    cache = FeatureCache(tmp_path / "cache")
+    artifact = publish(cache)
+    entry = cache.root / artifact.cache_key
+    os.link(entry / filename, tmp_path / f"alias-{filename.replace('.', '-')}")
+
+    with pytest.raises(ValueError, match="hard link"):
+        cache.load(artifact.cache_key)
+
+
+def test_load_hashes_the_table_returned_by_the_parquet_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path race cannot validate one table while returning different content."""
+    from quant_core.factors import cache as cache_module
+
+    cache = FeatureCache(tmp_path)
+    artifact = publish(cache)
+    different = (
+        make_frame(values=(0.3, 0.1))
+        .collect()
+        .sort("trade_date", "instrument_id", "factor_id", "factor_version")
+        .to_arrow()
+    )
+    monkeypatch.setattr(cache_module.pq, "read_table", lambda path: different)
+
+    with pytest.raises(ValueError, match="integrity metadata differs"):
+        cache.load(artifact.cache_key)
 
 
 def test_publish_canonicalizes_arrow_chunks_before_content_hashing(
@@ -249,9 +381,11 @@ def test_publish_manifest_is_canonical_and_binds_every_cache_key_input(
     tmp_path: Path,
 ) -> None:
     """The publication marker must audit the complete content address."""
-    artifact = publish(FeatureCache(tmp_path))
+    cache = FeatureCache(tmp_path)
+    artifact = publish(cache)
+    _, manifest_path = entry_paths(cache, artifact)
 
-    raw = artifact.manifest_path.read_bytes()
+    raw = manifest_path.read_bytes()
     manifest = json.loads(raw)
 
     assert b" " not in raw
@@ -282,14 +416,66 @@ def test_republishing_same_key_with_different_content_fails_without_overwrite(
     """A nondeterministic recomputation must conflict with the completed entry."""
     cache = FeatureCache(tmp_path)
     first = publish(cache)
-    original_data = first.data_path.read_bytes()
-    original_manifest = first.manifest_path.read_bytes()
+    data_path, manifest_path = entry_paths(cache, first)
+    original_data = data_path.read_bytes()
+    original_manifest = manifest_path.read_bytes()
 
     with pytest.raises(ValueError, match="conflict"):
         publish(cache, make_frame(values=(0.3, 0.1)))
 
-    assert first.data_path.read_bytes() == original_data
-    assert first.manifest_path.read_bytes() == original_manifest
+    assert data_path.read_bytes() == original_data
+    assert manifest_path.read_bytes() == original_manifest
+
+
+def test_concurrent_same_key_same_content_publishers_are_idempotent(
+    tmp_path: Path,
+) -> None:
+    """The shared token lock serializes identical feature publishers safely."""
+    cache = FeatureCache(tmp_path)
+    barrier = threading.Barrier(2)
+
+    def publish_after_barrier() -> FactorArtifact:
+        barrier.wait(timeout=5)
+        return publish(cache)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(publish_after_barrier) for _ in range(2)]
+        artifacts = [future.result(timeout=10) for future in futures]
+
+    assert artifacts[0] == artifacts[1]
+    assert artifacts[0].lazy_frame().collect().height == 2
+    assert sorted(path.name for path in cache.root.iterdir()) == [
+        artifacts[0].cache_key
+    ]
+
+
+def test_concurrent_same_key_different_content_has_one_winner_and_one_conflict(
+    tmp_path: Path,
+) -> None:
+    """Nondeterministic concurrent output cannot overwrite the winning artifact."""
+    cache = FeatureCache(tmp_path)
+    barrier = threading.Barrier(2)
+
+    def publish_after_barrier(frame: pl.LazyFrame) -> FactorArtifact:
+        barrier.wait(timeout=5)
+        return publish(cache, frame)
+
+    frames = [make_frame(values=(0.2, 0.1)), make_frame(values=(0.3, 0.1))]
+    artifacts: list[FactorArtifact] = []
+    conflicts: list[ValueError] = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(publish_after_barrier, frame) for frame in frames]
+        for future in futures:
+            try:
+                artifacts.append(future.result(timeout=10))
+            except ValueError as error:
+                conflicts.append(error)
+
+    assert len(artifacts) == 1
+    assert len(conflicts) == 1
+    assert "conflict" in str(conflicts[0])
+    loaded = cache.load(artifacts[0].cache_key)
+    assert loaded == artifacts[0]
 
 
 def test_publish_failure_never_leaves_a_visible_or_temporary_entry(
@@ -375,7 +561,7 @@ def test_retry_flushes_a_complete_entry_after_post_rename_flush_failure(
 
     recovered = publish(cache)
 
-    assert recovered.data_path.is_file()
+    assert recovered.lazy_frame().collect().height == 2
     assert root_flush_attempts == 2
 
 
@@ -454,7 +640,8 @@ def test_load_revalidates_parquet_content_and_fails_closed(tmp_path: Path) -> No
     """A manifest cannot make damaged Parquet appear to be a cache hit."""
     cache = FeatureCache(tmp_path)
     artifact = publish(cache)
-    artifact.data_path.write_bytes(b"not parquet")
+    data_path, _ = entry_paths(cache, artifact)
+    data_path.write_bytes(b"not parquet")
 
     with pytest.raises(ValueError, match="cache.*integrity|Parquet"):
         cache.load(artifact.cache_key)
@@ -464,9 +651,10 @@ def test_load_revalidates_manifest_path_and_cache_key(tmp_path: Path) -> None:
     """Moved or edited metadata cannot redirect a cache read."""
     cache = FeatureCache(tmp_path)
     artifact = publish(cache)
-    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    _, manifest_path = entry_paths(cache, artifact)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["data_path"] = "../outside.parquet"
-    artifact.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="manifest|path"):
         cache.load(artifact.cache_key)
@@ -494,7 +682,7 @@ def test_load_rejects_a_cache_entry_replaced_by_directory_link(tmp_path: Path) -
     """A junction cannot redirect feature reads outside the controlled root."""
     cache = FeatureCache(tmp_path / "cache")
     artifact = publish(cache)
-    entry = artifact.data_path.parent
+    entry = cache.root / artifact.cache_key
     outside = tmp_path / "outside"
     entry.rename(outside)
     _create_directory_link(entry, outside)
@@ -511,7 +699,7 @@ def test_load_revalidates_paths_after_a_read_time_directory_swap(
 
     cache = FeatureCache(tmp_path / "cache")
     artifact = publish(cache)
-    entry = artifact.data_path.parent
+    entry = cache.root / artifact.cache_key
     outside = tmp_path / "outside"
     parked = tmp_path / "parked"
     shutil.copytree(entry, outside)

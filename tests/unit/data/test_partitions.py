@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import subprocess
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty
@@ -433,7 +434,9 @@ def test_partition_lock_reclaims_a_dead_owner_lock(tmp_path: Path) -> None:
 
     lock_path = tmp_path / ".partition.lock"
     lock_path.mkdir()
-    (lock_path / "owner.json").write_text('{"pid":99999999}', encoding="utf-8")
+    (lock_path / "owner.json").write_text(
+        json.dumps({"pid": 99999999, "token": "0" * 32}), encoding="utf-8"
+    )
     os.utime(lock_path, (0, 0))
 
     with partitions._PartitionLock(lock_path):
@@ -442,10 +445,86 @@ def test_partition_lock_reclaims_a_dead_owner_lock(tmp_path: Path) -> None:
     assert not lock_path.exists()
 
 
-def test_publish_recovers_an_ownerless_lock_left_by_interrupted_install(
+@pytest.mark.parametrize("owner_bytes", [None, b"{"])
+def test_partition_lock_does_not_reclaim_a_fresh_missing_or_damaged_owner(
+    tmp_path: Path, owner_bytes: bytes | None
+) -> None:
+    """A transient owner read failure is not evidence that a live lease is stale."""
+    from quant_core.data import partitions
+
+    lock_path = tmp_path / ".partition.lock"
+    lock_path.mkdir()
+    if owner_bytes is not None:
+        (lock_path / "owner.json").write_bytes(owner_bytes)
+
+    with (
+        pytest.raises(TimeoutError),
+        partitions._PartitionLock(
+            lock_path,
+            timeout_seconds=0.05,
+            poll_seconds=0.005,
+            stale_after_seconds=60.0,
+        ),
+    ):
+        pytest.fail("fresh invalid-owner lock was reclaimed")
+
+    assert lock_path.is_dir()
+
+
+def test_partition_lock_release_cannot_remove_a_later_owners_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup after owner unlink may touch only the releasing owner's tombstone."""
+    from quant_core.data import partitions
+
+    lock_path = tmp_path / ".partition.lock"
+    holder = partitions._PartitionLock(lock_path, timeout_seconds=1.0)
+    holder.__enter__()
+    cleanup_started = threading.Event()
+    allow_cleanup = threading.Event()
+    release_errors: list[Exception] = []
+    unlink = Path.unlink
+
+    def block_releasing_owner_cleanup(path: Path, missing_ok: bool = False) -> None:
+        unlink(path, missing_ok=missing_ok)
+        if threading.current_thread().name == "releasing-owner" and path.name == (
+            "owner.json"
+        ):
+            cleanup_started.set()
+            assert allow_cleanup.wait(timeout=5)
+
+    monkeypatch.setattr(Path, "unlink", block_releasing_owner_cleanup)
+
+    def release_holder() -> None:
+        try:
+            holder.__exit__(None, None, None)
+        except (AssertionError, OSError, RuntimeError) as error:
+            release_errors.append(error)
+
+    release_thread = threading.Thread(
+        target=release_holder, name="releasing-owner", daemon=True
+    )
+    release_thread.start()
+    assert cleanup_started.wait(timeout=5)
+    contender = partitions._PartitionLock(lock_path, timeout_seconds=1.0)
+    try:
+        contender.__enter__()
+        assert (lock_path / "owner.json").is_file()
+        allow_cleanup.set()
+        release_thread.join(timeout=5)
+        assert not release_thread.is_alive()
+        assert release_errors == []
+        assert (lock_path / "owner.json").is_file()
+    finally:
+        allow_cleanup.set()
+        contender.__exit__(None, None, None)
+        release_thread.join(timeout=5)
+
+
+def test_publish_recovers_a_stale_ownerless_lock_left_by_interrupted_install(
     tmp_path: Path,
 ) -> None:
-    """A process dying before owner creation cannot block the next publisher forever."""
+    """An ownerless lock is recoverable only after its lease is demonstrably stale."""
     request_hash = hashlib.sha256(
         b'{"end":"2026-07-31","start":"2026-07-31"}'
     ).hexdigest()
@@ -455,6 +534,7 @@ def test_publish_recovers_an_ownerless_lock_left_by_interrupted_install(
         dataset_dir, "run-1", request_hash
     )
     lock_path.mkdir()
+    os.utime(lock_path, (0, 0))
     published = RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1")
 
     assert published.manifest_path.exists()
