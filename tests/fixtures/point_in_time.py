@@ -79,6 +79,20 @@ class FixtureSnapshotRepository:
         )
         return missing_identifier
 
+    def published_snapshot_without_timestamp(
+        self, identifier: SnapshotId
+    ) -> SnapshotId:
+        """Register a malformed published snapshot that lacks its publication time."""
+        original = self._snapshots[identifier]
+        missing_timestamp_identifier = SnapshotId.new()
+        self._snapshots[missing_timestamp_identifier] = replace(
+            original,
+            id=missing_timestamp_identifier,
+            status=SnapshotStatus.PUBLISHED,
+            published_at=None,
+        )
+        return missing_timestamp_identifier
+
 
 def point_in_time_fixture(tmp_path: Path) -> PointInTimeFixture:
     """Create canonical Parquet partitions and two catalog-bound snapshots."""
@@ -125,6 +139,21 @@ def point_in_time_fixture(tmp_path: Path) -> PointInTimeFixture:
                 revision=5,
                 available_at=datetime(2024, 4, 29, 12, tzinfo=UTC),
                 pit_usable=False,
+            ),
+            _financial_row(
+                value=160.0,
+                revision=0,
+                available_at=datetime(2024, 4, 29, 12, tzinfo=UTC),
+                pit_usable=False,
+                metric="unusable_metric",
+                report_period=date(2023, 9, 30),
+            ),
+            _financial_row(
+                value=170.0,
+                revision=0,
+                available_at=None,
+                metric="unknown_availability_metric",
+                report_period=date(2023, 6, 30),
             ),
         ],
     )
@@ -248,11 +277,13 @@ def _financial_row(
     revision: int,
     available_at: datetime | None,
     pit_usable: bool = True,
+    metric: str = "revenue",
+    report_period: date = date(2023, 12, 31),
 ) -> dict[str, object]:
     return {
         "instrument_id": "SSE:600000",
-        "report_period": date(2023, 12, 31),
-        "metric": "revenue",
+        "report_period": report_period,
+        "metric": metric,
         "value": value,
         "revision": revision,
         "announced_at": available_at,

@@ -127,3 +127,66 @@ None.
 ### Fix round 1 commit
 
 `git commit -m "fix: harden snapshot research catalog reads"`
+
+## Fix round 2: PIT predicate proof and zero-row results
+
+### Changes
+
+- Added standalone financial metric/report groups for a `pit_usable=False`
+  record and a record whose only availability timestamp is `NULL`; each is
+  explicitly queried and must yield zero rows.
+- Added a fake-catalog test for a `PUBLISHED` snapshot with `published_at=None`.
+- Fixed a real zero-row conversion defect exposed by the new tests: DuckDB's
+  empty `RecordBatchReader` had no batches for Polars to infer a schema from.
+  The query result now uses `to_arrow_table()`, which preserves the canonical
+  empty schema.
+
+### RED and mutation evidence
+
+Initial enhanced target run:
+
+```text
+uv run pytest tests/point_in_time/test_research_repository.py -v --basetemp=C:\t\pit1f
+
+2 failed, 9 passed
+ValueError: Must pass schema, or at least one RecordBatch
+```
+
+After the zero-row conversion fix, each test was mutation-checked and failed
+as expected before restoring the production predicate:
+
+```text
+# Remove `pit_usable = TRUE`
+test_financials_exclude_an_unusable_metric_group — 1 failed
+
+# Treat `available_at IS NULL` as usable
+test_financials_exclude_a_metric_group_with_unknown_availability — 1 failed
+
+# Remove `published_at is None` from snapshot publication validation
+test_research_rejects_published_snapshot_without_published_at — 1 failed
+```
+
+### GREEN and verification
+
+```text
+uv run pytest tests/point_in_time/test_research_repository.py -v --basetemp=C:\t\pit1f
+11 passed
+
+uv run ruff format --check
+66 files already formatted
+
+uv run ruff check
+All checks passed!
+
+uv run mypy
+Success: no issues found in 36 source files
+
+git diff --check
+passed
+```
+
+### Fix round 2 commit and concerns
+
+`git commit -m "test: strengthen PIT research repository coverage"`
+
+None.

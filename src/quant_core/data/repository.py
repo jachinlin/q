@@ -189,7 +189,7 @@ class SnapshotResearchRepository:
             result = connection.execute(
                 "WITH data AS (" + source_query + ") " + query,
                 [*source_parameters, *parameters],
-            ).arrow()
+            ).to_arrow_table()
         finally:
             connection.close()
         frame = cast(pl.DataFrame, pl.from_arrow(result))

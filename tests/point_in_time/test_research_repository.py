@@ -63,6 +63,42 @@ def test_financials_choose_latest_available_revision_before_shanghai_close(
     assert result.schema == CANONICAL_SCHEMAS[DatasetKind.FINANCIAL_OBSERVATION].columns
 
 
+def test_financials_exclude_an_unusable_metric_group(tmp_path: Path) -> None:
+    """Removing the PIT usability predicate would expose this otherwise isolated row."""
+    fixture = point_in_time_fixture(tmp_path)
+
+    result = (
+        SnapshotResearchRepository(fixture.repository)
+        .financials_as_of(
+            fixture.late_snapshot_id,
+            ["unusable_metric"],
+            date(2024, 4, 29),
+        )
+        .collect()
+    )
+
+    assert result.is_empty()
+
+
+def test_financials_exclude_a_metric_group_with_unknown_availability(
+    tmp_path: Path,
+) -> None:
+    """Any report-period fallback would expose this metric despite no availability."""
+    fixture = point_in_time_fixture(tmp_path)
+
+    result = (
+        SnapshotResearchRepository(fixture.repository)
+        .financials_as_of(
+            fixture.late_snapshot_id,
+            ["unknown_availability_metric"],
+            date(2024, 4, 29),
+        )
+        .collect()
+    )
+
+    assert result.is_empty()
+
+
 def test_bars_are_snapshot_bound_range_reads_with_canonical_sort(
     tmp_path: Path,
 ) -> None:
@@ -285,3 +321,23 @@ def test_research_rejects_nonpublished_dataset_version(tmp_path: Path) -> None:
         )
 
     assert captured.value.detail.code == "SNAPSHOT_CATALOG_INVALID"
+
+
+def test_research_rejects_published_snapshot_without_published_at(
+    tmp_path: Path,
+) -> None:
+    """A missing publication timestamp cannot be treated as a published snapshot."""
+    fixture = point_in_time_fixture(tmp_path)
+    snapshot_id = fixture.repository.published_snapshot_without_timestamp(
+        fixture.early_snapshot_id
+    )
+
+    with pytest.raises(QuantError) as captured:
+        SnapshotResearchRepository(fixture.repository).bars(
+            snapshot_id,
+            [InstrumentId.parse("SSE:600000")],
+            date(2024, 4, 28),
+            date(2024, 4, 29),
+        )
+
+    assert captured.value.detail.code == "SNAP_NOT_PUBLISHED"
