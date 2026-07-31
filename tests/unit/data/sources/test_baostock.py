@@ -613,6 +613,27 @@ def test_all_market_rejects_non_post_adjusted_rows() -> None:
     assert error.value.detail.context["actual"] == "2"
 
 
+@pytest.mark.parametrize(("field", "index"), [("open", 2), ("code", 1)])
+def test_all_market_rejects_non_string_cursor_values(field: str, index: int) -> None:
+    """Accepting provider scalars would break the raw-string schema contract."""
+    values: list[object] = list(make_row("2026-01-02", "sh.600000"))
+    values[index] = 10
+    gateway = FakeGateway()
+    gateway.daily_market_outcomes["2026-01-02"] = deque(
+        [FakeCursor([[values]])]  # type: ignore[arg-type]
+    )
+    client = make_client(gateway)
+    client.login()
+
+    with pytest.raises(QuantError) as error:
+        tuple(client.fetch_daily_bars(date(2026, 1, 2), date(2026, 1, 2), None))
+
+    assert error.value.detail.code == "DATA_PROVIDER_BAOSTOCK_SCHEMA"
+    assert error.value.detail.context["operation"] == "query_daily_history_k_AStock"
+    assert error.value.detail.retryable is False
+    assert field in error.value.detail.message
+
+
 def test_all_market_empty_open_day_retries_and_preserves_fatal_error() -> None:
     """Treating an empty open-day response as success silently loses the market."""
     gateway = FakeGateway()

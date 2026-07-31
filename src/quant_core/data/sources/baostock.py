@@ -419,7 +419,7 @@ class BaoStockClient:
         catalog_hash = hashlib.sha256("\n".join(catalog_ids).encode()).hexdigest()
         for index, trading_day in enumerate(open_dates, start=1):
             rows = self._fetch_all_market_rows(trading_day)
-            codes = sorted(str(row["code"]) for row in rows)
+            codes = sorted(cast(str, row["code"]) for row in rows)
             request: dict[str, JsonValue] = {
                 "api": "query_daily_history_k_AStock",
                 "scope": "ALL",
@@ -636,6 +636,14 @@ class BaoStockClient:
                     expected=len(fields),
                     actual=len(values),
                 )
+            for field, value in zip(fields, values, strict=True):
+                if not isinstance(value, str):
+                    raise self._schema_error(
+                        operation,
+                        f"cursor field {field} must be a provider-native string",
+                        expected="str",
+                        actual=type(value).__name__,
+                    )
             rows.append(dict(zip(fields, values, strict=True)))
 
     def _retry[T](self, operation: str, function: Callable[[], T]) -> T:
