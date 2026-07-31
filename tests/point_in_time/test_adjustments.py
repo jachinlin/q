@@ -352,6 +352,64 @@ def test_backward_adjustment_empty_actions_preserves_schema_order_and_metadata(
     assert result["adjustment_as_of"].to_list() == [_DAYS[-1]] * len(_DAYS)
 
 
+def test_backward_adjustment_exposes_exact_event_factor_and_availability(
+    tmp_path: Path,
+) -> None:
+    """Without event-level lineage a factor cannot reconstruct an earlier PIT anchor."""
+    available_at = datetime(2024, 1, 5, 18, tzinfo=UTC)
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="cash-and-bonus",
+                ex_date=_DAYS[3],
+                available_at=available_at,
+                cash_per_share=2.0,
+                share_ratio=0.1,
+            )
+        ],
+    )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[-1], _DAYS[-1])
+
+    event_factor = 15.0 / 18.7
+    assert result["adjustment_factor"].to_list() == pytest.approx(
+        [event_factor, event_factor, event_factor, 1.0, 1.0]
+    )
+    assert result["adjustment_event_factor"].to_list() == pytest.approx(
+        [1.0, 1.0, 1.0, event_factor, 1.0]
+    )
+    assert result["adjustment_event_available_at"].to_list() == [
+        None,
+        None,
+        None,
+        available_at,
+        None,
+    ]
+
+
+def test_backward_metadata_excludes_event_after_requested_rows(tmp_path: Path) -> None:
+    """A future ex-date may scale rows globally but must not masquerade as a used event."""
+    fixture = _adjustment_fixture(
+        tmp_path,
+        [
+            _action_row(
+                action_type="after-output",
+                ex_date=_DAYS[3],
+                available_at=datetime(2024, 1, 5, tzinfo=UTC),
+                cash_per_share=2.0,
+                share_ratio=0.1,
+            )
+        ],
+    )
+
+    result = _backward_bars(fixture, _DAYS[0], _DAYS[2], _DAYS[3])
+
+    assert result["adjustment_factor"].to_list() == pytest.approx([15.0 / 18.7] * 3)
+    assert result["adjustment_event_factor"].to_list() == [1.0] * 3
+    assert result["adjustment_event_available_at"].to_list() == [None] * 3
+
+
 def test_backward_adjustment_empty_bars_preserves_schema_and_metadata(
     tmp_path: Path,
 ) -> None:

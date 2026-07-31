@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from math import isfinite
@@ -31,6 +31,15 @@ class _DailyAction:
     ex_date: date
     cash_per_share: float
     share_ratio: float
+    available_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _AdjustmentEvent:
+    instrument_id: str
+    ex_date: date
+    factor: float
+    available_at: datetime
 
 
 class PriceAdjustmentService:
@@ -74,7 +83,7 @@ class PriceAdjustmentService:
             "instrument_id", "trade_date"
         )
         if result.is_empty():
-            return _with_metadata(result, mode, as_of).lazy()
+            return _with_metadata(result, mode, as_of, events=factors).lazy()
 
         price_factors = [
             _combined_factor(factors, row["instrument_id"], row["trade_date"])
@@ -88,7 +97,13 @@ class PriceAdjustmentService:
         result = result.with_columns(adjusted_prices).with_columns(
             _adjusted_volumes(result["volume"], price_factors)
         )
-        return _with_metadata(result, mode, as_of).lazy()
+        return _with_metadata(
+            result,
+            mode,
+            as_of,
+            adjustment_factors=price_factors,
+            events=factors,
+        ).lazy()
 
 
 def _validate_request(start: date, end: date, as_of: date) -> None:
@@ -99,11 +114,33 @@ def _validate_request(start: date, end: date, as_of: date) -> None:
 
 
 def _with_metadata(
-    frame: pl.DataFrame, mode: AdjustmentMode, as_of: date
+    frame: pl.DataFrame,
+    mode: AdjustmentMode,
+    as_of: date,
+    *,
+    adjustment_factors: Sequence[float] | None = None,
+    events: dict[str, list[_AdjustmentEvent]] | None = None,
 ) -> pl.DataFrame:
-    return frame.sort("instrument_id", "trade_date").with_columns(
+    factors = (
+        list(adjustment_factors)
+        if adjustment_factors is not None
+        else [1.0] * frame.height
+    )
+    if len(factors) != frame.height:
+        raise ValueError("adjustment factor count must match bar rows")
+    normalized = frame.with_columns(
+        pl.Series("adjustment_factor", factors, dtype=pl.Float64)
+    ).sort("instrument_id", "trade_date")
+    event_factors, event_available = _event_metadata(normalized, events or {})
+    return normalized.with_columns(
         pl.lit(mode.value, dtype=pl.String).alias("adjustment_mode"),
         pl.lit(as_of, dtype=pl.Date).alias("adjustment_as_of"),
+        pl.Series("adjustment_event_factor", event_factors, dtype=pl.Float64),
+        pl.Series(
+            "adjustment_event_available_at",
+            event_available,
+            dtype=pl.Datetime("us", "UTC"),
+        ),
     )
 
 
@@ -128,8 +165,8 @@ def _applicable_actions(
 
 def _backward_factors(
     bars: pl.DataFrame, actions: Sequence[_DailyAction]
-) -> dict[str, list[tuple[date, float]]]:
-    factors: dict[str, list[tuple[date, float]]] = defaultdict(list)
+) -> dict[str, list[_AdjustmentEvent]]:
+    factors: dict[str, list[_AdjustmentEvent]] = defaultdict(list)
     for action in actions:
         preclose_rows = bars.filter(
             (pl.col("instrument_id") == action.instrument_id)
@@ -145,7 +182,14 @@ def _backward_factors(
         ):
             raise ValueError("corporate action requires a positive ex-date preclose")
         factor = _event_factor(action, float(preclose))
-        factors[action.instrument_id].append((action.ex_date, factor))
+        factors[action.instrument_id].append(
+            _AdjustmentEvent(
+                action.instrument_id,
+                action.ex_date,
+                factor,
+                action.available_at,
+            )
+        )
     return factors
 
 
@@ -157,6 +201,7 @@ def _daily_actions(actions: Sequence[dict[str, object]]) -> list[_DailyAction]:
         cash = _nonnegative_number(action, "cash_per_share")
         share_ratio = _nonnegative_number(action, "share_ratio")
         rights_price = _nonnegative_number(action, "rights_price")
+        available_at = _required_datetime(action, "available_at")
         if rights_price != 0:
             raise ValueError(
                 "corporate action rights_price is unsupported without an independent rights ratio"
@@ -164,13 +209,16 @@ def _daily_actions(actions: Sequence[dict[str, object]]) -> list[_DailyAction]:
         key = (instrument, ex_date)
         existing = aggregated.get(key)
         if existing is None:
-            aggregated[key] = _DailyAction(instrument, ex_date, cash, share_ratio)
+            aggregated[key] = _DailyAction(
+                instrument, ex_date, cash, share_ratio, available_at
+            )
         else:
             aggregated[key] = _DailyAction(
                 instrument,
                 ex_date,
                 existing.cash_per_share + cash,
                 existing.share_ratio + share_ratio,
+                max(existing.available_at, available_at),
             )
     return list(aggregated.values())
 
@@ -209,18 +257,45 @@ def _required_date(action: dict[str, object], column: str) -> date:
     return value
 
 
+def _required_datetime(action: dict[str, object], column: str) -> datetime:
+    value = action[column]
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise TypeError(f"corporate action {column} must be a timezone-aware datetime")
+    return value
+
+
 def _combined_factor(
-    factors: dict[str, list[tuple[date, float]]], instrument: object, trade_date: object
+    factors: dict[str, list[_AdjustmentEvent]],
+    instrument: object,
+    trade_date: object,
 ) -> float:
     if not isinstance(instrument, str) or not isinstance(trade_date, date):
         raise TypeError("daily bars must have canonical instrument and trade dates")
     factor = 1.0
-    for ex_date, event_factor in factors[instrument]:
-        if trade_date < ex_date:
-            factor *= event_factor
+    for event in factors[instrument]:
+        if trade_date < event.ex_date:
+            factor *= event.factor
     if not isfinite(factor) or factor <= 0:
         raise ValueError("combined corporate action adjustment factor must be positive")
     return factor
+
+
+def _event_metadata(
+    frame: pl.DataFrame, events: dict[str, list[_AdjustmentEvent]]
+) -> tuple[list[float], list[datetime | None]]:
+    by_key = {
+        (event.instrument_id, event.ex_date): event
+        for instrument_events in events.values()
+        for event in instrument_events
+        if event.factor != 1.0
+    }
+    event_factors: list[float] = []
+    event_available: list[datetime | None] = []
+    for row in frame.select("instrument_id", "trade_date").to_dicts():
+        event = by_key.get((row["instrument_id"], row["trade_date"]))
+        event_factors.append(event.factor if event is not None else 1.0)
+        event_available.append(event.available_at if event is not None else None)
+    return event_factors, event_available
 
 
 def _adjusted_volumes(volumes: pl.Series, factors: Sequence[float]) -> pl.Series:

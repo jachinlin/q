@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from itertools import pairwise
 from math import isfinite, log, sqrt
 
 from quant_core.data.adjustments import AdjustmentMode
@@ -36,7 +35,7 @@ class Volatility60dFactor(_MarketFactor):
                     "adjustment_mode": AdjustmentMode.BACKWARD.value,
                     "annualization_sessions": 252,
                     "ddof": 1,
-                    "formula": "std(log(close[t]/close[t-1]),ddof=1)*sqrt(252)",
+                    "formula": "std(log(close[t])-log(close[t-1]),ddof=1)*sqrt(252)",
                     "price_field": "close",
                     "window_prices": 61,
                     "window_returns": 60,
@@ -48,7 +47,10 @@ class Volatility60dFactor(_MarketFactor):
 
 
 def _volatility_value(closes: Sequence[float]) -> float | None:
-    returns = [log(current / previous) for previous, current in pairwise(closes)]
+    log_prices = [log(close) for close in closes]
+    returns = [
+        log_prices[index] - log_prices[index - 1] for index in range(1, len(log_prices))
+    ]
     count = len(returns)
     mean = sum(returns) / count
     variance = sum((value - mean) ** 2 for value in returns) / (count - 1)

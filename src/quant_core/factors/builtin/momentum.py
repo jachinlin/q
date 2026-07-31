@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from math import isclose, isfinite, log
-from typing import Protocol
+from typing import Protocol, cast
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -16,6 +17,7 @@ from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorS
 _VERSION = "1.0.0"
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class AdjustedBarService(Protocol):
@@ -69,7 +71,13 @@ class _MarketFactor:
             "instrument_id", maintain_order=True
         ):
             rows = instrument_frame.select(
-                "trade_date", "instrument_id", "close", "available_at"
+                "trade_date",
+                "instrument_id",
+                "close",
+                "available_at",
+                "adjustment_factor",
+                "adjustment_event_factor",
+                "adjustment_event_available_at",
             ).to_dicts()
             for index, row in enumerate(rows):
                 trade_date = row["trade_date"]
@@ -79,12 +87,17 @@ class _MarketFactor:
                     continue
                 start_index = index - self._required_prices + 1
                 window = rows[max(0, start_index) : index + 1]
-                available_at = _latest_available_at(window)
+                bar_available_at = _latest_available_at(window)
+                available_at = bar_available_at
                 value: float | None = None
                 if start_index >= 0 and len(window) == self._required_prices:
-                    raw_closes = [item["close"] for item in window]
-                    if _valid_positive_prices(raw_closes) and available_at is not None:
-                        closes = [float(close) for close in raw_closes]
+                    closes, action_available_at = _point_in_time_closes(
+                        window, trade_date
+                    )
+                    available_at = _max_available_at(
+                        bar_available_at, action_available_at
+                    )
+                    if closes is not None and available_at is not None:
                         value = self._evaluator(closes)
                         if value is not None and not isfinite(value):
                             value = None
@@ -248,6 +261,9 @@ def _validate_adjusted_bars(frame: pl.DataFrame) -> None:
         "trade_date": pl.Date,
         "close": pl.Float64,
         "available_at": pl.Datetime("us", "UTC"),
+        "adjustment_factor": pl.Float64,
+        "adjustment_event_factor": pl.Float64,
+        "adjustment_event_available_at": pl.Datetime("us", "UTC"),
     }
     missing = sorted(set(required) - set(frame.columns))
     if missing:
@@ -265,6 +281,59 @@ def _valid_positive_prices(values: Sequence[object]) -> bool:
         and value > 0
         for value in values
     )
+
+
+def _point_in_time_closes(
+    window: Sequence[dict[str, object]], signal_date: date
+) -> tuple[list[float] | None, datetime | None]:
+    global_closes = [row["close"] for row in window]
+    global_factors = [row["adjustment_factor"] for row in window]
+    event_factors = [row["adjustment_event_factor"] for row in window]
+    if not (
+        _valid_positive_prices(global_closes)
+        and _valid_positive_prices(global_factors)
+        and _valid_positive_prices(event_factors)
+    ):
+        return None, None
+
+    cutoff = datetime.combine(signal_date, time.max, _SHANGHAI).astimezone(UTC)
+    known_events: list[tuple[int, float, datetime]] = []
+    for index, row in enumerate(window):
+        factor = float(cast(int | float, row["adjustment_event_factor"]))
+        available_at = row["adjustment_event_available_at"]
+        if factor == 1.0:
+            continue
+        if not isinstance(available_at, datetime) or available_at.tzinfo is None:
+            return None, None
+        if available_at <= cutoff:
+            known_events.append((index, factor, available_at))
+
+    closes: list[float] = []
+    for index, (adjusted, global_factor) in enumerate(
+        zip(global_closes, global_factors, strict=True)
+    ):
+        raw_close = float(cast(int | float, adjusted)) / float(
+            cast(int | float, global_factor)
+        )
+        local_factor = 1.0
+        for event_index, event_factor, _ in known_events:
+            if index < event_index:
+                local_factor *= event_factor
+        local_close = raw_close * local_factor
+        if not isfinite(local_close) or local_close <= 0:
+            return None, None
+        closes.append(local_close)
+
+    used_available = [
+        available_at for event_index, _, available_at in known_events if event_index > 0
+    ]
+    return closes, max(used_available, default=None)
+
+
+def _max_available_at(left: datetime | None, right: datetime | None) -> datetime | None:
+    if left is None:
+        return None
+    return max(left, right) if right is not None else left
 
 
 def _latest_available_at(

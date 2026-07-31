@@ -50,10 +50,78 @@ class RecordingPriceService:
     ) -> pl.LazyFrame:
         self.calls.append((snapshot_id, tuple(instruments), start, end, mode, as_of))
         instrument_ids = [instrument.canonical() for instrument in instruments]
-        return self._bars.filter(
+        result = self._bars.filter(
             pl.col("instrument_id").is_in(instrument_ids)
             & pl.col("trade_date").is_between(start, end, closed="both")
-        ).lazy()
+        )
+        if "adjustment_factor" not in result.columns:
+            result = result.with_columns(
+                pl.lit(1.0, dtype=pl.Float64).alias("adjustment_factor"),
+                pl.lit(1.0, dtype=pl.Float64).alias("adjustment_event_factor"),
+                pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
+                    "adjustment_event_available_at"
+                ),
+            )
+        return result.lazy()
+
+
+class ActionAwarePriceService:
+    """Apply only actions whose ex-date and availability are known by ``as_of``."""
+
+    def __init__(
+        self,
+        raw_bars: pl.DataFrame,
+        actions: Sequence[tuple[date, float, datetime]],
+    ) -> None:
+        self._raw_bars = raw_bars
+        self._actions = actions
+
+    def bars(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+        mode: AdjustmentMode,
+        as_of: date,
+    ) -> pl.LazyFrame:
+        assert mode is AdjustmentMode.BACKWARD
+        instrument_ids = [instrument.canonical() for instrument in instruments]
+        applicable = [
+            action
+            for action in self._actions
+            if action[0] <= as_of and action[2].date() <= as_of
+        ]
+        rows: list[dict[str, object]] = []
+        for row in self._raw_bars.filter(
+            pl.col("instrument_id").is_in(instrument_ids)
+            & pl.col("trade_date").is_between(start, end, closed="both")
+        ).to_dicts():
+            trade_date = row["trade_date"]
+            assert isinstance(trade_date, date)
+            adjustment_factor = np.prod(
+                [factor for ex_date, factor, _ in applicable if trade_date < ex_date],
+                dtype=np.float64,
+            ).item()
+            events = [action for action in applicable if action[0] == trade_date]
+            row["close"] = float(row["close"]) * adjustment_factor
+            row["adjustment_factor"] = adjustment_factor
+            row["adjustment_event_factor"] = (
+                np.prod([event[1] for event in events], dtype=np.float64).item()
+                if events
+                else 1.0
+            )
+            row["adjustment_event_available_at"] = (
+                max(event[2] for event in events) if events else None
+            )
+            rows.append(row)
+        schema = {
+            **self._raw_bars.schema,
+            "adjustment_factor": pl.Float64,
+            "adjustment_event_factor": pl.Float64,
+            "adjustment_event_available_at": pl.Datetime("us", "UTC"),
+        }
+        return pl.DataFrame(rows, schema=schema).lazy()
 
 
 def test_return_factors_use_exact_lagged_close_formula() -> None:
@@ -293,6 +361,83 @@ def test_available_at_is_latest_required_input_availability() -> None:
     )
 
     assert result["available_at"].item() == delayed
+
+
+@pytest.mark.parametrize("event_offset", [100, 120])
+def test_extending_context_end_does_not_change_earlier_trend(
+    event_offset: int,
+) -> None:
+    """Global end-anchored adjustment would leak a later action into an early trend."""
+    closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
+    bars = _bars(_SSE, closes)
+    signal_day = bars["trade_date"][119]
+    extended_end = bars["trade_date"][124]
+    action_available = datetime.combine(
+        bars["trade_date"][120], datetime.min.time(), tzinfo=UTC
+    )
+    service = ActionAwarePriceService(
+        bars,
+        [(bars["trade_date"][event_offset], 0.5, action_available)],
+    )
+
+    short = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+    extended = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(signal_day, extended_end))
+        .collect()
+    )
+    extended_early = extended.filter(pl.col("trade_date") == signal_day)
+
+    assert extended_early["value"].item() == pytest.approx(short["value"].item())
+    assert extended_early["available_at"].item() == short["available_at"].item()
+
+
+def test_actual_adjustment_action_availability_propagates_to_factor() -> None:
+    """Using only bar timestamps would publish an adjusted signal too early."""
+    closes = np.exp(2.0 + 0.003 * np.arange(120)).tolist()
+    bars = _bars(_SSE, closes).with_columns(
+        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
+    )
+    signal_day = bars["trade_date"][-1]
+    action_available = datetime.combine(
+        signal_day, datetime.min.time(), tzinfo=UTC
+    ) + timedelta(hours=12)
+    service = ActionAwarePriceService(
+        bars,
+        [(signal_day, 0.5, action_available)],
+    )
+
+    result = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["is_valid"].item() is True
+    assert result["available_at"].item() == action_available
+
+
+def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
+    """Dividing extremes before log can overflow although both logarithms are finite."""
+    smallest = float.fromhex("0x0.0000000000001p-1022")
+    closes = [smallest, *([1e308] * 60)]
+    bars = _bars(_SSE, closes)
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        Volatility60dFactor(RecordingPriceService(bars), [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    log_prices = np.log(np.asarray(closes, dtype=np.float64))
+    expected = np.std(np.diff(log_prices), ddof=1) * sqrt(252.0)
+    assert result["value"].item() == pytest.approx(expected)
+    assert result["is_valid"].item() is True
 
 
 def test_duplicate_bar_key_is_rejected() -> None:
