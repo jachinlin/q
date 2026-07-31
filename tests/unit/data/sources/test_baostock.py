@@ -500,7 +500,9 @@ def test_all_market_selection_uses_daily_api_only(selection: object) -> None:
 
     batches = tuple(
         client.fetch_daily_bars(
-            date(2026, 1, 2), date(2026, 1, 3), selection  # type: ignore[arg-type]
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+            selection,  # type: ignore[arg-type]
         )
     )
 
@@ -549,12 +551,12 @@ def test_all_market_batch_records_response_scope_hash() -> None:
             InstrumentListing(
                 instrument(Exchange.SZSE, "000001"), date(1991, 4, 3), None
             ),
-        InstrumentListing(
-            instrument(Exchange.SSE, "600000"), date(1999, 11, 10), None
-        ),
-        InstrumentListing(
-            instrument(Exchange.SSE, "000300"), date(2005, 4, 8), None, "2"
-        ),
+            InstrumentListing(
+                instrument(Exchange.SSE, "600000"), date(1999, 11, 10), None
+            ),
+            InstrumentListing(
+                instrument(Exchange.SSE, "000300"), date(2005, 4, 8), None, "2"
+            ),
         ]
     )
     client = make_client(gateway, catalog)
@@ -637,7 +639,9 @@ def test_all_market_rejects_non_string_cursor_values(field: str, index: int) -> 
 def test_all_market_empty_open_day_retries_and_preserves_fatal_error() -> None:
     """Treating an empty open-day response as success silently loses the market."""
     gateway = FakeGateway()
-    gateway.daily_market_outcomes["2026-01-02"] = deque([FakeCursor([]), FakeCursor([])])
+    gateway.daily_market_outcomes["2026-01-02"] = deque(
+        [FakeCursor([]), FakeCursor([])]
+    )
     sleeps: list[float] = []
     client = make_client(
         gateway,

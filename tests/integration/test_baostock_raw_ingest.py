@@ -25,6 +25,7 @@ class OfflineCursor:
 
     error_code = "0"
     error_msg = "success"
+
     def __init__(
         self, rows: Sequence[Sequence[str]], fields: Sequence[str] = DAILY_BAR_FIELDS
     ) -> None:
