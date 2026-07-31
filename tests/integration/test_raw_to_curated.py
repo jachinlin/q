@@ -160,6 +160,12 @@ def test_published_all_market_raw_rebuilds_canonical_after_gateway_is_disabled(
     ]
     assert daily.frame.select("trade_date").unique().item() == date(2026, 1, 2)
     assert status.frame.height == 2
+    assert status.frame.schema == CANONICAL_SCHEMAS[DatasetKind.SECURITY_STATUS].columns
+    assert set(status.frame.select("instrument_id").to_series().to_list()) == {
+        "SSE:600000",
+        "SZSE:000001",
+    }
+    assert status.frame.select("trade_date").unique().item() == date(2026, 1, 2)
     assert set(daily.frame.columns) == set(
         CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR].columns
     )
