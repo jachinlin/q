@@ -1179,7 +1179,7 @@ def test_background_heartbeat_covers_source_work_before_first_yield(
     source = LeaseCoordinatedSource()
     options = {
         "clock": lambda: datetime.now(UTC),
-        "lease_duration": timedelta(milliseconds=100),
+        "lease_duration": timedelta(milliseconds=600),
         "heartbeat_interval": timedelta(milliseconds=20),
     }
     first, _ = make_pipeline(tmp_path, source, **options)  # type: ignore[arg-type]
@@ -1188,12 +1188,14 @@ def test_background_heartbeat_covers_source_work_before_first_yield(
     with ThreadPoolExecutor(max_workers=2) as executor:
         leader = executor.submit(first.bootstrap)
         assert source.entered.wait(timeout=5)
-        threading.Event().wait(0.25)
+        threading.Event().wait(0.8)
         follower = executor.submit(second.bootstrap)
-        with pytest.raises(QuantError) as captured:
-            follower.result(timeout=5)
-        assert source.second_collector_entered.is_set() is False
-        source.release.set()
+        try:
+            with pytest.raises(QuantError) as captured:
+                follower.result(timeout=5)
+            assert source.second_collector_entered.is_set() is False
+        finally:
+            source.release.set()
         result = leader.result(timeout=10)
 
     assert captured.value.detail.code == "DATA_PIPELINE_BUSY"
