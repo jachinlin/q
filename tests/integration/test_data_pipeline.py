@@ -1193,12 +1193,12 @@ def test_background_heartbeat_covers_source_work_before_first_yield(
         try:
             with pytest.raises(QuantError) as captured:
                 follower.result(timeout=5)
+            assert captured.value.detail.code == "DATA_PIPELINE_BUSY"
             assert source.second_collector_entered.is_set() is False
         finally:
             source.release.set()
         result = leader.result(timeout=10)
 
-    assert captured.value.detail.code == "DATA_PIPELINE_BUSY"
     assert isinstance(result.snapshot_id, SnapshotId)
 
 
