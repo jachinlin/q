@@ -55,7 +55,9 @@ def _thread_guard_for(path: Path) -> LockType:
 class _AcquisitionGuard:
     """Serialize fixed lock-path transitions across threads and processes."""
 
-    def __init__(self, path: Path, *, deadline: float, poll_seconds: float) -> None:
+    def __init__(
+        self, path: Path, *, deadline: float | None, poll_seconds: float
+    ) -> None:
         self._path = path.parent / f"{path.name}.guard"
         self._lock_path = path
         self._deadline = deadline
@@ -65,15 +67,21 @@ class _AcquisitionGuard:
         self._handle: int | None = None
 
     def __enter__(self) -> Self:
-        remaining = self._deadline - time.monotonic()
-        if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
-            self._raise_timeout()
+        if self._deadline is None:
+            self._thread_lock.acquire()
+        else:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0 or not self._thread_lock.acquire(timeout=remaining):
+                self._raise_timeout()
         try:
             while not self._try_acquire_os_guard():
-                remaining = self._deadline - time.monotonic()
-                if remaining <= 0:
-                    self._raise_timeout()
-                time.sleep(min(self._poll_seconds, remaining))
+                if self._deadline is None:
+                    time.sleep(self._poll_seconds)
+                else:
+                    remaining = self._deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._raise_timeout()
+                    time.sleep(min(self._poll_seconds, remaining))
         except BaseException:
             self._thread_lock.release()
             raise
@@ -236,17 +244,21 @@ class _PartitionLock:
             time.sleep(min(self._poll_seconds, deadline - time.monotonic()))
 
     def __exit__(self, *_: object) -> None:
-        """Atomically detach and remove only this owner's tokenized directory."""
+        """Release this owner, waiting until the crash-safe guard is available."""
+        self.release()
+
+    def release(self) -> None:
+        """Detach this owner's fixed path; retain ownership on pre-detach errors."""
         if not self._owned:
             return
         token = self._token
         if token is None:
             raise RuntimeError("partition lock ownership token is missing")
         tombstone = self._path.parent / f"{self._path.name}.release-{token}"
+        detached = False
         try:
-            deadline = time.monotonic() + self._timeout_seconds
             with _AcquisitionGuard(
-                self._path, deadline=deadline, poll_seconds=self._poll_seconds
+                self._path, deadline=None, poll_seconds=self._poll_seconds
             ):
                 identity = self._path_identity(self._path)
                 owner_identity = self._owner_identity(self._path)
@@ -262,10 +274,12 @@ class _PartitionLock:
                 ):
                     raise RuntimeError("partition lock identity changed before release")
                 self._path.rename(tombstone)
+                detached = True
             self._remove_token_directory(tombstone, token)
         finally:
-            self._owned = False
-            self._token = None
+            if detached:
+                self._owned = False
+                self._token = None
 
     def _owner_path_for(self, directory: Path) -> Path:
         return directory / self._OWNER_FILE

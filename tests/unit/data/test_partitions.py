@@ -574,6 +574,95 @@ def test_partition_lock_release_cannot_remove_a_later_owners_directory(
         release_thread.join(timeout=5)
 
 
+def test_partition_lock_release_waits_past_acquire_timeout_for_guard(
+    tmp_path: Path,
+) -> None:
+    """Release must not abandon a live fixed lock because its guard is busy."""
+    from quant_core.data import partitions
+
+    lock_path = tmp_path / ".partition.lock"
+    owner = partitions._PartitionLock(
+        lock_path, timeout_seconds=0.05, poll_seconds=0.005
+    )
+    owner.__enter__()
+    guard_acquired = threading.Event()
+    allow_guard_release = threading.Event()
+    release_started = threading.Event()
+    release_finished = threading.Event()
+    release_errors: list[Exception] = []
+
+    def hold_guard() -> None:
+        with partitions._AcquisitionGuard(
+            lock_path, deadline=time.monotonic() + 5, poll_seconds=0.005
+        ):
+            guard_acquired.set()
+            assert allow_guard_release.wait(timeout=5)
+
+    def release_owner() -> None:
+        release_started.set()
+        try:
+            owner.__exit__(None, None, None)
+        except (AssertionError, OSError, RuntimeError, TimeoutError) as error:
+            release_errors.append(error)
+        finally:
+            release_finished.set()
+
+    guard_thread = threading.Thread(target=hold_guard, daemon=True)
+    release_thread = threading.Thread(target=release_owner, daemon=True)
+    guard_thread.start()
+    assert guard_acquired.wait(timeout=5)
+    release_thread.start()
+    assert release_started.wait(timeout=5)
+
+    assert not release_finished.wait(timeout=0.15)
+    assert (lock_path / "owner.json").is_file()
+
+    allow_guard_release.set()
+    guard_thread.join(timeout=5)
+    release_thread.join(timeout=5)
+    assert not guard_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert release_errors == []
+    assert not lock_path.exists()
+
+    with partitions._PartitionLock(lock_path, timeout_seconds=1.0):
+        assert (lock_path / "owner.json").is_file()
+
+
+def test_partition_lock_release_can_retry_after_identity_check_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-detach release error must retain ownership for an explicit retry."""
+    from quant_core.data import partitions
+
+    lock_path = tmp_path / ".partition.lock"
+    owner = partitions._PartitionLock(lock_path, timeout_seconds=1.0)
+    owner.__enter__()
+    path_identity = owner._path_identity
+    calls = 0
+
+    def fail_second_identity_check(path: Path) -> tuple[int, int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected release identity failure")
+        return path_identity(path)
+
+    monkeypatch.setattr(owner, "_path_identity", fail_second_identity_check)
+
+    with pytest.raises(OSError, match="injected release identity failure"):
+        owner.release()
+
+    assert (lock_path / "owner.json").is_file()
+    monkeypatch.setattr(owner, "_path_identity", path_identity)
+    owner.release()
+    assert not lock_path.exists()
+
+    with partitions._PartitionLock(lock_path, timeout_seconds=1.0):
+        assert (lock_path / "owner.json").is_file()
+
+
 def _assert_stale_reclaim_does_not_displace_later_owner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
