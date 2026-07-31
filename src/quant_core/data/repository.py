@@ -23,6 +23,12 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 class ResearchDataRepository(Protocol):
     """Read research data from one immutable snapshot at a time."""
 
+    def instruments(self, snapshot_id: SnapshotId) -> pl.LazyFrame: ...
+
+    def trade_calendar(
+        self, snapshot_id: SnapshotId, start: date, end: date
+    ) -> pl.LazyFrame: ...
+
     def bars(
         self,
         snapshot_id: SnapshotId,
@@ -85,6 +91,23 @@ class SnapshotResearchRepository:
 
     def __init__(self, catalog: SnapshotCatalog) -> None:
         self._catalog = catalog
+
+    def instruments(self, snapshot_id: SnapshotId) -> pl.LazyFrame:
+        """Return every canonical instrument bound to ``snapshot_id``."""
+        return self._read(snapshot_id, DatasetKind.INSTRUMENT, "TRUE", [])
+
+    def trade_calendar(
+        self, snapshot_id: SnapshotId, start: date, end: date
+    ) -> pl.LazyFrame:
+        """Return the inclusive canonical calendar range bound to ``snapshot_id``."""
+        if start > end:
+            raise ValueError("start must not follow end")
+        return self._read(
+            snapshot_id,
+            DatasetKind.TRADE_CALENDAR,
+            "trade_date >= ? AND trade_date <= ?",
+            [start, end],
+        )
 
     def bars(
         self,
@@ -180,8 +203,15 @@ class SnapshotResearchRepository:
     ) -> pl.LazyFrame:
         """Return the canonical status observations recorded for ``as_of``."""
         predicates, parameters = _instrument_predicate(instruments)
-        predicates.append("trade_date = ?")
-        parameters.append(as_of)
+        predicates.extend(
+            (
+                "trade_date = ?",
+                "pit_usable = TRUE",
+                "available_at IS NOT NULL",
+                "available_at <= ?",
+            )
+        )
+        parameters.extend((as_of, _shanghai_close_utc(as_of)))
         return self._read(
             snapshot_id,
             DatasetKind.SECURITY_STATUS,
