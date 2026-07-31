@@ -53,10 +53,11 @@ class UniverseBuilder:
         """Return one row per snapshot instrument, sorted by ``instrument_id``."""
         instruments = self._repository.instruments(snapshot_id).collect()
         instruments = _validated_instruments(instruments)
+        calendar_start = date.min
         calendar = self._repository.trade_calendar(
-            snapshot_id, date.min, as_of
+            snapshot_id, calendar_start, as_of
         ).collect()
-        _validate_calendar(calendar)
+        calendar = _validated_calendar(calendar, calendar_start, as_of)
         identifiers = _instrument_ids(instruments)
         if not _is_trading_day(calendar, as_of):
             return _all_closed(identifiers, as_of, "AS_OF_NOT_TRADING_DAY")
@@ -107,10 +108,23 @@ def _validated_instruments(instruments: pl.DataFrame) -> pl.DataFrame:
     return instruments.sort("instrument_id")
 
 
-def _validate_calendar(calendar: pl.DataFrame) -> None:
+def _validated_calendar(
+    calendar: pl.DataFrame, calendar_start: date, as_of: date
+) -> pl.DataFrame:
+    required_columns = {"trade_date", "is_trading_day"}
+    if not required_columns.issubset(calendar.schema):
+        _invalid("invalid calendar schema")
     dates = calendar["trade_date"].to_list()
-    if len(dates) != len(set(dates)):
-        _invalid("duplicate trade_date")
+    seen: set[date] = set()
+    for value in dates:
+        if type(value) is not date:
+            _invalid("invalid trade_date")
+        if value < calendar_start or value > as_of:
+            _invalid("unexpected trade_date")
+        if value in seen:
+            _invalid("duplicate trade_date")
+        seen.add(value)
+    return calendar.sort("trade_date")
 
 
 def _validate_statuses(

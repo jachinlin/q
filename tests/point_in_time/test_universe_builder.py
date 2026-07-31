@@ -303,6 +303,85 @@ def test_non_trading_and_empty_universes_are_stably_sorted(tmp_path: Path) -> No
     assert empty.is_empty()
 
 
+def test_reversed_calendar_produces_the_same_historical_universe(
+    tmp_path: Path,
+) -> None:
+    """Repository row order must not change the selected 20-day evidence window."""
+    repository, snapshot_id = _universe_fixture(tmp_path)
+    frames = _frames(repository, snapshot_id)
+    earlier_days = [date(2024, 3, day) for day in range(4, 9)]
+    calendar = pl.concat(
+        [pl.DataFrame([_calendar_row(day) for day in earlier_days]), frames.calendar]
+    )
+    bars = pl.concat(
+        [
+            pl.DataFrame(
+                [_bar_row(_IDS["eligible"], day, 0.0) for day in earlier_days]
+            ),
+            frames.bars.filter(pl.col("instrument_id") == _IDS["eligible"]),
+        ]
+    )
+    instruments = frames.instruments.filter(pl.col("instrument_id") == _IDS["eligible"])
+    statuses = frames.statuses.filter(pl.col("instrument_id") == _IDS["eligible"])
+    forward = UniverseBuilder(
+        _AlternateRepository(instruments, calendar, statuses, bars)
+    ).build(
+        snapshot_id, _AS_OF, UniverseRules(min_listing_days=3, min_avg_amount_20d=180.0)
+    )
+    reversed_ = UniverseBuilder(
+        _AlternateRepository(instruments, calendar.reverse(), statuses, bars)
+    ).build(
+        snapshot_id, _AS_OF, UniverseRules(min_listing_days=3, min_avg_amount_20d=180.0)
+    )
+
+    assert reversed_.rows() == forward.rows()
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("future", "unexpected trade_date"),
+        ("null", "invalid trade_date"),
+        ("string", "invalid trade_date"),
+    ],
+)
+def test_builder_fail_closes_invalid_alternate_calendar_rows(
+    tmp_path: Path, kind: str, message: str
+) -> None:
+    """Out-of-request or malformed calendar dates cannot silently redefine history."""
+    repository, snapshot_id = _universe_fixture(tmp_path)
+    frames = _frames(repository, snapshot_id)
+    calendar = frames.calendar
+    if kind == "future":
+        calendar = pl.concat(
+            [calendar, pl.DataFrame([_calendar_row(_AS_OF + timedelta(days=1))])]
+        )
+    elif kind == "null":
+        calendar = pl.concat(
+            [
+                calendar,
+                calendar.head(1).with_columns(
+                    pl.lit(None).cast(pl.Date).alias("trade_date")
+                ),
+            ]
+        )
+    elif kind == "string":
+        calendar = calendar.with_columns(pl.col("trade_date").cast(pl.String))
+    else:
+        raise AssertionError(f"unknown calendar corruption: {kind}")
+
+    with pytest.raises(ValueError, match="UNIVERSE_INPUT_INVALID: " + message):
+        UniverseBuilder(
+            _AlternateRepository(
+                frames.instruments,
+                calendar,
+                frames.statuses,
+                frames.bars,
+                ignore_calendar_bounds=True,
+            )
+        ).build(snapshot_id, _AS_OF, UniverseRules())
+
+
 class _Frames:
     def __init__(
         self,
@@ -328,9 +407,11 @@ class _AlternateRepository:
         bars: pl.DataFrame,
         *,
         ignore_bar_bounds: bool = False,
+        ignore_calendar_bounds: bool = False,
     ) -> None:
         self._frames = _Frames(instruments, calendar, statuses, bars)
         self._ignore_bar_bounds = ignore_bar_bounds
+        self._ignore_calendar_bounds = ignore_calendar_bounds
 
     def instruments(self, snapshot_id: SnapshotId) -> pl.LazyFrame:
         return self._frames.instruments.lazy()
@@ -338,9 +419,10 @@ class _AlternateRepository:
     def trade_calendar(
         self, snapshot_id: SnapshotId, start: date, end: date
     ) -> pl.LazyFrame:
-        return self._frames.calendar.filter(
-            pl.col("trade_date").is_between(start, end)
-        ).lazy()
+        frame = self._frames.calendar
+        if not self._ignore_calendar_bounds:
+            frame = frame.filter(pl.col("trade_date").is_between(start, end))
+        return frame.lazy()
 
     def security_status(
         self,
