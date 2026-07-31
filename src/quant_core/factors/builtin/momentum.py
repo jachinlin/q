@@ -205,8 +205,44 @@ class Trend120dFactor(_MarketFactor):
         )
 
 
+class Momentum12020Factor(_MarketFactor):
+    """Adjusted return from t-120 through t-20, skipping recent sessions."""
+
+    def __init__(
+        self,
+        price_service: AdjustedBarService,
+        instruments: Sequence[InstrumentId],
+    ) -> None:
+        super().__init__(
+            price_service,
+            instruments,
+            FactorSpec(
+                factor_id="momentum_120_20_v1",
+                version=_VERSION,
+                frequency="daily",
+                lookback_sessions=120,
+                dependencies=(),
+                direction=1,
+                parameters={
+                    "adjustment_mode": AdjustmentMode.BACKWARD.value,
+                    "eligible_for_alpha": True,
+                    "formula": "close[t-20]/close[t-120]-1",
+                    "skip_recent_sessions": 20,
+                    "window_prices": 121,
+                },
+            ),
+            required_prices=121,
+            evaluator=_momentum_120_20_value,
+        )
+
+
 def _return_value(closes: Sequence[float]) -> float | None:
     value = closes[-1] / closes[0] - 1.0
+    return value if isfinite(value) else None
+
+
+def _momentum_120_20_value(closes: Sequence[float]) -> float | None:
+    value = closes[-21] / closes[0] - 1.0
     return value if isfinite(value) else None
 
 

@@ -180,7 +180,17 @@ def factor_table_content_hash(table: pa.Table) -> str:
 
 
 def _factor_table_ipc_bytes(table: pa.Table) -> bytes:
-    canonical = table.combine_chunks()
+    combined = table.combine_chunks()
+    # Arrow does not define bytes beneath null validity bits.  Parquet is free to
+    # rewrite those invisible bytes, so hash a logical reconstruction instead of
+    # allocator-dependent buffers.
+    canonical = pa.table(
+        [
+            pa.array(combined.column(index).to_pylist(), type=field.type)
+            for index, field in enumerate(combined.schema)
+        ],
+        schema=combined.schema,
+    )
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, canonical.schema) as writer:
         writer.write_table(canonical)

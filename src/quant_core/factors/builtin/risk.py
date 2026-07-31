@@ -46,6 +46,63 @@ class Volatility60dFactor(_MarketFactor):
         )
 
 
+class DownsideVolatility60dFactor(_MarketFactor):
+    """Annualized root-mean-square of negative log returns."""
+
+    def __init__(
+        self, price_service: AdjustedBarService, instruments: Sequence[InstrumentId]
+    ) -> None:
+        super().__init__(
+            price_service,
+            instruments,
+            FactorSpec(
+                factor_id="downside_volatility_60d_v1",
+                version=_VERSION,
+                frequency="daily",
+                lookback_sessions=60,
+                dependencies=(),
+                direction=-1,
+                parameters={
+                    "adjustment_mode": AdjustmentMode.BACKWARD.value,
+                    "annualization_sessions": 252,
+                    "eligible_for_alpha": True,
+                    "formula": "sqrt(mean(min(log_return,0)^2))*sqrt(252)",
+                    "window_prices": 61,
+                },
+            ),
+            required_prices=61,
+            evaluator=_downside_volatility_value,
+        )
+
+
+class MaxDrawdown120dFactor(_MarketFactor):
+    """Largest peak-to-later-close loss in the latest 120 prices."""
+
+    def __init__(
+        self, price_service: AdjustedBarService, instruments: Sequence[InstrumentId]
+    ) -> None:
+        super().__init__(
+            price_service,
+            instruments,
+            FactorSpec(
+                factor_id="max_drawdown_120d_v1",
+                version=_VERSION,
+                frequency="daily",
+                lookback_sessions=119,
+                dependencies=(),
+                direction=-1,
+                parameters={
+                    "adjustment_mode": AdjustmentMode.BACKWARD.value,
+                    "eligible_for_alpha": True,
+                    "formula": "max(1-close/running_peak)",
+                    "window_prices": 120,
+                },
+            ),
+            required_prices=120,
+            evaluator=_max_drawdown_value,
+        )
+
+
 def _volatility_value(closes: Sequence[float]) -> float | None:
     log_prices = [log(close) for close in closes]
     returns = [
@@ -56,3 +113,23 @@ def _volatility_value(closes: Sequence[float]) -> float | None:
     variance = sum((value - mean) ** 2 for value in returns) / (count - 1)
     result = sqrt(variance) * sqrt(252.0)
     return result if isfinite(result) else None
+
+
+def _downside_volatility_value(closes: Sequence[float]) -> float | None:
+    log_prices = [log(close) for close in closes]
+    returns = [
+        log_prices[index] - log_prices[index - 1] for index in range(1, len(log_prices))
+    ]
+    result = sqrt(sum(min(value, 0.0) ** 2 for value in returns) / len(returns)) * sqrt(
+        252.0
+    )
+    return result if isfinite(result) else None
+
+
+def _max_drawdown_value(closes: Sequence[float]) -> float | None:
+    peak = closes[0]
+    drawdown = 0.0
+    for close in closes:
+        peak = max(peak, close)
+        drawdown = max(drawdown, 1.0 - close / peak)
+    return drawdown if isfinite(drawdown) else None
