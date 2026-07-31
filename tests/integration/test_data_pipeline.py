@@ -336,6 +336,23 @@ class FailOnceMapper:
         return self._delegate.normalize(raw_partition)
 
 
+class FailAfterFirstRawSource(OfflineBaoStockSource):
+    """Fail one Raw attempt after publication and timestamp retries from a clock."""
+
+    def __init__(self, clock: Callable[[], datetime]) -> None:
+        super().__init__()
+        self._clock = clock
+        self.attempts = 0
+
+    def fetch_range(self, start: date, end: date) -> Iterable[RawBatch]:
+        self.attempts += 1
+        attempt = self.attempts
+        for batch in super().fetch_range(start, end):
+            yield replace(batch, retrieved_at=self._clock())
+            if attempt == 1:
+                raise RuntimeError("simulated Raw collection crash")
+
+
 def make_pipeline(
     tmp_path: Path,
     source: OfflineBaoStockSource,
@@ -453,6 +470,36 @@ def test_pipeline_recovers_after_curate_failure_without_calling_source_again(
 
     assert isinstance(recovered.snapshot_id, SnapshotId)
     assert source.fetch_calls == 1
+
+
+def test_pipeline_recovers_same_run_after_partial_raw_publish_and_clock_advance(
+    tmp_path: Path,
+) -> None:
+    """A missing Raw checkpoint must not make a stable request conflict on retry."""
+    now = [datetime(2026, 1, 6, 23, 59, tzinfo=UTC)]
+    clock = lambda: now[0]
+    source = FailAfterFirstRawSource(clock)
+    pipeline, repository = make_pipeline(tmp_path, source, clock=clock)
+
+    with pytest.raises(RuntimeError, match="simulated Raw collection crash"):
+        pipeline.bootstrap()
+    now[0] = datetime(2026, 1, 7, 0, 1, tzinfo=UTC)
+
+    recovered = pipeline.bootstrap()
+
+    checkpoint = repository.get_pipeline_stage(
+        recovered.run_id, PipelineStageName.INGEST_RAW
+    )
+    assert isinstance(checkpoint.output, Mapping)
+    partitions = checkpoint.output["partitions"]
+    assert isinstance(partitions, tuple)
+    first = partitions[0]
+    assert isinstance(first, Mapping)
+    assert first["retrieved_at"] == "2026-01-06T23:59:00+00:00"
+    assert first["ingest_date"] == "2026-01-06"
+    assert isinstance(recovered.snapshot_id, SnapshotId)
+    assert source.fetch_calls == 2
+    assert len(list((tmp_path / "data" / "raw").rglob("*.parquet"))) == 3
 
 
 def test_pipeline_rejects_tampered_raw_checkpoint_without_refetching(

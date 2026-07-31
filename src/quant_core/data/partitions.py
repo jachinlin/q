@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from collections.abc import Mapping
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
@@ -161,10 +161,11 @@ class RawPartitionStore:
         table = self._table_from_batch(batch)
         content_hash = self._content_hash(table)
         schema_fingerprint = self._schema_fingerprint(table.schema)
+        dataset_dir = (
+            self._raw_root / f"provider={batch.provider}" / f"dataset={batch.dataset}"
+        )
         partition_dir = (
-            self._raw_root
-            / f"provider={batch.provider}"
-            / f"dataset={batch.dataset}"
+            dataset_dir
             / f"ingest_date={batch.retrieved_at.astimezone(UTC).date().isoformat()}"
             / f"run_id={run_id}"
         )
@@ -182,17 +183,25 @@ class RawPartitionStore:
             schema_fingerprint=schema_fingerprint,
             row_count=table.num_rows,
         )
-        manifest = self._manifest(published)
-
-        validate_storage_path(self._raw_root, partition_dir)
-        partition_dir.mkdir(parents=True, exist_ok=True)
-        validate_storage_path(self._raw_root, partition_dir)
-        lock_path = partition_dir / f".{request_hash}.lock"
+        validate_storage_path(self._raw_root, dataset_dir)
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        validate_storage_path(self._raw_root, dataset_dir)
+        lock_path = self._identity_lock_path(dataset_dir, run_id, request_hash)
         validate_storage_path(self._raw_root, lock_path)
         with _PartitionLock(lock_path):
+            existing = self._find_existing_partition(published, dataset_dir, run_id)
+            if existing is not None:
+                return existing
+            validate_storage_path(self._raw_root, partition_dir)
+            partition_dir.mkdir(parents=True, exist_ok=True)
             validate_storage_path(self._raw_root, partition_dir)
             if data_path.exists() or manifest_path.exists():
-                return self._existing_or_conflict(published, manifest)
+                return self._existing_or_conflict(
+                    published,
+                    data_path=data_path,
+                    manifest_path=manifest_path,
+                    run_id=run_id,
+                )
 
             data_temp = partition_dir / f".{uuid.uuid4().hex}.parquet.tmp"
             manifest_temp = partition_dir / f".{uuid.uuid4().hex}.manifest.tmp"
@@ -211,7 +220,7 @@ class RawPartitionStore:
                 )
                 manifest_temp.write_text(
                     json.dumps(
-                        manifest,
+                        self._manifest(published),
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
@@ -285,24 +294,89 @@ class RawPartitionStore:
         ):
             raise ValueError("written Parquet file did not pass integrity verification")
 
+    @staticmethod
+    def _identity_lock_path(dataset_dir: Path, run_id: str, request_hash: str) -> Path:
+        identity = hashlib.sha256(f"{run_id}\0{request_hash}".encode()).hexdigest()
+        return dataset_dir / f".{identity}.lock"
+
+    def _find_existing_partition(
+        self,
+        published: PublishedPartition,
+        dataset_dir: Path,
+        run_id: str,
+    ) -> PublishedPartition | None:
+        manifest_name = f"{published.request_hash}.manifest.json"
+        data_name = f"{published.request_hash}.parquet"
+        directories = {
+            path.parent
+            for pattern in (
+                f"ingest_date=*/run_id={run_id}/{manifest_name}",
+                f"ingest_date=*/run_id={run_id}/{data_name}",
+            )
+            for path in dataset_dir.glob(pattern)
+        }
+        if not directories:
+            return None
+        if len(directories) != 1:
+            self._raise_conflict(
+                published, "request identity has multiple published partitions"
+            )
+        directory = directories.pop()
+        return self._existing_or_conflict(
+            published,
+            data_path=directory / data_name,
+            manifest_path=directory / manifest_name,
+            run_id=run_id,
+        )
+
     def _existing_or_conflict(
         self,
         published: PublishedPartition,
-        expected_manifest: Mapping[str, object],
+        *,
+        data_path: Path,
+        manifest_path: Path,
+        run_id: str,
     ) -> PublishedPartition:
-        validate_storage_path(self._raw_root, published.data_path)
-        validate_storage_path(self._raw_root, published.manifest_path)
-        if not published.data_path.is_file() or not published.manifest_path.is_file():
+        validate_storage_path(self._raw_root, data_path)
+        validate_storage_path(self._raw_root, manifest_path)
+        if not data_path.is_file() or not manifest_path.is_file():
             self._raise_conflict(published, "partition is incomplete")
         try:
-            manifest = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             self._raise_conflict(published, "manifest is unreadable", error)
-        if manifest != expected_manifest:
+        immutable_manifest = self._manifest(published)
+        immutable_manifest.pop("retrieved_at")
+        if (
+            not isinstance(manifest, Mapping)
+            or set(manifest) != {*immutable_manifest, "retrieved_at"}
+            or any(
+                manifest.get(key) != value for key, value in immutable_manifest.items()
+            )
+        ):
             self._raise_conflict(published, "content or metadata differs")
         try:
+            retrieved_value = manifest["retrieved_at"]
+            if not isinstance(retrieved_value, str):
+                raise TypeError("retrieved_at is not a string")
+            retrieved_at = datetime.fromisoformat(retrieved_value)
+            if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+                raise ValueError("retrieved_at is not timezone-aware")
+            retrieved_at = retrieved_at.astimezone(UTC)
+        except (KeyError, TypeError, ValueError) as error:
+            self._raise_conflict(published, "retrieval metadata is invalid", error)
+        if (
+            data_path.parent != manifest_path.parent
+            or manifest_path.parent.name != f"run_id={run_id}"
+            or manifest_path.parent.parent.name
+            != f"ingest_date={retrieved_at.date().isoformat()}"
+        ):
+            self._raise_conflict(
+                published, "retrieval metadata does not match its path"
+            )
+        try:
             self._verify_data_file(
-                published.data_path,
+                data_path,
                 content_hash=published.content_hash,
                 schema_fingerprint=published.schema_fingerprint,
                 row_count=published.row_count,
@@ -311,7 +385,18 @@ class RawPartitionStore:
             self._raise_conflict(
                 published, "published data fails integrity checks", error
             )
-        return published
+        return PublishedPartition(
+            provider=published.provider,
+            dataset=published.dataset,
+            request=published.request,
+            retrieved_at=retrieved_at,
+            data_path=data_path,
+            manifest_path=manifest_path,
+            request_hash=published.request_hash,
+            content_hash=published.content_hash,
+            schema_fingerprint=published.schema_fingerprint,
+            row_count=published.row_count,
+        )
 
     @staticmethod
     def _manifest(published: PublishedPartition) -> dict[str, object]:

@@ -62,13 +62,17 @@ def _publish_after_signal(
     completed.set()
 
 
-def make_batch(*, close: float = 10.25) -> RawBatch:
+def make_batch(
+    *,
+    close: float = 10.25,
+    retrieved_at: datetime = datetime(2026, 7, 31, 9, 30, tzinfo=UTC),
+) -> RawBatch:
     """Build a hand-checked raw daily-bar batch for filesystem integration tests."""
     return RawBatch(
         provider="example",
         dataset="daily_bars",
         request={"end": "2026-07-31", "start": "2026-07-31"},
-        retrieved_at=datetime(2026, 7, 31, 9, 30, tzinfo=UTC),
+        retrieved_at=retrieved_at,
         schema=("symbol", "trade_date", "close"),
         rows=(
             {
@@ -175,6 +179,56 @@ def test_republishing_identical_partition_is_idempotent(tmp_path: Path) -> None:
     assert second == first
 
 
+def test_republishing_identical_request_reuses_manifest_retrieval_time(
+    tmp_path: Path,
+) -> None:
+    """A retry after the clock advances must reuse the original Raw evidence."""
+    store = RawPartitionStore(tmp_path)
+    first = store.publish(make_batch(), run_id="run-1")
+
+    second = store.publish(
+        make_batch(retrieved_at=datetime(2026, 8, 1, 9, 30, tzinfo=UTC)),
+        run_id="run-1",
+    )
+
+    assert second == first
+    assert second.retrieved_at == datetime(2026, 7, 31, 9, 30, tzinfo=UTC)
+    assert len(list(tmp_path.rglob("*.parquet"))) == 1
+    assert len(list(tmp_path.rglob("*.manifest.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("provider", "other"),
+        ("dataset", "other"),
+        ("request_hash", "0" * 64),
+        ("content_hash", "1" * 64),
+        ("row_count", 2),
+        ("schema_fingerprint", "2" * 64),
+    ],
+)
+def test_republishing_with_later_timestamp_still_rejects_changed_manifest_metadata(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    """Only retrieved_at may differ when recovering an existing Raw partition."""
+    store = RawPartitionStore(tmp_path)
+    first = store.publish(make_batch(), run_id="run-1")
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = replacement
+    first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(QuantError) as error:
+        store.publish(
+            make_batch(retrieved_at=datetime(2026, 8, 1, 9, 30, tzinfo=UTC)),
+            run_id="run-1",
+        )
+
+    assert error.value.detail.code == "raw_partition_conflict"
+
+
 def test_republishing_partition_with_different_content_is_a_structured_conflict(
     tmp_path: Path,
 ) -> None:
@@ -183,7 +237,13 @@ def test_republishing_partition_with_different_content_is_a_structured_conflict(
     store.publish(make_batch(close=10.25), run_id="run-1")
 
     with pytest.raises(QuantError, match="already exists") as error:
-        store.publish(make_batch(close=11.25), run_id="run-1")
+        store.publish(
+            make_batch(
+                close=11.25,
+                retrieved_at=datetime(2026, 8, 1, 9, 30, tzinfo=UTC),
+            ),
+            run_id="run-1",
+        )
 
     assert error.value.detail.code == "raw_partition_conflict"
 
@@ -331,15 +391,11 @@ def test_partition_lock_serializes_a_competing_publisher(tmp_path: Path) -> None
     request_hash = hashlib.sha256(
         b'{"end":"2026-07-31","start":"2026-07-31"}'
     ).hexdigest()
-    partition_dir = (
-        tmp_path
-        / "provider=example"
-        / "dataset=daily_bars"
-        / "ingest_date=2026-07-31"
-        / "run_id=run-1"
+    dataset_dir = tmp_path / "provider=example" / "dataset=daily_bars"
+    dataset_dir.mkdir(parents=True)
+    lock_path = RawPartitionStore._identity_lock_path(
+        dataset_dir, "run-1", request_hash
     )
-    partition_dir.mkdir(parents=True)
-    lock_path = partition_dir / f".{request_hash}.lock"
     context = multiprocessing.get_context("spawn")
     acquired = context.Event()
     release = context.Event()
@@ -393,15 +449,11 @@ def test_publish_recovers_an_ownerless_lock_left_by_interrupted_install(
     request_hash = hashlib.sha256(
         b'{"end":"2026-07-31","start":"2026-07-31"}'
     ).hexdigest()
-    partition_dir = (
-        tmp_path
-        / "provider=example"
-        / "dataset=daily_bars"
-        / "ingest_date=2026-07-31"
-        / "run_id=run-1"
+    dataset_dir = tmp_path / "provider=example" / "dataset=daily_bars"
+    dataset_dir.mkdir(parents=True)
+    lock_path = RawPartitionStore._identity_lock_path(
+        dataset_dir, "run-1", request_hash
     )
-    partition_dir.mkdir(parents=True)
-    lock_path = partition_dir / f".{request_hash}.lock"
     lock_path.mkdir()
     published = RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1")
 
@@ -417,14 +469,10 @@ def test_partial_owner_write_leaves_no_lock_and_next_publish_recovers(
     request_hash = hashlib.sha256(
         b'{"end":"2026-07-31","start":"2026-07-31"}'
     ).hexdigest()
-    partition_dir = (
-        tmp_path
-        / "provider=example"
-        / "dataset=daily_bars"
-        / "ingest_date=2026-07-31"
-        / "run_id=run-1"
+    dataset_dir = tmp_path / "provider=example" / "dataset=daily_bars"
+    lock_path = RawPartitionStore._identity_lock_path(
+        dataset_dir, "run-1", request_hash
     )
-    lock_path = partition_dir / f".{request_hash}.lock"
     write_text = Path.write_text
 
     def write_partially_then_fail(path: Path, text: str, **kwargs: object) -> int:
