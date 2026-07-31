@@ -31,6 +31,13 @@ class ResearchDataRepository(Protocol):
         end: date,
     ) -> pl.LazyFrame: ...
 
+    def corporate_actions_as_of(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId] | None,
+        as_of: date,
+    ) -> pl.LazyFrame: ...
+
     def financials_as_of(
         self,
         snapshot_id: SnapshotId,
@@ -137,6 +144,29 @@ class SnapshotResearchRepository:
             snapshot_id,
             DatasetKind.FINANCIAL_OBSERVATION,
             query,
+            parameters,
+        )
+
+    def corporate_actions_as_of(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId] | None,
+        as_of: date,
+    ) -> pl.LazyFrame:
+        """Return only PIT-usable corporate actions known by Shanghai close."""
+        predicates, parameters = _instrument_predicate(instruments)
+        predicates.extend(
+            (
+                "pit_usable = TRUE",
+                "available_at IS NOT NULL",
+                "available_at <= ?",
+            )
+        )
+        parameters.append(_shanghai_close_utc(as_of))
+        return self._read(
+            snapshot_id,
+            DatasetKind.CORPORATE_ACTION,
+            " AND ".join(predicates),
             parameters,
         )
 
