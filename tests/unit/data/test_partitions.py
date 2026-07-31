@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import subprocess
 import threading
+import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty
@@ -61,6 +62,23 @@ def _publish_after_signal(
     RawPartitionStore(Path(raw_root)).publish(make_batch(close=11.25), run_id="run-1")
     result.put("published")
     completed.set()
+
+
+def _hold_acquisition_guard_until_crash(
+    lock_path: str,
+    acquired: multiprocessing.synchronize.Event,
+    crash: multiprocessing.synchronize.Event,
+) -> None:
+    """Hold the OS guard, then exit without Python cleanup to model a crash."""
+    from quant_core.data import partitions
+
+    guard = partitions._AcquisitionGuard(
+        Path(lock_path), deadline=time.monotonic() + 10, poll_seconds=0.01
+    )
+    guard.__enter__()
+    acquired.set()
+    assert crash.wait(timeout=10)
+    os._exit(0)
 
 
 def make_batch(
@@ -336,7 +354,9 @@ def test_publish_removes_temporary_files_when_write_fails_after_creating_data(
     with pytest.raises(OSError, match="injected write failure"):
         RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1")
 
-    assert list(tmp_path.rglob("*.*")) == []
+    remaining = list(tmp_path.rglob("*.*"))
+    assert len(remaining) == 1
+    assert remaining[0].name.endswith(".lock.guard")
 
 
 def test_publish_removes_installed_data_when_manifest_install_fails(
@@ -356,7 +376,9 @@ def test_publish_removes_installed_data_when_manifest_install_fails(
     with pytest.raises(OSError, match="injected manifest install failure"):
         RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1")
 
-    assert list(tmp_path.rglob("*.*")) == []
+    remaining = list(tmp_path.rglob("*.*"))
+    assert len(remaining) == 1
+    assert remaining[0].name.endswith(".lock.guard")
 
 
 def test_republishing_with_invalid_utf8_manifest_is_a_structured_conflict(
@@ -426,6 +448,37 @@ def test_partition_lock_serializes_a_competing_publisher(tmp_path: Path) -> None
     assert result.get_nowait() == "published"
     with pytest.raises(Empty):
         result.get_nowait()
+
+
+def test_partition_guard_is_released_automatically_when_a_process_crashes(
+    tmp_path: Path,
+) -> None:
+    """An abrupt process exit releases the OS guard without recursive recovery."""
+    from quant_core.data import partitions
+
+    lock_path = tmp_path / ".partition.lock"
+    context = multiprocessing.get_context("spawn")
+    acquired = context.Event()
+    crash = context.Event()
+    holder = context.Process(
+        target=_hold_acquisition_guard_until_crash,
+        args=(str(lock_path), acquired, crash),
+    )
+    holder.start()
+    assert acquired.wait(timeout=10)
+
+    with (
+        pytest.raises(TimeoutError),
+        partitions._PartitionLock(lock_path, timeout_seconds=0.05, poll_seconds=0.005),
+    ):
+        pytest.fail("fixed lock path changed while another process held the guard")
+
+    crash.set()
+    holder.join(timeout=10)
+    assert holder.exitcode == 0
+
+    with partitions._PartitionLock(lock_path, timeout_seconds=1.0):
+        assert (lock_path / "owner.json").is_file()
 
 
 def test_partition_lock_reclaims_a_dead_owner_lock(tmp_path: Path) -> None:
@@ -519,6 +572,122 @@ def test_partition_lock_release_cannot_remove_a_later_owners_directory(
         allow_cleanup.set()
         contender.__exit__(None, None, None)
         release_thread.join(timeout=5)
+
+
+def _assert_stale_reclaim_does_not_displace_later_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_bytes: bytes | None,
+) -> None:
+    """Freeze the stale-observe/detach gap and protect the replacement owner."""
+    from quant_core.data import partitions
+
+    lock_path = tmp_path / ".partition.lock"
+    lock_path.mkdir()
+    if owner_bytes is not None:
+        (lock_path / "owner.json").write_bytes(owner_bytes)
+    os.utime(lock_path, (0, 0))
+
+    stale_observed = threading.Event()
+    allow_first_detach = threading.Event()
+    replacement_acquired = threading.Event()
+    release_replacement = threading.Event()
+    first_errors: list[Exception] = []
+    replacement_errors: list[Exception] = []
+    rename = Path.rename
+
+    def pause_first_stale_detach(path: Path, target: Path) -> Path:
+        target_path = Path(target)
+        if (
+            threading.current_thread().name == "first-reclaimer"
+            and path == lock_path
+            and ".stale-" in target_path.name
+        ):
+            stale_observed.set()
+            assert allow_first_detach.wait(timeout=5)
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", pause_first_stale_detach)
+
+    def reclaim_first_observation() -> None:
+        try:
+            partitions._PartitionLock(
+                lock_path, stale_after_seconds=0.0
+            )._reclaim_stale_lock("a" * 32)
+        except (AssertionError, OSError, RuntimeError) as error:
+            first_errors.append(error)
+
+    def replace_old_lock_and_hold_new_owner() -> None:
+        try:
+            partitions._PartitionLock(
+                lock_path, stale_after_seconds=0.0
+            )._reclaim_stale_lock("b" * 32)
+            with partitions._PartitionLock(lock_path, timeout_seconds=2.0):
+                replacement_acquired.set()
+                assert release_replacement.wait(timeout=5)
+        except (AssertionError, OSError, RuntimeError) as error:
+            replacement_errors.append(error)
+
+    first_thread = threading.Thread(
+        target=reclaim_first_observation, name="first-reclaimer", daemon=True
+    )
+    replacement_thread = threading.Thread(
+        target=replace_old_lock_and_hold_new_owner,
+        name="replacement-owner",
+        daemon=True,
+    )
+    first_thread.start()
+    assert stale_observed.wait(timeout=5)
+    replacement_thread.start()
+
+    # The vulnerable implementation lets the replacement acquire here. A guarded
+    # implementation holds it until the first stale transition has completed.
+    replacement_acquired.wait(timeout=0.2)
+    allow_first_detach.set()
+    assert replacement_acquired.wait(timeout=5)
+    first_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+
+    try:
+        assert first_errors == []
+        assert (lock_path / "owner.json").is_file()
+        with (
+            pytest.raises(TimeoutError),
+            partitions._PartitionLock(
+                lock_path,
+                timeout_seconds=0.05,
+                poll_seconds=0.005,
+                stale_after_seconds=0.0,
+            ),
+        ):
+            pytest.fail("a third owner acquired while the replacement held the lock")
+    finally:
+        release_replacement.set()
+        replacement_thread.join(timeout=5)
+
+    assert not replacement_thread.is_alive()
+    assert replacement_errors == []
+
+
+@pytest.mark.parametrize("owner_bytes", [None, b"{"])
+def test_stale_reclaim_does_not_apply_invalid_owner_observation_to_a_later_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_bytes: bytes | None,
+) -> None:
+    """An ownerless or malformed stale snapshot cannot detach a later owner."""
+    _assert_stale_reclaim_does_not_displace_later_owner(
+        tmp_path, monkeypatch, owner_bytes
+    )
+
+
+def test_stale_reclaim_does_not_apply_dead_token_observation_to_a_later_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale dead-token snapshot cannot detach a later live-token owner."""
+    owner = json.dumps({"pid": 99999999, "token": "0" * 32}).encode()
+    _assert_stale_reclaim_does_not_displace_later_owner(tmp_path, monkeypatch, owner)
 
 
 def test_publish_recovers_a_stale_ownerless_lock_left_by_interrupted_install(

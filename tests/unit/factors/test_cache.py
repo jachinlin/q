@@ -117,6 +117,13 @@ def entry_paths(cache: FeatureCache, artifact: FactorArtifact) -> tuple[Path, Pa
     return entry / "data.parquet", entry / "manifest.json"
 
 
+def assert_only_persistent_guard_files(root: Path) -> None:
+    remaining = list(root.iterdir())
+    assert len(remaining) == 1
+    assert remaining[0].is_file()
+    assert remaining[0].name.endswith(".lock.guard")
+
+
 def test_cache_key_is_canonical_across_mapping_order() -> None:
     """Equivalent parameter and dependency mappings must share one address."""
     first = make_spec(
@@ -444,7 +451,7 @@ def test_concurrent_same_key_same_content_publishers_are_idempotent(
 
     assert artifacts[0] == artifacts[1]
     assert artifacts[0].lazy_frame().collect().height == 2
-    assert sorted(path.name for path in cache.root.iterdir()) == [
+    assert sorted(path.name for path in cache.root.iterdir() if path.is_dir()) == [
         artifacts[0].cache_key
     ]
 
@@ -495,7 +502,7 @@ def test_publish_failure_never_leaves_a_visible_or_temporary_entry(
     with pytest.raises(OSError, match="injected feature write failure"):
         publish(FeatureCache(tmp_path))
 
-    assert list(tmp_path.iterdir()) == []
+    assert_only_persistent_guard_files(tmp_path)
 
 
 def test_directory_flush_failure_before_rename_leaves_no_visible_entry(
@@ -514,7 +521,7 @@ def test_directory_flush_failure_before_rename_leaves_no_visible_entry(
     with pytest.raises(OSError, match="injected directory flush failure"):
         publish(FeatureCache(tmp_path))
 
-    assert list(tmp_path.iterdir()) == []
+    assert_only_persistent_guard_files(tmp_path)
 
 
 def test_publish_recovers_stale_same_key_staging_after_dead_owner(
@@ -535,7 +542,7 @@ def test_publish_recovers_stale_same_key_staging_after_dead_owner(
 
     assert artifact.cache_key == key
     assert not stale.exists()
-    assert sorted(path.name for path in tmp_path.iterdir()) == [key]
+    assert sorted(path.name for path in tmp_path.iterdir() if path.is_dir()) == [key]
 
 
 def test_retry_flushes_a_complete_entry_after_post_rename_flush_failure(
