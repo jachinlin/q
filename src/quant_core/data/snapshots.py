@@ -28,6 +28,8 @@ from quant_core.persistence.repositories import (
 )
 
 _TEMP_MANIFEST = re.compile(r"\.[0-9a-f]{32}\.manifest\.tmp\Z")
+SNAPSHOT_MANIFEST_FORMAT_VERSION = 1
+SNAPSHOT_MANIFEST_VERSION = "snapshot-manifest-v1"
 
 
 class SnapshotPublisher:
@@ -90,7 +92,7 @@ class SnapshotPublisher:
                 }
                 for dataset, record in sorted(versions.items())
             },
-            "format_version": 1,
+            "format_version": SNAPSHOT_MANIFEST_FORMAT_VERSION,
             "quality_run_id": str(quality_run_id),
             "snapshot_id": str(identifier),
             "status": SnapshotStatus.PUBLISHED.value,
@@ -181,6 +183,33 @@ class SnapshotPublisher:
                 for temporary_path in self._temporary_manifests(directory, identifier):
                     temporary_path.unlink(missing_ok=True)
 
+    def verify_published(
+        self,
+        identifier: SnapshotId,
+        dataset_versions: Mapping[str, DatasetVersionId],
+        quality_run_id: QualityRunId,
+    ) -> SnapshotRecord:
+        """Revalidate a published snapshot and its complete quality-gated scope."""
+        snapshot = self._repository.get_snapshot(identifier)
+        if snapshot.quality_run_id != quality_run_id or dict(
+            snapshot.dataset_versions
+        ) != dict(dataset_versions):
+            _raise_snapshot_error(
+                "SNAP_MANIFEST_MISMATCH",
+                Severity.FATAL,
+                "published snapshot does not match the checkpoint scope",
+                {"snapshot_id": str(identifier)},
+            )
+        quality = self._repository.get_quality_run(quality_run_id)
+        _validate_quality_gate(
+            dataset_versions,
+            quality.status,
+            quality.dataset_versions,
+            quality.issues,
+        )
+        self._verify_published(snapshot)
+        return snapshot
+
     def _recover_draft(self, snapshot: SnapshotRecord) -> None:
         directory, final_path = self._snapshot_paths(
             snapshot.id, snapshot.manifest_path
@@ -264,7 +293,7 @@ class SnapshotPublisher:
         if not isinstance(datasets, dict) or canonical != manifest_bytes:
             return False
         if (
-            manifest.get("format_version") != 1
+            manifest.get("format_version") != SNAPSHOT_MANIFEST_FORMAT_VERSION
             or manifest.get("snapshot_id") != str(snapshot.id)
             or manifest.get("quality_run_id") != str(snapshot.quality_run_id)
             or manifest.get("status") != SnapshotStatus.PUBLISHED.value

@@ -54,12 +54,19 @@ class TradingCalendar:
     def next_session(self, trade_date: date) -> date: ...
     def sessions(self, start: date, end: date) -> tuple[date, ...]: ...
 
+
 class MarketRuleBook(Protocol):
     @property
     def version(self) -> str: ...
     def lot_size(self, instrument: InstrumentId, trade_date: date) -> int: ...
     def earliest_sell_date(self, buy_date: date, instrument: InstrumentId) -> date: ...
-    def price_limits(self, instrument: InstrumentId, trade_date: date, prev_close: float, status: SecurityStatus) -> PriceBand | None: ...
+    def price_limits(
+        self,
+        instrument: InstrumentId,
+        trade_date: date,
+        prev_close: float,
+        status: SecurityStatus,
+    ) -> PriceBand | None: ...
     def fees(self, fill: SimulatedFill) -> FeeBreakdown: ...
 ```
 
@@ -104,6 +111,7 @@ class TargetPosition:
     score: float | None
     reason_code: str
 
+
 @dataclass(frozen=True)
 class TargetPortfolio:
     signal_date: date
@@ -111,8 +119,15 @@ class TargetPortfolio:
     positions: tuple[TargetPosition, ...]
     cash_weight: float
 
+
 class PortfolioConstructor:
-    def construct(self, candidates: pl.DataFrame, constraints: PortfolioConstraints, signal_date: date, execute_date: date) -> TargetPortfolio: ...
+    def construct(
+        self,
+        candidates: pl.DataFrame,
+        constraints: PortfolioConstraints,
+        signal_date: date,
+        execute_date: date,
+    ) -> TargetPortfolio: ...
 ```
 
 - [ ] **步骤 1：先写约束优先级和不可行测试**
@@ -147,7 +162,14 @@ git commit -m "feat: construct constrained target portfolios"
 
 ```python
 class ExecutionModel:
-    def execute(self, intents: Sequence[OrderIntent], market: MarketSlice, account: AccountView, rulebook: MarketRuleBook, config: ExecutionConfig) -> ExecutionBatch: ...
+    def execute(
+        self,
+        intents: Sequence[OrderIntent],
+        market: MarketSlice,
+        account: AccountView,
+        rulebook: MarketRuleBook,
+        config: ExecutionConfig,
+    ) -> ExecutionBatch: ...
 ```
 
 - [ ] **步骤 1：写成交原因码真值表**
@@ -182,9 +204,13 @@ git commit -m "feat: simulate A-share daily executions"
 
 ```python
 class PortfolioAccount:
-    def begin_session(self, trade_date: date, actions: Sequence[CorporateAction]) -> None: ...
+    def begin_session(
+        self, trade_date: date, actions: Sequence[CorporateAction]
+    ) -> None: ...
     def apply(self, execution: ExecutionBatch) -> None: ...
-    def mark_to_market(self, trade_date: date, closes: Mapping[InstrumentId, float]) -> AccountSnapshot: ...
+    def mark_to_market(
+        self, trade_date: date, closes: Mapping[InstrumentId, float]
+    ) -> AccountSnapshot: ...
 ```
 
 - [ ] **步骤 1：写复式不变量与 T+1 测试**
@@ -232,8 +258,14 @@ class BacktestRequest:
     rulebook_version: str
     execution_config: ExecutionConfig
 
+
 class BacktestEngine:
-    def run(self, request: BacktestRequest, progress: ProgressSink, cancellation: CancellationToken) -> BacktestResult: ...
+    def run(
+        self,
+        request: BacktestRequest,
+        progress: ProgressSink,
+        cancellation: CancellationToken,
+    ) -> BacktestResult: ...
 ```
 
 - [ ] **步骤 1：写 T/T+1 时间线失败测试**
@@ -277,8 +309,11 @@ git commit -m "feat: run reproducible daily backtests"
 class Strategy(Protocol):
     strategy_id: str
     version: str
+
     def validate(self, ctx: StrategyContext) -> list[ValidationIssue]: ...
-    def generate_targets(self, ctx: StrategyContext, rebalance_date: date, current: PortfolioState) -> TargetPortfolio: ...
+    def generate_targets(
+        self, ctx: StrategyContext, rebalance_date: date, current: PortfolioState
+    ) -> TargetPortfolio: ...
 ```
 
 - [ ] **步骤 1：写 ETF 策略测试**

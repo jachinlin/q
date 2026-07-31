@@ -45,9 +45,26 @@
 
 ```python
 class ResearchDataRepository(Protocol):
-    def bars(self, snapshot_id: SnapshotId, instruments: Sequence[InstrumentId], start: date, end: date) -> pl.LazyFrame: ...
-    def financials_as_of(self, snapshot_id: SnapshotId, field_ids: Sequence[str], as_of: date, instruments: Sequence[InstrumentId] | None = None) -> pl.LazyFrame: ...
-    def security_status(self, snapshot_id: SnapshotId, as_of: date, instruments: Sequence[InstrumentId] | None = None) -> pl.LazyFrame: ...
+    def bars(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame: ...
+    def financials_as_of(
+        self,
+        snapshot_id: SnapshotId,
+        field_ids: Sequence[str],
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame: ...
+    def security_status(
+        self,
+        snapshot_id: SnapshotId,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame: ...
 ```
 
 - [ ] **步骤 1：先写快照隔离和可用时间失败测试**
@@ -84,8 +101,17 @@ class AdjustmentMode(StrEnum):
     RAW = "RAW"
     BACKWARD = "BACKWARD"
 
+
 class PriceAdjustmentService:
-    def bars(self, snapshot_id: SnapshotId, instruments: Sequence[InstrumentId], start: date, end: date, mode: AdjustmentMode, as_of: date) -> pl.LazyFrame: ...
+    def bars(
+        self,
+        snapshot_id: SnapshotId,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+        mode: AdjustmentMode,
+        as_of: date,
+    ) -> pl.LazyFrame: ...
 ```
 
 - [ ] **步骤 1：先写除权除息和未来事件测试**
@@ -123,13 +149,18 @@ git commit -m "feat: add point-in-time price adjustments"
 @dataclass(frozen=True)
 class UniverseRules:
     min_listing_days: int = 120
-    allowed_boards: frozenset[Board] = frozenset({Board.MAIN, Board.CHINEXT, Board.STAR})
+    allowed_boards: frozenset[Board] = frozenset(
+        {Board.MAIN, Board.CHINEXT, Board.STAR}
+    )
     exclude_st: bool = True
     exclude_suspended: bool = True
     min_avg_amount_20d: float | None = None
 
+
 class UniverseBuilder:
-    def build(self, snapshot_id: SnapshotId, as_of: date, rules: UniverseRules) -> pl.DataFrame: ...
+    def build(
+        self, snapshot_id: SnapshotId, as_of: date, rules: UniverseRules
+    ) -> pl.DataFrame: ...
 ```
 
 - [ ] **步骤 1：写完整规则真值表**
@@ -176,13 +207,17 @@ class FactorSpec:
     direction: int
     parameters: Mapping[str, JsonValue]
 
+
 class Factor(Protocol):
     @property
     def spec(self) -> FactorSpec: ...
     def compute(self, ctx: FactorContext) -> pl.LazyFrame: ...
 
+
 class FactorEngine:
-    def compute(self, factor_ids: Sequence[str], ctx: FactorContext) -> Mapping[str, FactorArtifact]: ...
+    def compute(
+        self, factor_ids: Sequence[str], ctx: FactorContext
+    ) -> Mapping[str, FactorArtifact]: ...
 ```
 
 - [ ] **步骤 1：先写注册和缓存键测试**
@@ -215,9 +250,15 @@ git commit -m "feat: add versioned factor DAG and cache"
 **接口：**
 
 ```python
-def winsorize_mad(frame: pl.DataFrame, value_col: str, group_cols: Sequence[str], n_mad: float = 3.0) -> pl.DataFrame: ...
-def neutralize_wls(frame: pl.DataFrame, value_col: str, industry_col: str, size_col: str) -> pl.DataFrame: ...
-def zscore(frame: pl.DataFrame, value_col: str, group_cols: Sequence[str]) -> pl.DataFrame: ...
+def winsorize_mad(
+    frame: pl.DataFrame, value_col: str, group_cols: Sequence[str], n_mad: float = 3.0
+) -> pl.DataFrame: ...
+def neutralize_wls(
+    frame: pl.DataFrame, value_col: str, industry_col: str, size_col: str
+) -> pl.DataFrame: ...
+def zscore(
+    frame: pl.DataFrame, value_col: str, group_cols: Sequence[str]
+) -> pl.DataFrame: ...
 ```
 
 - [ ] **步骤 1：先写数值测试**

@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -16,7 +16,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import Engine, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.data.quality.models import (
@@ -68,12 +68,15 @@ class PipelineRunSpec:
     resolved_start: date
     resolved_end: date
     created_at: datetime
+    pipeline_fingerprint: str = "pipeline-v1"
 
     def __post_init__(self) -> None:
         if self.mode not in {"BOOTSTRAP", "UPDATE"}:
             raise ValueError("pipeline mode must be BOOTSTRAP or UPDATE")
         if not self.provider:
             raise ValueError("provider must not be empty")
+        if not self.pipeline_fingerprint:
+            raise ValueError("pipeline_fingerprint must not be empty")
         _validate_hash(self.request_hash, "request_hash")
         if (self.requested_start is None) != (self.requested_end is None):
             raise ValueError("requested dates must be supplied together")
@@ -95,6 +98,7 @@ class PipelineRunRecord:
     status: str
     created_at: datetime
     completed_at: datetime | None
+    pipeline_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +112,9 @@ class PipelineStageRecord:
     started_at: datetime
     completed_at: datetime | None
     error: FrozenJsonValue | None
+    owner_id: str | None
+    lease_expires_at: datetime | None
+    attempt: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +231,7 @@ class MetadataRepository:
                     mode=spec.mode,
                     provider=spec.provider,
                     request_hash=spec.request_hash,
+                    pipeline_fingerprint=spec.pipeline_fingerprint,
                     requested_start=_date_text(spec.requested_start),
                     requested_end=_date_text(spec.requested_end),
                     resolved_start=spec.resolved_start.isoformat(),
@@ -244,6 +252,7 @@ class MetadataRepository:
             expected = (
                 spec.mode,
                 spec.provider,
+                spec.pipeline_fingerprint,
                 _date_text(spec.requested_start),
                 _date_text(spec.requested_end),
                 spec.resolved_start.isoformat(),
@@ -252,6 +261,7 @@ class MetadataRepository:
             actual = (
                 row.mode,
                 row.provider,
+                row.pipeline_fingerprint,
                 row.requested_start,
                 row.requested_end,
                 row.resolved_start,
@@ -268,18 +278,21 @@ class MetadataRepository:
         *,
         input_hash: str,
         started_at: datetime,
+        owner_id: str = "legacy-owner",
+        lease_expires_at: datetime | None = None,
     ) -> PipelineStageRecord:
-        """Start or restart a non-successful stage under the same input hash."""
+        """Claim a stage with compare-and-swap owner and expiry semantics."""
         _validate_hash(input_hash, "input_hash")
+        started_at = _utc_datetime(started_at)
+        lease_expires_at = _utc_datetime(
+            lease_expires_at or started_at + timedelta(minutes=30)
+        )
+        if not owner_id or lease_expires_at <= started_at:
+            raise ValueError("stage owner and future lease are required")
         with Session(self._engine) as session, session.begin():
             run = session.get(PipelineRunORM, run_id)
             if run is None:
                 raise KeyError(f"pipeline run does not exist: {run_id}")
-            row = session.get(PipelineStageORM, (run_id, stage.value))
-            if row is not None and row.status == "SUCCEEDED":
-                if row.input_hash != input_hash:
-                    raise ValueError("successful pipeline stage input hash differs")
-                return self._pipeline_stage_record(row)
             values = {
                 "run_id": run_id,
                 "stage": stage.value,
@@ -290,12 +303,48 @@ class MetadataRepository:
                 "started_at": _timestamp(started_at),
                 "completed_at": None,
                 "error_json": None,
+                "owner_id": owner_id,
+                "lease_expires_at": _timestamp(lease_expires_at),
+                "attempt": 1,
             }
-            if row is None:
-                session.add(PipelineStageORM(**values))
-            else:
-                for key, value in values.items():
-                    setattr(row, key, value)
+            inserted = session.execute(
+                sqlite_insert(PipelineStageORM)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=["run_id", "stage"])
+            )
+            if getattr(inserted, "rowcount", 0):
+                run.status = "RUNNING"
+                session.flush()
+                return self._pipeline_stage_record(
+                    session.get_one(PipelineStageORM, (run_id, stage.value))
+                )
+            row = session.get_one(PipelineStageORM, (run_id, stage.value))
+            if row.status == "SUCCEEDED":
+                if row.input_hash != input_hash:
+                    raise ValueError("successful pipeline stage input hash differs")
+                return self._pipeline_stage_record(row)
+            lease_active = (
+                row.status == "RUNNING"
+                and row.owner_id != owner_id
+                and row.lease_expires_at is not None
+                and _parse_timestamp(row.lease_expires_at) > started_at
+            )
+            if lease_active:
+                _raise_pipeline_busy(run_id, stage, row.owner_id)
+            claimed = session.execute(
+                update(PipelineStageORM)
+                .where(
+                    PipelineStageORM.run_id == run_id,
+                    PipelineStageORM.stage == stage.value,
+                    PipelineStageORM.status != "SUCCEEDED",
+                )
+                .values(
+                    **{key: value for key, value in values.items() if key != "attempt"},
+                    attempt=PipelineStageORM.attempt + 1,
+                )
+            )
+            if getattr(claimed, "rowcount", 0) != 1:
+                _raise_pipeline_busy(run_id, stage, row.owner_id)
             run.status = "RUNNING"
             session.flush()
             return self._pipeline_stage_record(
@@ -311,6 +360,7 @@ class MetadataRepository:
         output_hash: str,
         output: JsonValue,
         completed_at: datetime,
+        owner_id: str | None = None,
     ) -> PipelineStageRecord:
         """Seal one stage checkpoint; successful rows are immutable afterwards."""
         _validate_hash(input_hash, "input_hash")
@@ -318,7 +368,12 @@ class MetadataRepository:
         output_json = canonical_json_bytes(output).decode("utf-8")
         with Session(self._engine) as session, session.begin():
             row = session.get(PipelineStageORM, (run_id, stage.value))
-            if row is None or row.status != "RUNNING" or row.input_hash != input_hash:
+            if (
+                row is None
+                or row.status != "RUNNING"
+                or row.input_hash != input_hash
+                or (owner_id is not None and row.owner_id != owner_id)
+            ):
                 raise ValueError("pipeline stage is not running with this input hash")
             row.status = "SUCCEEDED"
             row.output_hash = output_hash
@@ -346,12 +401,19 @@ class MetadataRepository:
         error: JsonValue,
         completed_at: datetime,
         blocked: bool = False,
+        owner_id: str | None = None,
     ) -> PipelineStageRecord:
         """Persist a structured stage failure so another process can resume it."""
         with Session(self._engine) as session, session.begin():
             row = session.get(PipelineStageORM, (run_id, stage.value))
             run = session.get(PipelineRunORM, run_id)
-            if row is None or run is None or row.input_hash != input_hash:
+            if (
+                row is None
+                or run is None
+                or row.input_hash != input_hash
+                or row.status != "RUNNING"
+                or (owner_id is not None and row.owner_id != owner_id)
+            ):
                 raise ValueError("pipeline stage is not running with this input hash")
             row.status = "BLOCKED" if blocked else "FAILED"
             row.completed_at = _timestamp(completed_at)
@@ -385,6 +447,35 @@ class MetadataRepository:
             row = session.scalar(query.order_by(PipelineRunORM.created_at.desc()))
             return None if row is None else self._pipeline_run_record(row)
 
+    def latest_pipeline_run_ready_for(
+        self,
+        target: PipelineStageName,
+        *,
+        provider: str,
+        pipeline_fingerprint: str,
+    ) -> PipelineRunRecord | None:
+        prerequisite = {
+            PipelineStageName.VALIDATE: PipelineStageName.CURATE,
+            PipelineStageName.PUBLISH_SNAPSHOT: PipelineStageName.VALIDATE,
+        }.get(target)
+        if prerequisite is None:
+            raise ValueError("target stage has no resumable prerequisite")
+        with Session(self._engine) as session:
+            ready = aliased(PipelineStageORM)
+            row = session.scalar(
+                select(PipelineRunORM)
+                .join(ready, ready.run_id == PipelineRunORM.id)
+                .where(
+                    PipelineRunORM.status != "SUCCEEDED",
+                    PipelineRunORM.provider == provider,
+                    PipelineRunORM.pipeline_fingerprint == pipeline_fingerprint,
+                    ready.stage == prerequisite.value,
+                    ready.status == "SUCCEEDED",
+                )
+                .order_by(PipelineRunORM.created_at.desc())
+            )
+            return None if row is None else self._pipeline_run_record(row)
+
     @staticmethod
     def _pipeline_run_record(row: PipelineRunORM) -> PipelineRunRecord:
         return PipelineRunRecord(
@@ -403,6 +494,7 @@ class MetadataRepository:
                 if row.completed_at is not None
                 else None
             ),
+            pipeline_fingerprint=row.pipeline_fingerprint,
         )
 
     @staticmethod
@@ -423,6 +515,13 @@ class MetadataRepository:
                 else None
             ),
             error=(freeze_json(json.loads(row.error_json)) if row.error_json else None),
+            owner_id=row.owner_id,
+            lease_expires_at=(
+                _parse_timestamp(row.lease_expires_at)
+                if row.lease_expires_at is not None
+                else None
+            ),
+            attempt=row.attempt,
         )
 
     def register_dataset_version(
@@ -987,5 +1086,20 @@ def _raise_repository_conflict(message: str) -> Never:
             context={},
             remediation="inspect the immutable data catalog",
             retryable=False,
+        )
+    )
+
+
+def _raise_pipeline_busy(
+    run_id: str, stage: PipelineStageName, owner_id: str | None
+) -> Never:
+    raise QuantError(
+        ErrorDetail(
+            code="DATA_PIPELINE_BUSY",
+            severity=Severity.SEVERE,
+            message="pipeline stage is owned by another active attempt",
+            context={"run_id": run_id, "stage": stage.value, "owner_id": owner_id},
+            remediation="wait for the active lease to complete or expire",
+            retryable=True,
         )
     )

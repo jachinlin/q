@@ -7,6 +7,7 @@ import polars as pl
 from quant_core.domain.enums import DatasetKind
 
 UTC_TIMESTAMP = pl.Datetime("us", "UTC")
+CANONICAL_SCHEMA_VERSION = "canonical-schema-v1"
 type PolarsDataType = pl.DataType | type[pl.DataType]
 
 

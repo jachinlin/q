@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import subprocess
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty
@@ -15,6 +16,24 @@ import pytest
 from quant_core.data.contracts import RawBatch
 from quant_core.data.partitions import RawPartitionStore
 from quant_core.errors import QuantError
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"New-Item -ItemType Junction -Path '{link}' -Target '{target}' | Out-Null",
+            ],
+            check=True,
+            capture_output=True,
+        )
 
 
 def _hold_partition_lock(
@@ -61,6 +80,25 @@ def make_batch(*, close: float = 10.25) -> RawBatch:
     )
 
 
+def test_publish_rejects_real_directory_link_escape_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    """A provider directory junction must never redirect Raw writes outside root."""
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    _create_directory_link(raw_root / "provider=example", outside)
+
+    with pytest.raises((QuantError, ValueError)):
+        RawPartitionStore(raw_root).publish(make_batch(), run_id="run-1")
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert sorted(path.name for path in outside.iterdir()) == ["victim.txt"]
+
+
 def test_publish_uses_canonical_request_json_for_request_hash(tmp_path: Path) -> None:
     """Changing request key insertion order cannot change its partition identity."""
     store = RawPartitionStore(tmp_path)
@@ -83,7 +121,9 @@ def test_same_arrow_content_produces_same_content_hash(tmp_path: Path) -> None:
     assert first.schema_fingerprint == second.schema_fingerprint
 
 
-def test_publish_leaves_no_final_files_when_batch_validation_fails(tmp_path: Path) -> None:
+def test_publish_leaves_no_final_files_when_batch_validation_fails(
+    tmp_path: Path,
+) -> None:
     """A row/schema mismatch never creates a partially visible partition."""
     store = RawPartitionStore(tmp_path)
     malformed = RawBatch(
@@ -163,9 +203,9 @@ def test_publish_normalizes_timestamp_in_partition_and_manifest(tmp_path: Path) 
     published = RawPartitionStore(tmp_path).publish(batch, run_id="run-1")
 
     assert published.retrieved_at == datetime(2026, 7, 31, 9, 30, tzinfo=UTC)
-    assert json.loads(published.manifest_path.read_text(encoding="utf-8"))["retrieved_at"] == (
-        "2026-07-31T09:30:00+00:00"
-    )
+    assert json.loads(published.manifest_path.read_text(encoding="utf-8"))[
+        "retrieved_at"
+    ] == ("2026-07-31T09:30:00+00:00")
 
 
 def test_request_key_insertion_order_is_idempotent(tmp_path: Path) -> None:
@@ -187,11 +227,14 @@ def test_request_key_insertion_order_is_idempotent(tmp_path: Path) -> None:
     assert second == first
 
 
-@pytest.mark.parametrize("provider,dataset,run_id", [
-    ("Example", "daily_bars", "run-1"),
-    ("example", "daily/bars", "run-1"),
-    ("example", "daily_bars", "../run-1"),
-])
+@pytest.mark.parametrize(
+    "provider,dataset,run_id",
+    [
+        ("Example", "daily_bars", "run-1"),
+        ("example", "daily/bars", "run-1"),
+        ("example", "daily_bars", "../run-1"),
+    ],
+)
 def test_publish_rejects_path_tokens_outside_the_partition_grammar(
     tmp_path: Path,
     provider: str,
@@ -269,7 +312,9 @@ def test_republishing_with_invalid_utf8_manifest_is_a_structured_conflict(
     assert error.value.detail.code == "raw_partition_conflict"
 
 
-def test_republishing_with_damaged_parquet_is_a_structured_conflict(tmp_path: Path) -> None:
+def test_republishing_with_damaged_parquet_is_a_structured_conflict(
+    tmp_path: Path,
+) -> None:
     """A manifest cannot make corrupt Parquet appear idempotently published."""
     store = RawPartitionStore(tmp_path)
     published = store.publish(make_batch(), run_id="run-1")
@@ -301,7 +346,9 @@ def test_partition_lock_serializes_a_competing_publisher(tmp_path: Path) -> None
     started = context.Event()
     completed = context.Event()
     result = context.Queue()
-    holder = context.Process(target=_hold_partition_lock, args=(str(lock_path), acquired, release))
+    holder = context.Process(
+        target=_hold_partition_lock, args=(str(lock_path), acquired, release)
+    )
     publisher = context.Process(
         target=_publish_after_signal,
         args=(str(tmp_path), started, completed, result),
@@ -393,4 +440,8 @@ def test_partial_owner_write_leaves_no_lock_and_next_publish_recovers(
 
     assert not lock_path.exists()
     monkeypatch.undo()
-    assert RawPartitionStore(tmp_path).publish(make_batch(), run_id="run-1").manifest_path.exists()
+    assert (
+        RawPartitionStore(tmp_path)
+        .publish(make_batch(), run_id="run-1")
+        .manifest_path.exists()
+    )

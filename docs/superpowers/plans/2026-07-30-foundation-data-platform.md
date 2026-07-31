@@ -70,9 +70,14 @@ def test_settings_resolves_runtime_paths_under_data_root(tmp_path: Path) -> None
     assert settings.raw_root == tmp_path / "runtime" / "data" / "raw"
     assert settings.state_db == tmp_path / "runtime" / "state" / "quant.db"
 
+
 def test_settings_rejects_data_root_inside_source_tree(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="outside source_root"):
-        Settings.load(tmp_path / "base.yaml", data_root=tmp_path / "repo" / "data", source_root=tmp_path / "repo")
+        Settings.load(
+            tmp_path / "base.yaml",
+            data_root=tmp_path / "repo" / "data",
+            source_root=tmp_path / "repo",
+        )
 ```
 
 - [ ] **步骤 2：确认测试因模块不存在而失败**
@@ -125,8 +130,16 @@ def test_instrument_id_round_trip() -> None:
     assert instrument.exchange is Exchange.SSE
     assert instrument.symbol == "600000"
 
+
 def test_quant_error_preserves_detail() -> None:
-    detail = ErrorDetail(code="DATA_SCHEMA_MISMATCH", severity=Severity.SEVERE, message="schema mismatch", context={"dataset": "daily_bar"}, remediation="inspect raw schema", retryable=False)
+    detail = ErrorDetail(
+        code="DATA_SCHEMA_MISMATCH",
+        severity=Severity.SEVERE,
+        message="schema mismatch",
+        context={"dataset": "daily_bar"},
+        remediation="inspect raw schema",
+        retryable=False,
+    )
     error = QuantError(detail)
     assert error.detail == detail
 ```
@@ -170,6 +183,7 @@ class ProviderCapabilities:
     corporate_actions: bool
     adjustment_factors: bool
 
+
 @dataclass(frozen=True)
 class RawBatch:
     provider: str
@@ -179,11 +193,17 @@ class RawBatch:
     schema: tuple[str, ...]
     rows: Sequence[Mapping[str, JsonValue]]
 
+
 class SourceClient(Protocol):
-    def fetch_daily_bars(self, start: date, end: date, instruments: Sequence[InstrumentId] | None = None) -> Iterable[RawBatch]: ...
+    def fetch_daily_bars(
+        self, start: date, end: date, instruments: Sequence[InstrumentId] | None = None
+    ) -> Iterable[RawBatch]: ...
+
 
 class CanonicalMapper(Protocol):
-    def normalize(self, raw_partition: PublishedPartition) -> Iterable[CanonicalBatch]: ...
+    def normalize(
+        self, raw_partition: PublishedPartition
+    ) -> Iterable[CanonicalBatch]: ...
 ```
 
 - [ ] **步骤 1：写失败测试**
@@ -224,7 +244,9 @@ git commit -m "feat: define source contracts and atomic raw storage"
 覆盖登录/登出、分页、错误码转换、重试、日期与证券分块，并明确：
 
 ```python
-assert collect(client.fetch_daily_bars(start, end, None)) == collect(client.fetch_daily_bars(start, end, []))
+assert collect(client.fetch_daily_bars(start, end, None)) == collect(
+    client.fetch_daily_bars(start, end, [])
+)
 ```
 
 全量证券必须来自历史 `instrument` 清单，筛选条件为 `list_date <= end` 且 `delist_date is null or delist_date >= start`，不能只取请求结束日仍上市的证券。
@@ -306,7 +328,11 @@ git commit -m "feat: map BaoStock raw data to canonical datasets"
 
 ```python
 class SnapshotPublisher:
-    def publish(self, dataset_versions: Mapping[str, DatasetVersionId], quality_run_id: QualityRunId) -> SnapshotId: ...
+    def publish(
+        self,
+        dataset_versions: Mapping[str, DatasetVersionId],
+        quality_run_id: QualityRunId,
+    ) -> SnapshotId: ...
 ```
 
 - [ ] **步骤 1：写失败集成测试**

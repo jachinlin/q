@@ -20,6 +20,7 @@ from quant_core.data.contracts import (
     RawBatch,
     canonical_json_bytes,
 )
+from quant_core.data.storage import resolved_storage_root, validate_storage_path
 from quant_core.domain.enums import Severity
 from quant_core.errors import ErrorDetail, QuantError
 
@@ -65,7 +66,9 @@ class _PartitionLock:
                 self._remove_owned_lock_directory(temporary_path)
                 self._reclaim_stale_lock()
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for partition lock: {self._path}")
+                    raise TimeoutError(
+                        f"timed out waiting for partition lock: {self._path}"
+                    )
                 time.sleep(self._poll_seconds)
             except Exception:
                 self._remove_owned_lock_directory(temporary_path)
@@ -106,7 +109,9 @@ class _PartitionLock:
             age_seconds = time.time() - self._path.stat().st_mtime
         except FileNotFoundError:
             return
-        if age_seconds < self._stale_after_seconds or self._process_is_alive(process_id):
+        if age_seconds < self._stale_after_seconds or self._process_is_alive(
+            process_id
+        ):
             return
         self._remove_owned_lock_directory(self._path)
 
@@ -138,7 +143,11 @@ class RawPartitionStore:
     """Publishes raw batches with a manifest as the atomic visibility marker."""
 
     def __init__(self, raw_root: Path) -> None:
-        self._raw_root = raw_root
+        self._raw_root = resolved_storage_root(raw_root)
+
+    @property
+    def root(self) -> Path:
+        return self._raw_root
 
     def publish(self, batch: RawBatch, *, run_id: str) -> PublishedPartition:
         """Write, verify, and atomically publish one immutable raw partition."""
@@ -175,9 +184,13 @@ class RawPartitionStore:
         )
         manifest = self._manifest(published)
 
+        validate_storage_path(self._raw_root, partition_dir)
         partition_dir.mkdir(parents=True, exist_ok=True)
+        validate_storage_path(self._raw_root, partition_dir)
         lock_path = partition_dir / f".{request_hash}.lock"
+        validate_storage_path(self._raw_root, lock_path)
         with _PartitionLock(lock_path):
+            validate_storage_path(self._raw_root, partition_dir)
             if data_path.exists() or manifest_path.exists():
                 return self._existing_or_conflict(published, manifest)
 
@@ -186,7 +199,10 @@ class RawPartitionStore:
             data_installed = False
             manifest_installed = False
             try:
+                validate_storage_path(self._raw_root, data_temp)
+                validate_storage_path(self._raw_root, manifest_temp)
                 pq.write_table(table, data_temp, compression="zstd")
+                validate_storage_path(self._raw_root, data_temp, require_file=True)
                 self._verify_data_file(
                     data_temp,
                     content_hash=content_hash,
@@ -195,14 +211,22 @@ class RawPartitionStore:
                 )
                 manifest_temp.write_text(
                     json.dumps(
-                        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                        manifest,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ),
                     encoding="utf-8",
                 )
+                validate_storage_path(self._raw_root, manifest_temp, require_file=True)
+                validate_storage_path(self._raw_root, data_path)
                 data_temp.replace(data_path)
                 data_installed = True
+                validate_storage_path(self._raw_root, data_path, require_file=True)
+                validate_storage_path(self._raw_root, manifest_path)
                 manifest_temp.replace(manifest_path)
                 manifest_installed = True
+                validate_storage_path(self._raw_root, manifest_path, require_file=True)
                 return published
             finally:
                 if data_temp.exists():
@@ -213,7 +237,9 @@ class RawPartitionStore:
                     data_path.unlink()
 
     @staticmethod
-    def _validate_path_segment(value: str, label: str, pattern: re.Pattern[str]) -> None:
+    def _validate_path_segment(
+        value: str, label: str, pattern: re.Pattern[str]
+    ) -> None:
         if not pattern.fullmatch(value):
             raise ValueError(f"{label} contains unsupported characters")
 
@@ -264,6 +290,8 @@ class RawPartitionStore:
         published: PublishedPartition,
         expected_manifest: Mapping[str, object],
     ) -> PublishedPartition:
+        validate_storage_path(self._raw_root, published.data_path)
+        validate_storage_path(self._raw_root, published.manifest_path)
         if not published.data_path.is_file() or not published.manifest_path.is_file():
             self._raise_conflict(published, "partition is incomplete")
         try:
@@ -280,7 +308,9 @@ class RawPartitionStore:
                 row_count=published.row_count,
             )
         except (OSError, pa.ArrowException, ValueError) as error:
-            self._raise_conflict(published, "published data fails integrity checks", error)
+            self._raise_conflict(
+                published, "published data fails integrity checks", error
+            )
         return published
 
     @staticmethod

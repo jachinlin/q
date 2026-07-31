@@ -2,23 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Never
+from typing import Never, cast
 
 import typer
 
-from quant_core.data.mappers.baostock import BaoStockMapper
+from quant_core.data.contracts import JsonValue, canonical_json_bytes
+from quant_core.data.mappers.baostock import BAOSTOCK_MAPPER_VERSION, BaoStockMapper
 from quant_core.data.partitions import RawPartitionStore
 from quant_core.data.pipelines.curate import CuratedPartitionStore
-from quant_core.data.pipelines.publish import DataPipeline, PipelineResult
+from quant_core.data.pipelines.publish import (
+    DataPipeline,
+    PipelineResult,
+    PipelineVersions,
+)
+from quant_core.data.quality.rules import QUALITY_RULE_SET_VERSION
 from quant_core.data.quality.runner import QualityRunner
-from quant_core.data.snapshots import SnapshotPublisher
+from quant_core.data.schemas import CANONICAL_SCHEMA_VERSION
+from quant_core.data.snapshots import SNAPSHOT_MANIFEST_VERSION, SnapshotPublisher
 from quant_core.data.sources.baostock import (
+    BAOSTOCK_SOURCE_ADAPTER_VERSION,
     BaoStockCalendarPolicy,
     BaoStockClient,
     BaoStockConfig,
@@ -222,6 +231,20 @@ def build_default_services() -> ApplicationServices:
     )
     source = BaoStockClient(source_gateway, None, source_config)
     calendar_client = BaoStockClient(calendar_gateway, None, source_config)
+    retryable_error_codes = [
+        cast(JsonValue, code) for code in sorted(source_config.retryable_error_codes)
+    ]
+    fetch_config_fingerprint = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "max_attempts": source_config.max_attempts,
+                "max_days_per_batch": source_config.max_days_per_batch,
+                "max_instruments_per_batch": source_config.max_instruments_per_batch,
+                "retry_backoff_seconds": list(source_config.retry_backoff_seconds),
+                "retryable_error_codes": retryable_error_codes,
+            }
+        )
+    ).hexdigest()
     pipeline = DataPipeline(
         source=source,
         mapper=BaoStockMapper(),
@@ -232,6 +255,14 @@ def build_default_services() -> ApplicationServices:
         quality_runner=QualityRunner(),
         snapshot_publisher=SnapshotPublisher(
             repository, settings.data_root / "data" / "snapshots"
+        ),
+        versions=PipelineVersions(
+            source_adapter=BAOSTOCK_SOURCE_ADAPTER_VERSION,
+            fetch_config=fetch_config_fingerprint,
+            mapper=BAOSTOCK_MAPPER_VERSION,
+            canonical_schema=CANONICAL_SCHEMA_VERSION,
+            quality_rules=QUALITY_RULE_SET_VERSION,
+            snapshot_manifest=SNAPSHOT_MANIFEST_VERSION,
         ),
     )
     return ApplicationServices(pipeline, repository)

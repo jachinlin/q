@@ -57,11 +57,13 @@ class ExperimentStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
+
 class ResearchMark(StrEnum):
     UNREVIEWED = "UNREVIEWED"
     BASELINE = "BASELINE"
     CANDIDATE = "CANDIDATE"
     DISCARDED = "DISCARDED"
+
 
 class TaskStatus(StrEnum):
     QUEUED = "QUEUED"
@@ -117,6 +119,7 @@ class ExperimentFingerprintInput:
     lockfile_hash: str
     rulebook_version: str
 
+
 def compute_fingerprint(value: ExperimentFingerprintInput) -> str: ...
 ```
 
@@ -153,10 +156,30 @@ git commit -m "feat: fingerprint experiments and verify artifacts"
 
 ```python
 class ExperimentRegistry:
-    def create(self, config: ResolvedExperimentConfig, fingerprint: str) -> ExperimentId: ...
-    def transition(self, experiment_id: ExperimentId, expected: ExperimentStatus, target: ExperimentStatus, reason: ErrorDetail | None = None) -> None: ...
-    def register_success(self, experiment_id: ExperimentId, manifest: ArtifactManifest, metrics: Mapping[str, float]) -> None: ...
-    def update_research(self, experiment_id: ExperimentId, mark: ResearchMark, tags: Sequence[str], note: str, actor: str) -> None: ...
+    def create(
+        self, config: ResolvedExperimentConfig, fingerprint: str
+    ) -> ExperimentId: ...
+    def transition(
+        self,
+        experiment_id: ExperimentId,
+        expected: ExperimentStatus,
+        target: ExperimentStatus,
+        reason: ErrorDetail | None = None,
+    ) -> None: ...
+    def register_success(
+        self,
+        experiment_id: ExperimentId,
+        manifest: ArtifactManifest,
+        metrics: Mapping[str, float],
+    ) -> None: ...
+    def update_research(
+        self,
+        experiment_id: ExperimentId,
+        mark: ResearchMark,
+        tags: Sequence[str],
+        note: str,
+        actor: str,
+    ) -> None: ...
 ```
 
 - [ ] **步骤 1：写状态转换矩阵测试**
@@ -192,11 +215,25 @@ git commit -m "feat: manage immutable experiment lifecycle"
 
 ```python
 class TaskQueue:
-    def enqueue(self, task_type: str, payload: Mapping[str, JsonValue], priority: int, experiment_id: ExperimentId | None = None) -> TaskId: ...
+    def enqueue(
+        self,
+        task_type: str,
+        payload: Mapping[str, JsonValue],
+        priority: int,
+        experiment_id: ExperimentId | None = None,
+    ) -> TaskId: ...
     def claim(self, worker_id: str, now: datetime) -> ClaimedTask | None: ...
-    def heartbeat(self, attempt_id: TaskAttemptId, worker_id: str, progress: TaskProgress, now: datetime) -> None: ...
+    def heartbeat(
+        self,
+        attempt_id: TaskAttemptId,
+        worker_id: str,
+        progress: TaskProgress,
+        now: datetime,
+    ) -> None: ...
     def request_cancel(self, task_id: TaskId, actor: str) -> None: ...
-    def finish(self, attempt_id: TaskAttemptId, worker_id: str, outcome: TaskOutcome) -> None: ...
+    def finish(
+        self, attempt_id: TaskAttemptId, worker_id: str, outcome: TaskOutcome
+    ) -> None: ...
     def mark_orphans(self, now: datetime, stale_after: timedelta) -> int: ...
 ```
 
@@ -238,7 +275,11 @@ git commit -m "feat: add durable SQLite task queue"
 ```python
 class TaskHandler(Protocol):
     task_type: str
-    def run(self, task: ClaimedTask, progress: ProgressSink, cancellation: CancellationToken) -> TaskOutcome: ...
+
+    def run(
+        self, task: ClaimedTask, progress: ProgressSink, cancellation: CancellationToken
+    ) -> TaskOutcome: ...
+
 
 class Worker:
     def run_forever(self) -> None: ...

@@ -264,9 +264,11 @@ quant/                                      # 代码仓库根目录，只保存�
 from dataclasses import dataclass
 from enum import StrEnum
 
+
 class Exchange(StrEnum):
     SSE = "SSE"
     SZSE = "SZSE"
+
 
 @dataclass(frozen=True, slots=True)
 class InstrumentId:
@@ -287,6 +289,7 @@ class Board(StrEnum):
     CHINEXT = "CHINEXT"
     STAR = "STAR"
 
+
 class ExperimentStatus(StrEnum):
     CREATED = "CREATED"
     QUEUED = "QUEUED"
@@ -295,11 +298,13 @@ class ExperimentStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
+
 class ResearchMark(StrEnum):
     UNREVIEWED = "UNREVIEWED"
     BASELINE = "BASELINE"
     CANDIDATE = "CANDIDATE"
     DISCARDED = "DISCARDED"
+
 
 class Severity(StrEnum):
     INFO = "INFO"
@@ -336,6 +341,7 @@ class ProviderCapabilities:
     corporate_actions: bool
     adjustment_factors: bool
 
+
 @dataclass(frozen=True)
 class RawBatch:
     provider: str
@@ -343,6 +349,7 @@ class RawBatch:
     request: Mapping[str, JsonValue]
     retrieved_at: datetime
     frame: pl.DataFrame
+
 
 class SourceClient(Protocol):
     @property
@@ -362,6 +369,7 @@ class SourceClient(Protocol):
     def fetch_security_status(self, start: date, end: date) -> RawBatch: ...
     def fetch_financials(self, start: date, end: date) -> RawBatch: ...
     def fetch_corporate_actions(self, start: date, end: date) -> RawBatch: ...
+
 
 class CanonicalMapper(Protocol):
     @property
@@ -725,6 +733,7 @@ class UniverseRules:
     min_avg_amount_window: int
     min_avg_amount: float
 
+
 class UniverseBuilder:
     def build(
         self,
@@ -748,6 +757,7 @@ class Factor(Protocol):
     lookback_trading_days: int
 
     def compute(self, ctx: "FactorContext") -> pl.LazyFrame: ...
+
 
 @dataclass(frozen=True)
 class FactorContext:
@@ -930,6 +940,7 @@ class TargetPosition:
     score: float | None
     reason_code: str
 
+
 @dataclass(frozen=True)
 class TargetPortfolio:
     signal_date: date
@@ -987,6 +998,7 @@ class BacktestRequest:
     initial_cash_fen: int
     rulebook_version: str
     execution_config: ExecutionConfig
+
 
 class BacktestEngine:
     def run(

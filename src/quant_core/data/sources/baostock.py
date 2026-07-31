@@ -19,6 +19,8 @@ from quant_core.domain.enums import Exchange, Severity
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.errors import ErrorDetail, QuantError
 
+BAOSTOCK_SOURCE_ADAPTER_VERSION = "baostock-source-adapter-v1"
+
 DAILY_BAR_FIELDS = (
     "date",
     "code",

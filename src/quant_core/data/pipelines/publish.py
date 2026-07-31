@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Never, Protocol, cast
+from uuid import uuid4
 
 import polars as pl
 
@@ -21,6 +22,7 @@ from quant_core.data.partitions import RawPartitionStore
 from quant_core.data.pipelines.curate import CuratedPartitionStore, CuratedResult
 from quant_core.data.pipelines.ingest import partition_from_json, partition_to_json
 from quant_core.data.quality.models import QualityRunSpec, thaw_json
+from quant_core.data.quality.rules import required_dataset_issues
 from quant_core.data.quality.runner import QualityRunner
 from quant_core.data.snapshots import SnapshotPublisher
 from quant_core.domain.enums import DatasetKind, Severity
@@ -63,6 +65,32 @@ class PipelineResult:
     snapshot_id: SnapshotId
 
 
+@dataclass(frozen=True, slots=True)
+class PipelineVersions:
+    """Explicit versions for every stable component that affects pipeline output."""
+
+    source_adapter: str = "pipeline-source-contract-v1"
+    fetch_config: str = "pipeline-fetch-config-v1"
+    mapper: str = "canonical-mapper-v1"
+    canonical_schema: str = "canonical-schema-v1"
+    quality_rules: str = "foundation-quality-rules-v1"
+    snapshot_manifest: str = "snapshot-manifest-v1"
+
+    def __post_init__(self) -> None:
+        if any(not value for value in self.as_json().values()):
+            raise ValueError("pipeline version fingerprints must not be empty")
+
+    def as_json(self) -> dict[str, JsonValue]:
+        return {
+            "source_adapter": self.source_adapter,
+            "fetch_config": self.fetch_config,
+            "mapper": self.mapper,
+            "canonical_schema": self.canonical_schema,
+            "quality_rules": self.quality_rules,
+            "snapshot_manifest": self.snapshot_manifest,
+        }
+
+
 class DataPipeline:
     """Execute and recover the fixed four-stage data pipeline."""
 
@@ -77,6 +105,7 @@ class DataPipeline:
         repository: MetadataRepository,
         quality_runner: QualityRunner,
         snapshot_publisher: SnapshotPublisher,
+        versions: PipelineVersions | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._source = source
@@ -87,10 +116,15 @@ class DataPipeline:
         self._repository = repository
         self._quality_runner = quality_runner
         self._snapshot_publisher = snapshot_publisher
+        self._versions = versions or PipelineVersions()
+        self._pipeline_fingerprint = _hash(self._versions.as_json())
         self._clock = clock
 
     def bootstrap(self) -> PipelineResult:
-        start, end = self._calendar.bootstrap_window(20)
+        try:
+            start, end = self._calendar.bootstrap_window(20)
+        except ValueError as error:
+            self._raise_argument(str(error))
         return self._execute("BOOTSTRAP", None, None, start, end, None)
 
     def update(
@@ -102,16 +136,46 @@ class DataPipeline:
         if previous is None:
             self._raise_argument("update requires an existing published snapshot")
         assert previous is not None
-        if start is not None and end is not None:
-            resolved_start, resolved_end = self._calendar.explicit_window(start, end)
-        else:
-            daily_id = previous.dataset_versions.get(DatasetKind.DAILY_BAR.value)
-            if daily_id is None:
-                self._raise_argument("latest snapshot has no daily_bar watermark")
-            watermark = self._repository.get_dataset_version(daily_id).end_date
-            if watermark is None:
-                self._raise_argument("latest daily_bar version has no watermark")
-            resolved_start, resolved_end = self._calendar.update_window(watermark, 5)
+        previous_records = {
+            dataset: self._repository.get_dataset_version(identifier)
+            for dataset, identifier in previous.dataset_versions.items()
+        }
+        incompatible = sorted(
+            dataset
+            for dataset, record in previous_records.items()
+            if record.source != self._source.provider
+        )
+        if incompatible:
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_PIPELINE_PROVIDER_MISMATCH",
+                    severity=Severity.FATAL,
+                    message="update cannot merge history from a different provider",
+                    context={
+                        "current_provider": self._source.provider,
+                        "datasets": incompatible,
+                    },
+                    remediation="run an explicit bootstrap or controlled migration",
+                    retryable=False,
+                )
+            )
+        try:
+            if start is not None and end is not None:
+                resolved_start, resolved_end = self._calendar.explicit_window(
+                    start, end
+                )
+            else:
+                daily_id = previous.dataset_versions.get(DatasetKind.DAILY_BAR.value)
+                if daily_id is None:
+                    self._raise_argument("latest snapshot has no daily_bar watermark")
+                watermark = previous_records[DatasetKind.DAILY_BAR.value].end_date
+                if watermark is None:
+                    self._raise_argument("latest daily_bar version has no watermark")
+                resolved_start, resolved_end = self._calendar.update_window(
+                    watermark, 5
+                )
+        except ValueError as error:
+            self._raise_argument(str(error))
         return self._execute(
             "UPDATE",
             start,
@@ -123,13 +187,25 @@ class DataPipeline:
 
     def validate_latest(self) -> Mapping[str, JsonValue]:
         """Validate the latest run whose Curated checkpoint is complete."""
-        run = self._repository.latest_recoverable_pipeline_run(self._source.provider)
+        run = self._repository.latest_pipeline_run_ready_for(
+            PipelineStageName.VALIDATE,
+            provider=self._source.provider,
+            pipeline_fingerprint=self._pipeline_fingerprint,
+        )
         if run is None:
             self._raise_argument("no recoverable pipeline run exists")
         assert run is not None
-        curated = self._curated_checkpoint(run.id)
+        curated, curated_output_hash = self._resume_curated(run.id)
         quality_id = self._validate(
-            run.id, _versions_hash(curated.dataset_versions), curated
+            run.id,
+            _hash(
+                {
+                    "curated_output_hash": curated_output_hash,
+                    "quality_rules": self._versions.quality_rules,
+                }
+            ),
+            curated,
+            uuid4().hex,
         )
         return {
             "run_id": run.id,
@@ -139,23 +215,42 @@ class DataPipeline:
 
     def publish_latest(self) -> PipelineResult:
         """Publish the latest run whose validation checkpoint is complete."""
-        run = self._repository.latest_recoverable_pipeline_run(self._source.provider)
+        run = self._repository.latest_pipeline_run_ready_for(
+            PipelineStageName.PUBLISH_SNAPSHOT,
+            provider=self._source.provider,
+            pipeline_fingerprint=self._pipeline_fingerprint,
+        )
         if run is None:
             self._raise_argument("no recoverable pipeline run exists")
         assert run is not None
-        curated = self._curated_checkpoint(run.id)
-        curated_hash = _versions_hash(curated.dataset_versions)
-        quality_checkpoint = self._checkpoint(
-            run.id, PipelineStageName.VALIDATE, curated_hash
+        owner_id = uuid4().hex
+        curated, curated_output_hash = self._resume_curated(run.id)
+        validate_input_hash = _hash(
+            {
+                "curated_output_hash": curated_output_hash,
+                "quality_rules": self._versions.quality_rules,
+            }
         )
-        if not isinstance(quality_checkpoint, Mapping):
+        quality_checkpoint = self._checkpoint(
+            run.id,
+            PipelineStageName.VALIDATE,
+            validate_input_hash,
+            lambda value: self._restore_quality(value, curated.dataset_versions),
+        )
+        if not isinstance(quality_checkpoint, QualityRunId):
             self._raise_argument("latest pipeline run has no successful validation")
-        quality_id = QualityRunId.parse(str(quality_checkpoint["quality_run_id"]))
+        quality_id = quality_checkpoint
         snapshot_id = self._publish(
             run.id,
-            _hash({"versions": curated_hash, "quality": str(quality_id)}),
+            _hash(
+                {
+                    "quality_output_hash": _hash({"quality_run_id": str(quality_id)}),
+                    "snapshot_manifest": self._versions.snapshot_manifest,
+                }
+            ),
             curated,
             quality_id,
+            owner_id,
         )
         self._repository.complete_pipeline_run(run.id, self._now())
         return PipelineResult(run.id, curated.dataset_versions, quality_id, snapshot_id)
@@ -169,6 +264,7 @@ class DataPipeline:
         end: date,
         previous_ids: Mapping[str, DatasetVersionId] | None,
     ) -> PipelineResult:
+        owner_id = uuid4().hex
         request: JsonValue = {
             "mode": mode,
             "provider": self._source.provider,
@@ -179,6 +275,7 @@ class DataPipeline:
             "previous_versions": {
                 key: str(value) for key, value in sorted((previous_ids or {}).items())
             },
+            "versions": self._versions.as_json(),
         }
         request_hash = _hash(request)
         run = self._repository.register_pipeline_run(
@@ -191,48 +288,89 @@ class DataPipeline:
                 resolved_start=start,
                 resolved_end=end,
                 created_at=self._now(),
+                pipeline_fingerprint=self._pipeline_fingerprint,
             )
         )
 
-        raw = self._ingest(run.id, request_hash, start, end)
-        raw_output_hash = _hash([partition_to_json(item) for item in raw])
+        ingest_input_hash = _hash(
+            {
+                "request_hash": request_hash,
+                "source_adapter": self._versions.source_adapter,
+                "fetch_config": self._versions.fetch_config,
+            }
+        )
+        raw = self._ingest(run.id, ingest_input_hash, start, end, owner_id)
+        raw_output_hash = _hash(
+            {"partitions": [partition_to_json(item) for item in raw]}
+        )
         previous = {
             dataset: self._repository.get_dataset_version(identifier)
             for dataset, identifier in (previous_ids or {}).items()
         }
-        curated = self._curate(run.id, raw_output_hash, raw, previous, start, end)
-        curated_hash = _versions_hash(curated.dataset_versions)
-        quality_id = self._validate(run.id, curated_hash, curated)
+        curate_input_hash = _hash(
+            {
+                "raw_output_hash": raw_output_hash,
+                "mapper": self._versions.mapper,
+                "canonical_schema": self._versions.canonical_schema,
+            }
+        )
+        curated = self._curate(
+            run.id, curate_input_hash, raw, previous, start, end, owner_id
+        )
+        curated_hash = _hash(
+            {
+                "dataset_versions": {
+                    key: str(value)
+                    for key, value in sorted(curated.dataset_versions.items())
+                }
+            }
+        )
+        validate_input_hash = _hash(
+            {
+                "curated_output_hash": curated_hash,
+                "quality_rules": self._versions.quality_rules,
+            }
+        )
+        quality_id = self._validate(run.id, validate_input_hash, curated, owner_id)
+        quality_output_hash = _hash({"quality_run_id": str(quality_id)})
         snapshot_id = self._publish(
             run.id,
-            _hash({"versions": curated_hash, "quality": str(quality_id)}),
+            _hash(
+                {
+                    "quality_output_hash": quality_output_hash,
+                    "snapshot_manifest": self._versions.snapshot_manifest,
+                }
+            ),
             curated,
             quality_id,
+            owner_id,
         )
         self._repository.complete_pipeline_run(run.id, self._now())
         return PipelineResult(run.id, curated.dataset_versions, quality_id, snapshot_id)
 
     def _ingest(
-        self, run_id: str, input_hash: str, start: date, end: date
+        self,
+        run_id: str,
+        input_hash: str,
+        start: date,
+        end: date,
+        owner_id: str,
     ) -> tuple[PublishedPartition, ...]:
-        checkpoint = self._checkpoint(run_id, PipelineStageName.INGEST_RAW, input_hash)
+        checkpoint = self._checkpoint(
+            run_id,
+            PipelineStageName.INGEST_RAW,
+            input_hash,
+            self._restore_raw,
+        )
         if checkpoint is not None:
-            try:
-                values = cast(Mapping[str, object], checkpoint)
-                items = values.get("partitions")
-                if not isinstance(items, tuple):
-                    raise TypeError("raw checkpoint partitions are invalid")
-                return tuple(
-                    partition_from_json(cast(Mapping[str, object], item))
-                    for item in items
-                )
-            except Exception as error:  # noqa: BLE001 - integrity boundary.
-                self._raise_checkpoint(PipelineStageName.INGEST_RAW, error)
+            return cast(tuple[PublishedPartition, ...], checkpoint)
         self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.INGEST_RAW,
             input_hash=input_hash,
             started_at=self._now(),
+            owner_id=owner_id,
+            lease_expires_at=self._lease_expires_at(),
         )
         try:
             self._source.login()
@@ -253,10 +391,13 @@ class DataPipeline:
                 output_hash=_hash(output),
                 output=output,
                 completed_at=self._now(),
+                owner_id=owner_id,
             )
             return partitions
         except Exception as error:
-            self._fail(run_id, PipelineStageName.INGEST_RAW, input_hash, error)
+            self._fail(
+                run_id, PipelineStageName.INGEST_RAW, input_hash, error, owner_id
+            )
             raise
 
     def _curate(
@@ -267,33 +408,26 @@ class DataPipeline:
         previous: Mapping[str, DatasetVersionRecord],
         start: date,
         end: date,
+        owner_id: str,
     ) -> CuratedResult:
-        checkpoint = self._checkpoint(run_id, PipelineStageName.CURATE, input_hash)
+        checkpoint = self._checkpoint(
+            run_id,
+            PipelineStageName.CURATE,
+            input_hash,
+            lambda value: self._restore_curated(value, run_id),
+        )
         if checkpoint is not None:
-            values = cast(Mapping[str, object], checkpoint)
-            serialized = values.get("dataset_versions")
-            if not isinstance(serialized, Mapping):
-                raise ValueError("curated checkpoint versions are invalid")
-            version_ids = {
-                str(dataset): DatasetVersionId.parse(str(identifier))
-                for dataset, identifier in serialized.items()
-            }
-            frames = {
-                record.dataset: self._curated_store.read_version(record)
-                for record in (
-                    self._repository.get_dataset_version(identifier)
-                    for identifier in version_ids.values()
-                )
-            }
-            return CuratedResult(version_ids, frames)
+            return cast(CuratedResult, checkpoint)
         self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.CURATE,
             input_hash=input_hash,
             started_at=self._now(),
+            owner_id=owner_id,
+            lease_expires_at=self._lease_expires_at(),
         )
         try:
-            batches = tuple(
+            batches = (
                 batch
                 for partition in raw
                 for batch in self._mapper.normalize(partition)
@@ -320,30 +454,42 @@ class DataPipeline:
                 output_hash=_hash(output),
                 output=output,
                 completed_at=self._now(),
+                owner_id=owner_id,
             )
             return result
         except Exception as error:
-            self._fail(run_id, PipelineStageName.CURATE, input_hash, error)
+            self._fail(run_id, PipelineStageName.CURATE, input_hash, error, owner_id)
             raise
 
     def _validate(
-        self, run_id: str, input_hash: str, curated: CuratedResult
+        self,
+        run_id: str,
+        input_hash: str,
+        curated: CuratedResult,
+        owner_id: str,
     ) -> QualityRunId:
-        checkpoint = self._checkpoint(run_id, PipelineStageName.VALIDATE, input_hash)
+        checkpoint = self._checkpoint(
+            run_id,
+            PipelineStageName.VALIDATE,
+            input_hash,
+            lambda value: self._restore_quality(value, curated.dataset_versions),
+        )
         if checkpoint is not None:
-            values = cast(Mapping[str, object], checkpoint)
-            identifier = QualityRunId.parse(str(values["quality_run_id"]))
-            self._repository.get_quality_run(identifier)
-            return identifier
+            return cast(QualityRunId, checkpoint)
         self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.VALIDATE,
             input_hash=input_hash,
             started_at=self._now(),
+            owner_id=owner_id,
+            lease_expires_at=self._lease_expires_at(),
         )
         try:
             started = self._now()
-            issues = self._quality_runner.evaluate(curated.frames)
+            issues = (
+                *self._quality_runner.evaluate(curated.frames),
+                *required_dataset_issues(curated.frames),
+            )
             quality = self._repository.register_quality_run(
                 QualityRunSpec(
                     dataset_versions=curated.dataset_versions,
@@ -360,10 +506,11 @@ class DataPipeline:
                 output_hash=_hash(output),
                 output=output,
                 completed_at=self._now(),
+                owner_id=owner_id,
             )
             return quality.id
         except Exception as error:
-            self._fail(run_id, PipelineStageName.VALIDATE, input_hash, error)
+            self._fail(run_id, PipelineStageName.VALIDATE, input_hash, error, owner_id)
             raise
 
     def _publish(
@@ -372,20 +519,25 @@ class DataPipeline:
         input_hash: str,
         curated: CuratedResult,
         quality_id: QualityRunId,
+        owner_id: str,
     ) -> SnapshotId:
         checkpoint = self._checkpoint(
-            run_id, PipelineStageName.PUBLISH_SNAPSHOT, input_hash
+            run_id,
+            PipelineStageName.PUBLISH_SNAPSHOT,
+            input_hash,
+            lambda value: self._restore_snapshot(
+                value, curated.dataset_versions, quality_id
+            ),
         )
         if checkpoint is not None:
-            values = cast(Mapping[str, object], checkpoint)
-            identifier = SnapshotId.parse(str(values["snapshot_id"]))
-            self._repository.get_snapshot(identifier)
-            return identifier
+            return cast(SnapshotId, checkpoint)
         self._repository.start_pipeline_stage(
             run_id,
             PipelineStageName.PUBLISH_SNAPSHOT,
             input_hash=input_hash,
             started_at=self._now(),
+            owner_id=owner_id,
+            lease_expires_at=self._lease_expires_at(),
         )
         try:
             identifier = self._snapshot_publisher.publish(
@@ -399,6 +551,7 @@ class DataPipeline:
                 output_hash=_hash(output),
                 output=output,
                 completed_at=self._now(),
+                owner_id=owner_id,
             )
             return identifier
         except Exception as error:
@@ -407,38 +560,55 @@ class DataPipeline:
                 PipelineStageName.PUBLISH_SNAPSHOT,
                 input_hash,
                 error,
+                owner_id,
                 blocked=isinstance(error, QuantError)
                 and error.detail.code == "SNAP_QUALITY_BLOCKED",
             )
             raise
 
     def _checkpoint(
-        self, run_id: str, stage: PipelineStageName, input_hash: str
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        input_hash: str,
+        verifier: Callable[[Mapping[str, object]], object] | None = None,
     ) -> object | None:
         try:
             checkpoint = self._repository.get_pipeline_stage(run_id, stage)
         except KeyError:
             return None
-        if checkpoint.status != "SUCCEEDED":
-            return None
-        if checkpoint.input_hash != input_hash or checkpoint.output is None:
-            raise ValueError("successful pipeline checkpoint does not match its input")
-        if checkpoint.output_hash != _hash(thaw_json(checkpoint.output)):
-            raise ValueError("successful pipeline checkpoint output hash is invalid")
-        return checkpoint.output
-
-    def _curated_checkpoint(self, run_id: str) -> CuratedResult:
         try:
-            checkpoint = self._repository.get_pipeline_stage(
-                run_id, PipelineStageName.CURATE
-            )
-        except KeyError:
-            self._raise_argument("latest pipeline run has no Curated checkpoint")
-        if checkpoint.status != "SUCCEEDED" or checkpoint.output is None:
-            self._raise_argument(
-                "latest pipeline run has no successful Curated checkpoint"
-            )
-        values = cast(Mapping[str, object], checkpoint.output)
+            if checkpoint.status != "SUCCEEDED":
+                return None
+            if checkpoint.input_hash != input_hash or checkpoint.output is None:
+                raise ValueError(
+                    "successful pipeline checkpoint does not match its input"
+                )
+            output = thaw_json(checkpoint.output)
+            if checkpoint.output_hash != _hash(output):
+                raise ValueError(
+                    "successful pipeline checkpoint output hash is invalid"
+                )
+            if not isinstance(output, Mapping):
+                raise TypeError("pipeline checkpoint output is not an object")
+            return verifier(output) if verifier is not None else output
+        except Exception as error:  # noqa: BLE001 - checkpoint trust boundary.
+            self._raise_checkpoint(stage, error)
+
+    def _restore_raw(
+        self, values: Mapping[str, object]
+    ) -> tuple[PublishedPartition, ...]:
+        items = values.get("partitions")
+        if not isinstance(items, list):
+            raise TypeError("raw checkpoint partitions are invalid")
+        return tuple(
+            partition_from_json(cast(Mapping[str, object], item), self._raw_store.root)
+            for item in items
+        )
+
+    def _restore_curated(
+        self, values: Mapping[str, object], run_id: str
+    ) -> CuratedResult:
         serialized = values.get("dataset_versions")
         if not isinstance(serialized, Mapping):
             raise TypeError("curated checkpoint versions are invalid")
@@ -446,11 +616,100 @@ class DataPipeline:
             str(dataset): DatasetVersionId.parse(str(identifier))
             for dataset, identifier in serialized.items()
         }
-        frames: dict[DatasetKind, tuple[pl.DataFrame, ...]] = {}
-        for identifier in version_ids.values():
+        run = self._repository.get_pipeline_run(run_id)
+        frames: dict[DatasetKind, tuple[pl.LazyFrame, ...]] = {}
+        for dataset, identifier in version_ids.items():
             record = self._repository.get_dataset_version(identifier)
-            frames[record.dataset] = self._curated_store.read_version(record)
+            range_dataset = record.dataset in {
+                DatasetKind.TRADE_CALENDAR,
+                DatasetKind.DAILY_BAR,
+                DatasetKind.SECURITY_STATUS,
+            }
+            if (
+                record.dataset.value != dataset
+                or record.status != "PUBLISHED"
+                or record.source != run.provider
+                or (
+                    range_dataset
+                    and (
+                        record.start_date is None
+                        or record.end_date is None
+                        or record.start_date > run.resolved_start
+                        or record.end_date < run.resolved_end
+                    )
+                )
+            ):
+                raise ValueError("curated checkpoint dataset scope is invalid")
+            self._curated_store.verify_version(record)
+            frames[record.dataset] = self._curated_store.scan_version(record)
         return CuratedResult(version_ids, frames)
+
+    def _restore_quality(
+        self,
+        values: Mapping[str, object],
+        dataset_versions: Mapping[str, DatasetVersionId],
+    ) -> QualityRunId:
+        identifier = QualityRunId.parse(str(values["quality_run_id"]))
+        quality = self._repository.get_quality_run(identifier)
+        if quality.status != "COMPLETED" or dict(quality.dataset_versions) != dict(
+            dataset_versions
+        ):
+            raise ValueError("quality checkpoint scope or status is invalid")
+        return identifier
+
+    def _restore_snapshot(
+        self,
+        values: Mapping[str, object],
+        dataset_versions: Mapping[str, DatasetVersionId],
+        quality_id: QualityRunId,
+    ) -> SnapshotId:
+        identifier = SnapshotId.parse(str(values["snapshot_id"]))
+        self._snapshot_publisher.verify_published(
+            identifier, dataset_versions, quality_id
+        )
+        return identifier
+
+    def _resume_curated(self, run_id: str) -> tuple[CuratedResult, str]:
+        run = self._repository.get_pipeline_run(run_id)
+        ingest_input_hash = _hash(
+            {
+                "request_hash": run.request_hash,
+                "source_adapter": self._versions.source_adapter,
+                "fetch_config": self._versions.fetch_config,
+            }
+        )
+        raw = self._checkpoint(
+            run_id,
+            PipelineStageName.INGEST_RAW,
+            ingest_input_hash,
+            self._restore_raw,
+        )
+        if raw is None:
+            self._raise_argument("pipeline run has no successful Raw checkpoint")
+        raw_stage = self._repository.get_pipeline_stage(
+            run_id, PipelineStageName.INGEST_RAW
+        )
+        assert raw_stage.output_hash is not None
+        curate_input_hash = _hash(
+            {
+                "raw_output_hash": raw_stage.output_hash,
+                "mapper": self._versions.mapper,
+                "canonical_schema": self._versions.canonical_schema,
+            }
+        )
+        curated = self._checkpoint(
+            run_id,
+            PipelineStageName.CURATE,
+            curate_input_hash,
+            lambda value: self._restore_curated(value, run_id),
+        )
+        if not isinstance(curated, CuratedResult):
+            self._raise_argument("pipeline run has no successful Curated checkpoint")
+        curated_stage = self._repository.get_pipeline_stage(
+            run_id, PipelineStageName.CURATE
+        )
+        assert curated_stage.output_hash is not None
+        return curated, curated_stage.output_hash
 
     def _fail(
         self,
@@ -458,6 +717,7 @@ class DataPipeline:
         stage: PipelineStageName,
         input_hash: str,
         error: Exception,
+        owner_id: str,
         *,
         blocked: bool = False,
     ) -> None:
@@ -487,6 +747,7 @@ class DataPipeline:
             error=detail,
             completed_at=self._now(),
             blocked=blocked,
+            owner_id=owner_id,
         )
 
     def _now(self) -> datetime:
@@ -494,6 +755,9 @@ class DataPipeline:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("pipeline clock must return timezone-aware timestamps")
         return value.astimezone(UTC)
+
+    def _lease_expires_at(self) -> datetime:
+        return self._now() + timedelta(minutes=30)
 
     @staticmethod
     def _raise_checkpoint(stage: PipelineStageName, cause: Exception) -> Never:
@@ -524,7 +788,3 @@ class DataPipeline:
 
 def _hash(value: JsonValue) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
-
-
-def _versions_hash(versions: Mapping[str, DatasetVersionId]) -> str:
-    return _hash({key: str(value) for key, value in sorted(versions.items())})
