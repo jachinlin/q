@@ -17,6 +17,7 @@ from quant_core.data.sources.baostock import (
     BaoStockConfig,
     BaoStockHistoricalCatalog,
     BaoStockSdkGateway,
+    DAILY_BAR_FIELDS,
     InstrumentListing,
     from_baostock_code,
     to_baostock_code,
@@ -767,6 +768,26 @@ def test_transport_failure_after_max_attempts_is_structured() -> None:
     assert error.value.detail.retryable is True
     assert len(gateway.query_calls) == 2
     assert sleeps == [0.25]
+
+
+class DailyMarketSdk:
+    def __init__(self) -> None:
+        self.dates: list[str] = []
+
+    def query_daily_history_k_AStock(self, date: str = "") -> FakeCursor:
+        self.dates.append(date)
+        return FakeCursor([[make_row(date, "sh.600000")]])
+
+
+def test_sdk_gateway_forwards_daily_market_date_without_extra_parameters() -> None:
+    """Adding SDK arguments would violate the provider's market-query contract."""
+    sdk = DailyMarketSdk()
+    gateway = BaoStockSdkGateway(sdk=sdk)  # type: ignore[arg-type]
+
+    result = gateway.query_daily_history_k_AStock("2026-01-02")
+
+    assert result.fields == DAILY_BAR_FIELDS
+    assert sdk.dates == ["2026-01-02"]
 
 
 def test_sdk_gateway_forwards_only_the_declared_baostock_surface() -> None:

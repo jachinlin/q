@@ -75,6 +75,9 @@ class BaoStockGateway(Protocol):
     def logout(self) -> BaoStockResponse:
         """Close an SDK session."""
 
+    def query_daily_history_k_AStock(self, date: str = "") -> BaoStockCursor:
+        """Query all A-share daily bars for one provider date."""
+
     def query_history_k_data_plus(
         self,
         code: str,
@@ -102,6 +105,9 @@ class _BaoStockSdk(Protocol):
 
     def logout(self) -> BaoStockResponse:
         """Close an SDK session."""
+
+    def query_daily_history_k_AStock(self, date: str = "") -> BaoStockCursor:
+        """Query all A-share daily bars for one provider date."""
 
     def query_history_k_data_plus(
         self,
@@ -133,6 +139,9 @@ class BaoStockSdkGateway:
 
     def logout(self) -> BaoStockResponse:
         return self._sdk.logout()
+
+    def query_daily_history_k_AStock(self, date: str = "") -> BaoStockCursor:
+        return self._sdk.query_daily_history_k_AStock(date)
 
     def query_history_k_data_plus(
         self,
