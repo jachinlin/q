@@ -301,6 +301,9 @@ def make_pipeline(
     calendar: object | None = None,
     versions: object | None = None,
     curated_store: object | None = None,
+    clock: Callable[[], datetime] = lambda: datetime(2026, 1, 6, tzinfo=UTC),
+    lease_duration: timedelta = timedelta(minutes=30),
+    heartbeat_interval: timedelta | None = None,
 ) -> tuple[DataPipeline, MetadataRepository]:
     database = tmp_path / "state" / "quant.db"
     upgrade_database(database)
@@ -326,7 +329,13 @@ def make_pipeline(
         quality_runner=quality_runner or QualityRunner(),  # type: ignore[arg-type]
         snapshot_publisher=publisher,  # type: ignore[arg-type]
         **({"versions": versions} if versions is not None else {}),
-        clock=lambda: datetime(2026, 1, 6, tzinfo=UTC),
+        clock=clock,
+        lease_duration=lease_duration,
+        **(
+            {"heartbeat_interval": heartbeat_interval}
+            if heartbeat_interval is not None
+            else {}
+        ),
     )
     return pipeline, repository
 
@@ -1106,8 +1115,15 @@ class LeaseCoordinatedSource(OfflineBaoStockSource):
         super().__init__()
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.second_collector_entered = threading.Event()
+        self._entry_lock = threading.Lock()
+        self._entries = 0
 
     def fetch_range(self, start: date, end: date) -> Iterable[RawBatch]:
+        with self._entry_lock:
+            self._entries += 1
+            if self._entries > 1:
+                self.second_collector_entered.set()
         self.fetch_calls += 1
         self.entered.set()
         assert self.release.wait(timeout=5)
@@ -1155,6 +1171,33 @@ def test_pipeline_renews_every_long_running_stage(
     assert set(renewed_stages) == set(PipelineStageName)
     assert renewed_stages.count(PipelineStageName.INGEST_RAW) >= 3
     assert renewed_stages.count(PipelineStageName.VALIDATE) >= 6
+
+
+def test_background_heartbeat_covers_source_work_before_first_yield(
+    tmp_path: Path,
+) -> None:
+    source = LeaseCoordinatedSource()
+    options = {
+        "clock": lambda: datetime.now(UTC),
+        "lease_duration": timedelta(milliseconds=100),
+        "heartbeat_interval": timedelta(milliseconds=20),
+    }
+    first, _ = make_pipeline(tmp_path, source, **options)  # type: ignore[arg-type]
+    second, _ = make_pipeline(tmp_path, source, **options)  # type: ignore[arg-type]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        leader = executor.submit(first.bootstrap)
+        assert source.entered.wait(timeout=5)
+        threading.Event().wait(0.25)
+        follower = executor.submit(second.bootstrap)
+        with pytest.raises(QuantError) as captured:
+            follower.result(timeout=5)
+        assert source.second_collector_entered.is_set() is False
+        source.release.set()
+        result = leader.result(timeout=10)
+
+    assert captured.value.detail.code == "DATA_PIPELINE_BUSY"
+    assert isinstance(result.snapshot_id, SnapshotId)
 
 
 class FakeCliPipeline:

@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from threading import Event, Lock, Thread
 from typing import Never, Protocol, cast
 from uuid import uuid4
 
@@ -95,6 +96,54 @@ class PipelineVersions:
         }
 
 
+class _StageLeaseKeeper:
+    """Renew one fenced stage lease independently of long provider operations."""
+
+    def __init__(self, renew: Callable[[], None], interval: timedelta) -> None:
+        self._renew = renew
+        self._interval_seconds = interval.total_seconds()
+        self._stopped = Event()
+        self._failure_lock = Lock()
+        self._failure: Exception | None = None
+        self._thread = Thread(
+            target=self._run,
+            name="quant-pipeline-lease-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def pulse(self) -> None:
+        self._raise_if_failed()
+        self._renew()
+        self._raise_if_failed()
+
+    def stop(self) -> Exception | None:
+        self._stopped.set()
+        self._thread.join()
+        return self.failure
+
+    @property
+    def failure(self) -> Exception | None:
+        with self._failure_lock:
+            return self._failure
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval_seconds):
+            try:
+                self._renew()
+            except Exception as error:  # noqa: BLE001 - cross-thread handoff boundary.
+                with self._failure_lock:
+                    self._failure = error
+                self._stopped.set()
+
+    def _raise_if_failed(self) -> None:
+        failure = self.failure
+        if failure is not None:
+            raise failure
+
+
 class DataPipeline:
     """Execute and recover the fixed four-stage data pipeline."""
 
@@ -112,6 +161,7 @@ class DataPipeline:
         versions: PipelineVersions | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         lease_duration: timedelta = timedelta(minutes=30),
+        heartbeat_interval: timedelta | None = None,
     ) -> None:
         self._source = source
         self._mapper = mapper
@@ -127,6 +177,13 @@ class DataPipeline:
         if lease_duration <= timedelta(0):
             raise ValueError("pipeline lease duration must be positive")
         self._lease_duration = lease_duration
+        self._heartbeat_interval = heartbeat_interval or min(
+            lease_duration / 3, timedelta(minutes=1)
+        )
+        if not timedelta(0) < self._heartbeat_interval < lease_duration:
+            raise ValueError(
+                "heartbeat interval must be positive and shorter than lease"
+            )
 
     def bootstrap(self) -> PipelineResult:
         try:
@@ -380,24 +437,27 @@ class DataPipeline:
             owner_id=owner_id,
             lease_expires_at=self._lease_expires_at(),
         )
+        keeper = self._lease_keeper(
+            run_id, PipelineStageName.INGEST_RAW, owner_id, claim.attempt
+        )
+        keeper.start()
         try:
             self._source.login()
             try:
                 published: list[PublishedPartition] = []
                 for batch in self._source.fetch_range(start, end):
-                    self._heartbeat(
-                        run_id, PipelineStageName.INGEST_RAW, owner_id, claim.attempt
-                    )
+                    keeper.pulse()
                     published.append(self._raw_store.publish(batch, run_id=run_id))
-                    self._heartbeat(
-                        run_id, PipelineStageName.INGEST_RAW, owner_id, claim.attempt
-                    )
+                    keeper.pulse()
                 partitions = tuple(published)
             finally:
                 self._source.close()
             output: JsonValue = {
                 "partitions": [partition_to_json(item) for item in partitions]
             }
+            lease_failure = keeper.stop()
+            if lease_failure is not None:
+                raise lease_failure
             self._repository.complete_pipeline_stage(
                 run_id,
                 PipelineStageName.INGEST_RAW,
@@ -410,14 +470,18 @@ class DataPipeline:
             )
             return partitions
         except Exception as error:
+            lease_failure = keeper.stop()
+            active_error = lease_failure or error
             self._fail(
                 run_id,
                 PipelineStageName.INGEST_RAW,
                 input_hash,
-                error,
+                active_error,
                 owner_id,
                 claim.attempt,
             )
+            if active_error is not error:
+                raise active_error from error
             raise
 
     def _curate(
@@ -446,6 +510,10 @@ class DataPipeline:
             owner_id=owner_id,
             lease_expires_at=self._lease_expires_at(),
         )
+        keeper = self._lease_keeper(
+            run_id, PipelineStageName.CURATE, owner_id, claim.attempt
+        )
+        keeper.start()
         try:
             batches = (
                 batch
@@ -460,9 +528,7 @@ class DataPipeline:
                 start=start,
                 end=end,
                 repository=self._repository,
-                heartbeat=lambda: self._heartbeat(
-                    run_id, PipelineStageName.CURATE, owner_id, claim.attempt
-                ),
+                heartbeat=keeper.pulse,
             )
             output: JsonValue = {
                 "dataset_versions": {
@@ -470,6 +536,9 @@ class DataPipeline:
                     for key, value in sorted(result.dataset_versions.items())
                 }
             }
+            lease_failure = keeper.stop()
+            if lease_failure is not None:
+                raise lease_failure
             self._repository.complete_pipeline_stage(
                 run_id,
                 PipelineStageName.CURATE,
@@ -482,14 +551,18 @@ class DataPipeline:
             )
             return result
         except Exception as error:
+            lease_failure = keeper.stop()
+            active_error = lease_failure or error
             self._fail(
                 run_id,
                 PipelineStageName.CURATE,
                 input_hash,
-                error,
+                active_error,
                 owner_id,
                 claim.attempt,
             )
+            if active_error is not error:
+                raise active_error from error
             raise
 
     def _validate(
@@ -515,23 +588,24 @@ class DataPipeline:
             owner_id=owner_id,
             lease_expires_at=self._lease_expires_at(),
         )
+        keeper = self._lease_keeper(
+            run_id, PipelineStageName.VALIDATE, owner_id, claim.attempt
+        )
+        keeper.start()
         try:
             started = self._now()
-            heartbeat: Callable[[], None] = lambda: self._heartbeat(
-                run_id, PipelineStageName.VALIDATE, owner_id, claim.attempt
-            )
             issues = (
                 *self._quality_runner.evaluate(
                     curated.frames,
-                    heartbeat=heartbeat,
+                    heartbeat=keeper.pulse,
                 ),
             )
-            heartbeat()
+            keeper.pulse()
             issues = (
                 *issues,
                 *required_dataset_issues(curated.frames),
             )
-            heartbeat()
+            keeper.pulse()
             quality = self._repository.register_quality_run(
                 QualityRunSpec(
                     dataset_versions=curated.dataset_versions,
@@ -541,6 +615,9 @@ class DataPipeline:
                 )
             )
             output: JsonValue = {"quality_run_id": str(quality.id)}
+            lease_failure = keeper.stop()
+            if lease_failure is not None:
+                raise lease_failure
             self._repository.complete_pipeline_stage(
                 run_id,
                 PipelineStageName.VALIDATE,
@@ -553,14 +630,18 @@ class DataPipeline:
             )
             return quality.id
         except Exception as error:
+            lease_failure = keeper.stop()
+            active_error = lease_failure or error
             self._fail(
                 run_id,
                 PipelineStageName.VALIDATE,
                 input_hash,
-                error,
+                active_error,
                 owner_id,
                 claim.attempt,
             )
+            if active_error is not error:
+                raise active_error from error
             raise
 
     def _publish(
@@ -589,17 +670,20 @@ class DataPipeline:
             owner_id=owner_id,
             lease_expires_at=self._lease_expires_at(),
         )
+        keeper = self._lease_keeper(
+            run_id, PipelineStageName.PUBLISH_SNAPSHOT, owner_id, claim.attempt
+        )
+        keeper.start()
         try:
-            self._heartbeat(
-                run_id, PipelineStageName.PUBLISH_SNAPSHOT, owner_id, claim.attempt
-            )
+            keeper.pulse()
             identifier = self._snapshot_publisher.publish(
                 curated.dataset_versions, quality_id
             )
-            self._heartbeat(
-                run_id, PipelineStageName.PUBLISH_SNAPSHOT, owner_id, claim.attempt
-            )
+            keeper.pulse()
             output: JsonValue = {"snapshot_id": str(identifier)}
+            lease_failure = keeper.stop()
+            if lease_failure is not None:
+                raise lease_failure
             self._repository.complete_pipeline_stage(
                 run_id,
                 PipelineStageName.PUBLISH_SNAPSHOT,
@@ -612,16 +696,20 @@ class DataPipeline:
             )
             return identifier
         except Exception as error:
+            lease_failure = keeper.stop()
+            active_error = lease_failure or error
             self._fail(
                 run_id,
                 PipelineStageName.PUBLISH_SNAPSHOT,
                 input_hash,
-                error,
+                active_error,
                 owner_id,
                 claim.attempt,
                 blocked=isinstance(error, QuantError)
                 and error.detail.code == "SNAP_QUALITY_BLOCKED",
             )
+            if active_error is not error:
+                raise active_error from error
             raise
 
     def _checkpoint(
@@ -822,6 +910,18 @@ class DataPipeline:
 
     def _lease_expires_at(self) -> datetime:
         return self._now() + self._lease_duration
+
+    def _lease_keeper(
+        self,
+        run_id: str,
+        stage: PipelineStageName,
+        owner_id: str,
+        attempt: int,
+    ) -> _StageLeaseKeeper:
+        return _StageLeaseKeeper(
+            lambda: self._heartbeat(run_id, stage, owner_id, attempt),
+            self._heartbeat_interval,
+        )
 
     def _heartbeat(
         self,
