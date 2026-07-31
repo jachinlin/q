@@ -67,3 +67,63 @@ collected 5 items
 None. The task deliberately returns a `pl.LazyFrame` backed by the completed,
 parameterized DuckDB result so the caller retains the standard lazy dataframe
 interface while the repository never exposes unbound filesystem paths.
+
+## Fix round 1: catalog publication, partition identity, and PIT boundary hardening
+
+### Changes
+
+- Research reads now reject snapshots unless their catalog status is `PUBLISHED`
+  and `published_at` is present (`SNAP_NOT_PUBLISHED`). Dataset versions must
+  likewise be published.
+- Dataset version construction and registration reject duplicate resolved
+  partition paths and duplicate `content_hash` values. The research reader
+  independently detects either duplicate identity in a malformed catalog and
+  raises `SNAPSHOT_CATALOG_INVALID` before issuing `UNION ALL`.
+- Financial fixture data now locks the Shanghai end-of-day cutoff: the row at
+  `2024-04-29 15:59:59.999999 UTC` is visible, while the row at
+  `2024-04-29 16:00:00 UTC`, an unknown availability timestamp, and
+  `pit_usable=False` are not. Equal availability timestamps select the highest
+  revision.
+
+### RED evidence
+
+```text
+uv run pytest tests/point_in_time/test_research_repository.py tests/integration/test_snapshot_publication.py -v --basetemp=C:\t\pit1f
+
+collected 44 items
+4 failed, 40 passed
+```
+
+The failures showed that the reader attempted to read a real DRAFT metadata
+snapshot, accepted duplicate catalog partitions and a DRAFT dataset version,
+and that `DatasetVersionSpec` accepted duplicate path/content identities.
+
+### GREEN and complete verification
+
+```text
+uv run pytest tests/point_in_time/test_research_repository.py tests/integration/test_snapshot_publication.py -v --basetemp=C:\t\pit1f
+44 passed
+
+uv run pytest -q --basetemp=C:\t\pit1f
+215 passed in 38.90s
+
+uv run ruff format --check
+66 files already formatted
+
+uv run ruff check
+All checks passed!
+
+uv run mypy
+Success: no issues found in 36 source files
+
+git diff --check
+passed
+```
+
+### Fix round 1 concerns
+
+None.
+
+### Fix round 1 commit
+
+`git commit -m "fix: harden snapshot research catalog reads"`

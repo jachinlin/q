@@ -45,6 +45,23 @@ class FixtureSnapshotRepository:
     def get_dataset_version(self, identifier: DatasetVersionId) -> DatasetVersionRecord:
         return self._versions[identifier]
 
+    def bind_dataset(
+        self,
+        snapshot_id: SnapshotId,
+        dataset: DatasetKind,
+        record: DatasetVersionRecord,
+    ) -> SnapshotId:
+        """Create a test snapshot with one replacement catalog dataset version."""
+        original = self._snapshots[snapshot_id]
+        identifier = SnapshotId.new()
+        self._versions[record.id] = record
+        self._snapshots[identifier] = replace(
+            original,
+            id=identifier,
+            dataset_versions={**original.dataset_versions, dataset.value: record.id},
+        )
+        return identifier
+
     def snapshot_without_dataset(
         self, identifier: SnapshotId, dataset: str
     ) -> SnapshotId:
@@ -90,12 +107,24 @@ def point_in_time_fixture(tmp_path: Path) -> PointInTimeFixture:
             _financial_row(
                 value=120.0,
                 revision=1,
-                available_at=datetime(2024, 4, 28, 8, tzinfo=UTC),
+                available_at=datetime(2024, 4, 29, 15, 59, 59, 999999, tzinfo=UTC),
+            ),
+            _financial_row(
+                value=125.0,
+                revision=2,
+                available_at=datetime(2024, 4, 29, 15, 59, 59, 999999, tzinfo=UTC),
             ),
             _financial_row(
                 value=130.0,
-                revision=2,
-                available_at=datetime(2024, 4, 30, 8, tzinfo=UTC),
+                revision=3,
+                available_at=datetime(2024, 4, 29, 16, tzinfo=UTC),
+            ),
+            _financial_row(value=140.0, revision=4, available_at=None),
+            _financial_row(
+                value=150.0,
+                revision=5,
+                available_at=datetime(2024, 4, 29, 12, tzinfo=UTC),
+                pit_usable=False,
             ),
         ],
     )
@@ -200,19 +229,25 @@ def _write_dataset(
     )
 
 
-def _audit(available_at: datetime) -> dict[str, object]:
+def _audit(
+    available_at: datetime | None, *, pit_usable: bool = True
+) -> dict[str, object]:
     return {
         "source": "fixture",
         "source_version": "v1",
         "available_at": available_at,
         "availability_source": "announcement",
-        "pit_usable": True,
+        "pit_usable": pit_usable,
         "ingested_at": datetime(2024, 4, 30, tzinfo=UTC),
     }
 
 
 def _financial_row(
-    *, value: float, revision: int, available_at: datetime
+    *,
+    value: float,
+    revision: int,
+    available_at: datetime | None,
+    pit_usable: bool = True,
 ) -> dict[str, object]:
     return {
         "instrument_id": "SSE:600000",
@@ -221,7 +256,7 @@ def _financial_row(
         "value": value,
         "revision": revision,
         "announced_at": available_at,
-        **_audit(available_at),
+        **_audit(available_at, pit_usable=pit_usable),
     }
 
 

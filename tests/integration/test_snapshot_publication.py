@@ -133,6 +133,64 @@ def test_dataset_registration_is_idempotent_and_scoped_by_dataset(
     assert first.partitions[0].content_hash == daily.partitions[0].content_hash
 
 
+def test_dataset_version_spec_rejects_duplicate_partition_path_or_content_hash(
+    tmp_path: Path,
+) -> None:
+    """Either repeated identity would cause a later UNION ALL to duplicate rows."""
+    first = _partition(tmp_path, "first")
+    repeated_path = DatasetPartitionSpec(
+        content_hash="b" * 64,
+        path=first.path,
+        schema_fingerprint="c" * 64,
+        row_count=1,
+    )
+    repeated_content = DatasetPartitionSpec(
+        content_hash=first.content_hash,
+        path=tmp_path / "curated" / "copy.parquet",
+        schema_fingerprint="d" * 64,
+        row_count=1,
+    )
+
+    for duplicate, message in (
+        (repeated_path, "duplicate resolved partition path"),
+        (repeated_content, "duplicate partition content hash"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            DatasetVersionSpec(
+                dataset=DatasetKind.DAILY_BAR,
+                source="fixture",
+                partitions=(first, duplicate),
+                start_date=date(2024, 4, 28),
+                end_date=date(2024, 4, 29),
+                created_run_id="fixture",
+            )
+
+
+def test_dataset_registration_accepts_distinct_partition_identities(
+    repository: MetadataRepository,
+    tmp_path: Path,
+) -> None:
+    """Distinct partition files remain a valid multi-partition dataset version."""
+    first = _partition(tmp_path, "first")
+    second = _partition(tmp_path, "second")
+
+    record = repository.register_dataset_version(
+        DatasetVersionSpec(
+            dataset=DatasetKind.DAILY_BAR,
+            source="fixture",
+            partitions=(second, first),
+            start_date=date(2024, 4, 28),
+            end_date=date(2024, 4, 29),
+            created_run_id="fixture",
+        )
+    )
+
+    assert {partition.path for partition in record.partitions} == {
+        first.path,
+        second.path,
+    }
+
+
 def _audit_columns() -> dict[str, pl.Series]:
     instant = datetime(2026, 1, 5, 8, tzinfo=UTC)
     return {

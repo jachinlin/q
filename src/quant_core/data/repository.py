@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
+from pathlib import Path
 from typing import Never, Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -11,7 +12,7 @@ import duckdb
 import polars as pl
 
 from quant_core.data.schemas import CANONICAL_SCHEMAS, CanonicalSchema
-from quant_core.domain.enums import DatasetKind, Severity
+from quant_core.domain.enums import DatasetKind, Severity, SnapshotStatus
 from quant_core.domain.identifiers import DatasetVersionId, InstrumentId, SnapshotId
 from quant_core.errors import ErrorDetail, QuantError
 from quant_core.persistence.repositories import DatasetVersionRecord, SnapshotRecord
@@ -198,12 +199,23 @@ class SnapshotResearchRepository:
         self, snapshot_id: SnapshotId, dataset: DatasetKind
     ) -> DatasetVersionRecord:
         snapshot = self._catalog.get_snapshot(snapshot_id)
+        if (
+            snapshot.status is not SnapshotStatus.PUBLISHED
+            or snapshot.published_at is None
+        ):
+            _raise_snapshot_not_published(snapshot_id)
         version_id = snapshot.dataset_versions.get(dataset.value)
         if version_id is None:
             raise SnapshotDatasetMissing(snapshot_id, dataset)
         record = self._catalog.get_dataset_version(version_id)
-        if record.dataset is not dataset:
-            _raise_catalog_error(snapshot_id, dataset)
+        if (
+            record.dataset is not dataset
+            or record.status != SnapshotStatus.PUBLISHED.value
+        ):
+            _raise_catalog_error(
+                snapshot_id, dataset, "dataset version is not published"
+            )
+        _validate_catalog_partition_identities(snapshot_id, dataset, record)
         return record
 
 
@@ -257,12 +269,46 @@ def _shanghai_close_utc(value: date) -> datetime:
     return datetime.combine(value, time.max, tzinfo=_SHANGHAI).astimezone(UTC)
 
 
-def _raise_catalog_error(snapshot_id: SnapshotId, dataset: DatasetKind) -> Never:
+def _validate_catalog_partition_identities(
+    snapshot_id: SnapshotId,
+    dataset: DatasetKind,
+    record: DatasetVersionRecord,
+) -> None:
+    paths: set[Path] = set()
+    content_hashes: set[str] = set()
+    for partition in record.partitions:
+        path = partition.path.resolve()
+        if path in paths or partition.content_hash in content_hashes:
+            _raise_catalog_error(
+                snapshot_id,
+                dataset,
+                "dataset version contains duplicate partition identity",
+            )
+        paths.add(path)
+        content_hashes.add(partition.content_hash)
+
+
+def _raise_snapshot_not_published(snapshot_id: SnapshotId) -> Never:
     raise QuantError(
         ErrorDetail(
-            code="SNAPSHOT_DATASET_MISMATCH",
+            code="SNAP_NOT_PUBLISHED",
             severity=Severity.FATAL,
-            message="snapshot dataset version does not match the requested dataset",
+            message="snapshot is not published",
+            context={"snapshot_id": str(snapshot_id)},
+            remediation="select a published immutable snapshot",
+            retryable=False,
+        )
+    )
+
+
+def _raise_catalog_error(
+    snapshot_id: SnapshotId, dataset: DatasetKind, message: str
+) -> Never:
+    raise QuantError(
+        ErrorDetail(
+            code="SNAPSHOT_CATALOG_INVALID",
+            severity=Severity.FATAL,
+            message=message,
             context={"dataset": dataset.value, "snapshot_id": str(snapshot_id)},
             remediation="inspect the immutable snapshot catalog",
             retryable=False,

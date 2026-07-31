@@ -150,6 +150,7 @@ class DatasetVersionSpec:
             raise ValueError("source and created_run_id must not be empty")
         if not self.partitions:
             raise ValueError("dataset version must contain at least one partition")
+        _validate_partition_identities(self.partitions)
         if self.start_date and self.end_date and self.start_date > self.end_date:
             raise ValueError("start_date must not follow end_date")
 
@@ -595,6 +596,7 @@ class MetadataRepository:
         self, spec: DatasetVersionSpec
     ) -> DatasetVersionRecord:
         """Idempotently register one complete version under a stable UUIDv5."""
+        _validate_partition_identities(spec.partitions)
         fingerprint = dataset_version_fingerprint(spec)
         identifier = DatasetVersionId(
             uuid5(
@@ -1055,6 +1057,21 @@ def _sorted_partitions(
             ),
         )
     )
+
+
+def _validate_partition_identities(
+    partitions: tuple[DatasetPartitionSpec, ...],
+) -> None:
+    paths: set[Path] = set()
+    content_hashes: set[str] = set()
+    for partition in partitions:
+        path = partition.path.resolve()
+        if path in paths:
+            raise ValueError("duplicate resolved partition path")
+        if partition.content_hash in content_hashes:
+            raise ValueError("duplicate partition content hash")
+        paths.add(path)
+        content_hashes.add(partition.content_hash)
 
 
 def _validate_hash(value: str, field: str) -> None:
