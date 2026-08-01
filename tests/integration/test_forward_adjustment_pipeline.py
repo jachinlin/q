@@ -35,6 +35,11 @@ from quant_core.persistence.repositories import MetadataRepository
 
 _ID = InstrumentId.parse("SSE:600000")
 _DATES = (date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5))
+_FIXTURE_OPENS = (9.0, 11.0, 8.1, 8.5)
+_FIXTURE_HIGHS = (10.5, 12.5, 8.8, 9.8)
+_FIXTURE_LOWS = (8.5, 10.5, 7.8, 8.2)
+_FIXTURE_VOLUMES = (101, 202, 303, 404)
+_FIXTURE_AMOUNTS = (1_001.0, 2_002.0, 3_003.0, 4_004.0)
 
 
 class _FixedCalendar:
@@ -60,10 +65,33 @@ class _FixtureBaoStockSource:
         days: Sequence[date],
         closes: Sequence[float],
         precloses: Sequence[float],
+        opens: Sequence[float] | None = None,
+        highs: Sequence[float] | None = None,
+        lows: Sequence[float] | None = None,
+        volumes: Sequence[int] | None = None,
+        amounts: Sequence[float] | None = None,
     ) -> None:
         self.days = tuple(days)
         self.closes = tuple(closes)
         self.precloses = tuple(precloses)
+        self.opens = tuple(opens or closes)
+        self.highs = tuple(highs or closes)
+        self.lows = tuple(lows or closes)
+        self.volumes = tuple(volumes or (100 for _ in closes))
+        self.amounts = tuple(amounts or (1_000.0 for _ in closes))
+        if not all(
+            len(values) == len(self.days)
+            for values in (
+                self.closes,
+                self.precloses,
+                self.opens,
+                self.highs,
+                self.lows,
+                self.volumes,
+                self.amounts,
+            )
+        ):
+            raise ValueError("fixture daily columns must have one value per date")
         self.fetch_calls = 0
 
     def login(self) -> None:
@@ -115,13 +143,13 @@ class _FixtureBaoStockSource:
                 {
                     "date": day.isoformat(),
                     "code": "sh.600000",
-                    "open": str(close),
-                    "high": str(close),
-                    "low": str(close),
+                    "open": str(open_price),
+                    "high": str(high_price),
+                    "low": str(low_price),
                     "close": str(close),
                     "preclose": str(preclose),
-                    "volume": "100",
-                    "amount": "1000.0",
+                    "volume": str(volume),
+                    "amount": str(amount),
                     "adjustflag": "3",
                     "turn": "0.1",
                     "tradestatus": "1",
@@ -132,8 +160,25 @@ class _FixtureBaoStockSource:
                     "pcfNcfTTM": "1.0",
                     "isST": "0",
                 }
-                for day, close, preclose in zip(
-                    self.days, self.closes, self.precloses, strict=True
+                for (
+                    day,
+                    open_price,
+                    high_price,
+                    low_price,
+                    close,
+                    preclose,
+                    volume,
+                    amount,
+                ) in zip(
+                    self.days,
+                    self.opens,
+                    self.highs,
+                    self.lows,
+                    self.closes,
+                    self.precloses,
+                    self.volumes,
+                    self.amounts,
+                    strict=True,
                 )
             ),
         )
@@ -144,12 +189,19 @@ def _publish_fixture_snapshot(
     days: Sequence[date] = _DATES,
     closes: Sequence[float] = (10.0, 12.0, 8.4, 9.0),
     precloses: Sequence[float] = (0.0, 10.0, 8.0, 8.4),
+    opens: Sequence[float] | None = None,
+    highs: Sequence[float] | None = None,
+    lows: Sequence[float] | None = None,
+    volumes: Sequence[int] | None = None,
+    amounts: Sequence[float] | None = None,
 ) -> tuple[SnapshotResearchRepository, object, _FixtureBaoStockSource]:
     database = tmp_path / "state" / "quant.db"
     upgrade_database(database)
     metadata = MetadataRepository(create_sqlite_engine(database))
     snapshot_root = tmp_path / "data" / "snapshots"
-    source = _FixtureBaoStockSource(days, closes, precloses)
+    source = _FixtureBaoStockSource(
+        days, closes, precloses, opens, highs, lows, volumes, amounts
+    )
     pipeline = DataPipeline(
         source=source,
         mapper=BaoStockMapper(),
@@ -171,7 +223,14 @@ def test_baostock_raw_to_snapshot_forward_adjustment_needs_no_corporate_actions(
     tmp_path: Path,
 ) -> None:
     """Removing the FORWARD branch would make this snapshot read require actions."""
-    repository, result, _ = _publish_fixture_snapshot(tmp_path)
+    repository, result, _ = _publish_fixture_snapshot(
+        tmp_path,
+        opens=_FIXTURE_OPENS,
+        highs=_FIXTURE_HIGHS,
+        lows=_FIXTURE_LOWS,
+        volumes=_FIXTURE_VOLUMES,
+        amounts=_FIXTURE_AMOUNTS,
+    )
 
     # Baseline characterization: the full Raw -> Canonical -> Snapshot path already
     # exposes FORWARD without a CORPORATE_ACTION dataset.  The literal values below
@@ -190,8 +249,38 @@ def test_baostock_raw_to_snapshot_forward_adjustment_needs_no_corporate_actions(
         .collect()
     )
 
+    assert frame["open"].to_list() == pytest.approx([6.0, 22.0 / 3.0, 8.1, 8.5])
+    assert frame["high"].to_list() == pytest.approx([7.0, 25.0 / 3.0, 8.8, 9.8])
+    assert frame["low"].to_list() == pytest.approx([17.0 / 3.0, 7.0, 7.8, 8.2])
     assert frame["close"].to_list() == pytest.approx([20.0 / 3.0, 8.0, 8.4, 9.0])
     assert frame["preclose"].to_list() == pytest.approx([0.0, 20.0 / 3.0, 8.0, 8.4])
+    assert frame["adjustment_factor"].to_list() == pytest.approx(
+        [2.0 / 3.0, 2.0 / 3.0, 1.0, 1.0]
+    )
+    assert frame["volume"].to_list() == list(_FIXTURE_VOLUMES)
+    assert frame["amount"].to_list() == pytest.approx(_FIXTURE_AMOUNTS)
+    assert {
+        column: frame.schema[column]
+        for column in (
+            "open",
+            "high",
+            "low",
+            "close",
+            "preclose",
+            "adjustment_factor",
+            "amount",
+            "volume",
+        )
+    } == {
+        "open": pl.Float64,
+        "high": pl.Float64,
+        "low": pl.Float64,
+        "close": pl.Float64,
+        "preclose": pl.Float64,
+        "adjustment_factor": pl.Float64,
+        "amount": pl.Float64,
+        "volume": pl.Int64,
+    }
     assert frame["adjustment_mode"].unique().to_list() == ["FORWARD"]
 
 
