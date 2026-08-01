@@ -1,23 +1,23 @@
-"""Forward-adjusted ETF return and log-price trend factors."""
+"""Row-log-return ETF return and log-price trend factors."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
-from math import isfinite, log
+from math import expm1, isfinite
 from typing import Protocol
 
 import polars as pl
 
-from quant_core.data.adjustments import FORWARD_RETURN_INDEX_COLUMN, AdjustmentMode
+from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorSpec
 
-_VERSION = "1.0.0"
-_TREND_VERSION = "1.1.0"
+_VERSION = "2.0.0"
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
-_PRICE_BASIS = "baostock_return_index_v1"
+_PRICE_BASIS = "baostock_forward_log_return_v1"
+_PATH_CONSTRUCTION = "window_forward_cumsum_v1"
 
 
 class AdjustedBarService(Protocol):
@@ -35,7 +35,7 @@ class AdjustedBarService(Protocol):
 
 
 class _MarketFactor:
-    """Shared deterministic window execution over adjusted observed sessions."""
+    """Shared deterministic window execution over row-level log returns."""
 
     def __init__(
         self,
@@ -43,7 +43,7 @@ class _MarketFactor:
         instruments: Sequence[InstrumentId],
         spec: FactorSpec,
         required_prices: int,
-        evaluator: Callable[[Sequence[float]], float | None],
+        evaluator: Callable[[Sequence[float], Sequence[float]], float | None],
     ) -> None:
         self._price_service = price_service
         self._instruments = _canonical_instrument_scope(instruments)
@@ -56,7 +56,7 @@ class _MarketFactor:
         return self._spec
 
     def compute(self, ctx: FactorContext) -> pl.LazyFrame:
-        """Compute rows inside ``ctx`` using signal-local forward-adjusted prices."""
+        """Compute rows inside ``ctx`` using request-stable row log returns."""
         history_start = _expanded_history_start(ctx.start, self.spec.lookback_sessions)
         normalized = self._load_bars(ctx, history_start)
         if history_start != date.min and _needs_full_history(
@@ -73,7 +73,7 @@ class _MarketFactor:
             rows = instrument_frame.select(
                 "trade_date",
                 "instrument_id",
-                FORWARD_RETURN_INDEX_COLUMN,
+                FORWARD_LOG_RETURN_COLUMN,
                 "available_at",
             ).to_dicts()
             for index, row in enumerate(rows):
@@ -88,9 +88,10 @@ class _MarketFactor:
                 available_at = bar_available_at
                 value: float | None = None
                 if start_index >= 0 and len(window) == self._required_prices:
-                    closes = _forward_return_index_values(window)
-                    if closes is not None and available_at is not None:
-                        value = self._evaluator(closes)
+                    log_window = _relative_log_window(window)
+                    if log_window is not None and available_at is not None:
+                        relative_log_path, log_returns = log_window
+                        value = self._evaluator(relative_log_path, log_returns)
                         if value is not None and not isfinite(value):
                             value = None
                 output.append(
@@ -151,9 +152,10 @@ class ReturnFactor(_MarketFactor):
                 direction=1,
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
-                    "formula": "forward_return_index[t]/forward_return_index[t-n]-1",
+                    "formula": ("expm1(forward_cumsum(forward_log_return[1:n+1])[-1])"),
+                    "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
-                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
+                    "price_field": FORWARD_LOG_RETURN_COLUMN,
                     "window_sessions": window,
                 },
             ),
@@ -175,7 +177,7 @@ class Trend120dFactor(_MarketFactor):
             instruments,
             FactorSpec(
                 factor_id="trend_120d_v1",
-                version=_TREND_VERSION,
+                version=_VERSION,
                 frequency="daily",
                 lookback_sessions=120,
                 dependencies=(),
@@ -183,13 +185,13 @@ class Trend120dFactor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "formula": (
-                        "ols_slope(log(forward_return_index/"
-                        "forward_return_index[0]),x=0..119)"
+                        "ols_slope([0,forward_cumsum("
+                        "forward_log_return[1:120])],x=0..119)"
                     ),
-                    "formula_version": "log_price_ols_slope_v2",
                     "include_intercept": True,
+                    "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
-                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
+                    "price_field": FORWARD_LOG_RETURN_COLUMN,
                     "window_prices": 120,
                 },
             ),
@@ -219,11 +221,10 @@ class Momentum12020Factor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
-                    "formula": (
-                        "forward_return_index[t-20]/forward_return_index[t-120]-1"
-                    ),
+                    "formula": ("expm1(forward_cumsum(forward_log_return[1:101])[-1])"),
+                    "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
-                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
+                    "price_field": FORWARD_LOG_RETURN_COLUMN,
                     "skip_recent_sessions": 20,
                     "window_prices": 121,
                 },
@@ -233,37 +234,33 @@ class Momentum12020Factor(_MarketFactor):
         )
 
 
-def _return_value(closes: Sequence[float]) -> float | None:
-    value = closes[-1] / closes[0] - 1.0
-    return value if isfinite(value) else None
+def _return_value(
+    relative_log_path: Sequence[float], log_returns: Sequence[float]
+) -> float | None:
+    del log_returns
+    return _finite_expm1(relative_log_path[-1])
 
 
-def _momentum_120_20_value(closes: Sequence[float]) -> float | None:
-    value = closes[-21] / closes[0] - 1.0
-    return value if isfinite(value) else None
+def _momentum_120_20_value(
+    relative_log_path: Sequence[float], log_returns: Sequence[float]
+) -> float | None:
+    del log_returns
+    return _finite_expm1(relative_log_path[-21])
 
 
-def _trend_value(closes: Sequence[float]) -> float | None:
-    anchor = closes[0]
-    log_prices: list[float] = []
-    for value in closes:
-        relative = value / anchor
-        relative_log = (
-            log(relative)
-            if isfinite(relative) and relative > 0.0
-            else log(value) - log(anchor)
-        )
-        if not isfinite(relative_log):
-            return None
-        log_prices.append(relative_log)
-    count = len(log_prices)
+def _trend_value(
+    relative_log_path: Sequence[float], log_returns: Sequence[float]
+) -> float | None:
+    del log_returns
+    count = len(relative_log_path)
     mean_x = (count - 1) / 2.0
-    mean_y = sum(log_prices) / count
+    mean_y = sum(relative_log_path) / count
     if not isfinite(mean_y):
         return None
     denominator = sum((index - mean_x) ** 2 for index in range(count))
     numerator = sum(
-        (index - mean_x) * (value - mean_y) for index, value in enumerate(log_prices)
+        (index - mean_x) * (value - mean_y)
+        for index, value in enumerate(relative_log_path)
     )
     slope = numerator / denominator
     return slope if isfinite(slope) else None
@@ -307,7 +304,7 @@ def _validate_adjusted_bars(frame: pl.DataFrame) -> None:
         "instrument_id": pl.String,
         "trade_date": pl.Date,
         "available_at": pl.Datetime("us", "UTC"),
-        FORWARD_RETURN_INDEX_COLUMN: pl.Float64,
+        FORWARD_LOG_RETURN_COLUMN: pl.Float64,
     }
     missing = sorted(set(required) - set(frame.columns))
     if missing:
@@ -317,27 +314,40 @@ def _validate_adjusted_bars(frame: pl.DataFrame) -> None:
             raise TypeError(f"adjusted bar {column} must have dtype {dtype}")
 
 
-def _positive_finite(value: object) -> float | None:
+def _finite_log_return(value: object) -> float | None:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not isfinite(value)
-        or value <= 0
     ):
         return None
     return float(value)
 
 
-def _forward_return_index_values(
+def _relative_log_window(
     window: Sequence[dict[str, object]],
-) -> list[float] | None:
-    values: list[float] = []
-    for row in window:
-        value = _positive_finite(row[FORWARD_RETURN_INDEX_COLUMN])
+) -> tuple[list[float], list[float]] | None:
+    relative_log_path = [0.0]
+    log_returns: list[float] = []
+    cumulative = 0.0
+    for row in window[1:]:
+        value = _finite_log_return(row[FORWARD_LOG_RETURN_COLUMN])
         if value is None:
             return None
-        values.append(value)
-    return values
+        log_returns.append(value)
+        cumulative += value
+        if not isfinite(cumulative):
+            return None
+        relative_log_path.append(cumulative)
+    return relative_log_path, log_returns
+
+
+def _finite_expm1(value: float) -> float | None:
+    try:
+        result = expm1(value)
+    except OverflowError:
+        return None
+    return result if isfinite(result) else None
 
 
 def _latest_available_at(

@@ -1,17 +1,18 @@
-"""Forward-adjusted ETF market risk factors."""
+"""Row-log-return market risk factors."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from math import isfinite, log, sqrt
+from math import expm1, isfinite, sqrt
 
-from quant_core.data.adjustments import FORWARD_RETURN_INDEX_COLUMN, AdjustmentMode
+from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.factors.base import FactorSpec
 from quant_core.factors.builtin.momentum import AdjustedBarService, _MarketFactor
 
-_VERSION = "1.0.0"
-_PRICE_BASIS = "baostock_return_index_v1"
+_VERSION = "2.0.0"
+_PRICE_BASIS = "baostock_forward_log_return_v1"
+_PATH_CONSTRUCTION = "window_forward_cumsum_v1"
 
 
 class Volatility60dFactor(_MarketFactor):
@@ -36,12 +37,10 @@ class Volatility60dFactor(_MarketFactor):
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "annualization_sessions": 252,
                     "ddof": 1,
-                    "formula": (
-                        "std(log(forward_return_index[t])-"
-                        "log(forward_return_index[t-1]),ddof=1)*sqrt(252)"
-                    ),
+                    "formula": "std(forward_log_return[1:61],ddof=1)*sqrt(252)",
+                    "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
-                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
+                    "price_field": FORWARD_LOG_RETURN_COLUMN,
                     "window_prices": 61,
                     "window_returns": 60,
                 },
@@ -71,9 +70,12 @@ class DownsideVolatility60dFactor(_MarketFactor):
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "annualization_sessions": 252,
                     "eligible_for_alpha": True,
-                    "formula": "sqrt(mean(min(log_return,0)^2))*sqrt(252)",
+                    "formula": (
+                        "sqrt(mean(min(forward_log_return[1:61],0)^2))*sqrt(252)"
+                    ),
+                    "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
-                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
+                    "price_field": FORWARD_LOG_RETURN_COLUMN,
                     "window_prices": 61,
                 },
             ),
@@ -101,9 +103,10 @@ class MaxDrawdown120dFactor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
-                    "formula": "max(1-forward_return_index/running_peak)",
+                    "formula": ("max(1-exp(relative_log_path-running_peak_log))"),
+                    "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
-                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
+                    "price_field": FORWARD_LOG_RETURN_COLUMN,
                     "window_prices": 120,
                 },
             ),
@@ -112,33 +115,34 @@ class MaxDrawdown120dFactor(_MarketFactor):
         )
 
 
-def _volatility_value(closes: Sequence[float]) -> float | None:
-    log_prices = [log(close) for close in closes]
-    returns = [
-        log_prices[index] - log_prices[index - 1] for index in range(1, len(log_prices))
-    ]
-    count = len(returns)
-    mean = sum(returns) / count
-    variance = sum((value - mean) ** 2 for value in returns) / (count - 1)
+def _volatility_value(
+    relative_log_path: Sequence[float], log_returns: Sequence[float]
+) -> float | None:
+    del relative_log_path
+    count = len(log_returns)
+    mean = sum(log_returns) / count
+    variance = sum((value - mean) ** 2 for value in log_returns) / (count - 1)
     result = sqrt(variance) * sqrt(252.0)
     return result if isfinite(result) else None
 
 
-def _downside_volatility_value(closes: Sequence[float]) -> float | None:
-    log_prices = [log(close) for close in closes]
-    returns = [
-        log_prices[index] - log_prices[index - 1] for index in range(1, len(log_prices))
-    ]
-    result = sqrt(sum(min(value, 0.0) ** 2 for value in returns) / len(returns)) * sqrt(
-        252.0
-    )
+def _downside_volatility_value(
+    relative_log_path: Sequence[float], log_returns: Sequence[float]
+) -> float | None:
+    del relative_log_path
+    result = sqrt(
+        sum(min(value, 0.0) ** 2 for value in log_returns) / len(log_returns)
+    ) * sqrt(252.0)
     return result if isfinite(result) else None
 
 
-def _max_drawdown_value(closes: Sequence[float]) -> float | None:
-    peak = closes[0]
+def _max_drawdown_value(
+    relative_log_path: Sequence[float], log_returns: Sequence[float]
+) -> float | None:
+    del log_returns
+    peak = relative_log_path[0]
     drawdown = 0.0
-    for close in closes:
-        peak = max(peak, close)
-        drawdown = max(drawdown, 1.0 - close / peak)
+    for log_price in relative_log_path:
+        peak = max(peak, log_price)
+        drawdown = max(drawdown, -expm1(log_price - peak))
     return drawdown if isfinite(drawdown) else None

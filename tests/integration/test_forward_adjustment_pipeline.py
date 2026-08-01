@@ -379,7 +379,7 @@ def test_etf_forward_factor_cache_and_future_jump_keep_prior_signal_rows_stable(
             registry.code_hash("return_20d_v1"),
             {},
         )
-        != first["return_20d_v1@1.0.0"].cache_key
+        != first["return_20d_v1@2.0.0"].cache_key
     )
 
     original_hashes = {

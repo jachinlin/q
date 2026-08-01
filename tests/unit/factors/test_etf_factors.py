@@ -12,6 +12,7 @@ import pytest
 
 from quant_core.data.adjustments import (
     ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+    FORWARD_LOG_RETURN_COLUMN,
     FORWARD_RETURN_INDEX_COLUMN,
     AdjustmentMode,
 )
@@ -65,11 +66,6 @@ class RecordingPriceService:
         )
         if "adjustment_factor" not in result.columns:
             result = result.with_columns(
-                pl.col("close")
-                .shift(1)
-                .over("instrument_id")
-                .fill_null(pl.col("close"))
-                .alias("preclose"),
                 pl.lit(1.0, dtype=pl.Float64).alias("adjustment_factor"),
                 pl.lit(1.0, dtype=pl.Float64).alias("adjustment_event_factor"),
                 pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
@@ -82,6 +78,14 @@ class RecordingPriceService:
         if FORWARD_RETURN_INDEX_COLUMN not in result.columns:
             result = result.with_columns(
                 pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN)
+            )
+        if FORWARD_LOG_RETURN_COLUMN not in result.columns:
+            result = result.with_columns(
+                pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise((pl.col("close") / pl.col("preclose")).log())
+                .cast(pl.Float64)
+                .alias(FORWARD_LOG_RETURN_COLUMN)
             )
         return result.lazy()
 
@@ -133,6 +137,7 @@ class ActionAwarePriceService:
             ).item()
             events = [action for action in applicable if action[0] == trade_date]
             raw_close = float(row["close"])
+            raw_preclose = float(row["preclose"])
             previous_index = return_indices.get(instrument_id)
             return_index = (
                 raw_close
@@ -141,8 +146,9 @@ class ActionAwarePriceService:
             )
             return_indices[instrument_id] = return_index
             row[FORWARD_RETURN_INDEX_COLUMN] = return_index
+            row[FORWARD_LOG_RETURN_COLUMN] = float(np.log(raw_close / raw_preclose))
             row["close"] = raw_close * adjustment_factor
-            row["preclose"] = float(row["preclose"]) * adjustment_factor
+            row["preclose"] = raw_preclose * adjustment_factor
             row["adjustment_factor"] = adjustment_factor
             row["adjustment_event_factor"] = (
                 np.prod([event[1] for event in events], dtype=np.float64).item()
@@ -169,6 +175,7 @@ class ActionAwarePriceService:
             "adjustment_event_available_at": pl.Datetime("us", "UTC"),
             "adjustment_event_components": ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
             FORWARD_RETURN_INDEX_COLUMN: pl.Float64,
+            FORWARD_LOG_RETURN_COLUMN: pl.Float64,
         }
         return pl.DataFrame(rows, schema=schema).lazy()
 
@@ -384,16 +391,14 @@ def test_invalid_price_anywhere_in_window_invalidates_signal(
     assert result["is_valid"].item() is False
 
 
-@pytest.mark.parametrize("bad_index", [None, 0.0, -1.0, float("nan"), float("inf")])
-def test_malformed_forward_return_index_invalidates_signal(
-    bad_index: float | None,
+@pytest.mark.parametrize("bad_return", [None, float("nan"), float("inf")])
+def test_malformed_forward_log_return_invalidates_signal(
+    bad_return: float | None,
 ) -> None:
     bars = _bars(_SSE, [10.0 + index for index in range(21)]).with_columns(
         pl.Series(
-            FORWARD_RETURN_INDEX_COLUMN,
-            [10.0 + index for index in range(10)]
-            + [bad_index]
-            + [20.0 + index for index in range(10)],
+            FORWARD_LOG_RETURN_COLUMN,
+            [0.0] * 10 + [bad_return] + [0.0] * 10,
             dtype=pl.Float64,
         )
     )
@@ -407,6 +412,56 @@ def test_malformed_forward_return_index_invalidates_signal(
 
     assert result["value"].item() is None
     assert result["is_valid"].item() is False
+
+
+@pytest.mark.parametrize("first_return", [None, float("nan"), float("inf")])
+def test_first_window_log_return_is_ignored(first_return: float | None) -> None:
+    """The first row's return precedes the factor window and must not invalidate it."""
+    log_return = float(np.log(1.01))
+    bars = _bars(_SSE, [100.0 * 1.01**index for index in range(21)]).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [first_return, *([log_return] * 20)],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        ReturnFactor(RecordingPriceService(bars), [_SSE], 20)
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() == pytest.approx(1.01**20 - 1.0)
+    assert result["is_valid"].item() is True
+
+
+def test_market_factor_ignores_unstable_return_index_values() -> None:
+    """Reintroducing cumulative-index consumption must fail this result contract."""
+    log_return = float(np.log(1.01))
+    bars = _bars(_SSE, [100.0] * 21).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, *([log_return] * 20)],
+            dtype=pl.Float64,
+        ),
+        pl.Series(
+            FORWARD_RETURN_INDEX_COLUMN,
+            [100.0, *([100.0] * 20)],
+            dtype=pl.Float64,
+        ),
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        ReturnFactor(RecordingPriceService(bars), [_SSE], 20)
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() == pytest.approx(1.01**20 - 1.0)
+    assert result["is_valid"].item() is True
 
 
 def test_constant_trend_is_exact_zero_and_valid() -> None:
@@ -584,10 +639,10 @@ def test_unknown_window_availability_invalidates_signal() -> None:
         (lambda service: Volatility60dFactor(service, [_SSE]), "volatility_60d_v1"),
     ],
 )
-def test_return_index_keeps_all_etf_market_factors_stable_after_future_jump(
+def test_row_log_returns_keep_all_etf_market_factors_stable_after_future_jump(
     make_factor: object, factor_id: str
 ) -> None:
-    """Every market factor must consume the prefix-stable forward return index."""
+    """Every market factor must consume request-stable row log returns."""
     closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
     bars = _bars(_SSE, closes)
     signal_day = bars["trade_date"][119]
@@ -611,8 +666,8 @@ def test_return_index_keeps_all_etf_market_factors_stable_after_future_jump(
     )
 
 
-def test_trend_return_index_rejects_the_global_forward_price_scale() -> None:
-    """Using globally adjusted close would publish the wrong scaled trend."""
+def test_trend_rejects_the_old_global_forward_price_formula() -> None:
+    """Using globally adjusted price levels would publish the wrong trend."""
     closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
     bars = _bars(_SSE, closes)
     signal_day = bars["trade_date"][119]
@@ -649,7 +704,7 @@ def test_trend_return_index_rejects_the_global_forward_price_scale() -> None:
         lambda service: Volatility60dFactor(service, [_SSE]),
     ],
 )
-def test_return_index_has_exact_stable_values_for_nonbinary_future_scale(
+def test_row_log_returns_have_exact_stable_values_for_nonbinary_future_scale(
     make_factor: object,
 ) -> None:
     """A 0.7 forward factor must not perturb bytes of earlier factor observations."""
@@ -675,14 +730,26 @@ def test_return_index_has_exact_stable_values_for_nonbinary_future_scale(
     )
 
 
-def test_trend_is_byte_stable_for_same_signal_across_request_anchors() -> None:
-    """Changing ctx.start across an earlier 2-for-1 jump must not rescale trend."""
+@pytest.mark.parametrize(
+    "make_factor",
+    [
+        lambda service: ReturnFactor(service, [_SSE], 20),
+        lambda service: ReturnFactor(service, [_SSE], 60),
+        lambda service: ReturnFactor(service, [_SSE], 120),
+        lambda service: Trend120dFactor(service, [_SSE]),
+        lambda service: Volatility60dFactor(service, [_SSE]),
+    ],
+)
+def test_etf_market_factor_is_byte_stable_across_request_anchors(
+    make_factor: object,
+) -> None:
+    """A 0.7 boundary before the window must not leak request-anchor rounding."""
     closes = [100.0 * 1.001**index for index in range(700)]
     bars = _bars(_SSE, closes)
     jump_index = 250
     bars = bars.with_columns(
         pl.when(pl.int_range(pl.len()) == jump_index)
-        .then(pl.col("preclose") * 0.5)
+        .then(pl.col("preclose") * 0.7)
         .otherwise(pl.col("preclose"))
         .alias("preclose")
     )
@@ -690,17 +757,13 @@ def test_trend_is_byte_stable_for_same_signal_across_request_anchors() -> None:
     wider_start = bars["trade_date"][500]
     service = ActionAwarePriceService(bars, [])
 
-    narrow = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(signal_day, signal_day))
-        .collect()
-    )
+    narrow = make_factor(service).compute(_context(signal_day, signal_day)).collect()  # type: ignore[operator]
     wide = (
-        Trend120dFactor(service, [_SSE])
+        make_factor(service)
         .compute(_context(wider_start, signal_day))
         .collect()
         .filter(pl.col("trade_date") == signal_day)
-    )
+    )  # type: ignore[operator]
 
     assert wide["value"].item() == narrow["value"].item()
     assert wide["available_at"].item() == narrow["available_at"].item()
@@ -719,7 +782,7 @@ def test_trend_is_byte_stable_for_same_signal_across_request_anchors() -> None:
         lambda service, scope: Volatility60dFactor(service, scope),
     ],
 )
-def test_return_index_is_byte_stable_for_wide_multi_instrument_histories(
+def test_row_log_returns_are_byte_stable_for_wide_multi_instrument_histories(
     make_factor: object,
 ) -> None:
     first = _bars(_SSE, [1e-8 * 1.01**index for index in range(122)])
@@ -749,8 +812,8 @@ def test_return_index_is_byte_stable_for_wide_multi_instrument_histories(
     )
 
 
-def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
-    """Dividing extremes before log can overflow although both logarithms are finite."""
+def test_nonfinite_row_log_return_invalidates_volatility() -> None:
+    """A provider boundary that exposes an infinite row return must fail closed."""
     smallest = float.fromhex("0x0.0000000000001p-1022")
     closes = [smallest, *([1e308] * 60)]
     bars = _bars(_SSE, closes)
@@ -762,10 +825,8 @@ def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
         .collect()
     )
 
-    log_prices = np.log(np.asarray(closes, dtype=np.float64))
-    expected = np.std(np.diff(log_prices), ddof=1) * sqrt(252.0)
-    assert result["value"].item() == pytest.approx(expected)
-    assert result["is_valid"].item() is True
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
 
 
 def test_duplicate_bar_key_is_rejected() -> None:
@@ -814,7 +875,7 @@ def test_output_schema_sorting_identity_and_availability_are_exact() -> None:
         result.select("trade_date", "instrument_id").rows()
     )
     assert result["factor_id"].unique().to_list() == ["return_20d_v1"]
-    assert result["factor_version"].unique().to_list() == ["1.0.0"]
+    assert result["factor_version"].unique().to_list() == ["2.0.0"]
     assert result["available_at"].null_count() == 0
 
 
@@ -826,11 +887,11 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
     register_etf_factors(registry, RecordingPriceService(bars), [_SSE])
 
     expected = {
-        "return_20d_v1@1.0.0": (20, 1),
-        "return_60d_v1@1.0.0": (60, 1),
-        "return_120d_v1@1.0.0": (120, 1),
-        "trend_120d_v1@1.1.0": (120, 1),
-        "volatility_60d_v1@1.0.0": (60, -1),
+        "return_20d_v1@2.0.0": (20, 1),
+        "return_60d_v1@2.0.0": (60, 1),
+        "return_120d_v1@2.0.0": (120, 1),
+        "trend_120d_v1@2.0.0": (120, 1),
+        "volatility_60d_v1@2.0.0": (60, -1),
     }
     for reference, (lookback, direction) in expected.items():
         spec = registry.spec(reference)
@@ -839,10 +900,9 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
         assert spec.direction == direction
         assert spec.dependencies == ()
         assert spec.parameters["adjustment_mode"] == "FORWARD"
-        assert spec.parameters["price_basis"] == "baostock_return_index_v1"
-        assert spec.parameters["price_field"] == FORWARD_RETURN_INDEX_COLUMN
-        if spec.factor_id == "trend_120d_v1":
-            assert spec.parameters["formula_version"] == "log_price_ols_slope_v2"
+        assert spec.parameters["price_basis"] == "baostock_forward_log_return_v1"
+        assert spec.parameters["price_field"] == FORWARD_LOG_RETURN_COLUMN
+        assert spec.parameters["path_construction"] == "window_forward_cumsum_v1"
         assert len(registry.code_hash(reference)) == 64
 
 

@@ -10,11 +10,13 @@ import polars as pl
 import pytest
 
 from quant_core.data.adjustments import (
+    FORWARD_LOG_RETURN_COLUMN,
     FORWARD_RETURN_INDEX_COLUMN,
     AdjustmentMode,
 )
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorRegistry
+from quant_core.factors.base import factor_table_content_hash
 from quant_core.factors.builtin import register_etf_factors, register_stock_factors
 from quant_core.factors.builtin.auxiliary import (
     AvgAmount20dFactor,
@@ -27,6 +29,7 @@ from quant_core.factors.builtin.quality import CfoToNetProfitFactor, RoeAvgPitFa
 from quant_core.factors.builtin.risk import (
     DownsideVolatility60dFactor,
     MaxDrawdown120dFactor,
+    Volatility60dFactor,
 )
 from quant_core.factors.builtin.valuation import BookToPriceFactor, EarningsYieldFactor
 
@@ -57,11 +60,21 @@ class BarService:
             pl.col("instrument_id").is_in(ids)
             & pl.col("trade_date").is_between(start, end, closed="both")
         )
-        if mode is AdjustmentMode.FORWARD and "adjustment_factor" not in result.columns:
-            result = result.with_columns(
-                pl.lit(1.0).alias("adjustment_factor"),
-                pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN),
-            )
+        if mode is AdjustmentMode.FORWARD:
+            additions: list[pl.Expr] = []
+            if "adjustment_factor" not in result.columns:
+                additions.append(pl.lit(1.0).alias("adjustment_factor"))
+            if FORWARD_RETURN_INDEX_COLUMN not in result.columns:
+                additions.append(pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN))
+            if FORWARD_LOG_RETURN_COLUMN not in result.columns:
+                additions.append(
+                    pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
+                    .then(pl.lit(None, dtype=pl.Float64))
+                    .otherwise((pl.col("close") / pl.col("preclose")).log())
+                    .cast(pl.Float64)
+                    .alias(FORWARD_LOG_RETURN_COLUMN)
+                )
+            result = result.with_columns(*additions)
         return result.lazy()
 
 
@@ -391,6 +404,58 @@ def test_market_formulas_and_exact_history_boundaries() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "make_factor",
+    [
+        lambda service: Momentum12020Factor(service, [_ID]),
+        lambda service: Volatility60dFactor(service, [_ID]),
+        lambda service: DownsideVolatility60dFactor(service, [_ID]),
+        lambda service: MaxDrawdown120dFactor(service, [_ID]),
+    ],
+)
+def test_stock_market_factors_are_byte_stable_when_return_index_changes(
+    make_factor: object,
+) -> None:
+    """Stock market factors must use row returns, not cumulative index levels."""
+    log_returns = np.linspace(-0.02, 0.03, 120).tolist()
+    bars = _bars([100.0] * 121).with_columns(
+        pl.lit(1.0, dtype=pl.Float64).alias("adjustment_factor"),
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, *log_returns],
+            dtype=pl.Float64,
+        ),
+        pl.Series(
+            FORWARD_RETURN_INDEX_COLUMN,
+            [100.0 + index for index in range(121)],
+            dtype=pl.Float64,
+        ),
+    )
+    changed_index = bars.with_columns(
+        pl.Series(
+            FORWARD_RETURN_INDEX_COLUMN,
+            [1e-8 * 1.01**index for index in range(121)],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    baseline = (
+        make_factor(BarService(bars)).compute(_ctx(signal_day, signal_day)).collect()
+    )  # type: ignore[operator]
+    changed = (
+        make_factor(BarService(changed_index))
+        .compute(_ctx(signal_day, signal_day))
+        .collect()
+    )  # type: ignore[operator]
+
+    assert changed["value"].item() == baseline["value"].item()
+    assert changed["available_at"].item() == baseline["available_at"].item()
+    assert factor_table_content_hash(changed.to_arrow()) == factor_table_content_hash(
+        baseline.to_arrow()
+    )
+
+
 def test_auxiliary_factors_use_raw_close_pit_providers_and_cannot_form_alpha() -> None:
     bars = _bars([10.0] * 20, amounts=[float(i) for i in range(1, 21)])
     day = bars["trade_date"][-1]
@@ -614,8 +679,13 @@ def test_all_stock_factors_register_once_with_alpha_metadata() -> None:
                 "max_drawdown_120d_v1",
             }:
                 assert spec.parameters["adjustment_mode"] == "FORWARD"
-                assert spec.parameters["price_basis"] == "baostock_return_index_v1"
-                assert spec.parameters["price_field"] == FORWARD_RETURN_INDEX_COLUMN
+                assert (
+                    spec.parameters["price_basis"] == "baostock_forward_log_return_v1"
+                )
+                assert spec.parameters["price_field"] == FORWARD_LOG_RETURN_COLUMN
+                assert (
+                    spec.parameters["path_construction"] == "window_forward_cumsum_v1"
+                )
 
 
 @pytest.mark.parametrize("etf_first", [True, False])
@@ -638,7 +708,7 @@ def test_shared_market_factor_registration_is_idempotent_for_equivalent_runtime(
     (etf if etf_first else stock)()
     (stock if etf_first else etf)()
 
-    assert registry.code_hash("volatility_60d_v1@1.0.0") == registry.code_hash(
+    assert registry.code_hash("volatility_60d_v1@2.0.0") == registry.code_hash(
         "volatility_60d_v1"
     )
 

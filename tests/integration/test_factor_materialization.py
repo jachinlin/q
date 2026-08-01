@@ -9,7 +9,11 @@ from pathlib import Path
 
 import polars as pl
 
-from quant_core.data.adjustments import FORWARD_RETURN_INDEX_COLUMN, AdjustmentMode
+from quant_core.data.adjustments import (
+    FORWARD_LOG_RETURN_COLUMN,
+    FORWARD_RETURN_INDEX_COLUMN,
+    AdjustmentMode,
+)
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorEngine, FactorRegistry, FeatureCache
 from quant_core.factors.builtin import register_etf_factors, register_stock_factors
@@ -63,6 +67,11 @@ class CountingBars:
             result = result.with_columns(
                 pl.lit(1.0).alias("adjustment_factor"),
                 pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN),
+                pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise((pl.col("close") / pl.col("preclose")).log())
+                .cast(pl.Float64)
+                .alias(FORWARD_LOG_RETURN_COLUMN),
             )
         return result.lazy()
 
@@ -133,7 +142,19 @@ def test_second_identical_materialization_hits_cache_without_provider_or_rewrite
     state = _cache_state(cache.root)
     second = engine.compute(requested, ctx)
 
-    assert set(first) == {f"{factor_id}@1.0.0" for factor_id in requested}
+    assert set(first) == {
+        "earnings_yield_ttm_v1@1.0.0",
+        "book_to_price_mrq_v1@1.0.0",
+        "roe_avg_pit_v1@1.0.0",
+        "cfo_to_np_pit_v1@1.0.0",
+        "momentum_120_20_v1@2.0.0",
+        "volatility_60d_v1@2.0.0",
+        "downside_volatility_60d_v1@2.0.0",
+        "max_drawdown_120d_v1@2.0.0",
+        "avg_amount_20d_v1@1.0.0",
+        "log_market_cap_v1@1.0.0",
+        "industry_code_pit_v1@1.0.0",
+    }
     assert {key: item.content_hash for key, item in second.items()} == {
         key: item.content_hash for key, item in first.items()
     }
@@ -175,11 +196,11 @@ def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
     second = engine.compute(requested, ctx)
 
     assert set(first) == {
-        "return_20d_v1@1.0.0",
-        "return_60d_v1@1.0.0",
-        "return_120d_v1@1.0.0",
-        "trend_120d_v1@1.1.0",
-        "volatility_60d_v1@1.0.0",
+        "return_20d_v1@2.0.0",
+        "return_60d_v1@2.0.0",
+        "return_120d_v1@2.0.0",
+        "trend_120d_v1@2.0.0",
+        "volatility_60d_v1@2.0.0",
     }
     assert bars.calls == calls
     assert _cache_state(cache.root) == cache_state

@@ -475,10 +475,13 @@ selected_batches = client.fetch_daily_bars(
 #### 研究价格口径
 
 ETF 与股票的市场行情因子在 MVP 统一使用 BaoStock 原始 `close/preclose`
-推导的 `baostock_return_index_v1` 收益指数：首个观测值取原始收盘价，之后按
-`I(t)=I(t-1)×close(t)/preclose(t)` 递推。指数只依赖当前及过去数据，因此追加
-未来跳变不会改变既有信号行的数值和内容哈希。展示与其他研究场景仍可使用
-同一涨跌幅链条生成的前复权价格；该口径只调整
+逐行推导的 `baostock_forward_log_return_v1`：当 `preclose` 为正数时，
+`r(t)=log(close(t)/preclose(t))`；查询首行的 `preclose` 为 null 或正负零时该字段
+为 null。每个因子窗口把首行对数价格设为 0，忽略首行自身的 `r`，并按固定
+顺序累加后续逐行收益形成相对对数价格路径。逐行收益不依赖请求起点或累计
+指数，因此跨请求起点、追加未来跳变时，既有信号行的数值和内容哈希保持字节
+稳定。`baostock_return_index_v1` 仍可用于展示与其他研究场景，但市场因子不再
+消费该累计指数。同一涨跌幅链条生成的前复权价格只调整
 `open/high/low/close/preclose`；`volume` 与 `amount` 保持供应商原始值。
 
 `BACKWARD` 保留为兼容接口，不是 MVP 市场因子的默认研究口径。公司行动
@@ -824,13 +827,13 @@ MVP 因子用于验证行情因子、时点财务因子、横截面处理、缓�
 
 | 因子 ID | 定义 | 方向 | 最小历史窗口 | 用途 |
 |---|---|---|---:|---|
-| `return_20d_v1` | `P(t) / P(t-20) - 1` | 越高越好 | 20日 | 短期动量 |
-| `return_60d_v1` | `P(t) / P(t-60) - 1` | 越高越好 | 60日 | 中期动量 |
-| `return_120d_v1` | `P(t) / P(t-120) - 1` | 越高越好 | 120日 | 长期动量 |
-| `trend_120d_v1` | `OLS斜率(log(P / P₀), x=0..119)` | 越高越好 | 120日 | 趋势过滤 |
-| `volatility_60d_v1` | `std(log_return, 60) × sqrt(252)` | 越低越好 | 61日 | 波动率惩罚 |
+| `return_20d_v1` | `expm1(sum(r[1:21]))` | 越高越好 | 20日 | 短期动量 |
+| `return_60d_v1` | `expm1(sum(r[1:61]))` | 越高越好 | 60日 | 中期动量 |
+| `return_120d_v1` | `expm1(sum(r[1:121]))` | 越高越好 | 120日 | 长期动量 |
+| `trend_120d_v1` | `OLS斜率([0, cumsum(r[1:120])], x=0..119)` | 越高越好 | 120日 | 趋势过滤 |
+| `volatility_60d_v1` | `std(r[1:61], ddof=1) × sqrt(252)` | 越低越好 | 61日 | 波动率惩罚 |
 
-`P` 在市场因子中固定为统一价格服务输出的 `baostock_return_index_v1`，其字段名为 `forward_return_index`；`P₀` 是当前 120 日窗口首值。趋势因子先除以 `P₀` 再取对数，使带截距的 OLS 斜率不受收益指数请求起点造成的整体尺度变化影响。ETF 基线策略使用三个收益因子形成动量分数，以 `trend_120d_v1 > 0` 作为趋势过滤，并对 `volatility_60d_v1` 施加惩罚。具体权重属于策略配置，不写入因子实现。
+`r` 是统一价格服务输出的 `forward_log_return`。窗口首行的 `r` 属于窗口前一日到首日的收益，必须忽略；后续 null 或非有限值使该信号失效。ETF 基线策略使用三个收益因子形成动量分数，以 `trend_120d_v1 > 0` 作为趋势过滤，并对 `volatility_60d_v1` 施加惩罚。具体权重属于策略配置，不写入因子实现。
 
 #### 股票 Alpha 因子
 
@@ -840,10 +843,10 @@ MVP 因子用于验证行情因子、时点财务因子、横截面处理、缓�
 | 估值 | `book_to_price_mrq_v1` | 当 `pbMRQ > 0` 时取 `1 / pbMRQ`，否则为 `null` | 越高越好 | 日频估值字段 |
 | 质量 | `roe_avg_pit_v1` | `available_at <= signal_at` 的最新报告平均 ROE | 越高越好 | 时点财务数据 |
 | 质量 | `cfo_to_np_pit_v1` | 最新可用报告的经营现金流/净利润 | 越高越好 | 时点现金流数据 |
-| 动量 | `momentum_120_20_v1` | `P(t-20) / P(t-120) - 1` | 越高越好 | `baostock_return_index_v1` |
-| 风险 | `volatility_60d_v1` | 60 日对数收益标准差年化 | 越低越好 | `baostock_return_index_v1` |
-| 风险 | `downside_volatility_60d_v1` | `sqrt(mean(min(log_return, 0)^2)) × sqrt(252)` | 越低越好 | `baostock_return_index_v1` |
-| 风险 | `max_drawdown_120d_v1` | 120 日内最大回撤的正数损失幅度 | 越低越好 | `baostock_return_index_v1` |
+| 动量 | `momentum_120_20_v1` | `expm1(sum(r[1:101]))` | 越高越好 | `baostock_forward_log_return_v1` |
+| 风险 | `volatility_60d_v1` | 60 日逐行对数收益标准差年化 | 越低越好 | `baostock_forward_log_return_v1` |
+| 风险 | `downside_volatility_60d_v1` | `sqrt(mean(min(r[1:61], 0)^2)) × sqrt(252)` | 越低越好 | `baostock_forward_log_return_v1` |
+| 风险 | `max_drawdown_120d_v1` | 相对对数价格路径的 120 日最大回撤 | 越低越好 | `baostock_forward_log_return_v1` |
 
 估值因子不得将负 PE、零 PB 或缺失值转换成正常分数。`cfo_to_np_pit_v1` 在净利润绝对值低于配置阈值时输出 `null`，防止分母接近零产生无意义极值。财务因子必须通过 `financials_as_of()` 查询；缺少可靠公告时间的数据不得使用报告期末日期替代。
 
@@ -905,7 +908,7 @@ FactorSpec(
 
 ### 14.8 数据源注意事项
 
-BaoStock 日线和财务接口的字段及历史覆盖在实现时以其[官方 Python API 文档](https://www.baostock.com/mainContent?file=pythonAPI.md)为准。复权价格只用于连续收益和信号计算；BaoStock 的涨跌幅复权算法不等价于现金分红精确会计，具体限制见其[复权因子说明](https://www.baostock.com/helpdocs/pdf/BaoStock%E5%A4%8D%E6%9D%83%E5%9B%A0%E5%AD%90%E7%AE%80%E4%BB%8B.pdf)。
+BaoStock 日线和财务接口的字段及历史覆盖在实现时以其[官方 Python API 文档](https://www.baostock.com/mainContent?file=pythonAPI.md)为准。前复权价格和累计收益指数供展示与其他研究使用；市场信号统一消费逐行 `forward_log_return`。BaoStock 的涨跌幅复权算法不等价于现金分红精确会计，具体限制见其[复权因子说明](https://www.baostock.com/helpdocs/pdf/BaoStock%E5%A4%8D%E6%9D%83%E5%9B%A0%E5%AD%90%E7%AE%80%E4%BB%8B.pdf)。
 
 当 SourceClient 声明缺少 `financials_with_announcement_date` 能力时，`roe_avg_pit_v1` 和 `cfo_to_np_pit_v1` 必须标记为不可用，股票多因子基线实验在提交阶段失败，不能退化为非时点财务数据。
 
