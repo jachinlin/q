@@ -9,6 +9,7 @@ from math import expm1, isfinite
 from threading import Lock, get_ident
 from typing import Protocol
 
+import numpy as np
 import polars as pl
 
 from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
@@ -167,6 +168,7 @@ class _MarketFactor:
         spec: FactorSpec,
         required_prices: int,
         evaluator: Callable[[Sequence[float], Sequence[float]], float | None],
+        native_evaluator: Callable[[pl.Expr], pl.Expr] | None = None,
         market_bars: MarketBarsCache | None = None,
     ) -> None:
         self._price_service = price_service
@@ -174,6 +176,7 @@ class _MarketFactor:
         self._spec = spec
         self._required_prices = required_prices
         self._evaluator = evaluator
+        self._native_evaluator = native_evaluator
         self._market_bars = market_bars
 
     @property
@@ -195,6 +198,9 @@ class _MarketFactor:
             normalized = self._market_bars.load(ctx)
         if normalized.is_empty():
             return _empty_factor_output().lazy()
+
+        if self._native_evaluator is not None:
+            return self._compute_native(normalized, ctx)
 
         output_dates: list[date] = []
         output_instruments: list[str] = []
@@ -252,6 +258,60 @@ class _MarketFactor:
             )
             .sort("trade_date", "instrument_id")
             .lazy()
+        )
+
+    def _compute_native(
+        self, normalized: pl.DataFrame, ctx: FactorContext
+    ) -> pl.LazyFrame:
+        """Build one native grouped window plan without Python data iteration."""
+        group = "instrument_id"
+        row_number = pl.int_range(1, pl.len() + 1, dtype=pl.UInt32).over(group)
+        observed_prices = row_number.clip(upper_bound=self._required_prices)
+        availability_count = (
+            pl.col("available_at")
+            .is_not_null()
+            .cast(pl.UInt32)
+            .rolling_sum(self._required_prices, min_samples=1)
+            .over(group)
+        )
+        latest_availability = (
+            pl.col("available_at")
+            .rolling_max(self._required_prices, min_samples=1)
+            .over(group)
+        )
+        available_at = (
+            pl.when(availability_count == observed_prices)
+            .then(latest_availability)
+            .otherwise(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
+        )
+        raw_value = self._native_evaluator(pl.col(FORWARD_LOG_RETURN_COLUMN))
+        valid = (
+            (row_number >= self._required_prices)
+            & available_at.is_not_null()
+            & raw_value.is_not_null()
+            & raw_value.is_finite()
+        )
+        return (
+            normalized.lazy()
+            .with_columns(
+                available_at.alias("_factor_available_at"),
+                raw_value.alias("_factor_value"),
+                valid.alias("_factor_valid"),
+            )
+            .filter(pl.col("trade_date").is_between(ctx.start, ctx.end, closed="both"))
+            .select(
+                pl.col("trade_date"),
+                pl.col("instrument_id"),
+                pl.lit(self.spec.factor_id, dtype=pl.String).alias("factor_id"),
+                pl.lit(self.spec.version, dtype=pl.String).alias("factor_version"),
+                pl.when(pl.col("_factor_valid"))
+                .then(pl.col("_factor_value"))
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .alias("value"),
+                pl.col("_factor_available_at").alias("available_at"),
+                pl.col("_factor_valid").alias("is_valid"),
+            )
+            .sort("trade_date", "instrument_id")
         )
 
     def _load_bars(self, ctx: FactorContext, start: date) -> pl.DataFrame:
@@ -316,6 +376,7 @@ class ReturnFactor(_MarketFactor):
             ),
             required_prices=window + 1,
             evaluator=_return_value,
+            native_evaluator=_return_expression(window),
             market_bars=market_bars,
         )
 
@@ -356,6 +417,7 @@ class Trend120dFactor(_MarketFactor):
             ),
             required_prices=120,
             evaluator=_trend_value,
+            native_evaluator=_trend_expression,
             market_bars=market_bars,
         )
 
@@ -403,6 +465,48 @@ def _return_value(
 ) -> float | None:
     del log_returns
     return _finite_expm1(relative_log_path[-1])
+
+
+def _return_expression(window: int) -> Callable[[pl.Expr], pl.Expr]:
+    def evaluate(log_returns: pl.Expr) -> pl.Expr:
+        total = log_returns.rolling_sum(window, min_samples=window).over(
+            "instrument_id"
+        )
+        return total.map_batches(
+            np.expm1,
+            return_dtype=pl.Float64,
+            is_elementwise=True,
+        )
+
+    return evaluate
+
+
+def _trend_expression(log_returns: pl.Expr) -> pl.Expr:
+    window_returns = 119
+    weights = [
+        index * (120 - index) / 2.0 for index in range(1, window_returns + 1)
+    ]
+    denominator = 120.0 * (120.0**2 - 1.0) / 12.0
+    finite_return = (
+        log_returns.is_not_null() & log_returns.is_not_nan() & log_returns.is_finite()
+    )
+    finite_count = (
+        finite_return.cast(pl.UInt32)
+        .rolling_sum(window_returns, min_samples=window_returns)
+        .over("instrument_id")
+    )
+    clean_return = pl.when(finite_return).then(log_returns).otherwise(0.0)
+    weighted = (
+        clean_return.rolling_sum(
+            window_returns,
+            weights=weights,
+            min_samples=window_returns,
+        ).over("instrument_id")
+        / denominator
+    )
+    return pl.when(finite_count == window_returns).then(weighted).otherwise(
+        pl.lit(None, dtype=pl.Float64)
+    )
 
 
 def _momentum_120_20_value(
@@ -453,14 +557,20 @@ def _expanded_history_start(start: date, lookback_sessions: int) -> date:
 def _needs_full_history(
     frame: pl.DataFrame, ctx: FactorContext, required_prices: int
 ) -> bool:
-    for instrument_frame in frame.partition_by("instrument_id", maintain_order=True):
-        dates = instrument_frame["trade_date"].to_list()
-        for index, trade_date in enumerate(dates):
-            if ctx.start <= trade_date <= ctx.end:
-                if index + 1 < required_prices:
-                    return True
-                break
-    return False
+    insufficient = (
+        frame.lazy()
+        .with_columns(
+            pl.int_range(1, pl.len() + 1, dtype=pl.UInt32)
+            .over("instrument_id")
+            .alias("_observed_prices")
+        )
+        .filter(pl.col("trade_date").is_between(ctx.start, ctx.end, closed="both"))
+        .group_by("instrument_id")
+        .agg(pl.col("_observed_prices").first())
+        .select((pl.col("_observed_prices") < required_prices).any())
+        .collect()
+    )
+    return bool(insufficient.item()) if insufficient.height else False
 
 
 def _validate_adjusted_bars(frame: pl.DataFrame) -> None:

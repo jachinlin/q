@@ -46,6 +46,39 @@ def test_market_factor_execution_does_not_materialize_row_dictionaries() -> None
     assert "to_dicts" not in getsource(_MarketFactor.compute)
 
 
+def test_five_market_factors_do_not_cross_python_row_or_group_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production kernels must remain native for every security and session."""
+    bars = pl.concat(
+        [
+            _bars(_SSE, [100.0 + index for index in range(130)]),
+            _bars(_SZSE, [250.0 - 0.5 * index for index in range(130)]),
+        ]
+    )
+    service = RecordingPriceService(bars)
+    signal_day = bars.get_column("trade_date").max()
+    assert isinstance(signal_day, date)
+    ctx = _context(signal_day, signal_day)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("market factor crossed a Python row/group boundary")
+
+    monkeypatch.setattr(pl.DataFrame, "partition_by", forbidden)
+    monkeypatch.setattr(pl.Series, "to_list", forbidden)
+
+    factors = (
+        ReturnFactor(service, [_SSE, _SZSE], 20),
+        ReturnFactor(service, [_SSE, _SZSE], 60),
+        ReturnFactor(service, [_SSE, _SZSE], 120),
+        Trend120dFactor(service, [_SSE, _SZSE]),
+        Volatility60dFactor(service, [_SSE, _SZSE]),
+    )
+    for factor in factors:
+        result = factor.compute(ctx).collect()
+        assert result.height == 2
+
+
 def test_market_bars_cache_single_flights_same_context_loads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

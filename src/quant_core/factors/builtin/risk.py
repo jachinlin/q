@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from math import expm1, fsum, isfinite, sqrt
 
+import polars as pl
+
 from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.factors.base import FactorSpec
@@ -56,6 +58,7 @@ class Volatility60dFactor(_MarketFactor):
             ),
             required_prices=61,
             evaluator=_volatility_value,
+            native_evaluator=_volatility_expression,
             market_bars=market_bars,
         )
 
@@ -145,6 +148,32 @@ def _volatility_value(
         log_returns,
         center=True,
         denominator=len(log_returns) - 1,
+    )
+
+
+def _volatility_expression(log_returns: pl.Expr) -> pl.Expr:
+    """Evaluate one exact local window with native horizontal expressions."""
+    group = "instrument_id"
+    window = 60
+    values = [log_returns.shift(lag).over(group) for lag in range(window)]
+    finite = [
+        value.is_not_null() & value.is_not_nan() & value.is_finite()
+        for value in values
+    ]
+    all_finite = pl.all_horizontal(finite)
+    scale = pl.max_horizontal([value.abs() for value in values])
+    normalized = [value / scale for value in values]
+    mean = pl.mean_horizontal(normalized)
+    square_sum = pl.sum_horizontal(
+        [(value - mean) * (value - mean) for value in normalized]
+    )
+    scaled = scale * (square_sum / (window - 1)).sqrt() * _ANNUALIZATION_SCALE
+    return (
+        pl.when(~all_finite)
+        .then(pl.lit(None, dtype=pl.Float64))
+        .when(scale == 0.0)
+        .then(0.0)
+        .otherwise(scaled)
     )
 
 
