@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
 from math import expm1, isfinite
+from threading import RLock
 from typing import Protocol
 
 import polars as pl
@@ -52,10 +53,13 @@ class MarketBarsCache:
         self._max_lookback_sessions = max_lookback_sessions
         self._ctx: FactorContext | None = None
         self._bars: pl.DataFrame | None = None
+        self._lock = RLock()
 
     def load(self, ctx: FactorContext) -> pl.DataFrame:
         """Return the one normalized price frame for the active factor context."""
-        if self._ctx != ctx or self._bars is None:
+        with self._lock:
+            if self._ctx == ctx and self._bars is not None:
+                return self._bars
             history_start = _expanded_history_start(
                 ctx.start, self._max_lookback_sessions
             )
@@ -76,7 +80,7 @@ class MarketBarsCache:
                 )
             self._ctx = ctx
             self._bars = bars
-        return self._bars
+            return bars
 
 
 class _MarketFactor:

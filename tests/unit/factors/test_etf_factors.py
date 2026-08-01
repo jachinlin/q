@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from inspect import getsource
 from math import sqrt
+from threading import Event, Lock, Thread
 
 import numpy as np
 import polars as pl
@@ -26,6 +27,7 @@ from quant_core.factors import (
 from quant_core.factors.base import factor_table_content_hash
 from quant_core.factors.builtin import register_etf_factors
 from quant_core.factors.builtin.momentum import (
+    MarketBarsCache,
     ReturnFactor,
     Trend120dFactor,
     _MarketFactor,
@@ -41,6 +43,49 @@ _UNIVERSE_HASH = "6" * 64
 def test_market_factor_execution_does_not_materialize_row_dictionaries() -> None:
     """Long histories must not allocate a Python mapping for every market row."""
     assert "to_dicts" not in getsource(_MarketFactor.compute)
+
+
+def test_market_bars_cache_single_flights_same_context_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent sibling factors must not duplicate one immutable read."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    entered = Event()
+    release = Event()
+    counter_lock = Lock()
+    calls = 0
+    frame = pl.DataFrame(
+        {"instrument_id": [_SSE.canonical()], "trade_date": [date(2024, 1, 1)]}
+    )
+
+    def delayed_load(*_args: object, **_kwargs: object) -> pl.DataFrame:
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            first = calls == 1
+        if first:
+            entered.set()
+            assert release.wait(timeout=2)
+        return frame
+
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", delayed_load)
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    ctx = _context(date.min, date.min)
+    results: list[pl.DataFrame] = []
+
+    first = Thread(target=lambda: results.append(cache.load(ctx)))
+    first.start()
+    assert entered.wait(timeout=2)
+    second = Thread(target=lambda: results.append(cache.load(ctx)))
+    second.start()
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == 1
+    assert results == [frame, frame]
 
 
 class RecordingPriceService:

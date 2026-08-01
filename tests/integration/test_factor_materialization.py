@@ -235,6 +235,42 @@ def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
     )
 
 
+@pytest.mark.parametrize("registration_order", ("etf_then_stock", "stock_then_etf"))
+def test_market_reads_are_shared_across_etf_and_stock_registration_orders(
+    tmp_path: Path, registration_order: str
+) -> None:
+    """The overlapping ETF/stock market registry must retain one shared reader."""
+    bars, financials = CountingBars(), CountingFinancials()
+    registry = FactorRegistry()
+    if registration_order == "etf_then_stock":
+        register_etf_factors(registry, bars, [_ID])
+        register_stock_factors(registry, bars, financials, [_ID], price_service=bars)
+    else:
+        register_stock_factors(registry, bars, financials, [_ID], price_service=bars)
+        register_etf_factors(registry, bars, [_ID])
+    engine = FactorEngine(
+        registry,
+        FeatureCache(tmp_path / "features"),
+        capabilities=ProviderCapabilities.complete(),
+    )
+    day = bars.frame["trade_date"][-1]
+    ctx = FactorContext(
+        SnapshotId.parse("00000000-0000-0000-0000-000000000080"), "e" * 64, day, day
+    )
+
+    engine.compute(
+        (
+            "return_20d_v1",
+            "momentum_120_20_v1",
+            "downside_volatility_60d_v1",
+            "max_drawdown_120d_v1",
+        ),
+        ctx,
+    )
+
+    assert bars.calls == 1
+
+
 def test_baostock_capability_preflight_rejects_unsupported_pit_factors_but_allows_market(
     tmp_path: Path,
 ) -> None:

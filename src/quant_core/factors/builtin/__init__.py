@@ -40,6 +40,7 @@ _RUNTIME_DEPENDENCY_ATTRIBUTES = (
     "_service",
     "_provider",
     "_calendar",
+    "_market_bars",
 )
 
 
@@ -82,13 +83,36 @@ def register_builtin(registry: FactorRegistry, factor: Factor) -> None:
         )
 
 
+def _market_bars_for(
+    registry: FactorRegistry,
+    price_service: AdjustedBarService,
+    instruments: Sequence[InstrumentId],
+) -> MarketBarsCache:
+    """Reuse the market cache already bound to the exact runtime domain."""
+    canonical_scope = tuple(instrument.canonical() for instrument in instruments)
+    for reference in registry.registered_references():
+        factor = registry.factor(reference)
+        existing = getattr(factor, "_market_bars", None)
+        if (
+            isinstance(existing, MarketBarsCache)
+            and getattr(factor, "_price_service", None) is price_service
+            and tuple(
+                instrument.canonical()
+                for instrument in getattr(factor, "_instruments", ())
+            )
+            == canonical_scope
+        ):
+            return existing
+    return MarketBarsCache(price_service, instruments, max_lookback_sessions=120)
+
+
 def register_etf_factors(
     registry: FactorRegistry,
     price_service: AdjustedBarService,
     instruments: Sequence[InstrumentId],
 ) -> None:
     """Register the five exact Task 6 ETF market-factor identities."""
-    market_bars = MarketBarsCache(price_service, instruments, max_lookback_sessions=120)
+    market_bars = _market_bars_for(registry, price_service, instruments)
     factors: tuple[Factor, ...] = (
         ReturnFactor(price_service, instruments, 20, market_bars=market_bars),
         ReturnFactor(price_service, instruments, 60, market_bars=market_bars),
@@ -112,7 +136,7 @@ def register_stock_factors(
     min_abs_net_profit: float = 1e-12,
 ) -> None:
     """Register all Task 7 alpha and auxiliary identities exactly once."""
-    market_bars = MarketBarsCache(price_service, instruments, max_lookback_sessions=120)
+    market_bars = _market_bars_for(registry, price_service, instruments)
     factors: tuple[Factor, ...] = (
         EarningsYieldFactor(bar_repository, instruments),
         BookToPriceFactor(bar_repository, instruments),
