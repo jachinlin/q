@@ -275,6 +275,42 @@ def test_month_end_rebalance_uses_next_actual_session_not_calendar_month_end() -
     )
 
 
+def test_etf_rotation_does_not_rebalance_when_next_session_stays_in_month() -> None:
+    context = StrategyContext(
+        _SNAPSHOT,
+        date(2026, 8, 3),
+        date(2026, 8, 4),
+        (date(2026, 7, 31), date(2026, 8, 3), date(2026, 8, 4)),
+        _Data(_factor_frame({})),
+        PortfolioConstructor(),
+    )
+    assert not EtfRotationStrategy(_config()).should_rebalance(
+        context, context.signal_date
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {
+            "return_factor_weights": {
+                **{ref: 1 / 3 for ref in _RETURN_REFS},
+                "unknown@1": 0.0,
+            }
+        },
+        {"frequency": RebalanceFrequency.WEEKLY},
+        {"missing_signal_policy": "IMPUTE"},
+        {"weighting": "SCORE"},
+        {"volatility_penalty": float("inf")},
+    ],
+)
+def test_etf_config_rejects_unknown_enums_and_nonfinite_values(
+    override: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _config(**override)
+
+
 @pytest.mark.parametrize(
     "override",
     [

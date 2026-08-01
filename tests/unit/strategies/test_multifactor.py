@@ -193,6 +193,21 @@ def test_multifactor_frequency_is_weekly_and_uses_next_session_boundary() -> Non
     assert strategy.should_rebalance(context, context.signal_date)
 
 
+def test_multifactor_does_not_rebalance_inside_an_iso_week() -> None:
+    factors, universe = _frames()
+    context = StrategyContext(
+        _SNAPSHOT,
+        date(2026, 8, 3),
+        date(2026, 8, 4),
+        (date(2026, 7, 31), date(2026, 8, 3), date(2026, 8, 4)),
+        _Data(factors, universe),
+        PortfolioConstructor(),
+    )
+    assert not MultifactorStrategy(_config()).should_rebalance(
+        context, context.signal_date
+    )
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -219,6 +234,48 @@ def test_example_multifactor_yaml_is_safe_loadable_and_rejects_unknown_keys() ->
     assert config.min_valid_factors == 6
     with pytest.raises(ValueError, match="unknown"):
         MultifactorConfig.from_mapping({**mapping, "unknown": True})
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        {"category": "VALUE"},
+        {"category": "VALUE", "direction": "1"},
+        {"category": "AUXILIARY", "direction": 1},
+    ],
+)
+def test_multifactor_mapping_rejects_bad_nested_factor_definitions(
+    definition: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        MultifactorConfig.from_mapping(
+            {
+                "constraints": {
+                    "max_position_weight": 0.6,
+                    "max_industry_weight": 0.8,
+                    "min_positions": 1,
+                    "max_positions": 2,
+                    "min_adv_amount": 1.0,
+                    "max_turnover": 1.0,
+                },
+                "factor_definitions": {
+                    **{
+                        ref: {"category": category, "direction": direction}
+                        for ref, (category, direction) in {
+                            "earnings_yield_ttm_v1@1.0.0": ("VALUE", 1),
+                            "book_to_price_mrq_v1@1.0.0": ("VALUE", 1),
+                            "roe_avg_pit_v1@1.0.0": ("QUALITY", 1),
+                            "cfo_to_np_pit_v1@1.0.0": ("QUALITY", 1),
+                            "momentum_120_20_v1@1.0.0": ("MOMENTUM", 1),
+                            "volatility_60d_v1@1.0.0": ("RISK", -1),
+                            "downside_volatility_60d_v1@1.0.0": ("RISK", -1),
+                            "max_drawdown_120d_v1@1.0.0": ("RISK", -1),
+                        }.items()
+                    },
+                    "earnings_yield_ttm_v1@1.0.0": definition,
+                },
+            }
+        )
 
 
 def test_multifactor_audits_insufficient_factor_coverage_with_source_reason() -> None:
