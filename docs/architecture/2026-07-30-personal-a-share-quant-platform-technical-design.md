@@ -478,9 +478,14 @@ ETF 与股票的市场行情因子在 MVP 统一使用 BaoStock 原始 `close/pr
 逐行推导的 `baostock_forward_log_return_v2`：当 `close` 与 `preclose` 均为正数时，
 `r(t)=log(close(t))-log(preclose(t))`，其公式标识为
 `log_close_minus_log_preclose_v2`。该写法与 `log(close(t)/preclose(t))` 数学等价，
-但不构造中间比值，可避免极端价格尺度下比值先发生上溢或下溢；查询首行的
-`preclose` 为 null、任一输入为非正数或非有限值时，该字段为 null。每个因子窗口
-把首行对数价格设为 0，忽略首行自身的 `r`，并按固定
+但不构造中间比值，可避免极端价格尺度下比值先发生上溢或下溢。对每只证券，
+查询结果首行的 `preclose` 为 null 或正负零时，仅该行 `forward_log_return` 输出
+类型确定的 null；首行 `preclose` 为有限正数时仍按上述公式计算。除此之外，价格
+服务采用 fail closed：任意 `close` 为空、非正或非有限，首行 `preclose` 为负数或
+非有限，后续 `preclose` 为空、正负零、负数或非有限，以及非空 `open/high/low`
+为非正或非有限时，均拒绝整次请求；复权因子、累计收益指数、非空逐行对数收益
+或调整后价格出现非法值时同样在服务级拒绝，不会逐字段降级为 null。每个因子
+窗口把首行对数价格设为 0，忽略首行自身的 `r`，并按固定
 顺序累加后续逐行收益形成相对对数价格路径。逐行收益不依赖请求起点或累计
 指数，因此跨请求起点、追加未来跳变时，既有信号行的数值和内容哈希保持字节
 稳定。`baostock_return_index_v1` 仍可用于展示与其他研究场景，但市场因子不再
