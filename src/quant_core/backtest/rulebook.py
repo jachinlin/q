@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
+from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from typing import Any, Protocol
@@ -288,24 +289,26 @@ def _interval(row: dict[str, object], value_name: str) -> _IntervalRule:
 def _validate_intervals(
     key: object, rules: list[_IntervalRule]
 ) -> tuple[_IntervalRule, ...]:
-    ordered = sorted(rules, key=lambda rule: rule.start)
-    if not ordered or ordered[0].start != _RULE_START:
+    for previous, current in pairwise(rules):
+        if current.start <= previous.start:
+            raise ValueError(f"rule intervals for {key} must be strictly increasing")
+    if not rules or rules[0].start != _RULE_START:
         raise ValueError(
             f"rule intervals for {key} must start at {_RULE_START.isoformat()}"
         )
-    for index, rule in enumerate(ordered):
+    for index, rule in enumerate(rules):
         if rule.end is None:
-            if index != len(ordered) - 1:
+            if index != len(rules) - 1:
                 raise ValueError(f"rule intervals for {key} overlap")
             continue
-        if index == len(ordered) - 1:
+        if index == len(rules) - 1:
             raise ValueError(f"rule intervals for {key} must have an open end")
-        next_start = ordered[index + 1].start
+        next_start = rules[index + 1].start
         if next_start <= rule.end:
             raise ValueError(f"rule intervals for {key} overlap")
         if (next_start - rule.end).days != 1:
             raise ValueError(f"rule intervals for {key} have a gap")
-    return tuple(ordered)
+    return tuple(rules)
 
 
 def _matching_rate(rules: tuple[_IntervalRule, ...], trade_date: date) -> Decimal:

@@ -138,6 +138,22 @@ def test_rulebook_rejects_overlapping_gapped_and_unmatched_rule_intervals(
         )
 
 
+def test_rulebook_rejects_out_of_order_rule_intervals(tmp_path: Path) -> None:
+    base = _RULES.read_text(encoding="utf-8")
+    earlier = (
+        "  - {board: MAIN, status: ST, start: 2005-01-24, "
+        'end: 2026-07-05, rate: "0.05"}'
+    )
+    later = '  - {board: MAIN, status: ST, start: 2026-07-06, end: null, rate: "0.10"}'
+    unordered = tmp_path / "unordered.yaml"
+    unordered.write_text(
+        base.replace(earlier + "\n" + later, later + "\n" + earlier), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        AShareRuleBook.load(unordered)
+
+
 def _fill(
     instrument: InstrumentId, day: date, side: Side, quantity: int, price: float
 ) -> SimulatedFill:
