@@ -644,19 +644,16 @@ def test_shared_market_factor_registration_is_idempotent_for_equivalent_runtime(
 
 
 @pytest.mark.parametrize("etf_first", [True, False])
-def test_shared_market_factor_registration_rejects_different_provider_and_domain(
+def test_shared_market_factor_registration_rejects_different_service_same_domain(
     etf_first: bool,
 ) -> None:
-    etf_id = InstrumentId.parse("SSE:510300")
-    stock_bars = _bars([100.0 + index for index in range(121)])
-    etf_bars = stock_bars.with_columns(
-        pl.lit(etf_id.canonical()).alias("instrument_id")
-    )
+    stock_bars = _bars([100.0 + float(index % 5) for index in range(121)])
+    etf_bars = _bars([10.0] * 121)
     stock_service = BarService(stock_bars)
     etf_service = BarService(etf_bars)
     financials = Financials(_empty_financials())
     registry = FactorRegistry()
-    etf = lambda: register_etf_factors(registry, etf_service, [etf_id])
+    etf = lambda: register_etf_factors(registry, etf_service, [_ID])
     stock = lambda: register_stock_factors(
         registry,
         stock_service,
@@ -671,8 +668,46 @@ def test_shared_market_factor_registration_rejects_different_provider_and_domain
 
     day = stock_bars["trade_date"][-1]
     result = registry.factor("volatility_60d_v1").compute(_ctx(day, day)).collect()
-    expected = etf_id.canonical() if etf_first else _ID.canonical()
-    assert result["instrument_id"].to_list() == [expected]
+    assert result["instrument_id"].to_list() == [_ID.canonical()]
+    if etf_first:
+        assert result["value"].item() == 0.0
+    else:
+        assert result["value"].item() > 0.0
+
+
+@pytest.mark.parametrize("etf_first", [True, False])
+def test_shared_market_factor_registration_rejects_different_domain_same_service(
+    etf_first: bool,
+) -> None:
+    etf_id = InstrumentId.parse("SSE:510300")
+    stock_bars = _bars([10.0] * 121)
+    etf_bars = _bars([100.0 + float(index % 5) for index in range(121)]).with_columns(
+        pl.lit(etf_id.canonical()).alias("instrument_id")
+    )
+    shared_service = BarService(pl.concat([stock_bars, etf_bars]))
+    financials = Financials(_empty_financials())
+    registry = FactorRegistry()
+    etf = lambda: register_etf_factors(registry, shared_service, [etf_id])
+    stock = lambda: register_stock_factors(
+        registry,
+        shared_service,
+        financials,
+        [_ID],
+        price_service=shared_service,
+    )
+
+    (etf if etf_first else stock)()
+    with pytest.raises(ValueError, match="conflicting built-in runtime dependencies"):
+        (stock if etf_first else etf)()
+
+    day = stock_bars["trade_date"][-1]
+    result = registry.factor("volatility_60d_v1").compute(_ctx(day, day)).collect()
+    expected_instrument = etf_id.canonical() if etf_first else _ID.canonical()
+    assert result["instrument_id"].to_list() == [expected_instrument]
+    if etf_first:
+        assert result["value"].item() > 0.0
+    else:
+        assert result["value"].item() == 0.0
 
 
 def _ctx(start: date, end: date) -> FactorContext:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
-from math import isclose, isfinite, log
+from math import isfinite, log
 from typing import Protocol
 
 import polars as pl
@@ -14,6 +14,7 @@ from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorSpec
 
 _VERSION = "1.0.0"
+_TREND_VERSION = "1.1.0"
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
 _PRICE_BASIS = "baostock_return_index_v1"
@@ -162,7 +163,7 @@ class ReturnFactor(_MarketFactor):
 
 
 class Trend120dFactor(_MarketFactor):
-    """Normalized OLS slope of the latest 120 adjusted log closes."""
+    """Scale-invariant OLS slope of the latest 120 adjusted log closes."""
 
     def __init__(
         self,
@@ -174,7 +175,7 @@ class Trend120dFactor(_MarketFactor):
             instruments,
             FactorSpec(
                 factor_id="trend_120d_v1",
-                version=_VERSION,
+                version=_TREND_VERSION,
                 frequency="daily",
                 lookback_sessions=120,
                 dependencies=(),
@@ -182,9 +183,10 @@ class Trend120dFactor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "formula": (
-                        "ols_slope(log(forward_return_index),x=0..119)/"
-                        "mean(log(forward_return_index))"
+                        "ols_slope(log(forward_return_index/"
+                        "forward_return_index[0]),x=0..119)"
                     ),
+                    "formula_version": "log_price_ols_slope_v2",
                     "include_intercept": True,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_RETURN_INDEX_COLUMN,
@@ -242,20 +244,29 @@ def _momentum_120_20_value(closes: Sequence[float]) -> float | None:
 
 
 def _trend_value(closes: Sequence[float]) -> float | None:
-    log_prices = [log(value) for value in closes]
+    anchor = closes[0]
+    log_prices: list[float] = []
+    for value in closes:
+        relative = value / anchor
+        relative_log = (
+            log(relative)
+            if isfinite(relative) and relative > 0.0
+            else log(value) - log(anchor)
+        )
+        if not isfinite(relative_log):
+            return None
+        log_prices.append(relative_log)
     count = len(log_prices)
     mean_x = (count - 1) / 2.0
     mean_y = sum(log_prices) / count
-    scale = max(1.0, *(abs(value) for value in log_prices))
-    if not isfinite(mean_y) or isclose(mean_y, 0.0, rel_tol=0.0, abs_tol=1e-15 * scale):
+    if not isfinite(mean_y):
         return None
     denominator = sum((index - mean_x) ** 2 for index in range(count))
     numerator = sum(
         (index - mean_x) * (value - mean_y) for index, value in enumerate(log_prices)
     )
     slope = numerator / denominator
-    normalized = slope / mean_y
-    return normalized if isfinite(normalized) else None
+    return slope if isfinite(slope) else None
 
 
 def _canonical_instrument_scope(

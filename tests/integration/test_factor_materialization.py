@@ -174,7 +174,13 @@ def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
     calls = bars.calls
     second = engine.compute(requested, ctx)
 
-    assert set(first) == {f"{factor_id}@1.0.0" for factor_id in requested}
+    assert set(first) == {
+        "return_20d_v1@1.0.0",
+        "return_60d_v1@1.0.0",
+        "return_120d_v1@1.0.0",
+        "trend_120d_v1@1.1.0",
+        "volatility_60d_v1@1.0.0",
+    }
     assert bars.calls == calls
     assert _cache_state(cache.root) == cache_state
     assert {key: artifact.content_hash for key, artifact in second.items()} == {

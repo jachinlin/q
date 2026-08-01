@@ -114,19 +114,33 @@ class ActionAwarePriceService:
             if action[0] <= as_of and action[2].date() <= as_of
         ]
         rows: list[dict[str, object]] = []
-        for row in self._raw_bars.filter(
-            pl.col("instrument_id").is_in(instrument_ids)
-            & pl.col("trade_date").is_between(start, end, closed="both")
-        ).to_dicts():
+        return_indices: dict[str, float] = {}
+        for row in (
+            self._raw_bars.filter(
+                pl.col("instrument_id").is_in(instrument_ids)
+                & pl.col("trade_date").is_between(start, end, closed="both")
+            )
+            .sort("instrument_id", "trade_date")
+            .to_dicts()
+        ):
             trade_date = row["trade_date"]
+            instrument_id = row["instrument_id"]
             assert isinstance(trade_date, date)
+            assert isinstance(instrument_id, str)
             adjustment_factor = np.prod(
                 [factor for ex_date, factor, _ in applicable if trade_date < ex_date],
                 dtype=np.float64,
             ).item()
             events = [action for action in applicable if action[0] == trade_date]
             raw_close = float(row["close"])
-            row[FORWARD_RETURN_INDEX_COLUMN] = raw_close
+            previous_index = return_indices.get(instrument_id)
+            return_index = (
+                raw_close
+                if previous_index is None
+                else previous_index * raw_close / float(row["preclose"])
+            )
+            return_indices[instrument_id] = return_index
+            row[FORWARD_RETURN_INDEX_COLUMN] = return_index
             row["close"] = raw_close * adjustment_factor
             row["preclose"] = float(row["preclose"]) * adjustment_factor
             row["adjustment_factor"] = adjustment_factor
@@ -276,8 +290,8 @@ def test_return_factors_use_exact_lagged_close_formula() -> None:
         assert result["is_valid"].item() is True
 
 
-def test_trend_uses_log_price_ols_slope_normalized_by_mean() -> None:
-    """Replacing the selected formula with P/MA or raw slope must change this result."""
+def test_trend_uses_scale_invariant_log_price_ols_slope() -> None:
+    """Normalizing by the log-price mean would make the trend level-dependent."""
     closes = np.exp(2.0 + 0.004 * np.arange(120) + 0.03 * np.sin(np.arange(120)))
     bars = _bars(_SSE, closes.tolist())
     ctx = _context(bars["trade_date"][-1], bars["trade_date"][-1])
@@ -289,7 +303,7 @@ def test_trend_uses_log_price_ols_slope_normalized_by_mean() -> None:
     expected_slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[
         0
     ][1]
-    assert result["value"].item() == pytest.approx(expected_slope / np.mean(y))
+    assert result["value"].item() == pytest.approx(expected_slope)
     assert result["is_valid"].item() is True
 
 
@@ -395,16 +409,33 @@ def test_malformed_forward_return_index_invalidates_signal(
     assert result["is_valid"].item() is False
 
 
-def test_trend_zero_log_mean_is_invalid() -> None:
-    """Dividing a zero normalization mean must not publish infinity or NaN."""
-    closes = np.exp(np.linspace(-1.0, 1.0, 120)).tolist()
+def test_constant_trend_is_exact_zero_and_valid() -> None:
+    """A flat valid price window is a zero trend, not missing data."""
+    closes = [1.0] * 120
     bars = _bars(_SSE, closes)
     ctx = _context(bars["trade_date"][-1], bars["trade_date"][-1])
 
     result = Trend120dFactor(RecordingPriceService(bars), [_SSE]).compute(ctx).collect()
 
-    assert result["value"].item() is None
-    assert result["is_valid"].item() is False
+    assert result["value"].item() == 0.0
+    assert result["is_valid"].item() is True
+
+
+def test_near_flat_trend_remains_finite_and_valid() -> None:
+    """A representable near-zero slope must not be rejected as a zero denominator."""
+    closes = [1.0 + index * 1e-15 for index in range(120)]
+    bars = _bars(_SSE, closes)
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        Trend120dFactor(RecordingPriceService(bars), [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() is not None
+    assert np.isfinite(result["value"].item())
+    assert result["is_valid"].item() is True
 
 
 def test_windows_are_isolated_by_instrument_and_input_order_is_normalized() -> None:
@@ -573,8 +604,11 @@ def test_return_index_keeps_all_etf_market_factors_stable_after_future_jump(
     early = extended.filter(pl.col("trade_date") == signal_day)
 
     assert short["factor_id"].item() == factor_id
-    assert early["value"].item() == pytest.approx(short["value"].item())
+    assert early["value"].item() == short["value"].item()
     assert early["available_at"].item() == short["available_at"].item()
+    assert factor_table_content_hash(early.to_arrow()) == factor_table_content_hash(
+        short.to_arrow()
+    )
 
 
 def test_trend_return_index_rejects_the_global_forward_price_scale() -> None:
@@ -638,6 +672,40 @@ def test_return_index_has_exact_stable_values_for_nonbinary_future_scale(
     assert early["available_at"].item() == short["available_at"].item()
     assert factor_table_content_hash(early.to_arrow()) == factor_table_content_hash(
         short.to_arrow()
+    )
+
+
+def test_trend_is_byte_stable_for_same_signal_across_request_anchors() -> None:
+    """Changing ctx.start across an earlier 2-for-1 jump must not rescale trend."""
+    closes = [100.0 * 1.001**index for index in range(700)]
+    bars = _bars(_SSE, closes)
+    jump_index = 250
+    bars = bars.with_columns(
+        pl.when(pl.int_range(pl.len()) == jump_index)
+        .then(pl.col("preclose") * 0.5)
+        .otherwise(pl.col("preclose"))
+        .alias("preclose")
+    )
+    signal_day = bars["trade_date"][-1]
+    wider_start = bars["trade_date"][500]
+    service = ActionAwarePriceService(bars, [])
+
+    narrow = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+    wide = (
+        Trend120dFactor(service, [_SSE])
+        .compute(_context(wider_start, signal_day))
+        .collect()
+        .filter(pl.col("trade_date") == signal_day)
+    )
+
+    assert wide["value"].item() == narrow["value"].item()
+    assert wide["available_at"].item() == narrow["available_at"].item()
+    assert factor_table_content_hash(wide.to_arrow()) == factor_table_content_hash(
+        narrow.to_arrow()
     )
 
 
@@ -761,7 +829,7 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
         "return_20d_v1@1.0.0": (20, 1),
         "return_60d_v1@1.0.0": (60, 1),
         "return_120d_v1@1.0.0": (120, 1),
-        "trend_120d_v1@1.0.0": (120, 1),
+        "trend_120d_v1@1.1.0": (120, 1),
         "volatility_60d_v1@1.0.0": (60, -1),
     }
     for reference, (lookback, direction) in expected.items():
@@ -773,6 +841,8 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
         assert spec.parameters["adjustment_mode"] == "FORWARD"
         assert spec.parameters["price_basis"] == "baostock_return_index_v1"
         assert spec.parameters["price_field"] == FORWARD_RETURN_INDEX_COLUMN
+        if spec.factor_id == "trend_120d_v1":
+            assert spec.parameters["formula_version"] == "log_price_ols_slope_v2"
         assert len(registry.code_hash(reference)) == 64
 
 
