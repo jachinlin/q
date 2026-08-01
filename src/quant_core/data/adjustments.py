@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
-from math import exp, isfinite, log
+from math import isfinite
 from typing import cast
 
 import polars as pl
@@ -17,6 +17,8 @@ from quant_core.data.repository import ResearchDataRepository
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 
 _INT64_MAX = 2**63 - 1
+FORWARD_RETURN_INDEX_COLUMN = "forward_return_index"
+_FORWARD_PRICE_COLUMNS = ("open", "high", "low", "close", "preclose")
 ADJUSTMENT_EVENT_COMPONENTS_DTYPE = pl.List(
     pl.Struct(
         {
@@ -93,10 +95,12 @@ class PriceAdjustmentService:
             factor_column = pl.Series("_price_factor", price_factors, dtype=pl.Float64)
             adjusted_prices = [
                 (pl.col(column) * factor_column).alias(column)
-                for column in ("open", "high", "low", "close", "preclose")
+                for column in _FORWARD_PRICE_COLUMNS
             ]
+            result = adjusted.with_columns(adjusted_prices)
+            _validate_forward_prices(result, adjusted=True)
             return _with_metadata(
-                adjusted.with_columns(adjusted_prices),
+                result,
                 mode,
                 as_of,
                 adjustment_factors=price_factors,
@@ -164,44 +168,97 @@ def _validate_unique_bar_keys(frame: pl.DataFrame) -> None:
         raise ValueError("duplicate daily bar key")
 
 
+def _has_any(frame: pl.DataFrame, expression: pl.Expr) -> bool:
+    return bool(frame.select(expression.any()).item())
+
+
+def _validate_forward_prices(frame: pl.DataFrame, *, adjusted: bool = False) -> None:
+    prefix = "adjusted " if adjusted else ""
+    close = pl.col("close")
+    if _has_any(frame, close.is_null() | ~close.is_finite() | (close <= 0)):
+        raise ValueError(f"{prefix}close must be finite and positive")
+
+    first = pl.col("instrument_id").is_first_distinct()
+    preclose = pl.col("preclose")
+    valid_first_preclose = preclose.is_null() | (preclose.is_finite() & (preclose >= 0))
+    invalid_later_preclose = (
+        preclose.is_null() | ~preclose.is_finite() | (preclose <= 0)
+    )
+    if _has_any(
+        frame,
+        pl.when(first).then(~valid_first_preclose).otherwise(invalid_later_preclose),
+    ):
+        if adjusted:
+            raise ValueError(
+                "adjusted preclose must be null or nonnegative on the first "
+                "session and finite and positive thereafter"
+            )
+        raise ValueError(
+            "first preclose must be null, zero, or finite and positive; "
+            "later preclose must be finite and positive"
+        )
+
+    for column in ("open", "high", "low"):
+        value = pl.col(column)
+        if _has_any(
+            frame,
+            value.is_not_null() & (~value.is_finite() | (value <= 0)),
+        ):
+            raise ValueError(
+                f"{prefix}{column} must be finite and positive when non-null"
+            )
+
+
 def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[float]]:
     ordered = frame.sort("instrument_id", "trade_date")
     _validate_unique_bar_keys(ordered)
-    factors_by_key: dict[tuple[str, date], float] = {}
-    for group in ordered.partition_by("instrument_id", maintain_order=True):
-        rows = group.select(
-            "instrument_id", "trade_date", "close", "preclose"
-        ).to_dicts()
-        log_factor = 0.0
-        last = len(rows) - 1
-        factors = [1.0] * len(rows)
-        for index in range(last, 0, -1):
-            previous_close = _required_positive(rows[index - 1]["close"], "close")
-            current_preclose = _required_positive(rows[index]["preclose"], "preclose")
-            log_factor += log(current_preclose) - log(previous_close)
-            try:
-                factor = exp(log_factor)
-            except OverflowError as error:
-                raise ValueError(
-                    "forward adjustment factor must be finite and positive"
-                ) from error
-            if not isfinite(factor) or factor <= 0:
-                raise ValueError(
-                    "forward adjustment factor must be finite and positive"
-                )
-            factors[index - 1] = factor
-        for row, factor in zip(rows, factors, strict=True):
-            factors_by_key[
-                (
-                    cast(str, row["instrument_id"]),
-                    cast(date, row["trade_date"]),
-                )
-            ] = factor
-    filtered = ordered.filter(pl.col("trade_date") <= end)
-    filtered_factors = [
-        factors_by_key[(cast(str, row["instrument_id"]), cast(date, row["trade_date"]))]
-        for row in filtered.select("instrument_id", "trade_date").to_dicts()
-    ]
+    _validate_forward_prices(ordered)
+    if ordered.is_empty():
+        return (
+            ordered.with_columns(
+                pl.Series(FORWARD_RETURN_INDEX_COLUMN, [], dtype=pl.Float64)
+            ),
+            [],
+        )
+
+    first = pl.col("instrument_id").is_first_distinct()
+    calculated = ordered.with_columns(
+        pl.when(first)
+        .then(0.0)
+        .otherwise(
+            pl.col("preclose").log()
+            - pl.col("close").shift(1).over("instrument_id").log()
+        )
+        .alias("_forward_log_ratio"),
+        pl.when(first)
+        .then(pl.col("close"))
+        .otherwise(pl.col("close") / pl.col("preclose"))
+        .alias("_forward_return_ratio"),
+    ).with_columns(
+        (
+            pl.col("_forward_log_ratio").sum().over("instrument_id")
+            - pl.col("_forward_log_ratio").cum_sum().over("instrument_id")
+        )
+        .exp()
+        .alias("_forward_factor"),
+        pl.col("_forward_return_ratio")
+        .cum_prod()
+        .over("instrument_id")
+        .cast(pl.Float64)
+        .alias(FORWARD_RETURN_INDEX_COLUMN),
+    )
+    factor = pl.col("_forward_factor")
+    if _has_any(calculated, ~factor.is_finite() | (factor <= 0)):
+        raise ValueError("forward adjustment factor must be finite and positive")
+    return_index = pl.col(FORWARD_RETURN_INDEX_COLUMN)
+    if _has_any(calculated, ~return_index.is_finite() | (return_index <= 0)):
+        raise ValueError("forward return index must be finite and positive")
+
+    filtered = calculated.filter(pl.col("trade_date") <= end)
+    filtered_factors = cast(list[float], filtered["_forward_factor"].to_list())
+    filtered = filtered.drop(
+        "_forward_log_ratio", "_forward_return_ratio", "_forward_factor"
+    )
     return filtered, filtered_factors
 
 

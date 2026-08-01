@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from inspect import getsource
 from pathlib import Path
 
 import polars as pl
@@ -200,6 +201,8 @@ def test_forward_adjustment_uses_baostock_preclose_without_action_dataset(
     assert result["adjustment_event_factor"].to_list() == [1.0, 1.0, 1.0]
     assert result["adjustment_event_available_at"].to_list() == [None, None, None]
     assert result["adjustment_event_components"].to_list() == [[], [], []]
+    assert result.schema["forward_return_index"] == pl.Float64
+    assert result["forward_return_index"].to_list() == pytest.approx([10.0, 12.0, 12.6])
 
 
 def test_forward_adjustment_sorts_and_isolates_instruments() -> None:
@@ -247,9 +250,195 @@ def test_forward_adjustment_empty_bars_preserves_schema() -> None:
 
     result, factors = _forward_adjust(frame, _DAYS[-1])
 
-    assert result.schema == frame.schema
+    assert result.drop("forward_return_index").schema == frame.schema
+    assert result.schema["forward_return_index"] == pl.Float64
     assert result.is_empty()
     assert factors == []
+
+
+@pytest.mark.parametrize(
+    "invalid_close", [None, 0.0, -0.0, -1.0, float("nan"), float("inf"), -float("inf")]
+)
+def test_forward_adjustment_rejects_invalid_anchor_close(
+    invalid_close: float | None,
+) -> None:
+    """The anchor close is output data even though no later ratio consumes it."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 10.0, 0.0),
+            ("SSE:600000", _DAYS[1], invalid_close, 10.0),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="close must be finite and positive"):
+        _forward_adjust(frame, _DAYS[1])
+
+
+@pytest.mark.parametrize(
+    "invalid_preclose", [-1.0, float("nan"), float("inf"), -float("inf")]
+)
+def test_forward_adjustment_rejects_invalid_first_preclose(
+    invalid_preclose: float,
+) -> None:
+    """Only null and zero relax the first observed preclose constraint."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 10.0, invalid_preclose),
+            ("SSE:600000", _DAYS[1], 11.0, 10.0),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="first.*preclose|preclose.*first"):
+        _forward_adjust(frame, _DAYS[1])
+
+
+@pytest.mark.parametrize("first_preclose", [None, 0.0, -0.0, 9.0])
+def test_forward_adjustment_accepts_valid_first_preclose(
+    first_preclose: float | None,
+) -> None:
+    """IPO null/zero and an ordinary positive first preclose are all canonical."""
+    result, _ = _forward_adjust(
+        _forward_frame(
+            [
+                ("SSE:600000", _DAYS[0], 10.0, first_preclose),
+                ("SSE:600000", _DAYS[1], 11.0, 10.0),
+            ]
+        ),
+        _DAYS[1],
+    )
+
+    assert result["preclose"].item(0) == first_preclose
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low"])
+@pytest.mark.parametrize(
+    "invalid_value", [0.0, -0.0, -1.0, float("nan"), float("inf"), -float("inf")]
+)
+def test_forward_adjustment_rejects_invalid_nonnull_ohlc(
+    column: str, invalid_value: float
+) -> None:
+    """Every non-null output price input must be finite and positive."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 10.0, 0.0),
+            ("SSE:600000", _DAYS[1], 11.0, 10.0),
+        ]
+    ).with_columns(pl.lit(invalid_value, dtype=pl.Float64).alias(column))
+
+    with pytest.raises(ValueError, match=rf"{column} must be finite and positive"):
+        _forward_adjust(frame, _DAYS[1])
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low"])
+def test_forward_adjustment_preserves_null_optional_ohlc(column: str) -> None:
+    """Canonical nullable OHLC values remain null instead of being fabricated."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 10.0, 0.0),
+            ("SSE:600000", _DAYS[1], 11.0, 10.0),
+        ]
+    ).with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
+
+    result, _ = _forward_adjust(frame, _DAYS[1])
+
+    assert result[column].to_list() == [None, None]
+
+
+def test_forward_adjustment_rejects_adjusted_price_overflow(tmp_path: Path) -> None:
+    """A finite raw price times a finite factor must not escape as infinity."""
+    overflowing = [
+        (1e308, 1e308, 1.0, 1.0, 0.0, 100, 100.0),
+        (10.0, 10.0, 10.0, 10.0, 10.0, 100, 1000.0),
+        (10.0, 10.0, 10.0, 10.0, 10.0, 100, 1000.0),
+        (10.0, 10.0, 10.0, 10.0, 10.0, 100, 1000.0),
+        (10.0, 10.0, 10.0, 10.0, 10.0, 100, 1000.0),
+    ]
+    fixture = _adjustment_fixture(tmp_path, [], bar_values=overflowing)
+
+    with pytest.raises(ValueError, match="adjusted open must be finite and positive"):
+        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+            fixture.snapshot_id,
+            [_INSTRUMENT],
+            _DAYS[0],
+            _DAYS[-1],
+            AdjustmentMode.FORWARD,
+            _DAYS[-1],
+        )
+
+
+def test_forward_return_index_is_byte_stable_after_nonbinary_future_jumps() -> None:
+    """A 0.7 future jump must not change any earlier research-price bytes."""
+    prefix = _forward_frame(
+        [
+            ("SSE:600001", _DAYS[2], 204.0, 202.0),
+            ("SSE:600000", _DAYS[0], 100.0, 0.0),
+            ("SSE:600001", _DAYS[0], 200.0, None),
+            ("SSE:600000", _DAYS[2], 102.0, 101.0),
+            ("SSE:600001", _DAYS[1], 202.0, 200.0),
+            ("SSE:600000", _DAYS[1], 101.0, 100.0),
+        ]
+    )
+    future = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[3], 103.0, 0.7 * 102.0),
+            ("SSE:600001", _DAYS[3], 205.0, 0.5 * 204.0),
+        ]
+    )
+
+    short, _ = _forward_adjust(prefix, _DAYS[2])
+    extended, _ = _forward_adjust(pl.concat([prefix, future]), _DAYS[2])
+
+    assert short.schema["forward_return_index"] == pl.Float64
+    assert short["forward_return_index"].to_list() == pytest.approx(
+        [100.0, 101.0, 102.0, 200.0, 202.0, 204.0]
+    )
+    assert (
+        short["forward_return_index"].to_numpy().tobytes()
+        == extended["forward_return_index"].to_numpy().tobytes()
+    )
+
+
+def test_forward_adjustment_uses_vectorized_path_at_research_scale() -> None:
+    """Research-scale adjustment must not materialize row dictionaries in Python."""
+    source = getsource(_forward_adjust)
+    assert "partition_by" not in source
+    assert "to_dicts" not in source
+    sessions = 250
+    row_count = 50_000
+    frame = (
+        pl.DataFrame({"_i": pl.arange(0, row_count, eager=True)})
+        .with_columns(
+            (pl.col("_i") // sessions).cast(pl.String).alias("instrument_id"),
+            (
+                pl.lit(date(2020, 1, 1)) + pl.duration(days=pl.col("_i") % sessions)
+            ).alias("trade_date"),
+            (100.0 + (pl.col("_i") % sessions).cast(pl.Float64) * 0.01).alias("close"),
+            pl.when((pl.col("_i") % sessions) == 0)
+            .then(0.0)
+            .otherwise(100.0 + ((pl.col("_i") % sessions) - 1).cast(pl.Float64) * 0.01)
+            .alias("preclose"),
+        )
+        .with_columns(
+            pl.col("close").alias("open"),
+            pl.col("close").alias("high"),
+            pl.col("close").alias("low"),
+        )
+        .select(
+            "instrument_id",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "preclose",
+        )
+    )
+
+    result, factors = _forward_adjust(frame, date(2030, 12, 31))
+
+    assert result.height == row_count
+    assert len(factors) == row_count
+    assert result["forward_return_index"].is_finite().all()
 
 
 @pytest.mark.parametrize(
@@ -872,15 +1061,31 @@ def _backward_bars(fixture: AdjustmentFixture, start: date, end: date, as_of: da
 def _forward_frame(
     rows: list[tuple[str, date, float | None, float | None]],
 ) -> pl.DataFrame:
-    return pl.DataFrame(
-        rows,
-        schema={
-            "instrument_id": pl.String,
-            "trade_date": pl.Date,
-            "close": pl.Float64,
-            "preclose": pl.Float64,
-        },
-        orient="row",
+    return (
+        pl.DataFrame(
+            rows,
+            schema={
+                "instrument_id": pl.String,
+                "trade_date": pl.Date,
+                "close": pl.Float64,
+                "preclose": pl.Float64,
+            },
+            orient="row",
+        )
+        .with_columns(
+            pl.col("close").alias("open"),
+            pl.col("close").alias("high"),
+            pl.col("close").alias("low"),
+        )
+        .select(
+            "instrument_id",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "preclose",
+        )
     )
 
 
