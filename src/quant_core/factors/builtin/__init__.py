@@ -40,7 +40,6 @@ _RUNTIME_DEPENDENCY_ATTRIBUTES = (
     "_service",
     "_provider",
     "_calendar",
-    "_market_bars",
 )
 
 
@@ -61,6 +60,9 @@ def _builtin_runtime_identity(factor: Factor) -> tuple[object, ...]:
         for attribute in _RUNTIME_DEPENDENCY_ATTRIBUTES
         if hasattr(factor, attribute)
     )
+    market_bars = getattr(factor, "_market_bars", None)
+    if isinstance(market_bars, MarketBarsCache):
+        identity.append(("market_bars_runtime", market_bars.runtime_identity()))
     return tuple(identity)
 
 
@@ -93,14 +95,10 @@ def _market_bars_for(
     for reference in registry.registered_references():
         factor = registry.factor(reference)
         existing = getattr(factor, "_market_bars", None)
-        if (
-            isinstance(existing, MarketBarsCache)
-            and getattr(factor, "_price_service", None) is price_service
-            and tuple(
-                instrument.canonical()
-                for instrument in getattr(factor, "_instruments", ())
-            )
-            == canonical_scope
+        if isinstance(existing, MarketBarsCache) and existing.runtime_identity() == (
+            id(price_service),
+            canonical_scope,
+            120,
         ):
             return existing
     return MarketBarsCache(price_service, instruments, max_lookback_sessions=120)

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import Future
 from datetime import UTC, date, datetime, timedelta
 from inspect import getsource
 from math import sqrt
-from threading import Event, Lock, Thread
+from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
 
 import numpy as np
 import polars as pl
@@ -25,7 +26,7 @@ from quant_core.factors import (
     FactorRegistry,
 )
 from quant_core.factors.base import factor_table_content_hash
-from quant_core.factors.builtin import register_etf_factors
+from quant_core.factors.builtin import register_builtin, register_etf_factors
 from quant_core.factors.builtin.momentum import (
     MarketBarsCache,
     ReturnFactor,
@@ -86,6 +87,195 @@ def test_market_bars_cache_single_flights_same_context_loads(
     assert not first.is_alive() and not second.is_alive()
     assert calls == 1
     assert results == [frame, frame]
+
+
+def test_market_bars_cache_loads_different_contexts_in_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One slow experiment must not serialize an unrelated experiment read."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    sources_started = Barrier(3)
+    first_entered = Event()
+    release_first = Event()
+    errors: list[AssertionError | BrokenBarrierError] = []
+    frame = pl.DataFrame(
+        {"instrument_id": [_SSE.canonical()], "trade_date": [date(2024, 1, 1)]}
+    )
+    first_ctx = _context(date.min, date.min)
+    second_ctx = FactorContext(
+        snapshot_id=_SNAPSHOT,
+        universe_hash="7" * 64,
+        start=date.min,
+        end=date.min,
+    )
+
+    def concurrent_load(
+        _service: object,
+        _instruments: object,
+        ctx: FactorContext,
+        _start: date,
+    ) -> pl.DataFrame:
+        if ctx == first_ctx:
+            first_entered.set()
+        sources_started.wait(timeout=2)
+        if ctx == first_ctx:
+            assert release_first.wait(timeout=2)
+        return frame
+
+    def run(ctx: FactorContext) -> None:
+        try:
+            cache.load(ctx)
+        except (AssertionError, BrokenBarrierError) as error:
+            errors.append(error)
+
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", concurrent_load)
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    first = Thread(target=run, args=(first_ctx,))
+    second = Thread(target=run, args=(second_ctx,))
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    try:
+        sources_started.wait(timeout=2)
+        ran_in_parallel = True
+    except BrokenBarrierError:
+        ran_in_parallel = False
+    finally:
+        release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert ran_in_parallel
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+
+
+def test_market_bars_cache_shares_failure_then_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All same-key waiters see one failure, while a later call can retry."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    waiter_entered = Event()
+
+    class ObservableFuture(Future[pl.DataFrame]):
+        def result(self, timeout: float | None = None) -> pl.DataFrame:
+            waiter_entered.set()
+            return super().result(timeout)
+
+    first_entered = Event()
+    release_failure = Event()
+    counter_lock = Lock()
+    calls = 0
+    failure = RuntimeError("market read failed")
+    frame = pl.DataFrame(
+        {"instrument_id": [_SSE.canonical()], "trade_date": [date(2024, 1, 1)]}
+    )
+
+    def failing_once(*_args: object, **_kwargs: object) -> pl.DataFrame:
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            attempt = calls
+        if attempt == 1:
+            first_entered.set()
+            assert release_failure.wait(timeout=2)
+            raise failure
+        return frame
+
+    monkeypatch.setattr(momentum_module, "Future", ObservableFuture, raising=False)
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", failing_once)
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    ctx = _context(date.min, date.min)
+    errors: list[RuntimeError] = []
+
+    def run() -> None:
+        try:
+            cache.load(ctx)
+        except RuntimeError as error:
+            errors.append(error)
+
+    first = Thread(target=run)
+    second = Thread(target=run)
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    waiter_joined = waiter_entered.wait(timeout=1)
+    release_failure.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert waiter_joined
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == 1
+    assert errors == [failure, failure]
+    assert cache.load(ctx) is frame
+    assert calls == 2
+
+
+def test_market_bars_cache_rejects_same_context_recursive_load_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider that re-enters its own key must fail fast without poisoning it."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    frame = pl.DataFrame(
+        {"instrument_id": [_SSE.canonical()], "trade_date": [date(2024, 1, 1)]}
+    )
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    ctx = _context(date.min, date.min)
+
+    def recursive_load(*_args: object, **_kwargs: object) -> pl.DataFrame:
+        return cache.load(ctx)
+
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", recursive_load)
+    with pytest.raises(RuntimeError, match="recursive market bar load"):
+        cache.load(ctx)
+
+    monkeypatch.setattr(
+        momentum_module,
+        "_load_adjusted_bars",
+        lambda *_args, **_kwargs: frame,
+    )
+    assert cache.load(ctx) is frame
+
+
+def test_market_bars_cache_allows_different_context_recursive_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider re-entry for another key must remain usable and deadlock-free."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    first_frame = pl.DataFrame(
+        {"instrument_id": [_SSE.canonical()], "trade_date": [date(2024, 1, 1)]}
+    )
+    second_frame = pl.DataFrame(
+        {"instrument_id": [_SSE.canonical()], "trade_date": [date(2024, 1, 2)]}
+    )
+    first_ctx = _context(date.min, date.min)
+    second_ctx = FactorContext(
+        snapshot_id=_SNAPSHOT,
+        universe_hash="7" * 64,
+        start=date.min,
+        end=date.min,
+    )
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+
+    def reentrant_load(
+        _service: object,
+        _instruments: object,
+        ctx: FactorContext,
+        _start: date,
+    ) -> pl.DataFrame:
+        if ctx == first_ctx:
+            assert cache.load(second_ctx) is second_frame
+            return first_frame
+        return second_frame
+
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", reentrant_load)
+
+    assert cache.load(first_ctx) is first_frame
 
 
 class RecordingPriceService:
@@ -926,6 +1116,43 @@ def test_builtin_registration_rejects_same_ref_with_a_different_hash() -> None:
 
     with pytest.raises(ValueError, match="conflicting built-in implementation"):
         register_etf_factors(registry, RecordingPriceService(bars), [_SSE])
+
+
+def test_builtin_registration_accepts_equivalent_new_market_cache() -> None:
+    """A cache allocation is not part of a factor's semantic runtime identity."""
+    service = RecordingPriceService(_bars(_SSE, [10.0]))
+    registry = FactorRegistry()
+    first_cache = MarketBarsCache(service, [_SSE], max_lookback_sessions=120)
+    second_cache = MarketBarsCache(service, [_SSE], max_lookback_sessions=120)
+
+    register_builtin(
+        registry,
+        ReturnFactor(service, [_SSE], 20, market_bars=first_cache),
+    )
+    register_builtin(
+        registry,
+        ReturnFactor(service, [_SSE], 20, market_bars=second_cache),
+    )
+
+    assert registry.registered_references() == ("return_20d_v1@2.1.0",)
+
+
+def test_builtin_registration_rejects_changed_market_cache_configuration() -> None:
+    """Changing the shared history contract must remain runtime-visible."""
+    service = RecordingPriceService(_bars(_SSE, [10.0]))
+    registry = FactorRegistry()
+    first_cache = MarketBarsCache(service, [_SSE], max_lookback_sessions=120)
+    changed_cache = MarketBarsCache(service, [_SSE], max_lookback_sessions=119)
+    register_builtin(
+        registry,
+        ReturnFactor(service, [_SSE], 20, market_bars=first_cache),
+    )
+
+    with pytest.raises(ValueError, match="conflicting built-in runtime dependencies"):
+        register_builtin(
+            registry,
+            ReturnFactor(service, [_SSE], 20, market_bars=changed_cache),
+        )
 
 
 @pytest.mark.parametrize("window", [0, -1, 21, 59, 61, 119, 121, True])

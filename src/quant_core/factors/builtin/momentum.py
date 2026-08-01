@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future
 from datetime import date, datetime, timedelta
 from math import expm1, isfinite
-from threading import RLock
+from threading import Lock, get_ident
 from typing import Protocol
 
 import polars as pl
@@ -53,13 +54,40 @@ class MarketBarsCache:
         self._max_lookback_sessions = max_lookback_sessions
         self._ctx: FactorContext | None = None
         self._bars: pl.DataFrame | None = None
-        self._lock = RLock()
+        self._inflight: dict[FactorContext, tuple[Future[pl.DataFrame], int]] = {}
+        self._lock = Lock()
+
+    def runtime_identity(self) -> tuple[object, ...]:
+        """Return the source domain and configuration, excluding cache allocation."""
+        return (
+            id(self._price_service),
+            tuple(instrument.canonical() for instrument in self._instruments),
+            self._max_lookback_sessions,
+        )
 
     def load(self, ctx: FactorContext) -> pl.DataFrame:
         """Return the one normalized price frame for the active factor context."""
+        owner_thread_id = get_ident()
         with self._lock:
             if self._ctx == ctx and self._bars is not None:
                 return self._bars
+            active = self._inflight.get(ctx)
+            if active is None:
+                future: Future[pl.DataFrame] = Future()
+                self._inflight[ctx] = (future, owner_thread_id)
+                owns_load = True
+            else:
+                future, active_owner_thread_id = active
+                if active_owner_thread_id == owner_thread_id:
+                    raise RuntimeError(
+                        "recursive market bar load for the same factor context"
+                    )
+                owns_load = False
+
+        if not owns_load:
+            return future.result()
+
+        try:
             history_start = _expanded_history_start(
                 ctx.start, self._max_lookback_sessions
             )
@@ -78,9 +106,20 @@ class MarketBarsCache:
                     ctx,
                     date.min,
                 )
+        except BaseException as error:
+            with self._lock:
+                if self._inflight.get(ctx) == (future, owner_thread_id):
+                    del self._inflight[ctx]
+            future.set_exception(error)
+            raise
+
+        with self._lock:
             self._ctx = ctx
             self._bars = bars
-            return bars
+            if self._inflight.get(ctx) == (future, owner_thread_id):
+                del self._inflight[ctx]
+        future.set_result(bars)
+        return bars
 
 
 class _MarketFactor:
