@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 from quant_core.backtest.accounting import (
+    AccountExecutionView,
     AccountSnapshot,
     CorporateAction,
     CorporateActionType,
@@ -393,6 +394,18 @@ def test_state_machine_price_validation_and_ledger_derived_snapshot() -> None:
     assert snapshot.nav_fen == sum(event.cash_delta_fen for event in account.ledger)
     with pytest.raises(ValueError, match="mark"):
         account.mark_to_market(_D2, {})
+
+
+def test_execution_view_exposes_only_begin_session_balances() -> None:
+    account = PortfolioAccount(1_000, _calendar())
+    account.begin_session(_D2, ())
+
+    view = account.execution_view()
+
+    assert isinstance(view, AccountExecutionView)
+    assert view.cash_fen == 1_000
+    assert dict(view.total_quantities) == {}
+    assert dict(view.sellable_quantities) == {}
 
 
 def test_state_machine_rejects_non_session_dates_wrong_batch_date_and_missing_close() -> (

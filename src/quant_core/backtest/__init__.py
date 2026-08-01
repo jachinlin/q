@@ -1,6 +1,7 @@
 """Deterministic, snapshot-bound primitives for daily A-share backtests."""
 
 from quant_core.backtest.accounting import (
+    AccountExecutionView,
     AccountSnapshot,
     CorporateAction,
     CorporateActionType,
@@ -9,7 +10,15 @@ from quant_core.backtest.accounting import (
     PortfolioAccount,
     PositionSnapshot,
 )
+from quant_core.backtest.artifacts import ArtifactEntry, BacktestArtifactWriter
 from quant_core.backtest.calendar import TradingCalendar
+from quant_core.backtest.engine import (
+    BacktestCancelled,
+    BacktestEngine,
+    BacktestRequest,
+    BacktestResult,
+    StrategyRef,
+)
 from quant_core.backtest.execution import ExecutionModel
 from quant_core.backtest.models import (
     AccountView,
@@ -33,8 +42,15 @@ from quant_core.backtest.rulebook import (
 
 __all__ = [
     "AShareRuleBook",
+    "AccountExecutionView",
     "AccountSnapshot",
     "AccountView",
+    "ArtifactEntry",
+    "BacktestArtifactWriter",
+    "BacktestCancelled",
+    "BacktestEngine",
+    "BacktestRequest",
+    "BacktestResult",
     "CorporateAction",
     "CorporateActionType",
     "ExecutionBatch",
@@ -55,5 +71,6 @@ __all__ = [
     "SecurityStatus",
     "Side",
     "SimulatedFill",
+    "StrategyRef",
     "TradingCalendar",
 ]

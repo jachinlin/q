@@ -8,6 +8,7 @@ from datetime import date, datetime
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from math import isfinite
+from types import MappingProxyType
 
 from quant_core.backtest.calendar import TradingCalendar
 from quant_core.backtest.models import ExecutionBatch, ExecutionReason, FillResult
@@ -152,6 +153,27 @@ class AccountSnapshot:
             raise ValueError("total_market_value_fen must equal positions")
         if self.nav_fen != self.cash_fen + self.total_market_value_fen:
             raise ValueError("nav_fen must equal cash plus market value")
+
+
+@dataclass(frozen=True, slots=True)
+class AccountExecutionView:
+    """Immutable balances available to the execution layer in an open session."""
+
+    cash_fen: int
+    total_quantities: Mapping[InstrumentId, int]
+    sellable_quantities: Mapping[InstrumentId, int]
+
+    def __post_init__(self) -> None:
+        _nonnegative_int(self.cash_fen, "cash_fen")
+        totals = _quantity_mapping(self.total_quantities, "total_quantities")
+        sellable = _quantity_mapping(self.sellable_quantities, "sellable_quantities")
+        if any(
+            quantity > totals.get(instrument, 0)
+            for instrument, quantity in sellable.items()
+        ):
+            raise ValueError("sellable quantities must not exceed total quantities")
+        object.__setattr__(self, "total_quantities", MappingProxyType(totals))
+        object.__setattr__(self, "sellable_quantities", MappingProxyType(sellable))
 
 
 @dataclass(slots=True)
@@ -381,6 +403,13 @@ class PortfolioAccount:
         self._ledger_event_ids = event_ids
         self._ledger_source_ids = source_ids
         self._phase = "applied"
+
+    def execution_view(self) -> AccountExecutionView:
+        """Return ledger-owned balances after ``begin_session`` and before apply."""
+        if self._phase != "open" or self._last_session is None:
+            raise ValueError("execution_view requires an open begin_session")
+        quantities, _, sellable = _lot_totals(self._lots, self._last_session)
+        return AccountExecutionView(self._cash_fen, quantities, sellable)
 
     def mark_to_market(
         self, trade_date: date, closes: Mapping[InstrumentId, float]
@@ -639,6 +668,18 @@ def _prices(closes: Mapping[InstrumentId, float]) -> dict[InstrumentId, int]:
         instrument: _close_fen(instrument, close)
         for instrument, close in closes.items()
     }
+
+
+def _quantity_mapping(
+    values: Mapping[InstrumentId, int], name: str
+) -> dict[InstrumentId, int]:
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    result = dict(values)
+    for instrument, quantity in result.items():
+        _instrument(instrument)
+        _nonnegative_int(quantity, name)
+    return result
 
 
 def _close_fen(instrument: object, close: object) -> int:
