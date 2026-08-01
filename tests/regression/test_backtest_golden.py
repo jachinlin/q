@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import UUID
@@ -18,7 +19,11 @@ from quant_core.backtest.artifacts import (
     ManifestContext,
     WriterState,
 )
-from quant_core.backtest.engine import BacktestEngine, BacktestRequest, StrategyRef
+from quant_core.backtest.engine import (
+    BacktestEngine,
+    BacktestResult,
+    StrategyRef,
+)
 from quant_core.backtest.models import (
     ExecutionBatch,
     ExecutionReason,
@@ -500,46 +505,6 @@ def test_validate_rejects_each_missing_required_artifact(
     assert writer.state.value == "CLOSED"
 
 
-@pytest.mark.parametrize(
-    "factory",
-    [
-        lambda: StrategyRef("", "1"),
-        lambda: StrategyRef("x", 1),
-        lambda: BacktestRequest(
-            "x",
-            _request().snapshot_id,
-            _request().strategy,
-            _request().start_date,
-            _request().end_date,
-            _request().benchmark,
-            0,
-            "v",
-            _request().execution_config,
-        ),
-        lambda: ArtifactEntry("../x", "x", 0, 0, "0" * 64),
-        lambda: ManifestContext(
-            UUID(int=1),
-            UUID(int=2),
-            "s",
-            "v",
-            datetime(2024, 1, 1, tzinfo=UTC),
-            date(2024, 1, 2),
-            InstrumentId.parse("SSE:600001"),
-            0,
-            "v",
-            _request().execution_config,
-        ),
-        lambda: WriterState("INVALID"),
-    ],
-)
-def test_public_models_fail_closed_for_invalid_direct_construction(
-    factory: object,
-) -> None:
-    assert callable(factory)
-    with pytest.raises((TypeError, ValueError)):
-        factory()
-
-
 def test_empty_artifacts_keep_hard_coded_arrow_schemas(tmp_path: Path) -> None:
     class NoneTargets:
         def generate_target(self, *args: object, **kwargs: object) -> None:
@@ -612,3 +577,290 @@ def test_empty_artifacts_keep_hard_coded_arrow_schemas(tmp_path: Path) -> None:
         assert pq.read_schema(result.artifact_dir / name) == schema
         if name != "nav.parquet":
             assert table.num_rows == 0
+
+
+def _valid_result() -> BacktestResult:
+    artifact_dir = Path("artifacts")
+    return BacktestResult(
+        UUID(int=1),
+        artifact_dir,
+        artifact_dir / "manifest.json",
+        1,
+        AccountSnapshot(date(2024, 1, 1), 0, (), 0, 0),
+    )
+
+
+@pytest.mark.parametrize(
+    ("strategy_id", "version"),
+    [
+        pytest.param("", "v1", id="empty-strategy-id"),
+        pytest.param("strategy", "", id="empty-version"),
+        pytest.param(1, "v1", id="non-string-strategy-id"),
+    ],
+)
+def test_strategy_ref_rejects_invalid_direct_construction(
+    strategy_id: object, version: object
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        StrategyRef(strategy_id, version)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "invalid_request",
+    [
+        pytest.param(
+            lambda: replace(_request(), experiment_id="not-a-uuid"),
+            id="experiment-id-not-uuid",
+        ),
+        pytest.param(
+            lambda: replace(_request(), snapshot_id="not-a-uuid"),
+            id="snapshot-id-not-uuid",
+        ),
+        pytest.param(
+            lambda: replace(_request(), strategy=object()),
+            id="strategy-wrong-type",
+        ),
+        pytest.param(
+            lambda: replace(_request(), start_date=datetime(2024, 1, 1, tzinfo=UTC)),
+            id="start-date-datetime",
+        ),
+        pytest.param(
+            lambda: replace(_request(), end_date=datetime(2024, 1, 3, tzinfo=UTC)),
+            id="end-date-datetime",
+        ),
+        pytest.param(
+            lambda: replace(
+                _request(),
+                start_date=date(2024, 1, 3),
+                end_date=date(2024, 1, 1),
+            ),
+            id="start-date-after-end-date",
+        ),
+        pytest.param(
+            lambda: replace(_request(), benchmark="not-an-instrument"),
+            id="benchmark-wrong-type",
+        ),
+        pytest.param(
+            lambda: replace(_request(), initial_cash_fen=-1),
+            id="negative-initial-cash",
+        ),
+        pytest.param(
+            lambda: replace(_request(), rulebook_version=""),
+            id="empty-rulebook-version",
+        ),
+        pytest.param(
+            lambda: replace(_request(), execution_config=object()),
+            id="execution-config-wrong-type",
+        ),
+    ],
+)
+def test_backtest_request_rejects_invalid_direct_construction(
+    invalid_request: object,
+) -> None:
+    assert callable(invalid_request)
+    with pytest.raises((TypeError, ValueError)):
+        invalid_request()
+
+
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        pytest.param(
+            lambda: BacktestResult(
+                "not-a-uuid",
+                Path("artifacts"),
+                Path("artifacts/manifest.json"),
+                1,
+                _valid_result().final_snapshot,
+            ),
+            id="experiment-id-not-uuid",
+        ),
+        pytest.param(
+            lambda: BacktestResult(
+                UUID(int=1),
+                "artifacts",
+                Path("artifacts/manifest.json"),
+                1,
+                _valid_result().final_snapshot,
+            ),
+            id="artifact-dir-wrong-type",
+        ),
+        pytest.param(
+            lambda: BacktestResult(
+                UUID(int=1),
+                Path("artifacts"),
+                "artifacts/manifest.json",
+                1,
+                _valid_result().final_snapshot,
+            ),
+            id="manifest-path-wrong-type",
+        ),
+        pytest.param(
+            lambda: BacktestResult(
+                UUID(int=1),
+                Path("artifacts"),
+                Path("different/manifest.json"),
+                1,
+                _valid_result().final_snapshot,
+            ),
+            id="manifest-path-not-under-artifact-dir",
+        ),
+        pytest.param(
+            lambda: BacktestResult(
+                UUID(int=1),
+                Path("artifacts"),
+                Path("artifacts/manifest.json"),
+                0,
+                _valid_result().final_snapshot,
+            ),
+            id="zero-sessions-completed",
+        ),
+        pytest.param(
+            lambda: BacktestResult(
+                UUID(int=1),
+                Path("artifacts"),
+                Path("artifacts/manifest.json"),
+                -1,
+                _valid_result().final_snapshot,
+            ),
+            id="negative-sessions-completed",
+        ),
+        pytest.param(
+            lambda: BacktestResult(
+                UUID(int=1),
+                Path("artifacts"),
+                Path("artifacts/manifest.json"),
+                1,
+                object(),
+            ),
+            id="final-snapshot-wrong-type",
+        ),
+    ],
+)
+def test_backtest_result_rejects_invalid_direct_construction(
+    invalid_result: object,
+) -> None:
+    assert callable(invalid_result)
+    with pytest.raises((TypeError, ValueError)):
+        invalid_result()
+
+
+@pytest.mark.parametrize(
+    "invalid_entry",
+    [
+        pytest.param(
+            lambda: ArtifactEntry("/absolute.parquet", "schema", 0, 0, "0" * 64),
+            id="absolute-path",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("../escape.parquet", "schema", 0, 0, "0" * 64),
+            id="parent-directory-escape",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("nested/file.parquet", "schema", 0, 0, "0" * 64),
+            id="nested-path",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("data.parquet", "", 0, 0, "0" * 64),
+            id="empty-schema",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("data.parquet", "schema", -1, 0, "0" * 64),
+            id="negative-row-count",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("data.parquet", "schema", 0, -1, "0" * 64),
+            id="negative-size-bytes",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("data.parquet", "schema", 0, 0, "0" * 63),
+            id="sha256-not-64-characters",
+        ),
+        pytest.param(
+            lambda: ArtifactEntry("data.parquet", "schema", 0, 0, "A" * 64),
+            id="sha256-not-lowercase-hex",
+        ),
+    ],
+)
+def test_artifact_entry_rejects_invalid_direct_construction(
+    invalid_entry: object,
+) -> None:
+    assert callable(invalid_entry)
+    with pytest.raises((TypeError, ValueError)):
+        invalid_entry()
+
+
+@pytest.mark.parametrize(
+    "invalid_context",
+    [
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), experiment_id="not-a-uuid"),
+            id="experiment-id-not-uuid",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), snapshot_id="not-a-uuid"),
+            id="snapshot-id-not-uuid",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), strategy_id=""),
+            id="empty-strategy-id",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), strategy_version=""),
+            id="empty-strategy-version",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), rulebook_version=""),
+            id="empty-rulebook-version",
+        ),
+        pytest.param(
+            lambda: replace(
+                _context(UUID(int=1)),
+                start_date=datetime(2024, 1, 1, tzinfo=UTC),
+            ),
+            id="start-date-datetime",
+        ),
+        pytest.param(
+            lambda: replace(
+                _context(UUID(int=1)),
+                end_date=datetime(2024, 1, 3, tzinfo=UTC),
+            ),
+            id="end-date-datetime",
+        ),
+        pytest.param(
+            lambda: replace(
+                _context(UUID(int=1)),
+                start_date=date(2024, 1, 3),
+                end_date=date(2024, 1, 1),
+            ),
+            id="start-date-after-end-date",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), benchmark="not-an-instrument"),
+            id="benchmark-wrong-type",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), initial_cash_fen=-1),
+            id="negative-initial-cash",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), execution_config=object()),
+            id="execution-config-wrong-type",
+        ),
+        pytest.param(
+            lambda: replace(_context(UUID(int=1)), schema_version=2),
+            id="unsupported-schema-version",
+        ),
+    ],
+)
+def test_manifest_context_rejects_invalid_direct_construction(
+    invalid_context: object,
+) -> None:
+    assert callable(invalid_context)
+    with pytest.raises((TypeError, ValueError)):
+        invalid_context()
+
+
+def test_writer_state_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError):
+        WriterState("INVALID")
