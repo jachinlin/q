@@ -160,3 +160,38 @@ def test_engine_failures_preserve_diagnostic_staging(
 
     assert not list(tmp_path.glob("experiment_id=*/manifest.json"))
     assert list(tmp_path.glob(".staging-*/diagnostic.json"))
+
+
+@pytest.mark.parametrize("append_failure", [False, True])
+def test_all_parquet_writers_close_on_cancellation_or_append_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, append_failure: bool
+) -> None:
+    original = artifacts_module.pq.ParquetWriter
+    writers: list[object] = []
+
+    class TrackingWriter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.inner = original(*args, **kwargs)
+            self.close_calls = 0
+            self.writes = 0
+            writers.append(self)
+
+        def write_table(self, table: object) -> None:
+            self.writes += 1
+            if append_failure and self.writes == 1:
+                raise RuntimeError("append proxy failure")
+            self.inner.write_table(table)
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.inner.close()
+
+    monkeypatch.setattr(artifacts_module.pq, "ParquetWriter", TrackingWriter)
+    token = _AlreadyCancelled() if not append_failure else _NeverCancelled()
+    with pytest.raises((BacktestCancelled, RuntimeError)):
+        BacktestEngine(
+            _Data(), _Targets(), _RuleBook(), RebalancePlanner(), artifact_root=tmp_path
+        ).run(_request(), _Progress(), token)
+    assert len(writers) == 5 and all(writer.close_calls >= 1 for writer in writers)
+    assert list(tmp_path.glob(".staging-*/diagnostic.json"))
+    assert not list(tmp_path.glob("experiment_id=*/manifest.json"))

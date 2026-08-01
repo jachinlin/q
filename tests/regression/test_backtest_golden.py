@@ -538,3 +538,77 @@ def test_public_models_fail_closed_for_invalid_direct_construction(
     assert callable(factory)
     with pytest.raises((TypeError, ValueError)):
         factory()
+
+
+def test_empty_artifacts_keep_hard_coded_arrow_schemas(tmp_path: Path) -> None:
+    class NoneTargets:
+        def generate_target(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    result = BacktestEngine(
+        _Data(), NoneTargets(), _RuleBook(), RebalancePlanner(), artifact_root=tmp_path
+    ).run(_request(), _Progress(), _NeverCancelled())
+    expected = {
+        "nav.parquet": pa.schema(
+            [
+                pa.field("trade_date", pa.date32(), nullable=False),
+                pa.field("cash_fen", pa.int64(), nullable=False),
+                pa.field("market_value_fen", pa.int64(), nullable=False),
+                pa.field("nav_fen", pa.int64(), nullable=False),
+                pa.field("benchmark_close", pa.float64(), nullable=False),
+            ]
+        ),
+        "holdings.parquet": pa.schema(
+            [
+                pa.field("trade_date", pa.date32(), nullable=False),
+                pa.field("instrument_id", pa.string(), nullable=False),
+                pa.field("total_quantity", pa.int64(), nullable=False),
+                pa.field("sellable_quantity", pa.int64(), nullable=False),
+                pa.field("cost_basis_fen", pa.int64(), nullable=False),
+                pa.field("market_value_fen", pa.int64(), nullable=False),
+            ]
+        ),
+        "targets.parquet": pa.schema(
+            [
+                pa.field("signal_date", pa.date32(), nullable=False),
+                pa.field("execute_date", pa.date32(), nullable=False),
+                pa.field("position_index", pa.int32(), nullable=False),
+                pa.field("instrument_id", pa.string(), nullable=True),
+                pa.field("target_weight", pa.float64(), nullable=False),
+                pa.field("score", pa.float64(), nullable=True),
+                pa.field("reason_code", pa.string(), nullable=False),
+                pa.field("cash_weight", pa.float64(), nullable=False),
+            ]
+        ),
+        "fills.parquet": pa.schema(
+            [
+                pa.field("trade_date", pa.date32(), nullable=False),
+                pa.field("result_index", pa.int32(), nullable=False),
+                pa.field("instrument_id", pa.string(), nullable=False),
+                pa.field("side", pa.string(), nullable=False),
+                pa.field("requested_quantity", pa.int64(), nullable=False),
+                pa.field("filled_quantity", pa.int64(), nullable=False),
+                pa.field("unfilled_quantity", pa.int64(), nullable=False),
+                pa.field("price", pa.float64(), nullable=True),
+                pa.field("gross_value_fen", pa.int64(), nullable=False),
+                pa.field("reason_code", pa.string(), nullable=False),
+                pa.field("detail", pa.string(), nullable=True),
+            ]
+        ),
+        "costs.parquet": pa.schema(
+            [
+                pa.field("trade_date", pa.date32(), nullable=False),
+                pa.field("result_index", pa.int32(), nullable=False),
+                pa.field("instrument_id", pa.string(), nullable=False),
+                pa.field("commission_fen", pa.int64(), nullable=False),
+                pa.field("stamp_tax_fen", pa.int64(), nullable=False),
+                pa.field("transfer_fee_fen", pa.int64(), nullable=False),
+                pa.field("total_fees_fen", pa.int64(), nullable=False),
+            ]
+        ),
+    }
+    for name, schema in expected.items():
+        table = pq.read_table(result.artifact_dir / name)
+        assert pq.read_schema(result.artifact_dir / name) == schema
+        if name != "nav.parquet":
+            assert table.num_rows == 0
