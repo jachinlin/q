@@ -207,10 +207,10 @@ assert _IDS[0] not in selected
 assert decision.factor_reasons[_ALPHA_REFS[0]] == "SOURCE_INVALID"
 ```
 
-在 `test_etf_rotation.py` 对 `_factor_frame()` 结果做三类独立变异：真正删除 `_ETF_A` 的一个必需 factor row；将该行设成 `is_valid=False, value=0.2, invalid_reason="SOURCE_INVALID"`；将 valid 行分别设成 NaN、inf、T+1 `available_at`。每个 case 都保留 `_ETF_B` 为完全合法且可入选的对照：
+在 `test_etf_rotation.py` 对 `_factor_frame()` 结果做独立变异。真正删除 `_ETF_A` 的一个必需 factor row，或将该行设成 `is_valid=False, value=0.2, invalid_reason="SOURCE_INVALID"` 时，只剔除 `_ETF_A`，并保留 `_ETF_B` 为完全合法且可入选的对照：
 
 ```python
-@pytest.mark.parametrize("mode", ["missing", "invalid", "nan", "inf"])
+@pytest.mark.parametrize("mode", ["missing", "invalid"])
 def test_etf_excludes_one_instrument_for_each_unusable_signal(mode: str) -> None:
     frame = _factor_frame(_fully_valid_etf_values())
     mask = (
@@ -228,18 +228,13 @@ def test_etf_excludes_one_instrument_for_each_unusable_signal(mode: str) -> None
             .otherwise(pl.col("invalid_reason"))
             .alias("invalid_reason"),
         )
-    else:
-        bad = float(mode)
-        frame = frame.with_columns(
-            pl.when(mask).then(bad).otherwise(pl.col("value")).alias("value")
-        )
     target = EtfRotationStrategy(_config(top_n=1)).generate_targets(
         _context(_Data(frame)), _SIGNAL, _empty_state()
     )
     assert [p.instrument_id.canonical() for p in target.positions] == [_ETF_B]
 ```
 
-未来 `available_at` 对公共 PIT 契约必须 fail closed：分别在 ETF 和多因子数据端将一行改成 `_EXECUTE` 的 UTC datetime，断言 `ValueError` message 含 `available_at`，证明未来数据未进入策略目标。
+valid 行的 NaN、inf 和未来 `available_at` 属于共享 PIT 契约违规，必须整批 fail closed，而不是逐证券剔除。分别在 ETF 数据端写入 NaN、inf，以及在 ETF/多因子数据端将一行时点改成 `_EXECUTE` 的 UTC datetime，断言 `ValueError` message 分别含 `finite` 或 `available_at`，证明非法数据未进入任何策略目标。该裁决保留 `validated_factor_values()` 和既有公共契约测试的语义。
 
 - [ ] **Step 5：补齐 ETF `from_mapping()` 非 canonical identifier**
 
