@@ -1,0 +1,17 @@
+etf_pool:
+  - SSE:510001
+  - SSE:510002
+  - SSE:510003
+  - SSE:510004
+  - SSE:510005
+return_factor_weights:
+  return_20d_v1@1.0.0: 0.2
+  return_60d_v1@1.0.0: 0.3
+  return_120d_v1@1.0.0: 0.5
+trend_factor_ref: trend_120d_v1@1.0.0
+volatility_factor_ref: volatility_60d_v1@1.0.0
+volatility_penalty: 0.5
+top_n: 3
+frequency: MONTHLY
+missing_signal_policy: EXCLUDE
+weighting: EQUAL

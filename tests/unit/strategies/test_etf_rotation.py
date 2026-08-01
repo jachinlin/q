@@ -1,0 +1,333 @@
+"""Behavioral tests for snapshot-bound ETF rotation targets."""
+
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from uuid import UUID
+
+import polars as pl
+import pytest
+import yaml
+
+from quant_core.backtest.accounting import AccountSnapshot
+from quant_core.domain import InstrumentId
+from quant_core.portfolio import PortfolioConstructor
+from quant_core.strategies.base import (
+    PortfolioState,
+    RebalanceFrequency,
+    StrategyContext,
+    StrategyTargetAdapter,
+    StrategyValidationError,
+)
+from quant_core.strategies.etf_rotation import EtfRotationConfig, EtfRotationStrategy
+
+_SNAPSHOT = UUID("00000000-0000-0000-0000-000000000601")
+_SIGNAL = date(2026, 7, 31)
+_EXECUTE = date(2026, 8, 3)
+_ETF_A = "SSE:510001"
+_ETF_B = "SSE:510002"
+_ETF_C = "SSE:510003"
+_RETURN_REFS = (
+    "return_20d_v1@1.0.0",
+    "return_60d_v1@1.0.0",
+    "return_120d_v1@1.0.0",
+)
+_TREND_REF = "trend_120d_v1@1.0.0"
+_VOL_REF = "volatility_60d_v1@1.0.0"
+
+
+class _Data:
+    def __init__(self, frame: pl.DataFrame) -> None:
+        self.frame = frame
+        self.calls: list[
+            tuple[UUID, date, tuple[InstrumentId, ...] | None, tuple[str, ...]]
+        ] = []
+
+    def factor_values(
+        self,
+        snapshot_id: UUID,
+        signal_date: date,
+        instruments: tuple[InstrumentId, ...] | None,
+        factor_refs: tuple[str, ...],
+    ) -> pl.DataFrame:
+        self.calls.append((snapshot_id, signal_date, instruments, factor_refs))
+        return self.frame
+
+    def stock_universe(self, snapshot_id: UUID, signal_date: date) -> pl.DataFrame:
+        raise AssertionError("ETF rotation must not request a stock universe")
+
+
+def _config(**overrides: object) -> EtfRotationConfig:
+    values: dict[str, object] = {
+        "etf_pool": tuple(
+            InstrumentId.parse(value) for value in (_ETF_A, _ETF_B, _ETF_C)
+        ),
+        "return_factor_weights": {
+            _RETURN_REFS[0]: 0.2,
+            _RETURN_REFS[1]: 0.3,
+            _RETURN_REFS[2]: 0.5,
+        },
+        "trend_factor_ref": _TREND_REF,
+        "volatility_factor_ref": _VOL_REF,
+        "volatility_penalty": 0.5,
+        "top_n": 2,
+    }
+    values.update(overrides)
+    return EtfRotationConfig(**values)  # type: ignore[arg-type]
+
+
+def _factor_frame(values: dict[str, dict[str, float | None]]) -> pl.DataFrame:
+    rows: list[dict[str, object]] = []
+    visible = datetime(2026, 7, 31, 7, tzinfo=UTC)
+    for instrument, factors in values.items():
+        for factor_ref in (*_RETURN_REFS, _TREND_REF, _VOL_REF):
+            value = factors.get(factor_ref)
+            rows.append(
+                {
+                    "trade_date": _SIGNAL,
+                    "instrument_id": instrument,
+                    "factor_ref": factor_ref,
+                    "value": value,
+                    "available_at": visible,
+                    "is_valid": value is not None,
+                    "invalid_reason": None,
+                }
+            )
+    return pl.DataFrame(
+        rows,
+        schema={
+            "trade_date": pl.Date,
+            "instrument_id": pl.String,
+            "factor_ref": pl.String,
+            "value": pl.Float64,
+            "available_at": pl.Datetime("us", "UTC"),
+            "is_valid": pl.Boolean,
+            "invalid_reason": pl.String,
+        },
+    )
+
+
+def _context(
+    data: _Data, *, sessions: tuple[date, ...] | None = None
+) -> StrategyContext:
+    return StrategyContext(
+        snapshot_id=_SNAPSHOT,
+        signal_date=_SIGNAL,
+        execute_date=_EXECUTE,
+        sessions=sessions or (date(2026, 7, 30), _SIGNAL, _EXECUTE),
+        data=data,
+        portfolio_constructor=PortfolioConstructor(),
+    )
+
+
+def _empty_state() -> PortfolioState:
+    return PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0)
+
+
+def _empty_account_snapshot() -> AccountSnapshot:
+    return AccountSnapshot(_SIGNAL, 1_000_000, (), 0, 1_000_000)
+
+
+def test_etf_rotation_scores_selected_etfs_and_normalizes_equal_weights() -> None:
+    data = _Data(
+        _factor_frame(
+            {
+                _ETF_A: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: 0.2,
+                    _RETURN_REFS[2]: 0.3,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_B: {
+                    _RETURN_REFS[0]: 0.2,
+                    _RETURN_REFS[1]: 0.1,
+                    _RETURN_REFS[2]: 0.4,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.2,
+                },
+                _ETF_C: {
+                    _RETURN_REFS[0]: 0.4,
+                    _RETURN_REFS[1]: 0.4,
+                    _RETURN_REFS[2]: 0.4,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.8,
+                },
+            }
+        )
+    )
+
+    target = EtfRotationStrategy(_config()).generate_targets(
+        _context(data), _SIGNAL, _empty_state()
+    )
+
+    assert [position.instrument_id.canonical() for position in target.positions] == [
+        _ETF_A,
+        _ETF_B,
+    ]
+    assert [position.target_weight for position in target.positions] == [0.5, 0.5]
+    assert [position.score for position in target.positions] == pytest.approx(
+        [0.18, 0.17]
+    )
+    assert all(
+        position.reason_code == "ETF_ROTATION_SELECTED" for position in target.positions
+    )
+    assert target.cash_weight == 0.0
+    assert data.calls[0][2] == tuple(
+        InstrumentId.parse(item) for item in (_ETF_A, _ETF_B, _ETF_C)
+    )
+    assert data.calls[0][3] == (*_RETURN_REFS, _TREND_REF, _VOL_REF)
+
+
+def test_etf_rotation_excludes_missing_or_nonpositive_trend_signals_and_moves_to_cash() -> (
+    None
+):
+    data = _Data(
+        _factor_frame(
+            {
+                _ETF_A: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: 0.1,
+                    _RETURN_REFS[2]: 0.1,
+                    _TREND_REF: 0.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_B: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: None,
+                    _RETURN_REFS[2]: 0.1,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_C: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: 0.1,
+                    _RETURN_REFS[2]: 0.1,
+                    _TREND_REF: -1.0,
+                    _VOL_REF: 0.1,
+                },
+            }
+        )
+    )
+
+    target = EtfRotationStrategy(_config()).generate_targets(
+        _context(data), _SIGNAL, _empty_state()
+    )
+
+    assert target.positions == ()
+    assert target.cash_weight == 1.0
+
+
+def test_etf_rotation_breaks_score_ties_by_canonical_identifier() -> None:
+    data = _Data(
+        _factor_frame(
+            {
+                _ETF_C: {
+                    _RETURN_REFS[0]: 0.2,
+                    _RETURN_REFS[1]: 0.2,
+                    _RETURN_REFS[2]: 0.2,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_A: {
+                    _RETURN_REFS[0]: 0.2,
+                    _RETURN_REFS[1]: 0.2,
+                    _RETURN_REFS[2]: 0.2,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_B: {
+                    _RETURN_REFS[0]: 0.2,
+                    _RETURN_REFS[1]: 0.2,
+                    _RETURN_REFS[2]: 0.2,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+            }
+        )
+    )
+
+    target = EtfRotationStrategy(_config(top_n=2)).generate_targets(
+        _context(data), _SIGNAL, _empty_state()
+    )
+
+    assert [position.instrument_id.canonical() for position in target.positions] == [
+        _ETF_A,
+        _ETF_B,
+    ]
+
+
+def test_month_end_rebalance_uses_next_actual_session_not_calendar_month_end() -> None:
+    strategy = EtfRotationStrategy(_config())
+    holiday_after_month_end = StrategyContext(
+        _SNAPSHOT,
+        date(2026, 1, 30),
+        date(2026, 2, 2),
+        (date(2026, 1, 29), date(2026, 1, 30), date(2026, 2, 2)),
+        _Data(_factor_frame({})),
+        PortfolioConstructor(),
+    )
+
+    assert strategy.should_rebalance(
+        holiday_after_month_end, holiday_after_month_end.signal_date
+    )
+    assert not strategy.should_rebalance(
+        _context(_Data(_factor_frame({}))), _SIGNAL - timedelta(days=1)
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"top_n": 0},
+        {
+            "return_factor_weights": {
+                _RETURN_REFS[0]: 1.0,
+                _RETURN_REFS[1]: 0.0,
+                _RETURN_REFS[2]: 0.1,
+            }
+        },
+        {"etf_pool": (InstrumentId.parse(_ETF_A), InstrumentId.parse(_ETF_A))},
+    ],
+)
+def test_etf_config_fails_closed_for_invalid_inputs(
+    override: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _config(**override)
+
+
+def test_example_etf_yaml_is_safe_loadable_and_has_one_validated_entry_point() -> None:
+    mapping = yaml.safe_load(
+        (Path("configs/experiments/examples/etf_rotation.yaml")).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    config = EtfRotationConfig.from_mapping(mapping)
+
+    assert config.frequency is RebalanceFrequency.MONTHLY
+    with pytest.raises(ValueError, match="unknown"):
+        EtfRotationConfig.from_mapping({**mapping, "unknown": True})
+
+
+def test_adapter_rejects_validation_issues_before_generating_a_target() -> None:
+    class _InvalidStrategy(EtfRotationStrategy):
+        def validate(self, ctx: StrategyContext) -> list[object]:
+            return [object()]
+
+    strategy = _InvalidStrategy(_config())
+    adapter = StrategyTargetAdapter(
+        {strategy.ref: strategy},
+        lambda snapshot_id, signal_date, execute_date: _context(
+            _Data(_factor_frame({}))
+        ),
+    )
+
+    with pytest.raises(StrategyValidationError):
+        adapter.generate_target(
+            strategy.ref,
+            _SNAPSHOT,
+            _SIGNAL,
+            _EXECUTE,
+            _empty_account_snapshot(),
+        )
