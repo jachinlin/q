@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
@@ -158,7 +158,12 @@ class ManifestContext:
             )
         ):
             raise ValueError("manifest string identifiers must be nonempty")
-        if not isinstance(self.start_date, date) or not isinstance(self.end_date, date):
+        if (
+            not isinstance(self.start_date, date)
+            or isinstance(self.start_date, datetime)
+            or not isinstance(self.end_date, date)
+            or isinstance(self.end_date, datetime)
+        ):
             raise TypeError("manifest dates must be dates")
         if self.start_date > self.end_date:
             raise ValueError("manifest start_date must not follow end_date")
@@ -402,10 +407,10 @@ class BacktestArtifactWriter:
         if context.experiment_id != self._final_dir_experiment_id:
             raise ValueError("manifest context experiment does not match writer")
         if (
-            context.start_date != expected_sessions[0]
-            or context.end_date != expected_sessions[-1]
+            expected_sessions[0] < context.start_date
+            or expected_sessions[-1] > context.end_date
         ):
-            raise ValueError("manifest context dates do not match sessions")
+            raise ValueError("manifest context does not cover sessions")
         entries = _collect_entries(self._staging_dir)
         _validate_content(self._staging_dir, expected_sessions)
         self._entries = entries
@@ -666,6 +671,8 @@ def _validate_targets(rows: list[dict[str, Any]]) -> None:
         if len(cash_rows) != 1 or cash_rows[0]["reason_code"] != "CASH":
             raise ValueError("target requires exactly one CASH row")
         cash = cash_rows[0]
+        if rows_for_target[-1] is not cash:
+            raise ValueError("target CASH row must be last")
         positions = [row for row in rows_for_target if row["instrument_id"] is not None]
         if [row["position_index"] for row in positions] != list(range(len(positions))):
             raise ValueError("target position indexes are invalid")
@@ -690,6 +697,13 @@ def _validate_targets(rows: list[dict[str, Any]]) -> None:
                 )
             ):
                 raise ValueError("target position is invalid")
+            if (
+                not isinstance(row["cash_weight"], float)
+                or not isfinite(row["cash_weight"])
+                or row["cash_weight"] < 0
+                or row["cash_weight"] != cash["cash_weight"]
+            ):
+                raise ValueError("target position cash_weight is invalid")
             try:
                 if InstrumentId.parse(raw_id).canonical() != raw_id:
                     raise ValueError("target instrument is not canonical")
@@ -710,7 +724,7 @@ def _validate_targets(rows: list[dict[str, Any]]) -> None:
 def _validate_execution(
     fills: list[dict[str, Any]], costs: list[dict[str, Any]]
 ) -> None:
-    filled_keys: set[tuple[object, int]] = set()
+    filled_instruments: dict[tuple[date, int], str] = {}
     previous: tuple[date, int] | None = None
     expected_index: dict[date, int] = {}
     for row in fills:
@@ -736,6 +750,10 @@ def _validate_execution(
             if (
                 row["filled_quantity"] != 0
                 or row["gross_value_fen"] != 0
+                or not isinstance(row["requested_quantity"], int)
+                or row["requested_quantity"] <= 0
+                or not isinstance(row["unfilled_quantity"], int)
+                or row["unfilled_quantity"] < 0
                 or row["requested_quantity"] != row["unfilled_quantity"]
             ):
                 raise ValueError("reject fill rows must have zero execution values")
@@ -745,6 +763,8 @@ def _validate_execution(
             or not isfinite(row["price"])
             or row["price"] <= 0
             or row["gross_value_fen"] <= 0
+            or not isinstance(row["requested_quantity"], int)
+            or row["requested_quantity"] <= 0
             or row["filled_quantity"] <= 0
             or row["unfilled_quantity"] < 0
         ):
@@ -754,12 +774,20 @@ def _validate_execution(
             != row["filled_quantity"] + row["unfilled_quantity"]
         ):
             raise ValueError("fill quantities do not reconcile")
-        filled_keys.add(key)
-    cost_keys: set[tuple[object, int]] = set()
+        filled_instruments[key] = row["instrument_id"]
+    cost_keys: set[tuple[date, int]] = set()
     for row in costs:
         key = (row["trade_date"], row["result_index"])
-        if key in cost_keys or key not in filled_keys:
+        if key in cost_keys or key not in filled_instruments:
             raise ValueError("cost rows must map one-to-one to fills")
+        raw_id = row["instrument_id"]
+        try:
+            if InstrumentId.parse(raw_id).canonical() != raw_id:
+                raise ValueError("cost instrument is not canonical")
+        except (TypeError, ValueError) as error:
+            raise ValueError("cost instrument is not canonical") from error
+        if raw_id != filled_instruments[key]:
+            raise ValueError("cost instrument must match fill")
         cost_keys.add(key)
         if any(
             not isinstance(row[name], int) or row[name] < 0
@@ -775,5 +803,5 @@ def _validate_execution(
             row["commission_fen"] + row["stamp_tax_fen"] + row["transfer_fee_fen"]
         ):
             raise ValueError("cost fee identity is invalid")
-    if cost_keys != filled_keys:
+    if cost_keys != set(filled_instruments):
         raise ValueError("every fill requires one cost row")

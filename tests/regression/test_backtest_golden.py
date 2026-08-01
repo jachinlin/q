@@ -130,19 +130,53 @@ def test_manifest_hashes_describe_closed_deterministic_artifacts(
             "cash_weight": 1.0,
         },
     ]
-    assert [
-        (row["trade_date"], row["side"], row["gross_value_fen"])
-        for row in pq.read_table(result.artifact_dir / "fills.parquet").to_pylist()
-    ] == [
-        (date(2024, 1, 8), "BUY", 120_000),
-        (date(2024, 1, 9), "SELL", 110_000),
+    assert pq.read_table(result.artifact_dir / "fills.parquet").to_pylist() == [
+        {
+            "trade_date": date(2024, 1, 8),
+            "result_index": 0,
+            "instrument_id": "SSE:600001",
+            "side": "BUY",
+            "requested_quantity": 100,
+            "filled_quantity": 100,
+            "unfilled_quantity": 0,
+            "price": 12.0,
+            "gross_value_fen": 120_000,
+            "reason_code": "FILLED",
+            "detail": None,
+        },
+        {
+            "trade_date": date(2024, 1, 9),
+            "result_index": 0,
+            "instrument_id": "SSE:600001",
+            "side": "SELL",
+            "requested_quantity": 100,
+            "filled_quantity": 100,
+            "unfilled_quantity": 0,
+            "price": 11.0,
+            "gross_value_fen": 110_000,
+            "reason_code": "FILLED",
+            "detail": None,
+        },
     ]
-    assert [
-        (row["trade_date"], row["total_fees_fen"])
-        for row in pq.read_table(result.artifact_dir / "costs.parquet").to_pylist()
-    ] == [
-        (date(2024, 1, 8), 100),
-        (date(2024, 1, 9), 100),
+    assert pq.read_table(result.artifact_dir / "costs.parquet").to_pylist() == [
+        {
+            "trade_date": date(2024, 1, 8),
+            "result_index": 0,
+            "instrument_id": "SSE:600001",
+            "commission_fen": 100,
+            "stamp_tax_fen": 0,
+            "transfer_fee_fen": 0,
+            "total_fees_fen": 100,
+        },
+        {
+            "trade_date": date(2024, 1, 9),
+            "result_index": 0,
+            "instrument_id": "SSE:600001",
+            "commission_fen": 100,
+            "stamp_tax_fen": 0,
+            "transfer_fee_fen": 0,
+            "total_fees_fen": 100,
+        },
     ]
     assert {name: entry["row_count"] for name, entry in artifacts.items()} == {
         "nav.parquet": 3,
@@ -258,3 +292,115 @@ def test_validation_accepts_a_finite_negative_target_score(tmp_path: Path) -> No
     )
 
     assert entries["targets.parquet"].row_count == 2
+
+
+@pytest.mark.parametrize(
+    "fills,costs,targets",
+    [
+        (
+            [
+                {
+                    "trade_date": date(2024, 1, 5),
+                    "result_index": 0,
+                    "instrument_id": "SSE:600001",
+                    "price": None,
+                    "requested_quantity": 0,
+                    "filled_quantity": 0,
+                    "unfilled_quantity": 0,
+                    "gross_value_fen": 0,
+                }
+            ],
+            [],
+            [],
+        ),
+        (
+            [
+                {
+                    "trade_date": date(2024, 1, 5),
+                    "result_index": 0,
+                    "instrument_id": "SSE:600001",
+                    "price": 1.0,
+                    "requested_quantity": 0,
+                    "filled_quantity": 1,
+                    "unfilled_quantity": -1,
+                    "gross_value_fen": 100,
+                }
+            ],
+            [
+                {
+                    "trade_date": date(2024, 1, 5),
+                    "result_index": 0,
+                    "instrument_id": "SSE:600001",
+                    "commission_fen": 0,
+                    "stamp_tax_fen": 0,
+                    "transfer_fee_fen": 0,
+                    "total_fees_fen": 0,
+                }
+            ],
+            [],
+        ),
+        (
+            [
+                {
+                    "trade_date": date(2024, 1, 5),
+                    "result_index": 0,
+                    "instrument_id": "SSE:600001",
+                    "price": 1.0,
+                    "requested_quantity": 1,
+                    "filled_quantity": 1,
+                    "unfilled_quantity": 0,
+                    "gross_value_fen": 100,
+                }
+            ],
+            [
+                {
+                    "trade_date": date(2024, 1, 5),
+                    "result_index": 0,
+                    "instrument_id": "SSE:600002",
+                    "commission_fen": 0,
+                    "stamp_tax_fen": 0,
+                    "transfer_fee_fen": 0,
+                    "total_fees_fen": 0,
+                }
+            ],
+            [],
+        ),
+        (
+            [],
+            [],
+            [
+                {
+                    "signal_date": date(2024, 1, 5),
+                    "execute_date": date(2024, 1, 8),
+                    "position_index": 0,
+                    "instrument_id": None,
+                    "target_weight": 1.0,
+                    "score": None,
+                    "reason_code": "CASH",
+                    "cash_weight": 1.0,
+                },
+                {
+                    "signal_date": date(2024, 1, 5),
+                    "execute_date": date(2024, 1, 8),
+                    "position_index": 0,
+                    "instrument_id": "SSE:600001",
+                    "target_weight": 0.0,
+                    "score": 0.0,
+                    "reason_code": "TEST",
+                    "cash_weight": 1.0,
+                },
+            ],
+        ),
+    ],
+)
+def test_parquet_row_validator_rejects_execution_cost_and_cash_tampering(
+    fills: list[dict[str, object]],
+    costs: list[dict[str, object]],
+    targets: list[dict[str, object]],
+) -> None:
+    if targets:
+        with pytest.raises((TypeError, ValueError)):
+            artifacts_module._validate_targets(targets)
+    else:
+        with pytest.raises((TypeError, ValueError)):
+            artifacts_module._validate_execution(fills, costs)

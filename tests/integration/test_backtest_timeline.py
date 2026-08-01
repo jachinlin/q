@@ -273,3 +273,39 @@ def test_engine_orders_begin_execution_mark_then_target(
         ("execute", _TUESDAY),
         ("mark", _TUESDAY),
     ]
+
+
+def test_manifest_retains_non_session_request_boundary(tmp_path: Path) -> None:
+    request = replace(
+        _request(),
+        experiment_id=UUID("00000000-0000-0000-0000-000000000010"),
+        start_date=date(2024, 1, 6),
+    )
+
+    class WeekendData(_Data):
+        def calendar(
+            self, snapshot_id: UUID, start: date, end: date
+        ) -> TradingCalendar:
+            assert (snapshot_id, start, end) == (_SNAPSHOT, date(2024, 1, 6), _TUESDAY)
+            return self.calendar_value
+
+    result = BacktestEngine(
+        WeekendData(),
+        _Targets(),
+        _RuleBook(),
+        RebalancePlanner(),
+        artifact_root=tmp_path,
+    ).run(request, _Progress(), _NeverCancelled())
+
+    manifest = __import__("json").loads(
+        result.manifest_path.read_text(encoding="utf-8")
+    )
+    assert (
+        result.sessions_completed,
+        manifest["start_date"],
+        manifest["end_date"],
+    ) == (
+        2,
+        "2024-01-06",
+        "2024-01-09",
+    )
