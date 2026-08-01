@@ -154,7 +154,7 @@ class FactorEngine:
         registry: FactorRegistry,
         cache: FeatureCache,
         *,
-        capabilities: ProviderCapabilities | None = None,
+        capabilities: ProviderCapabilities,
     ) -> None:
         self._registry = registry
         self._cache = cache
@@ -162,8 +162,6 @@ class FactorEngine:
 
     def runnable_references(self) -> tuple[str, ...]:
         """List factors runnable under this engine's explicit capability profile."""
-        if self._capabilities is None:
-            return self._registry.registered_references()
         return self._registry.runnable_references(self._capabilities)
 
     def compute(
@@ -173,11 +171,7 @@ class FactorEngine:
         requested = tuple(self._registry.resolve(reference) for reference in factor_ids)
         if len(set(requested)) != len(requested):
             raise ValueError("factor request contains duplicate logical identities")
-        plan = (
-            self._registry.preflight(requested, self._capabilities)
-            if self._capabilities is not None
-            else self._registry.topological_order(requested)
-        )
+        plan = self._registry.preflight(requested, self._capabilities)
         computed: dict[str, FactorArtifact] = {}
         for canonical_ref in plan:
             factor = self._registry.factor(canonical_ref)

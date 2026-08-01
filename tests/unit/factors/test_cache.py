@@ -17,6 +17,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from quant_core.data.contracts import ProviderCapabilities
 from quant_core.domain.identifiers import SnapshotId
 from quant_core.factors import (
     FACTOR_OUTPUT_SCHEMA,
@@ -816,7 +817,9 @@ def test_engine_computes_dependencies_once_in_stable_order_then_hits_cache(
         registry.register(
             RecordingFactor(spec, calls), code_hash=digest(spec.factor_id)
         )
-    engine = FactorEngine(registry, FeatureCache(tmp_path))
+    engine = FactorEngine(
+        registry, FeatureCache(tmp_path), capabilities=ProviderCapabilities.complete()
+    )
 
     first = engine.compute(("signal@1.0.0",), make_context())
     mtimes = {
@@ -828,6 +831,18 @@ def test_engine_computes_dependencies_once_in_stable_order_then_hits_cache(
     assert tuple(first) == ("signal@1.0.0",)
     assert second == first
     assert {path: path.stat().st_mtime_ns for path in mtimes} == mtimes
+
+
+def test_engine_requires_an_explicit_capability_profile(tmp_path: Path) -> None:
+    """Dropping the required profile would make production preflight optional again."""
+    with pytest.raises(TypeError, match="capabilities"):
+        FactorEngine(FactorRegistry(), FeatureCache(tmp_path))
+
+    FactorEngine(
+        FactorRegistry(),
+        FeatureCache(tmp_path),
+        capabilities=ProviderCapabilities.complete(),
+    )
 
 
 def test_artifact_is_immutable(tmp_path: Path) -> None:

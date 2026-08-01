@@ -19,7 +19,7 @@ from quant_core.data.pipelines.publish import DataPipeline
 from quant_core.data.quality.runner import QualityRunner
 from quant_core.data.repository import SnapshotResearchRepository
 from quant_core.data.snapshots import SnapshotPublisher
-from quant_core.data.sources.baostock import DAILY_BAR_FIELDS
+from quant_core.data.sources.baostock import BAOSTOCK_CAPABILITIES, DAILY_BAR_FIELDS
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorEngine, FactorRegistry, FeatureCache
 from quant_core.factors.base import (
@@ -333,7 +333,7 @@ def test_etf_forward_factor_cache_and_future_jump_keep_prior_signal_rows_stable(
     registry = FactorRegistry()
     register_etf_factors(registry, prices, [_ID])
     cache = FeatureCache(tmp_path / "features")
-    engine = FactorEngine(registry, cache)
+    engine = FactorEngine(registry, cache, capabilities=BAOSTOCK_CAPABILITIES)
     requested = (
         "return_20d_v1",
         "return_60d_v1",

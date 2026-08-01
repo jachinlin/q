@@ -122,7 +122,7 @@ def test_second_identical_materialization_hits_cache_without_provider_or_rewrite
     registry = FactorRegistry()
     register_stock_factors(registry, bars, financials, [_ID], price_service=bars)
     cache = FeatureCache(tmp_path / "features")
-    engine = FactorEngine(registry, cache)
+    engine = FactorEngine(registry, cache, capabilities=ProviderCapabilities.complete())
     day = bars.frame["trade_date"][-1]
     ctx = FactorContext(
         SnapshotId.parse("00000000-0000-0000-0000-000000000077"), "a" * 64, day, day
@@ -181,7 +181,7 @@ def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
     registry = FactorRegistry()
     register_etf_factors(registry, bars, [_ID])
     cache = FeatureCache(tmp_path / "features")
-    engine = FactorEngine(registry, cache)
+    engine = FactorEngine(registry, cache, capabilities=BAOSTOCK_CAPABILITIES)
     day = bars.frame["trade_date"][-1]
     ctx = FactorContext(
         SnapshotId.parse("00000000-0000-0000-0000-000000000078"), "c" * 64, day, day
