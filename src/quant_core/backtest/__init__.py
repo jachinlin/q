@@ -13,6 +13,7 @@ from quant_core.backtest.accounting import (
 from quant_core.backtest.artifacts import (
     ArtifactEntry,
     BacktestArtifactWriter,
+    ManifestContext,
     WriterState,
 )
 from quant_core.backtest.calendar import TradingCalendar
@@ -67,6 +68,7 @@ __all__ = [
     "FillResult",
     "LedgerEvent",
     "LedgerEventType",
+    "ManifestContext",
     "MarketRuleBook",
     "MarketSlice",
     "PortfolioAccount",

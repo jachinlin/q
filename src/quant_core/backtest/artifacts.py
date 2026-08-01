@@ -18,7 +18,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from quant_core.backtest.accounting import AccountSnapshot
-from quant_core.backtest.models import ExecutionBatch, FillResult
+from quant_core.backtest.models import ExecutionBatch, ExecutionConfig, FillResult
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.portfolio.constructor import TargetPortfolio
 
@@ -130,6 +130,82 @@ class ArtifactEntry:
             raise ValueError("sha256 must be a lowercase SHA-256 hex digest")
 
 
+@dataclass(frozen=True, slots=True)
+class ManifestContext:
+    experiment_id: UUID
+    snapshot_id: UUID
+    strategy_id: str
+    strategy_version: str
+    start_date: date
+    end_date: date
+    benchmark: InstrumentId
+    initial_cash_fen: int
+    rulebook_version: str
+    execution_config: ExecutionConfig
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.experiment_id, UUID) or not isinstance(
+            self.snapshot_id, UUID
+        ):
+            raise TypeError("manifest IDs must be UUID values")
+        if any(
+            not isinstance(value, str) or not value
+            for value in (
+                self.strategy_id,
+                self.strategy_version,
+                self.rulebook_version,
+            )
+        ):
+            raise ValueError("manifest string identifiers must be nonempty")
+        if not isinstance(self.start_date, date) or not isinstance(self.end_date, date):
+            raise TypeError("manifest dates must be dates")
+        if self.start_date > self.end_date:
+            raise ValueError("manifest start_date must not follow end_date")
+        if not isinstance(self.benchmark, InstrumentId):
+            raise TypeError("manifest benchmark must be an InstrumentId")
+        if type(self.initial_cash_fen) is not int or self.initial_cash_fen < 0:
+            raise ValueError("manifest initial_cash_fen must be nonnegative")
+        if not isinstance(self.execution_config, ExecutionConfig):
+            raise TypeError("manifest execution_config must be an ExecutionConfig")
+        if self.schema_version != 1:
+            raise ValueError("manifest schema_version must be 1")
+
+    def build_manifest(
+        self, entries: dict[str, ArtifactEntry], completed_sessions: int
+    ) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "experiment_id": str(self.experiment_id),
+            "snapshot_id": str(self.snapshot_id),
+            "strategy": {
+                "strategy_id": self.strategy_id,
+                "version": self.strategy_version,
+            },
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "benchmark": self.benchmark.canonical(),
+            "initial_cash_fen": self.initial_cash_fen,
+            "rulebook_version": self.rulebook_version,
+            "execution_config": {
+                "reference_price": self.execution_config.reference_price.value,
+                "slippage_bps": self.execution_config.slippage_bps,
+                "max_volume_participation": self.execution_config.max_volume_participation,
+            },
+            "completed_sessions": completed_sessions,
+            "artifacts": {
+                name: {
+                    "path": entry.path,
+                    "schema": entry.schema,
+                    "row_count": entry.row_count,
+                    "size_bytes": entry.size_bytes,
+                    "sha256": entry.sha256,
+                }
+                for name, entry in entries.items()
+            },
+        }
+
+
 class BacktestArtifactWriter:
     """Append fixed-schema daily rows to isolated staging, then publish once."""
 
@@ -140,6 +216,7 @@ class BacktestArtifactWriter:
             raise TypeError("experiment_id must be a UUID")
         artifact_root.mkdir(parents=True, exist_ok=True)
         self._root = artifact_root
+        self._final_dir_experiment_id = experiment_id
         self._final_dir = artifact_root / f"experiment_id={experiment_id}"
         if (self._final_dir / "manifest.json").exists():
             raise FileExistsError("a successful artifact already exists for experiment")
@@ -151,6 +228,8 @@ class BacktestArtifactWriter:
         self._writers: dict[str, Any] = {}
         self._state = WriterState.OPEN
         self._entries: dict[str, ArtifactEntry] | None = None
+        self._expected_sessions: tuple[date, ...] | None = None
+        self._context: ManifestContext | None = None
         try:
             for name, schema in _SCHEMAS.items():
                 self._writers[name] = pq.ParquetWriter(
@@ -306,7 +385,9 @@ class BacktestArtifactWriter:
         self._state = WriterState.ABORTED
         self._safe_diagnostic(error, close_error)
 
-    def validate(self, expected_sessions: tuple[date, ...]) -> dict[str, ArtifactEntry]:
+    def validate(
+        self, expected_sessions: tuple[date, ...], context: ManifestContext
+    ) -> dict[str, ArtifactEntry]:
         self._require(WriterState.CLOSED, "validate")
         if not isinstance(expected_sessions, tuple) or not expected_sessions:
             raise ValueError("expected_sessions must be a nonempty tuple of dates")
@@ -316,29 +397,36 @@ class BacktestArtifactWriter:
             set(expected_sessions)
         ) != len(expected_sessions):
             raise ValueError("expected_sessions must be strictly ascending and unique")
-        entries: dict[str, ArtifactEntry] = {}
-        for name, expected_schema in _SCHEMAS.items():
-            path = self._staging_dir / name
-            if not path.is_file():
-                raise ValueError(f"missing artifact {name}")
-            parquet = pq.ParquetFile(path)
-            if parquet.schema_arrow != expected_schema:
-                raise ValueError(f"artifact schema mismatch for {name}")
-            entries[name] = ArtifactEntry(
-                name,
-                expected_schema.to_string(show_field_metadata=False),
-                parquet.metadata.num_rows,
-                path.stat().st_size,
-                _sha256(path),
-            )
+        if not isinstance(context, ManifestContext):
+            raise TypeError("context must be a ManifestContext")
+        if context.experiment_id != self._final_dir_experiment_id:
+            raise ValueError("manifest context experiment does not match writer")
+        if (
+            context.start_date != expected_sessions[0]
+            or context.end_date != expected_sessions[-1]
+        ):
+            raise ValueError("manifest context dates do not match sessions")
+        entries = _collect_entries(self._staging_dir)
         _validate_content(self._staging_dir, expected_sessions)
         self._entries = entries
+        self._expected_sessions = expected_sessions
+        self._context = context
         self._state = WriterState.VALIDATED
         return dict(entries)
 
-    def publish(self, manifest: dict[str, object]) -> Path:
+    def publish(self) -> Path:
         self._require(WriterState.VALIDATED, "publish")
-        _validate_manifest(manifest, self._entries)
+        if (
+            self._entries is None
+            or self._expected_sessions is None
+            or self._context is None
+        ):
+            raise RuntimeError("validated writer is missing cached state")
+        entries = _collect_entries(self._staging_dir)
+        _validate_content(self._staging_dir, self._expected_sessions)
+        if entries != self._entries:
+            raise ValueError("artifact bytes changed after validation")
+        manifest = self._context.build_manifest(entries, len(self._expected_sessions))
         if (self._final_dir / "manifest.json").exists() or self._final_dir.exists():
             raise FileExistsError("experiment artifact directory already exists")
         os.replace(self._staging_dir, self._final_dir)
@@ -395,6 +483,25 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _collect_entries(staging_dir: Path) -> dict[str, ArtifactEntry]:
+    entries: dict[str, ArtifactEntry] = {}
+    for name, expected_schema in _SCHEMAS.items():
+        path = staging_dir / name
+        if not path.is_file():
+            raise ValueError(f"missing artifact {name}")
+        parquet = pq.ParquetFile(path)
+        if parquet.schema_arrow != expected_schema:
+            raise ValueError(f"artifact schema mismatch for {name}")
+        entries[name] = ArtifactEntry(
+            name,
+            expected_schema.to_string(show_field_metadata=False),
+            parquet.metadata.num_rows,
+            path.stat().st_size,
+            _sha256(path),
+        )
+    return entries
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -579,9 +686,7 @@ def _validate_targets(rows: list[dict[str, Any]]) -> None:
                 or weight < 0
                 or (
                     score is not None
-                    and (
-                        not isinstance(score, float) or not isfinite(score) or score < 0
-                    )
+                    and (not isinstance(score, float) or not isfinite(score))
                 )
             ):
                 raise ValueError("target position is invalid")

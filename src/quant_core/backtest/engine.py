@@ -15,7 +15,7 @@ from quant_core.backtest.accounting import (
     CorporateAction,
     PortfolioAccount,
 )
-from quant_core.backtest.artifacts import ArtifactEntry, BacktestArtifactWriter
+from quant_core.backtest.artifacts import BacktestArtifactWriter, ManifestContext
 from quant_core.backtest.calendar import TradingCalendar
 from quant_core.backtest.execution import ExecutionModel
 from quant_core.backtest.models import AccountView, ExecutionConfig, MarketSlice
@@ -284,9 +284,20 @@ class BacktestEngine:
             if final_snapshot is None:
                 raise RuntimeError("no final snapshot was produced")
             writer.close()
-            artifacts = writer.validate(sessions)
-            manifest = _manifest(request, completed, artifacts)
-            manifest_path = writer.publish(manifest)
+            context = ManifestContext(
+                request.experiment_id,
+                request.snapshot_id,
+                request.strategy.strategy_id,
+                request.strategy.version,
+                request.start_date,
+                request.end_date,
+                request.benchmark,
+                request.initial_cash_fen,
+                request.rulebook_version,
+                request.execution_config,
+            )
+            writer.validate(sessions, context)
+            manifest_path = writer.publish()
             return BacktestResult(
                 request.experiment_id,
                 writer.artifact_dir,
@@ -402,38 +413,3 @@ def _weight(value: object) -> bool:
 def _date(value: object, name: str) -> None:
     if not isinstance(value, date) or isinstance(value, datetime):
         raise TypeError(f"{name} must be a date")
-
-
-def _manifest(
-    request: BacktestRequest, completed: int, artifacts: Mapping[str, ArtifactEntry]
-) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "experiment_id": str(request.experiment_id),
-        "snapshot_id": str(request.snapshot_id),
-        "strategy": {
-            "strategy_id": request.strategy.strategy_id,
-            "version": request.strategy.version,
-        },
-        "start_date": request.start_date.isoformat(),
-        "end_date": request.end_date.isoformat(),
-        "benchmark": request.benchmark.canonical(),
-        "initial_cash_fen": request.initial_cash_fen,
-        "rulebook_version": request.rulebook_version,
-        "execution_config": {
-            "reference_price": request.execution_config.reference_price.value,
-            "slippage_bps": request.execution_config.slippage_bps,
-            "max_volume_participation": request.execution_config.max_volume_participation,
-        },
-        "completed_sessions": completed,
-        "artifacts": {
-            name: {
-                "path": entry.path,
-                "schema": entry.schema,
-                "row_count": entry.row_count,
-                "size_bytes": entry.size_bytes,
-                "sha256": entry.sha256,
-            }
-            for name, entry in artifacts.items()
-        },
-    }
