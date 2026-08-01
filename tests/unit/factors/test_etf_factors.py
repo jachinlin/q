@@ -17,7 +17,11 @@ from quant_core.data.adjustments import (
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorRegistry
 from quant_core.factors.builtin import register_etf_factors
-from quant_core.factors.builtin.momentum import ReturnFactor, Trend120dFactor
+from quant_core.factors.builtin.momentum import (
+    ReturnFactor,
+    Trend120dFactor,
+    _signal_local_closes,
+)
 from quant_core.factors.builtin.risk import Volatility60dFactor
 
 _SSE = InstrumentId.parse("SSE:510300")
@@ -588,6 +592,51 @@ def test_trend_signal_local_rebase_rejects_a_global_forward_scale() -> None:
     global_value = global_slope / np.mean(global_log_closes)
 
     assert actual != pytest.approx(global_value)
+
+
+@pytest.mark.parametrize(
+    "make_factor",
+    [
+        lambda service: ReturnFactor(service, [_SSE], 20),
+        lambda service: ReturnFactor(service, [_SSE], 60),
+        lambda service: ReturnFactor(service, [_SSE], 120),
+        lambda service: Trend120dFactor(service, [_SSE]),
+        lambda service: Volatility60dFactor(service, [_SSE]),
+    ],
+)
+def test_signal_local_rebase_has_exact_stable_values_for_nonbinary_future_scale(
+    make_factor: object,
+) -> None:
+    """A 0.7 forward factor must not perturb bytes of earlier factor observations."""
+    bars = _bars(_SSE, [100.0 + index for index in range(122)])
+    signal_day = bars["trade_date"][120]
+    service = ActionAwarePriceService(
+        bars,
+        [(bars["trade_date"][121], 0.7, datetime(2024, 5, 1, tzinfo=UTC))],
+    )
+
+    short = make_factor(service).compute(_context(signal_day, signal_day)).collect()  # type: ignore[operator]
+    extended = (
+        make_factor(service)
+        .compute(_context(signal_day, bars["trade_date"][121]))
+        .collect()
+    )  # type: ignore[operator]
+    early = extended.filter(pl.col("trade_date") == signal_day)
+
+    assert early["value"].item() == short["value"].item()
+    assert early["available_at"].item() == short["available_at"].item()
+
+
+def test_signal_local_close_canonicalization_limits_rounding_to_15_significant_digits() -> (
+    None
+):
+    """Canonical local prices remove arithmetic residue without changing market meaning."""
+    raw_close = 123.45678901234567
+
+    result = _signal_local_closes([{"close": raw_close, "adjustment_factor": 1.0}])
+
+    assert result == [float(f"{raw_close:.15g}")]
+    assert abs(result[0] - raw_close) / raw_close < 5e-15  # type: ignore[index]
 
 
 def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:

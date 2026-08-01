@@ -16,6 +16,7 @@ from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorS
 _VERSION = "1.0.0"
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
+_LOCAL_CLOSE_SIGNIFICANT_DIGITS = 15
 
 
 class AdjustedBarService(Protocol):
@@ -322,7 +323,11 @@ def _signal_local_closes(window: Sequence[dict[str, object]]) -> list[float] | N
         value = adjusted / signal_factor
         if not isfinite(value) or value <= 0:
             return None
-        closes.append(value)
+        # Division cancels the forward anchor mathematically, but its binary
+        # representation can leave a cache-visible residue (for example 0.7).
+        # Fifteen significant decimal digits remain far below market precision
+        # while making identical signal-local histories deterministic.
+        closes.append(float(f"{value:.{_LOCAL_CLOSE_SIGNIFICANT_DIGITS}g}"))
     return closes
 
 
