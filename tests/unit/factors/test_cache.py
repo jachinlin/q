@@ -16,6 +16,7 @@ from inspect import getsource
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
 import pytest
 
 from quant_core.data.contracts import ProviderCapabilities
@@ -30,7 +31,7 @@ from quant_core.factors import (
     FeatureCache,
     build_cache_key,
 )
-from quant_core.factors.base import _factor_table_ipc_bytes
+from quant_core.factors.base import _factor_table_ipc_bytes, factor_table_content_hash
 
 
 def digest(label: str) -> str:
@@ -390,6 +391,100 @@ def test_publish_canonicalizes_arrow_chunks_before_content_hashing(
 def test_factor_content_hash_normalizes_null_buffers_without_python_row_lists() -> None:
     """Research-size artifacts must not create one Python object per cell to hash."""
     assert "to_pylist" not in getsource(_factor_table_ipc_bytes)
+
+
+def test_factor_content_hash_matches_the_legacy_generic_arrow_contract() -> None:
+    """Nested and binary Arrow values keep the prior logical hash semantics."""
+    dictionary_type = pa.dictionary(pa.int8(), pa.string())
+    dictionary = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 0], type=pa.int8()), pa.array(["alpha", "beta"])
+    )
+    table = pa.table(
+        {
+            "large_text": pa.array(["x", None, "y", "z"], type=pa.large_string()),
+            "binary": pa.array([b"x", None, b"y", b"z"], type=pa.binary()),
+            "numbers": pa.array([[1, None], None, [2], []], type=pa.list_(pa.int32())),
+            "record": pa.array(
+                [
+                    {"number": 1, "label": "x"},
+                    None,
+                    {"number": 2, "label": None},
+                    {"number": None, "label": "z"},
+                ],
+                type=pa.struct([("number", pa.int32()), ("label", pa.string())]),
+            ),
+            "category": dictionary,
+        },
+        schema=pa.schema(
+            [
+                ("large_text", pa.large_string()),
+                ("binary", pa.binary()),
+                ("numbers", pa.list_(pa.int32())),
+                ("record", pa.struct([("number", pa.int32()), ("label", pa.string())])),
+                ("category", dictionary_type),
+            ]
+        ),
+    )
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+    assert factor_table_content_hash(table) == _legacy_generic_factor_hash(table)
+
+
+def test_factor_content_hash_ignores_chunk_slice_offset_and_dictionary_encoding() -> (
+    None
+):
+    """Equivalent Arrow logical values must not inherit physical layout identity."""
+    dictionary_type = pa.dictionary(pa.int8(), pa.string())
+    first = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 0], type=pa.int8()), pa.array(["alpha", "beta"])
+    )
+    second = pa.DictionaryArray.from_arrays(
+        pa.array([1, 0, None, 1], type=pa.int8()), pa.array(["beta", "alpha"])
+    )
+    expected = pa.table(
+        {
+            "value": pa.array(["alpha", "beta", None, "alpha"]),
+            "category": first,
+        },
+        schema=pa.schema([("value", pa.string()), ("category", dictionary_type)]),
+    )
+    physical_variant = pa.table(
+        {
+            "value": pa.chunked_array(
+                [
+                    pa.array(["ignored", "alpha", "beta"])[1:],
+                    pa.array([None, "alpha", "ignored"])[0:2],
+                ]
+            ),
+            "category": pa.chunked_array([second.slice(0, 2), second.slice(2)]),
+        },
+        schema=expected.schema,
+    )
+
+    assert factor_table_content_hash(physical_variant) == factor_table_content_hash(
+        expected
+    )
+
+
+def _legacy_generic_factor_hash(table: pa.Table) -> str:
+    """Reference the pre-performance generic logical Arrow canonicalization."""
+    return hashlib.sha256(_legacy_generic_factor_bytes(table)).hexdigest()
+
+
+def _legacy_generic_factor_bytes(table: pa.Table) -> bytes:
+    """Return the exact prior IPC representation without using production code."""
+    combined = table.combine_chunks()
+    canonical = pa.table(
+        [
+            pa.array(combined.column(index).to_pylist(), type=field.type)
+            for index, field in enumerate(combined.schema)
+        ],
+        schema=combined.schema,
+    )
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, canonical.schema) as writer:
+        writer.write_table(canonical)
+    return sink.getvalue().to_pybytes()
 
 
 def test_publish_manifest_is_canonical_and_binds_every_cache_key_input(

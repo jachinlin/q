@@ -6,7 +6,8 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from math import isfinite
 from types import MappingProxyType
 from typing import Protocol, cast
@@ -200,30 +201,84 @@ def _factor_table_ipc_bytes(table: pa.Table) -> bytes:
 
 
 def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
+    """Rebuild logical Arrow values without allocator-dependent null payloads."""
+    data_type = field.type
+    if pa.types.is_dictionary(data_type):
+        decoded = pc.dictionary_decode(array)
+        canonical = _canonical_null_buffers(
+            decoded, pa.field(field.name, data_type.value_type)
+        )
+        return pc.cast(canonical, data_type)
+    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type):
+        filled = _filled_nulls(array, data_type)
+        values = _canonical_null_buffers(
+            filled.values, pa.field("item", data_type.value_type)
+        )
+        return pa.Array.from_buffers(
+            data_type,
+            len(array),
+            [array.buffers()[0], filled.buffers()[1]],
+            null_count=array.null_count,
+            children=[values],
+        )
+    if pa.types.is_struct(data_type):
+        filled = _filled_nulls(array, data_type)
+        children = [
+            _canonical_null_buffers(filled.field(index), child)
+            for index, child in enumerate(data_type)
+        ]
+        return pa.Array.from_buffers(
+            data_type,
+            len(array),
+            [array.buffers()[0]],
+            null_count=array.null_count,
+            children=children,
+        )
     if array.null_count == 0:
         return array
-    filled = pc.fill_null(array, _null_fill_scalar(field.type))
+    filled = _filled_nulls(array, data_type)
     return pa.Array.from_buffers(
-        field.type,
+        data_type,
         len(array),
         [array.buffers()[0], *filled.buffers()[1:]],
         null_count=array.null_count,
     )
 
 
+def _filled_nulls(array: pa.Array, data_type: pa.DataType) -> pa.Array:
+    """Use one schema-sized scalar to make invisible null payloads deterministic."""
+    return pc.fill_null(array, _null_fill_scalar(data_type))
+
+
 def _null_fill_scalar(data_type: pa.DataType) -> pa.Scalar:
-    if pa.types.is_string(data_type):
+    if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
         value: object = ""
+    elif pa.types.is_binary(data_type) or pa.types.is_large_binary(data_type):
+        value = b""
+    elif pa.types.is_fixed_size_binary(data_type):
+        value = b"\0" * data_type.byte_width
     elif pa.types.is_boolean(data_type):
         value = False
     elif pa.types.is_floating(data_type):
         value = 0.0
     elif pa.types.is_integer(data_type):
         value = 0
+    elif pa.types.is_decimal(data_type):
+        value = Decimal(0)
     elif pa.types.is_date(data_type):
         value = date(1970, 1, 1)
     elif pa.types.is_timestamp(data_type):
         value = datetime(1970, 1, 1, tzinfo=UTC)
+    elif pa.types.is_time(data_type):
+        value = time()
+    elif pa.types.is_duration(data_type):
+        value = timedelta()
+    elif pa.types.is_list(data_type) or pa.types.is_large_list(data_type):
+        value = []
+    elif pa.types.is_struct(data_type):
+        value = {
+            child.name: _null_fill_scalar(child.type).as_py() for child in data_type
+        }
     else:
         raise TypeError(f"unsupported factor hash dtype: {data_type}")
     return pa.scalar(value, type=data_type)
