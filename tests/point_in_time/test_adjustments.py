@@ -229,8 +229,8 @@ def test_forward_adjustment_uses_baostock_preclose_without_action_dataset(
     assert result.schema[FORWARD_LOG_RETURN_COLUMN] == pl.Float64
     assert result[FORWARD_LOG_RETURN_COLUMN].to_list() == [
         None,
-        log(12.0 / 10.0),
-        log(8.4 / 8.0),
+        log(12.0) - log(10.0),
+        log(8.4) - log(8.0),
     ]
 
 
@@ -394,7 +394,9 @@ def test_forward_adjustment_accepts_valid_first_preclose(
     )
 
     assert result["preclose"].item(0) == first_preclose
-    expected_log_return = None if not first_preclose else log(10.0 / first_preclose)
+    expected_log_return = (
+        None if not first_preclose else log(10.0) - log(first_preclose)
+    )
     assert result[FORWARD_LOG_RETURN_COLUMN].item(0) == expected_log_return
 
 
@@ -511,45 +513,74 @@ def test_forward_adjustment_rejects_forward_return_index_underflow_to_zero() -> 
 
 
 @pytest.mark.parametrize(
-    ("close", "preclose"),
+    ("close", "preclose", "expected_log_return"),
     [
-        (1e308, 1e-308),
-        (float.fromhex("0x0.0000000000001p-1022"), 1e308),
+        (
+            float.fromhex("0x0.0000000000001p-1022"),
+            1e308,
+            -1453.6362805635472,
+        ),
+        (
+            1e308,
+            float.fromhex("0x0.0000000000001p-1022"),
+            1453.6362805635472,
+        ),
     ],
 )
-def test_forward_adjustment_rejects_nonfinite_row_log_return(
-    close: float, preclose: float
+def test_forward_service_accepts_finite_extreme_log_difference(
+    tmp_path: Path,
+    close: float,
+    preclose: float,
+    expected_log_return: float,
 ) -> None:
-    """Finite positive inputs must fail if their direct ratio log is non-finite."""
+    """A ratio may under/overflow even when its endpoint log difference is finite."""
+    bars = [
+        (close, close, close, close, preclose, 100, 100.0),
+        *[
+            (close, close, close, close, close, 100, 100.0)
+            for _ in range(len(_DAYS) - 1)
+        ],
+    ]
+    fixture = _adjustment_fixture(tmp_path, [], bar_values=bars)
+
+    result = (
+        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        .bars(
+            fixture.snapshot_id,
+            [_INSTRUMENT],
+            _DAYS[0],
+            _DAYS[-1],
+            AdjustmentMode.FORWARD,
+            _DAYS[-1],
+        )
+        .collect()
+    )
+
+    assert result["close"].to_list() == [close] * len(_DAYS)
+    assert result["adjustment_factor"].to_list() == [1.0] * len(_DAYS)
+    assert result[FORWARD_LOG_RETURN_COLUMN].to_list() == [
+        expected_log_return,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+
+
+def test_forward_log_return_matches_python_log_difference_exactly() -> None:
+    """Constructing an intermediate ratio changes an ordinary return's bytes."""
     frame = _forward_frame(
         [
-            ("SSE:600000", _DAYS[0], close, preclose),
+            ("SSE:600000", _DAYS[0], 12.0, 10.0),
         ]
     )
 
-    with pytest.raises(ValueError, match="forward log return must be finite"):
-        _forward_adjust(frame, _DAYS[0])
+    result, _ = _forward_adjust(frame, _DAYS[0])
 
-
-def test_forward_log_return_uses_raw_prices_before_adjustment() -> None:
-    """Deriving the row return from rounded adjusted prices changes its bytes."""
-    frame = _forward_frame(
-        [
-            ("SSE:600000", _DAYS[0], 100.0, 0.0),
-            ("SSE:600000", _DAYS[1], 101.0, 100.0),
-            ("SSE:600000", _DAYS[2], 102.0, 101.0),
-            ("SSE:600000", _DAYS[3], 103.0, 0.7 * 102.0),
-        ]
-    )
-
-    result, factors = _forward_adjust(frame, _DAYS[3])
-
-    expected = 0.009950330853168092
-    adjusted_derived = log(
-        (frame["close"].item(1) * factors[1]) / (frame["preclose"].item(1) * factors[1])
-    )
-    assert result[FORWARD_LOG_RETURN_COLUMN].item(1) == expected
-    assert adjusted_derived != expected
+    expected = log(12.0) - log(10.0)
+    ratio_derived = log(12.0 / 10.0)
+    assert result[FORWARD_LOG_RETURN_COLUMN].item() == expected
+    assert ratio_derived != expected
 
 
 def test_forward_log_return_is_not_reconstructed_from_return_index() -> None:
@@ -577,7 +608,7 @@ def test_forward_log_return_is_not_reconstructed_from_return_index() -> None:
 
     result, _ = _forward_adjust(frame, start + timedelta(days=10))
 
-    expected = -0.3453164409724669
+    expected = log(562.516409587767) - log(794.5188785368044)
     index_derived = log(
         result["forward_return_index"].item(10) / result["forward_return_index"].item(9)
     )
@@ -631,12 +662,12 @@ def test_forward_log_return_is_byte_stable_across_request_starts() -> None:
         == later[FORWARD_LOG_RETURN_COLUMN].to_numpy().tobytes()
     )
     assert later[FORWARD_LOG_RETURN_COLUMN].to_list() == [
-        log(101.65705717852148 / 72.00974404002423),
-        log(101.51431209232835 / 101.65705717852148),
-        log(103.0 / (0.7 * 101.51431209232835)),
-        log(199.0 / 140.0),
-        log(201.0 / 199.0),
-        log(203.0 / (0.7 * 201.0)),
+        log(101.65705717852148) - log(72.00974404002423),
+        log(101.51431209232835) - log(101.65705717852148),
+        log(103.0) - log(0.7 * 101.51431209232835),
+        log(199.0) - log(140.0),
+        log(201.0) - log(199.0),
+        log(203.0) - log(0.7 * 201.0),
     ]
 
 

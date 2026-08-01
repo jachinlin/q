@@ -238,7 +238,7 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
         .alias("_forward_return_ratio"),
         pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
         .then(pl.lit(None, dtype=pl.Float64))
-        .otherwise((pl.col("close") / pl.col("preclose")).log())
+        .otherwise(pl.col("close").log() - pl.col("preclose").log())
         .cast(pl.Float64)
         .alias(FORWARD_LOG_RETURN_COLUMN),
     ).with_columns(
