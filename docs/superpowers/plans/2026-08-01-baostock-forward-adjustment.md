@@ -183,15 +183,15 @@ raw_preclose = [0.0, 10.0, 8.0, 8.4]
 以最后一天为锚点，独立参考：
 
 ```python
-expected = [0.8, 0.8, 1.0, 1.0]
+expected = [2.0 / 3.0, 2.0 / 3.0, 1.0, 1.0]
 ```
 
 断言：
 
 ```python
 assert result["adjustment_factor"].to_list() == pytest.approx(expected)
-assert result["close"].to_list() == pytest.approx([8.0, 9.6, 8.4, 9.0])
-assert result["preclose"].to_list() == pytest.approx([0.0, 8.0, 8.0, 8.4])
+assert result["close"].to_list() == pytest.approx([20.0 / 3.0, 8.0, 8.4, 9.0])
+assert result["preclose"].to_list() == pytest.approx([0.0, 20.0 / 3.0, 8.0, 8.4])
 assert result["close"].to_list()[1] == pytest.approx(result["preclose"].to_list()[2])
 assert result["volume"].to_list() == raw_volume
 assert result["amount"].to_list() == raw_amount
