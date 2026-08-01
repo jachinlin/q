@@ -157,17 +157,13 @@ def _volatility_expression(log_returns: pl.Expr) -> pl.Expr:
     window = 60
     values = [log_returns.shift(lag).over(group) for lag in range(window)]
     finite = [
-        value.is_not_null() & value.is_not_nan() & value.is_finite()
-        for value in values
+        value.is_not_null() & value.is_not_nan() & value.is_finite() for value in values
     ]
     all_finite = pl.all_horizontal(finite)
     scale = pl.max_horizontal([value.abs() for value in values])
-    normalized = [value / scale for value in values]
-    mean = pl.mean_horizontal(normalized)
-    square_sum = pl.sum_horizontal(
-        [(value - mean) * (value - mean) for value in normalized]
-    )
-    scaled = scale * (square_sum / (window - 1)).sqrt() * _ANNUALIZATION_SCALE
+    window_array = pl.concat_list(values).list.to_array(window)
+    normalized_std = (window_array / scale).arr.std(ddof=1)
+    scaled = scale * normalized_std * _ANNUALIZATION_SCALE
     return (
         pl.when(~all_finite)
         .then(pl.lit(None, dtype=pl.Float64))

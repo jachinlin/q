@@ -33,6 +33,7 @@ from quant_core.factors.base import (
 )
 
 _PRIMARY_KEY = ("trade_date", "instrument_id", "factor_id", "factor_version")
+_PUBLISH_BATCH_ROWS = 65_536
 _MANIFEST_FIELDS = {
     "cache_key",
     "code_hash",
@@ -146,10 +147,7 @@ class FeatureCache:
         except (OSError, pa.ArrowException, TypeError, ValueError) as error:
             raise ValueError("feature cache Parquet integrity check failed") from error
         self._validate_entry_paths(entry_path, data_path, manifest_path)
-        if (
-            frame.select(_PRIMARY_KEY).rows()
-            != canonical_frame.select(_PRIMARY_KEY).rows()
-        ):
+        if not frame.select(_PRIMARY_KEY).equals(canonical_frame.select(_PRIMARY_KEY)):
             raise ValueError("feature cache Parquet is not canonically sorted")
         schema_fingerprint = _schema_fingerprint(table.schema)
         content_hash = _content_hash(table)
@@ -180,13 +178,16 @@ class FeatureCache:
             raise ValueError("cache_key does not match factor inputs")
         if not isinstance(frame, pl.LazyFrame):
             raise TypeError("factor output must be a polars LazyFrame")
-        canonical_frame = _validated_frame(
-            frame.collect(), factor_id=spec.factor_id, factor_version=spec.version
+        if frame.collect_schema() != FACTOR_OUTPUT_SCHEMA:
+            raise ValueError(
+                f"factor output schema must be exactly {FACTOR_OUTPUT_SCHEMA}"
+            )
+        canonical_plan = frame.sort(_PRIMARY_KEY, maintain_order=True)
+        _validate_lazy_plan(
+            canonical_plan,
+            factor_id=spec.factor_id,
+            factor_version=spec.version,
         )
-        table = canonical_frame.to_arrow().combine_chunks()
-        row_count = table.num_rows
-        content_hash = _content_hash(table)
-        schema_fingerprint = _schema_fingerprint(table.schema)
         entry_path = self._root / cache_key
         lock_path = self._root / f".{cache_key}.lock"
         validate_storage_path(self._root, entry_path)
@@ -194,15 +195,6 @@ class FeatureCache:
 
         with _PartitionLock(lock_path):
             self._recover_stale_staging(cache_key)
-            existing = self.load(cache_key)
-            if existing is not None:
-                if (
-                    existing.content_hash != content_hash
-                    or existing.row_count != row_count
-                ):
-                    raise ValueError("feature cache conflict: existing content differs")
-                _fsync_directory(self._root)
-                return existing
             staging_path = self._root / f".{cache_key}.{uuid.uuid4().hex}.tmp"
             data_path = staging_path / "data.parquet"
             manifest_path = staging_path / "manifest.json"
@@ -213,20 +205,44 @@ class FeatureCache:
                 validate_storage_path(self._root, staging_path)
                 validate_storage_path(self._root, data_path)
                 validate_storage_path(self._root, manifest_path)
-                pq.write_table(table, data_path, compression="zstd")
+                canonical_plan.sink_parquet(
+                    data_path,
+                    compression="zstd",
+                    row_group_size=_PUBLISH_BATCH_ROWS,
+                    maintain_order=True,
+                    engine="streaming",
+                )
                 validate_storage_path(self._root, data_path, require_file=True)
                 _fsync_file(data_path)
                 written = pq.read_table(data_path)
-                validate_storage_path(self._root, staging_path)
-                validate_storage_path(self._root, data_path, require_file=True)
-                if (
-                    written.num_rows != row_count
-                    or _schema_fingerprint(written.schema) != schema_fingerprint
-                    or _content_hash(written) != content_hash
+                written_frame = cast(pl.DataFrame, pl.from_arrow(written))
+                validated = _validated_frame(
+                    written_frame,
+                    factor_id=spec.factor_id,
+                    factor_version=spec.version,
+                )
+                if not written_frame.select(_PRIMARY_KEY).equals(
+                    validated.select(_PRIMARY_KEY)
                 ):
                     raise ValueError(
-                        "written feature Parquet failed integrity verification"
+                        "written feature Parquet is not canonically sorted"
                     )
+                row_count = written.num_rows
+                content_hash = _content_hash(written)
+                schema_fingerprint = _schema_fingerprint(written.schema)
+                validate_storage_path(self._root, staging_path)
+                validate_storage_path(self._root, data_path, require_file=True)
+                existing = self.load(cache_key)
+                if existing is not None:
+                    if (
+                        existing.content_hash != content_hash
+                        or existing.row_count != row_count
+                    ):
+                        raise ValueError(
+                            "feature cache conflict: existing content differs"
+                        )
+                    _fsync_directory(self._root)
+                    return existing
                 manifest = _manifest(
                     cache_key=cache_key,
                     spec=spec,
@@ -463,6 +479,68 @@ def _validated_frame(
             "null available_at is allowed only for a null invalid factor value"
         )
     return frame.sort(_PRIMARY_KEY, maintain_order=True)
+
+
+def _validate_lazy_plan(
+    frame: pl.LazyFrame, *, factor_id: str, factor_version: str
+) -> None:
+    """Reduce full semantic validation to one scalar streaming result."""
+    required_non_null = (
+        "trade_date",
+        "instrument_id",
+        "factor_id",
+        "factor_version",
+        "is_valid",
+    )
+    adjacent_duplicate = pl.all_horizontal(
+        [pl.col(column) == pl.col(column).shift(1) for column in _PRIMARY_KEY]
+    )
+    invalid_value = (
+        pl.col("value").is_null()
+        | pl.col("value").is_nan()
+        | pl.col("value").is_infinite()
+    )
+    checks = (
+        frame.select(
+            pl.any_horizontal(
+                [pl.col(column).is_null() for column in required_non_null]
+            )
+            .any()
+            .alias("required_null"),
+            adjacent_duplicate.any().alias("duplicate"),
+            (pl.col("factor_id") != factor_id).any().alias("factor_id"),
+            (pl.col("factor_version") != factor_version).any().alias("factor_version"),
+            (pl.col("is_valid") & invalid_value).any().alias("valid_value"),
+            (pl.col("is_valid") & pl.col("available_at").is_null())
+            .any()
+            .alias("valid_availability"),
+            (
+                ~pl.col("is_valid")
+                & pl.col("value").is_not_null()
+                & pl.col("available_at").is_null()
+            )
+            .any()
+            .alias("invalid_availability"),
+        )
+        .collect(engine="streaming")
+        .row(0, named=True)
+    )
+    if checks["required_null"]:
+        raise ValueError("factor output identity and audit fields must not be null")
+    if checks["duplicate"]:
+        raise ValueError("factor output contains a duplicate primary key")
+    if checks["factor_id"]:
+        raise ValueError("factor output factor_id does not match FactorSpec")
+    if checks["factor_version"]:
+        raise ValueError("factor output factor_version does not match FactorSpec")
+    if checks["valid_value"]:
+        raise ValueError("valid factor output value must be finite")
+    if checks["valid_availability"]:
+        raise ValueError("valid factor output available_at must not be null")
+    if checks["invalid_availability"]:
+        raise ValueError(
+            "null available_at is allowed only for a null invalid factor value"
+        )
 
 
 def _content_hash(table: pa.Table) -> str:

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from quant_core.data.contracts import ProviderCapabilities
@@ -113,6 +114,29 @@ def publish(cache: FeatureCache, frame: pl.LazyFrame | None = None) -> FactorArt
         ctx=ctx,
         code_hash=code_hash,
         dependency_hashes=dependencies,
+    )
+
+
+def large_factor_frame(row_count: int) -> pl.LazyFrame:
+    """Build many unique keys without allocating Python row objects."""
+    return (
+        pl.DataFrame({"_row": pl.int_range(0, row_count, eager=True)})
+        .select(
+            pl.lit(date(2025, 1, 2), dtype=pl.Date).alias("trade_date"),
+            pl.concat_str(
+                pl.lit("SSE:"), pl.col("_row").cast(pl.String).str.zfill(8)
+            ).alias("instrument_id"),
+            pl.lit("momentum", dtype=pl.String).alias("factor_id"),
+            pl.lit("1.0.0", dtype=pl.String).alias("factor_version"),
+            (pl.col("_row") / row_count).cast(pl.Float64).alias("value"),
+            pl.lit(
+                datetime(2025, 1, 2, 8, tzinfo=UTC),
+                dtype=pl.Datetime("us", "UTC"),
+            ).alias("available_at"),
+            pl.lit(True, dtype=pl.Boolean).alias("is_valid"),
+        )
+        .reverse()
+        .lazy()
     )
 
 
@@ -863,20 +887,44 @@ def test_publish_failure_never_leaves_a_visible_or_temporary_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed Parquet write cannot register partial cache state."""
-    from quant_core.factors import cache as cache_module
+    sink_parquet = pl.LazyFrame.sink_parquet
 
-    write_table = cache_module.pq.write_table
-
-    def write_then_fail(*args: object, **kwargs: object) -> None:
-        write_table(*args, **kwargs)
+    def write_then_fail(frame: pl.LazyFrame, *args: object, **kwargs: object) -> None:
+        sink_parquet(frame, *args, **kwargs)  # type: ignore[arg-type]
         raise OSError("injected feature write failure")
 
-    monkeypatch.setattr(cache_module.pq, "write_table", write_then_fail)
+    monkeypatch.setattr(pl.LazyFrame, "sink_parquet", write_then_fail)
 
     with pytest.raises(OSError, match="injected feature write failure"):
         publish(FeatureCache(tmp_path))
 
     assert_only_persistent_guard_files(tmp_path)
+
+
+def test_publish_streams_canonical_parquet_in_bounded_row_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publication must not convert the complete result through an eager Arrow table."""
+    row_count = 65_537
+
+    def forbidden_to_arrow(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("feature publication materialized a complete Arrow table")
+
+    monkeypatch.setattr(pl.DataFrame, "to_arrow", forbidden_to_arrow)
+
+    artifact = publish(FeatureCache(tmp_path), large_factor_frame(row_count))
+    data_path, _ = entry_paths(FeatureCache(tmp_path), artifact)
+    parquet = pq.ParquetFile(data_path)
+
+    assert artifact.row_count == row_count
+    assert parquet.num_row_groups == 2
+    assert (
+        max(
+            parquet.metadata.row_group(index).num_rows
+            for index in range(parquet.num_row_groups)
+        )
+        <= 65_536
+    )
 
 
 def test_directory_flush_failure_before_rename_leaves_no_visible_entry(

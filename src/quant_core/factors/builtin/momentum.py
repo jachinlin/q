@@ -264,6 +264,9 @@ class _MarketFactor:
         self, normalized: pl.DataFrame, ctx: FactorContext
     ) -> pl.LazyFrame:
         """Build one native grouped window plan without Python data iteration."""
+        native_evaluator = self._native_evaluator
+        if native_evaluator is None:
+            raise RuntimeError("native market factor evaluator is unavailable")
         group = "instrument_id"
         row_number = pl.int_range(1, pl.len() + 1, dtype=pl.UInt32).over(group)
         observed_prices = row_number.clip(upper_bound=self._required_prices)
@@ -284,7 +287,7 @@ class _MarketFactor:
             .then(latest_availability)
             .otherwise(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
         )
-        raw_value = self._native_evaluator(pl.col(FORWARD_LOG_RETURN_COLUMN))
+        raw_value = native_evaluator(pl.col(FORWARD_LOG_RETURN_COLUMN))
         valid = (
             (row_number >= self._required_prices)
             & available_at.is_not_null()
@@ -483,9 +486,7 @@ def _return_expression(window: int) -> Callable[[pl.Expr], pl.Expr]:
 
 def _trend_expression(log_returns: pl.Expr) -> pl.Expr:
     window_returns = 119
-    weights = [
-        index * (120 - index) / 2.0 for index in range(1, window_returns + 1)
-    ]
+    weights = [index * (120 - index) / 2.0 for index in range(1, window_returns + 1)]
     denominator = 120.0 * (120.0**2 - 1.0) / 12.0
     finite_return = (
         log_returns.is_not_null() & log_returns.is_not_nan() & log_returns.is_finite()
@@ -504,8 +505,10 @@ def _trend_expression(log_returns: pl.Expr) -> pl.Expr:
         ).over("instrument_id")
         / denominator
     )
-    return pl.when(finite_count == window_returns).then(weighted).otherwise(
-        pl.lit(None, dtype=pl.Float64)
+    return (
+        pl.when(finite_count == window_returns)
+        .then(weighted)
+        .otherwise(pl.lit(None, dtype=pl.Float64))
     )
 
 
