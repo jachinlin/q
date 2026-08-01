@@ -210,6 +210,12 @@ def _canonical_null_buffers(
     data_type = field.type
     if pa.types.is_dictionary(data_type):
         decoded = pc.dictionary_decode(array)
+        if parent_validity is not None:
+            visible = pc.and_(array.is_valid(), parent_validity)
+            values = pc.drop_null(pc.filter(decoded, visible))
+            if len(values) == 0:
+                return _empty_dictionary_array(array, data_type, parent_validity)
+            decoded = pc.if_else(parent_validity, decoded, values[0])
         canonical = _canonical_null_buffers(
             decoded, pa.field(field.name, data_type.value_type)
         )
@@ -240,27 +246,18 @@ def _canonical_null_buffers(
         visible_values = pc.if_else(
             own_value_validity, values, pa.scalar(None, type=data_type.value_type)
         )
+        item_parent_validity: pa.Array | None = None
         if parent_validity is not None:
-            visible_parents = pc.and_(own_validity, parent_validity)
-            visible_value_validity = pa.array(
-                np.repeat(
-                    visible_parents.to_numpy(zero_copy_only=False),
-                    data_type.list_size,
-                )
-            )
-            parent_value_validity = pa.array(
+            item_parent_validity = pa.array(
                 np.repeat(
                     parent_validity.to_numpy(zero_copy_only=False),
                     data_type.list_size,
                 )
             )
-            visible_values = pc.if_else(
-                parent_value_validity,
-                visible_values,
-                _null_fill_scalar(data_type.value_type, values, visible_value_validity),
-            )
         values = _canonical_null_buffers(
-            visible_values, pa.field("item", data_type.value_type)
+            visible_values,
+            pa.field("item", data_type.value_type),
+            item_parent_validity,
         )
         return pa.Array.from_buffers(
             data_type,
@@ -298,8 +295,20 @@ def _canonical_null_buffers(
             children=children,
         )
     if array.null_count == 0:
-        return array
+        if parent_validity is None:
+            return array
+        return pc.if_else(
+            parent_validity,
+            array,
+            _null_fill_scalar(data_type, array, parent_validity),
+        )
     filled = _filled_nulls(array, data_type)
+    if parent_validity is not None:
+        filled = pc.if_else(
+            parent_validity,
+            filled,
+            _null_fill_scalar(data_type, array, parent_validity),
+        )
     return pa.Array.from_buffers(
         data_type,
         len(array),
@@ -345,8 +354,28 @@ def _null_fill_scalar(
     elif pa.types.is_list(data_type) or pa.types.is_large_list(data_type):
         value = []
     elif pa.types.is_fixed_size_list(data_type):
+        item_array: pa.Array | None = None
+        item_validity: pa.Array | None = None
+        if isinstance(array, pa.FixedSizeListArray):
+            item_array = array.values.slice(
+                array.offset * data_type.list_size,
+                len(array) * data_type.list_size,
+            )
+            visible = array.is_valid()
+            if parent_validity is not None:
+                visible = pc.and_(visible, parent_validity)
+            item_validity = pa.array(
+                np.repeat(
+                    visible.to_numpy(zero_copy_only=False),
+                    data_type.list_size,
+                )
+            )
         value = [
-            _null_fill_scalar(data_type.value_type).as_py()
+            _null_fill_scalar(
+                data_type.value_type,
+                item_array,
+                item_validity,
+            ).as_py()
             for _ in range(data_type.list_size)
         ]
     elif pa.types.is_map(data_type):
@@ -383,6 +412,30 @@ def _dictionary_fill_value(
             return visible[0].as_py()
         return None
     return _null_fill_scalar(value_type).as_py()
+
+
+def _empty_dictionary_array(
+    array: pa.Array,
+    data_type: pa.DataType,
+    parent_validity: pa.Array,
+) -> pa.DictionaryArray:
+    """Match Arrow's empty dictionary encoding for ancestor-hidden values."""
+    validity = pc.or_(pc.invert(parent_validity), array.is_valid())
+    valid_count = int(pc.sum(pc.cast(validity, pa.int64())).as_py())
+    indices = pc.multiply(
+        pc.fill_null(array.indices, pa.scalar(0, type=data_type.index_type)),
+        pa.scalar(0, type=data_type.index_type),
+    )
+    return pa.DictionaryArray.from_buffers(
+        data_type,
+        len(array),
+        [
+            None if valid_count == len(array) else validity.buffers()[1],
+            indices.buffers()[1],
+        ],
+        pa.array([], type=data_type.value_type),
+        null_count=len(array) - valid_count,
+    )
 
 
 def _owned_read_only_table(table: pa.Table) -> pa.Table:

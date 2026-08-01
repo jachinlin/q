@@ -518,6 +518,136 @@ def test_factor_content_hash_ignores_fixed_list_dictionary_values_hidden_by_pare
     assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
 
 
+def test_factor_content_hash_propagates_ancestor_nulls_through_nested_fixed_lists() -> (
+    None
+):
+    """A null struct must hide categories beneath every fixed-list level."""
+    category_type = pa.dictionary(pa.int8(), pa.string())
+    inner_type = pa.list_(category_type, 2)
+    outer_type = pa.list_(inner_type, 2)
+    categories = pa.array(["hidden-a", "hidden-b", "alpha", "beta"], type=category_type)
+    inner = pa.FixedSizeListArray.from_arrays(categories, 2)
+    outer = pa.FixedSizeListArray.from_arrays(inner, 2)
+    nested = pa.StructArray.from_arrays(
+        [outer],
+        fields=[pa.field("categories", outer_type)],
+        mask=pa.array([True]),
+    )
+    table = pa.table({"nested": nested})
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
+def test_factor_content_hash_matches_legacy_three_level_fixed_list_nulls() -> None:
+    """Own fixed-list nulls and ancestor nulls retain distinct leaf encodings."""
+    category_type = pa.dictionary(pa.int8(), pa.string())
+    inner_type = pa.list_(category_type, 2)
+    middle_type = pa.list_(inner_type, 2)
+    outer_type = pa.list_(middle_type, 2)
+    categories = pa.array(
+        [f"category-{index}" for index in range(24)], type=category_type
+    )
+    inner = pa.FixedSizeListArray.from_arrays(categories, 2)
+    middle = pa.FixedSizeListArray.from_arrays(inner, 2)
+    outer = pa.FixedSizeListArray.from_arrays(
+        middle, 2, mask=pa.array([False, True, False])
+    )
+    nested = pa.StructArray.from_arrays(
+        [outer],
+        fields=[pa.field("categories", outer_type)],
+        mask=pa.array([True, False, False]),
+    )
+    table = pa.table({"nested": nested})
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
+def test_factor_content_hash_matches_legacy_chunked_mixed_nested_fixed_lists() -> None:
+    """Nested fixed lists recurse through list, struct, map, slices, and chunks."""
+    category_type = pa.dictionary(pa.int8(), pa.string())
+    fixed_type = pa.list_(pa.list_(category_type, 2), 2)
+    item_type = pa.struct(
+        [
+            pa.field("categories", fixed_type),
+            pa.field("mapping", pa.map_(pa.string(), category_type)),
+        ]
+    )
+    list_type = pa.list_(item_type)
+    outer_type = pa.struct([pa.field("items", list_type)])
+
+    def make_chunk(
+        labels: list[str],
+        outer_mask: list[bool] | None,
+        fixed_mask: list[bool] | None,
+    ) -> pa.StructArray:
+        categories = pa.array(labels, type=category_type)
+        inner = pa.FixedSizeListArray.from_arrays(categories, 2)
+        fixed = pa.FixedSizeListArray.from_arrays(
+            inner,
+            2,
+            mask=None if fixed_mask is None else pa.array(fixed_mask),
+        )
+        mapping = pa.array(
+            [
+                [("a", labels[0])],
+                [("b", labels[4])],
+                [("c", labels[8])],
+            ],
+            type=item_type[1].type,
+        )
+        items = pa.StructArray.from_arrays([fixed, mapping], fields=list(item_type))
+        lists = pa.ListArray.from_arrays(pa.array([0, 1, 2, 3]), items)
+        return pa.StructArray.from_arrays(
+            [lists],
+            fields=list(outer_type),
+            mask=None if outer_mask is None else pa.array(outer_mask),
+        )
+
+    prefix = make_chunk(
+        [
+            "ancestor-a",
+            "ancestor-b",
+            "ancestor-c",
+            "ancestor-d",
+            "own-a",
+            "own-b",
+            "own-c",
+            "own-d",
+            "visible-a",
+            "visible-b",
+            "visible-c",
+            "visible-d",
+        ],
+        [True, False, False],
+        [False, True, False],
+    )
+    suffix = make_chunk(
+        [
+            "slice-a",
+            "slice-b",
+            "slice-c",
+            "slice-d",
+            "unused-a",
+            "unused-b",
+            "unused-c",
+            "unused-d",
+            "unused-e",
+            "unused-f",
+            "unused-g",
+            "unused-h",
+        ],
+        None,
+        None,
+    )
+    assert suffix.buffers()[0] is None
+    chunked = pa.chunked_array(
+        [prefix.slice(0, 3), suffix.slice(0, 1)], type=outer_type
+    )
+    table = pa.table({"nested": chunked})
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
 def test_factor_content_hash_propagates_parent_nulls_through_deep_chunked_fixed_lists() -> (
     None
 ):
