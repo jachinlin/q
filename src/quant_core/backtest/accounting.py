@@ -10,7 +10,7 @@ from enum import StrEnum
 from math import isfinite
 
 from quant_core.backtest.calendar import TradingCalendar
-from quant_core.backtest.models import ExecutionBatch, FillResult
+from quant_core.backtest.models import ExecutionBatch, ExecutionReason, FillResult
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.portfolio.rebalance import OrderSide
 
@@ -105,8 +105,19 @@ class PositionSnapshot:
         _nonnegative_int(self.sellable_quantity, "sellable_quantity")
         _nonnegative_int(self.cost_basis_fen, "cost_basis_fen")
         _nonnegative_int(self.market_value_fen, "market_value_fen")
+        if self.total_quantity == 0 and any(
+            value != 0
+            for value in (
+                self.sellable_quantity,
+                self.cost_basis_fen,
+                self.market_value_fen,
+            )
+        ):
+            raise ValueError("zero quantity position must have zero balances")
         if self.sellable_quantity > self.total_quantity:
             raise ValueError("sellable_quantity must not exceed total_quantity")
+        if self.total_quantity > 0 and self.market_value_fen == 0:
+            raise ValueError("market_value_fen must be positive for a position")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,20 +177,21 @@ class PortfolioAccount:
         self._calendar = calendar
         self._cash_fen = initial_cash_fen
         self._lots: dict[InstrumentId, list[_Lot]] = {}
-        self._ledger = [
-            LedgerEvent(
-                "opening-cash",
-                LedgerEventType.OPENING_CASH,
-                calendar.start,
-                None,
-                initial_cash_fen,
-                0,
-                0,
-                0,
-                0,
-                "initial_cash",
-            )
-        ]
+        opening = LedgerEvent(
+            "account:opening-cash",
+            LedgerEventType.OPENING_CASH,
+            calendar.start,
+            None,
+            initial_cash_fen,
+            0,
+            0,
+            0,
+            0,
+            "account:init",
+        )
+        self._ledger = [opening]
+        self._ledger_event_ids = {opening.event_id}
+        self._ledger_source_ids = {opening.source_id}
         self._processed_action_ids: set[str] = set()
         self._record_quantities: dict[date, dict[InstrumentId, int]] = {}
         self._last_session: date | None = None
@@ -213,6 +225,8 @@ class PortfolioAccount:
         cash = self._cash_fen
         lots = _copy_lots(self._lots)
         ledger = list(self._ledger)
+        event_ids = set(self._ledger_event_ids)
+        source_ids = set(self._ledger_source_ids)
         processed = set(self._processed_action_ids)
         for action in action_items:
             if action.event_id in processed:
@@ -230,20 +244,21 @@ class PortfolioAccount:
             if action.action_type is CorporateActionType.CASH_DIVIDEND:
                 amount = _rounded_fen(Decimal(entitled) * action.cash_per_share_yuan)
                 cash += amount
-                ledger.append(
-                    LedgerEvent(
-                        action.event_id,
-                        LedgerEventType.CASH_DIVIDEND,
-                        trade_date,
-                        action.instrument_id,
-                        amount,
-                        0,
-                        0,
-                        0,
-                        0,
-                        action.event_id,
-                    )
+                event_id = f"corporate-action:{action.event_id}"
+                ledger_event = LedgerEvent(
+                    event_id,
+                    LedgerEventType.CASH_DIVIDEND,
+                    trade_date,
+                    action.instrument_id,
+                    amount,
+                    0,
+                    0,
+                    0,
+                    0,
+                    event_id,
                 )
+                _reserve_ledger_identity(ledger_event, event_ids, source_ids)
+                ledger.append(ledger_event)
             else:
                 quantity = int(
                     (Decimal(entitled) * action.share_ratio).to_integral_value(
@@ -254,25 +269,28 @@ class PortfolioAccount:
                     lots.setdefault(action.instrument_id, []).append(
                         _Lot(trade_date, trade_date, quantity, 0)
                     )
-                ledger.append(
-                    LedgerEvent(
-                        action.event_id,
-                        LedgerEventType.BONUS_SHARES,
-                        trade_date,
-                        action.instrument_id,
-                        0,
-                        quantity,
-                        0,
-                        0,
-                        0,
-                        action.event_id,
-                    )
+                event_id = f"corporate-action:{action.event_id}"
+                ledger_event = LedgerEvent(
+                    event_id,
+                    LedgerEventType.BONUS_SHARES,
+                    trade_date,
+                    action.instrument_id,
+                    0,
+                    quantity,
+                    0,
+                    0,
+                    0,
+                    event_id,
                 )
+                _reserve_ledger_identity(ledger_event, event_ids, source_ids)
+                ledger.append(ledger_event)
             processed.add(action.event_id)
         _unlock_lots(lots, trade_date)
         self._cash_fen = cash
         self._lots = lots
         self._ledger = ledger
+        self._ledger_event_ids = event_ids
+        self._ledger_source_ids = source_ids
         self._processed_action_ids = processed
         self._last_session = trade_date
         self._phase = "open"
@@ -289,11 +307,17 @@ class PortfolioAccount:
         cash = self._cash_fen
         lots = _copy_lots(self._lots)
         additions: list[LedgerEvent] = []
+        event_ids = set(self._ledger_event_ids)
+        source_ids = set(self._ledger_source_ids)
         for index, result in enumerate(execution.results):
             if not isinstance(result, FillResult):
                 continue
             _validate_fill(result)
             event_id = f"execution:{execution.trade_date.isoformat()}:{index}"
+            source_id = (
+                f"{event_id}:{result.intent.instrument_id.canonical()}:"
+                f"{result.intent.side.value}"
+            )
             charges = result.gross_value_fen + result.fees.total_cents
             if result.intent.side is OrderSide.BUY:
                 if charges > cash:
@@ -308,20 +332,20 @@ class PortfolioAccount:
                     )
                 )
                 cash -= charges
-                additions.append(
-                    LedgerEvent(
-                        event_id,
-                        LedgerEventType.BUY,
-                        result.trade_date,
-                        result.intent.instrument_id,
-                        -charges,
-                        result.filled_quantity,
-                        charges,
-                        result.gross_value_fen,
-                        result.fees.total_cents,
-                        result.intent.reason_code,
-                    )
+                ledger_event = LedgerEvent(
+                    event_id,
+                    LedgerEventType.BUY,
+                    result.trade_date,
+                    result.intent.instrument_id,
+                    -charges,
+                    result.filled_quantity,
+                    charges,
+                    result.gross_value_fen,
+                    result.fees.total_cents,
+                    source_id,
                 )
+                _reserve_ledger_identity(ledger_event, event_ids, source_ids)
+                additions.append(ledger_event)
             else:
                 consumed = _consume_lots_for_date(
                     lots,
@@ -335,25 +359,27 @@ class PortfolioAccount:
                 if cash + proceeds < 0:
                     raise ValueError("sell would make cash negative")
                 cash += proceeds
-                additions.append(
-                    LedgerEvent(
-                        event_id,
-                        LedgerEventType.SELL,
-                        result.trade_date,
-                        result.intent.instrument_id,
-                        proceeds,
-                        -result.filled_quantity,
-                        -consumed,
-                        result.gross_value_fen,
-                        result.fees.total_cents,
-                        result.intent.reason_code,
-                    )
+                ledger_event = LedgerEvent(
+                    event_id,
+                    LedgerEventType.SELL,
+                    result.trade_date,
+                    result.intent.instrument_id,
+                    proceeds,
+                    -result.filled_quantity,
+                    -consumed,
+                    result.gross_value_fen,
+                    result.fees.total_cents,
+                    source_id,
                 )
+                _reserve_ledger_identity(ledger_event, event_ids, source_ids)
+                additions.append(ledger_event)
         if cash != execution.ending_cash_fen:
             raise ValueError("execution ending cash does not match accounting")
         self._cash_fen = cash
         self._lots = lots
         self._ledger.extend(additions)
+        self._ledger_event_ids = event_ids
+        self._ledger_source_ids = source_ids
         self._phase = "applied"
 
     def mark_to_market(
@@ -425,6 +451,7 @@ def _validate_ledger_shape(event: LedgerEvent) -> None:
     if event.event_type is LedgerEventType.BUY:
         if (
             event.quantity_delta <= 0
+            or event.gross_value_fen <= 0
             or event.cost_basis_delta_fen != event.gross_value_fen + event.fees_fen
             or event.cash_delta_fen != -event.cost_basis_delta_fen
         ):
@@ -432,6 +459,7 @@ def _validate_ledger_shape(event: LedgerEvent) -> None:
     elif event.event_type is LedgerEventType.SELL:
         if (
             event.quantity_delta >= 0
+            or event.gross_value_fen <= 0
             or event.cost_basis_delta_fen > 0
             or event.cash_delta_fen != event.gross_value_fen - event.fees_fen
         ):
@@ -570,11 +598,37 @@ def _reduce_ledger(
 
 
 def _validate_fill(result: FillResult) -> None:
+    if result.requested_quantity != result.intent.quantity:
+        raise ValueError("fill requested quantity is inconsistent with intent")
+    if result.filled_quantity + result.unfilled_quantity != result.intent.quantity:
+        raise ValueError("fill quantities are inconsistent with intent")
     expected_gross = _rounded_fen(Decimal(str(result.price))) * result.filled_quantity
     if result.gross_value_fen != expected_gross:
         raise ValueError("fill gross value is inconsistent with price and quantity")
     if result.intent.side not in {OrderSide.BUY, OrderSide.SELL}:
         raise ValueError("fill side is invalid")
+    if (
+        result.filled_quantity == result.intent.quantity
+        and result.unfilled_quantity == 0
+    ):
+        if result.reason_code is not ExecutionReason.FILLED:
+            raise ValueError("fill reason is inconsistent with complete fill")
+        return
+    if result.unfilled_quantity <= 0 or result.reason_code not in {
+        ExecutionReason.INSUFFICIENT_CASH,
+        ExecutionReason.INSUFFICIENT_SELLABLE,
+        ExecutionReason.VOLUME_CAP,
+    }:
+        raise ValueError("fill reason is inconsistent with partial fill")
+
+
+def _reserve_ledger_identity(
+    event: LedgerEvent, event_ids: set[str], source_ids: set[str]
+) -> None:
+    if event.event_id in event_ids or event.source_id in source_ids:
+        raise ValueError("ledger event_id and source_id must be unique")
+    event_ids.add(event.event_id)
+    source_ids.add(event.source_id)
 
 
 def _prices(closes: Mapping[InstrumentId, float]) -> dict[InstrumentId, int]:
