@@ -60,9 +60,6 @@ def _builtin_runtime_identity(factor: Factor) -> tuple[object, ...]:
         for attribute in _RUNTIME_DEPENDENCY_ATTRIBUTES
         if hasattr(factor, attribute)
     )
-    market_bars = getattr(factor, "_market_bars", None)
-    if isinstance(market_bars, MarketBarsCache):
-        identity.append(("market_bars_runtime", market_bars.runtime_identity()))
     return tuple(identity)
 
 
@@ -91,14 +88,13 @@ def _market_bars_for(
     instruments: Sequence[InstrumentId],
 ) -> MarketBarsCache:
     """Reuse the market cache already bound to the exact runtime domain."""
-    canonical_scope = tuple(instrument.canonical() for instrument in instruments)
     for reference in registry.registered_references():
         factor = registry.factor(reference)
         existing = getattr(factor, "_market_bars", None)
-        if isinstance(existing, MarketBarsCache) and existing.runtime_identity() == (
-            id(price_service),
-            canonical_scope,
-            120,
+        if isinstance(existing, MarketBarsCache) and existing.matches(
+            price_service,
+            instruments,
+            max_lookback_sessions=120,
         ):
             return existing
     return MarketBarsCache(price_service, instruments, max_lookback_sessions=120)

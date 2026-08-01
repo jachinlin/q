@@ -55,14 +55,22 @@ class MarketBarsCache:
         self._ctx: FactorContext | None = None
         self._bars: pl.DataFrame | None = None
         self._inflight: dict[FactorContext, tuple[Future[pl.DataFrame], int]] = {}
+        self._waiting_for_owner: dict[int, int] = {}
         self._lock = Lock()
 
-    def runtime_identity(self) -> tuple[object, ...]:
-        """Return the source domain and configuration, excluding cache allocation."""
+    def matches(
+        self,
+        price_service: AdjustedBarService,
+        instruments: Sequence[InstrumentId],
+        *,
+        max_lookback_sessions: int,
+    ) -> bool:
+        """Return whether this cache can serve the same pooling boundary."""
         return (
-            id(self._price_service),
-            tuple(instrument.canonical() for instrument in self._instruments),
-            self._max_lookback_sessions,
+            self._price_service is price_service
+            and tuple(instrument.canonical() for instrument in self._instruments)
+            == tuple(instrument.canonical() for instrument in instruments)
+            and self._max_lookback_sessions == max_lookback_sessions
         )
 
     def load(self, ctx: FactorContext) -> pl.DataFrame:
@@ -82,10 +90,23 @@ class MarketBarsCache:
                     raise RuntimeError(
                         "recursive market bar load for the same factor context"
                     )
+                if self._would_create_wait_cycle(
+                    owner_thread_id, active_owner_thread_id
+                ):
+                    raise RuntimeError("cyclic market bar cache wait detected")
+                self._waiting_for_owner[owner_thread_id] = active_owner_thread_id
                 owns_load = False
 
         if not owns_load:
-            return future.result()
+            try:
+                return future.result()
+            finally:
+                with self._lock:
+                    if (
+                        self._waiting_for_owner.get(owner_thread_id)
+                        == active_owner_thread_id
+                    ):
+                        del self._waiting_for_owner[owner_thread_id]
 
         try:
             history_start = _expanded_history_start(
@@ -120,6 +141,19 @@ class MarketBarsCache:
                 del self._inflight[ctx]
         future.set_result(bars)
         return bars
+
+    def _would_create_wait_cycle(self, waiter: int, owner: int) -> bool:
+        current = owner
+        visited: set[int] = set()
+        while current not in visited:
+            if current == waiter:
+                return True
+            visited.add(current)
+            waiting_for = self._waiting_for_owner.get(current)
+            if waiting_for is None:
+                return False
+            current = waiting_for
+        return False
 
 
 class _MarketFactor:

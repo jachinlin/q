@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from datetime import UTC, date, datetime, timedelta
 from inspect import getsource
 from math import sqrt
@@ -276,6 +276,138 @@ def test_market_bars_cache_allows_different_context_recursive_load(
     monkeypatch.setattr(momentum_module, "_load_adjusted_bars", reentrant_load)
 
     assert cache.load(first_ctx) is first_frame
+
+
+def test_market_bars_cache_rejects_two_thread_wait_cycle_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A owns B/B owns A must fail instead of leaving both callers blocked."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    owners_ready = Barrier(2)
+    first_ctx = _context(date.min, date.min)
+    second_ctx = FactorContext(
+        snapshot_id=_SNAPSHOT,
+        universe_hash="7" * 64,
+        start=date.min,
+        end=date.min,
+    )
+    first_frame = pl.DataFrame({"context": ["first"]})
+    second_frame = pl.DataFrame({"context": ["second"]})
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    errors: list[RuntimeError | InvalidStateError] = []
+
+    def cyclic_load(
+        _service: object,
+        _instruments: object,
+        ctx: FactorContext,
+        _start: date,
+    ) -> pl.DataFrame:
+        owners_ready.wait(timeout=2)
+        return cache.load(second_ctx if ctx == first_ctx else first_ctx)
+
+    def run(ctx: FactorContext) -> None:
+        try:
+            cache.load(ctx)
+        except (RuntimeError, InvalidStateError) as error:
+            errors.append(error)
+
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", cyclic_load)
+    threads = [Thread(target=run, args=(ctx,)) for ctx in (first_ctx, second_ctx)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+    stalled = any(thread.is_alive() for thread in threads)
+    if stalled:
+        _release_stuck_market_cache_waiters(cache)
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert not stalled
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(errors) == 2
+    assert all(
+        type(error) is RuntimeError
+        and str(error) == "cyclic market bar cache wait detected"
+        for error in errors
+    )
+    assert cache._inflight == {}
+    assert cache._waiting_for_owner == {}
+
+    monkeypatch.setattr(
+        momentum_module,
+        "_load_adjusted_bars",
+        lambda _service, _instruments, ctx, _start: (
+            first_frame if ctx == first_ctx else second_frame
+        ),
+    )
+    assert cache.load(first_ctx) is first_frame
+    assert cache.load(second_ctx) is second_frame
+
+
+def test_market_bars_cache_rejects_three_thread_wait_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle detection must follow transitive wait edges, not only direct pairs."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    owners_ready = Barrier(3)
+    contexts = (
+        _context(date.min, date.min),
+        FactorContext(_SNAPSHOT, "7" * 64, date.min, date.min),
+        FactorContext(_SNAPSHOT, "8" * 64, date.min, date.min),
+    )
+    successor = dict(zip(contexts, (*contexts[1:], contexts[0]), strict=True))
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    errors: list[RuntimeError | InvalidStateError] = []
+
+    def cyclic_load(
+        _service: object,
+        _instruments: object,
+        ctx: FactorContext,
+        _start: date,
+    ) -> pl.DataFrame:
+        owners_ready.wait(timeout=2)
+        return cache.load(successor[ctx])
+
+    def run(ctx: FactorContext) -> None:
+        try:
+            cache.load(ctx)
+        except (RuntimeError, InvalidStateError) as error:
+            errors.append(error)
+
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", cyclic_load)
+    threads = [Thread(target=run, args=(ctx,)) for ctx in contexts]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+    stalled = any(thread.is_alive() for thread in threads)
+    if stalled:
+        _release_stuck_market_cache_waiters(cache)
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert not stalled
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(errors) == 3
+    assert all(
+        type(error) is RuntimeError
+        and str(error) == "cyclic market bar cache wait detected"
+        for error in errors
+    )
+    assert cache._inflight == {}
+    assert cache._waiting_for_owner == {}
+
+
+def _release_stuck_market_cache_waiters(cache: MarketBarsCache) -> None:
+    """Release an old deadlocking implementation so a RED run can terminate."""
+    with cache._lock:
+        futures = [future for future, _owner in cache._inflight.values()]
+    for future in futures:
+        if not future.done():
+            future.set_exception(RuntimeError("test cleanup for deadlocked cache"))
 
 
 class RecordingPriceService:
@@ -1137,8 +1269,8 @@ def test_builtin_registration_accepts_equivalent_new_market_cache() -> None:
     assert registry.registered_references() == ("return_20d_v1@2.1.0",)
 
 
-def test_builtin_registration_rejects_changed_market_cache_configuration() -> None:
-    """Changing the shared history contract must remain runtime-visible."""
+def test_builtin_registration_ignores_changed_market_cache_configuration() -> None:
+    """Cache lookback changes performance only and must not change factor identity."""
     service = RecordingPriceService(_bars(_SSE, [10.0]))
     registry = FactorRegistry()
     first_cache = MarketBarsCache(service, [_SSE], max_lookback_sessions=120)
@@ -1148,11 +1280,23 @@ def test_builtin_registration_rejects_changed_market_cache_configuration() -> No
         ReturnFactor(service, [_SSE], 20, market_bars=first_cache),
     )
 
-    with pytest.raises(ValueError, match="conflicting built-in runtime dependencies"):
-        register_builtin(
-            registry,
-            ReturnFactor(service, [_SSE], 20, market_bars=changed_cache),
-        )
+    register_builtin(
+        registry,
+        ReturnFactor(service, [_SSE], 20, market_bars=changed_cache),
+    )
+
+    assert registry.registered_references() == ("return_20d_v1@2.1.0",)
+
+
+def test_builtin_registration_accepts_default_factor_after_pooled_factor() -> None:
+    """Cache presence is a performance choice, not a semantic dependency."""
+    service = RecordingPriceService(_bars(_SSE, [10.0]))
+    registry = FactorRegistry()
+
+    register_etf_factors(registry, service, [_SSE])
+    register_builtin(registry, ReturnFactor(service, [_SSE], 20))
+
+    assert registry.registered_references().count("return_20d_v1@2.1.0") == 1
 
 
 @pytest.mark.parametrize("window", [0, -1, 21, 59, 61, 119, 121, True])
