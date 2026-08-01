@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
@@ -150,6 +151,9 @@ def test_fake_tushare_runs_through_same_pipeline_and_canonical_contract(
         mapper=FakeTushareCanonicalMapper(),
     )
     tushare = tushare_pipeline.bootstrap()
+    expected_baostock_available = datetime(
+        2026, 1, 5, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    ).astimezone(UTC)
 
     for dataset in (
         DatasetKind.INSTRUMENT,
@@ -190,7 +194,7 @@ def test_fake_tushare_runs_through_same_pipeline_and_canonical_contract(
             )
             assert bao_audit.select("available_at", "availability_source").rows() == [
                 (
-                    datetime(2026, 1, 5, 7, tzinfo=UTC),
+                    expected_baostock_available,
                     "MARKET_CLOSE_DERIVED",
                 )
             ]
