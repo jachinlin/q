@@ -470,7 +470,18 @@ selected_batches = client.fetch_daily_bars(
 | source/source_version | Utf8 |
 | available_at/ingested_at | Datetime[UTC] |
 
-交易模拟使用未复权 OHLC；信号计算通过统一价格服务请求指定复权口径。策略不得自行拼接复权因子。
+交易模拟使用未复权 OHLC；策略不得自行拼接复权因子。
+
+#### 研究价格口径
+
+ETF 与股票的市场行情因子在 MVP 统一使用 BaoStock 原始 `close/preclose`
+推导的涨跌幅前复权价格。前复权以每个信号日独立锚定：只使用该信号日
+及此前可见的日线，避免后续跳变改变既有信号。该口径只调整
+`open/high/low/close/preclose`；`volume` 与 `amount` 保持供应商原始值。
+
+`BACKWARD` 保留为兼容接口，不是 MVP 市场因子的默认研究口径。公司行动
+数据仍是现金精确会计与财务能力门禁的后续生产要求；它不再是 BaoStock
+市场因子生成前复权价格的前置数据集。
 
 ### 8.3 `security_status`
 

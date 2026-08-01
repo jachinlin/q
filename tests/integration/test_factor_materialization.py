@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,7 @@ import polars as pl
 from quant_core.data.adjustments import AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorEngine, FactorRegistry, FeatureCache
-from quant_core.factors.builtin import register_stock_factors
+from quant_core.factors.builtin import register_etf_factors, register_stock_factors
 
 _ID = InstrumentId.parse("SSE:600000")
 
@@ -144,6 +145,47 @@ def test_second_identical_materialization_hits_cache_without_provider_or_rewrite
     assert bars.calls > calls[0]
     assert financials.calls > calls[1]
     assert all(third[key].cache_key != first[key].cache_key for key in first)
+
+
+def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
+    tmp_path: Path,
+) -> None:
+    """Changing a market factor back to BACKWARD must miss this cache contract."""
+    bars = CountingBars()
+    registry = FactorRegistry()
+    register_etf_factors(registry, bars, [_ID])
+    cache = FeatureCache(tmp_path / "features")
+    engine = FactorEngine(registry, cache)
+    day = bars.frame["trade_date"][-1]
+    ctx = FactorContext(
+        SnapshotId.parse("00000000-0000-0000-0000-000000000078"), "c" * 64, day, day
+    )
+    requested = (
+        "return_20d_v1",
+        "return_60d_v1",
+        "return_120d_v1",
+        "trend_120d_v1",
+        "volatility_60d_v1",
+    )
+
+    first = engine.compute(requested, ctx)
+    cache_state = _cache_state(cache.root)
+    calls = bars.calls
+    second = engine.compute(requested, ctx)
+
+    assert set(first) == {f"{factor_id}@1.0.0" for factor_id in requested}
+    assert bars.calls == calls
+    assert _cache_state(cache.root) == cache_state
+    assert {key: artifact.content_hash for key, artifact in second.items()} == {
+        key: artifact.content_hash for key, artifact in first.items()
+    }
+    assert all(
+        json.loads((cache.root / artifact.cache_key / "manifest.json").read_text())[
+            "parameters"
+        ]["adjustment_mode"]
+        == AdjustmentMode.FORWARD.value
+        for artifact in first.values()
+    )
 
 
 def _cache_state(root: Path) -> dict[str, tuple[int, int, int]]:
