@@ -66,9 +66,10 @@ def trading_signal_dates(
         raise ValueError("trade calendar missing required columns")
     if frame["trade_date"].is_duplicated().any():
         raise ValueError("duplicate trade calendar date")
-    days = frame.filter(pl.col("is_trading_day"))["trade_date"].to_list()
-    if any(type(day) is not date or day < start or day > end for day in days):
+    calendar_dates = frame["trade_date"].to_list()
+    if any(type(day) is not date or day < start or day > end for day in calendar_dates):
         raise ValueError("trade calendar date is outside requested range")
+    days = frame.filter(pl.col("is_trading_day"))["trade_date"].to_list()
     return tuple(sorted(days))
 
 

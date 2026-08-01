@@ -511,3 +511,44 @@ def test_transforms_reject_boolean_values_and_invalid_mad_multiplier() -> None:
         winsorize_mad(boolean_values, "value", ["group"])
     with pytest.raises(ValueError, match="n_mad"):
         winsorize_mad(numeric_values, "value", ["group"], n_mad=0.0)
+
+
+def test_winsorize_mad_rejects_huge_integer_multiplier_with_value_error() -> None:
+    """Converting an arbitrarily large integer multiplier must not leak OverflowError."""
+    source = _frame(group=["a", "a", "a"], value=[1.0, 2.0, 3.0])
+
+    with pytest.raises(ValueError, match="n_mad"):
+        winsorize_mad(source, "value", ["group"], n_mad=10**400)
+
+
+@pytest.mark.parametrize("transform", [winsorize_mad, zscore])
+def test_group_transforms_reject_nested_polars_group_dtype_stably(
+    transform: object,
+) -> None:
+    """Nested keys are unhashable, so grouping must fail predictably before execution."""
+    source = pl.DataFrame(
+        {"group": [["a"], ["a"], ["a"]], "value": [1.0, 2.0, 3.0]},
+        schema={"group": pl.List(pl.String), "value": pl.Float64},
+    )
+
+    with pytest.raises(ValueError, match="unsupported group dtype"):
+        transform(source, "value", ["group"])  # type: ignore[operator]
+
+
+def test_neutralize_wls_rejects_nested_industry_dtype_stably() -> None:
+    """Nested industry labels cannot define deterministic WLS dummy columns."""
+    source = pl.DataFrame(
+        {
+            "industry": [["A"], ["A"], ["A"], ["A"]],
+            "size": [1.0, 2.0, 3.0, 4.0],
+            "value": [1.0, 2.0, 3.0, 4.0],
+        },
+        schema={
+            "industry": pl.List(pl.String),
+            "size": pl.Float64,
+            "value": pl.Float64,
+        },
+    )
+
+    with pytest.raises(ValueError, match="unsupported industry dtype"):
+        neutralize_wls(source, "value", "industry", "size")

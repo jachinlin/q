@@ -37,8 +37,8 @@ def winsorize_mad(
     """Clip finite valid values by each group's median absolute deviation."""
     _validate_frame(frame)
     groups = _validate_columns(frame, value_col, group_cols)
-    if type(n_mad) not in {int, float} or not math.isfinite(n_mad) or n_mad <= 0:
-        raise ValueError("n_mad must be a positive finite number")
+    _validate_group_dtypes(frame, groups)
+    multiplier = _validated_mad_multiplier(n_mad)
     state = _initial_state(frame, value_col)
     grouped = _candidate_groups(frame, groups, state.valid)
     for indices in grouped.values():
@@ -54,8 +54,8 @@ def winsorize_mad(
         mad = _median([abs(value - median) for value in scaled_values])
         if mad == 0.0:
             continue
-        lower = median - float(n_mad) * mad
-        upper = median + float(n_mad) * mad
+        lower = median - multiplier * mad
+        upper = median + multiplier * mad
         for index in indices:
             bounded = min(max(state.values[index] / scale, lower), upper)
             state.values[index] = bounded * scale
@@ -72,7 +72,9 @@ def neutralize_wls(
     _validate_frame(frame)
     _validate_columns(frame, value_col, (industry_col, size_col))
     if frame.schema[industry_col] != pl.String:
-        raise TypeError("industry column must have String dtype")
+        raise ValueError(
+            "unsupported industry dtype; industry column must have String dtype"
+        )
     _require_numeric_column(frame, size_col)
     state = _initial_state(frame, value_col)
     industries = frame[industry_col].to_list()
@@ -168,6 +170,7 @@ def zscore(
     """Standardize finite valid values within each group using population variance."""
     _validate_frame(frame)
     groups = _validate_columns(frame, value_col, group_cols)
+    _validate_group_dtypes(frame, groups)
     state = _initial_state(frame, value_col)
     grouped = _candidate_groups(frame, groups, state.valid)
     for indices in grouped.values():
@@ -234,6 +237,26 @@ def _require_numeric_column(frame: pl.DataFrame, name: str) -> None:
     dtype = frame.schema[name]
     if dtype == pl.Boolean or not dtype.is_numeric():
         raise TypeError(f"{name} must have a numeric dtype")
+
+
+def _validate_group_dtypes(frame: pl.DataFrame, group_cols: Sequence[str]) -> None:
+    """Reject nested/object group keys before Python grouping can raise TypeError."""
+    for name in group_cols:
+        dtype = frame.schema[name]
+        if dtype.is_nested() or dtype.is_object():
+            raise ValueError(f"unsupported group dtype: {name}")
+
+
+def _validated_mad_multiplier(n_mad: float) -> float:
+    if type(n_mad) not in {int, float}:
+        raise ValueError("n_mad must be a positive finite number")
+    try:
+        multiplier = float(n_mad)
+    except OverflowError as error:
+        raise ValueError("n_mad must be a positive finite number") from error
+    if not math.isfinite(multiplier) or multiplier <= 0.0:
+        raise ValueError("n_mad must be a positive finite number")
+    return multiplier
 
 
 def _initial_state(frame: pl.DataFrame, value_col: str) -> _TransformState:

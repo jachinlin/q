@@ -18,6 +18,7 @@ from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorRegistry
 from quant_core.factors.base import factor_table_content_hash
 from quant_core.factors.builtin import register_etf_factors, register_stock_factors
+from quant_core.factors.builtin._stock_common import trading_signal_dates
 from quant_core.factors.builtin.auxiliary import (
     AvgAmount20dFactor,
     IndustryCodePitFactor,
@@ -144,6 +145,22 @@ class Financials:
         if ids is not None:
             result = result.filter(pl.col("instrument_id").is_in(ids))
         return result.lazy()
+
+
+class CalendarRows:
+    """Calendar fixture that deliberately returns the provider's full response."""
+
+    def __init__(self, rows: dict[str, object]) -> None:
+        self._rows = rows
+
+    def trade_calendar(
+        self, snapshot_id: SnapshotId, start: date, end: date
+    ) -> pl.LazyFrame:
+        del snapshot_id, start, end
+        return pl.DataFrame(
+            self._rows,
+            schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
+        ).lazy()
 
 
 class PitValues:
@@ -688,6 +705,20 @@ def test_log_market_cap_uses_only_explicit_open_sessions() -> None:
     )
 
     assert result["trade_date"].to_list() == [friday, monday]
+
+
+def test_trading_signal_dates_rejects_out_of_range_closed_calendar_rows() -> None:
+    """Filtering closed rows before range validation would hide corrupt calendars."""
+    start, end = date(2024, 4, 26), date(2024, 4, 29)
+    provider = CalendarRows(
+        {
+            "trade_date": [end, start, date(2024, 4, 25)],
+            "is_trading_day": [True, True, False],
+        }
+    )
+
+    with pytest.raises(ValueError, match="outside requested range"):
+        trading_signal_dates(provider, _SNAPSHOT, start, end)
 
 
 def test_industry_codes_accept_finite_zero_and_negative_taxonomy_values() -> None:
