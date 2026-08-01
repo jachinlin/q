@@ -69,7 +69,7 @@ def test_offline_snapshot_matches_reviewed_semantic_golden(tmp_path: Path) -> No
         "datasets": {
             "daily_bar": [
                 {
-                    "content_hash": "8ef704e8a370435496f9cfee02ddf25ea5a71eec8572b03001e59361e8ebc32b",
+                    "content_hash": "adc14f3976c2e5115caea860ad64512aa9dcbcf53d719edbcfcb58707ef77772",
                     "row_count": 1,
                     "schema_fingerprint": "4f88a3e7656118b465f367201267313600780ab400de7a7d8fe83cc62dfbac9d",
                 }
@@ -83,7 +83,7 @@ def test_offline_snapshot_matches_reviewed_semantic_golden(tmp_path: Path) -> No
             ],
             "security_status": [
                 {
-                    "content_hash": "814008fd72f208028a8f0de30455bfe1f277e448ad9d98a7360a577f526d615f",
+                    "content_hash": "62ee780f3fbabe3dd5c73ddd3411fd8bbc7f1272d51176d6d82d01e09fe6cc1f",
                     "row_count": 1,
                     "schema_fingerprint": "02e735b0f16037e00075435ee2dc04d4cb74bd227fbf7403716e2cfc8c2cec3a",
                 }
@@ -99,5 +99,5 @@ def test_offline_snapshot_matches_reviewed_semantic_golden(tmp_path: Path) -> No
     }
     assert (
         semantic_hash
-        == "b04beb053b3569d20c739b946de735ce58d9dde361416783baaff26fa0ca900d"
+        == "48446d95f2c84347e5fe9b3da25044fea027cd1fe52e389f2b209b167f9879d3"
     )

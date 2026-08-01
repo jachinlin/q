@@ -165,11 +165,38 @@ def test_fake_tushare_runs_through_same_pipeline_and_canonical_contract(
         )
         bao_frame = pl.concat(
             bao_pipeline._curated_store.read_version(bao_version)
-        ).drop("source", "source_version", "ingested_at")
+        ).drop(
+            "source",
+            "source_version",
+            "available_at",
+            "availability_source",
+            "ingested_at",
+        )
         tushare_frame = pl.concat(
             tushare_pipeline._curated_store.read_version(tushare_version)
-        ).drop("source", "source_version", "ingested_at")
+        ).drop(
+            "source",
+            "source_version",
+            "available_at",
+            "availability_source",
+            "ingested_at",
+        )
         assert tushare_frame.equals(bao_frame)
+
+        if dataset in {DatasetKind.DAILY_BAR, DatasetKind.SECURITY_STATUS}:
+            bao_audit = pl.concat(bao_pipeline._curated_store.read_version(bao_version))
+            tushare_audit = pl.concat(
+                tushare_pipeline._curated_store.read_version(tushare_version)
+            )
+            assert bao_audit.select("available_at", "availability_source").rows() == [
+                (
+                    datetime(2026, 1, 5, 7, tzinfo=UTC),
+                    "MARKET_CLOSE_DERIVED",
+                )
+            ]
+            assert tushare_audit.select(
+                "available_at", "availability_source"
+            ).rows() == [(datetime(2026, 1, 6, tzinfo=UTC), "RAW_RETRIEVED_AT")]
 
     manifest = json.loads(
         tushare_repository.get_snapshot(tushare.snapshot_id).manifest_path.read_text(
