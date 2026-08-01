@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+import shutil
+import stat
+import tempfile
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Never, Protocol, cast
@@ -127,12 +132,16 @@ class SnapshotResearchRepository:
             if instrument_ids
             else pl.lit(False)
         )
+        leases = tuple(
+            _SnapshotPartitionLease(partition.path) for partition in record.partitions
+        )
         return (
-            pl.scan_parquet([partition.path for partition in record.partitions])
+            pl.scan_parquet([lease.path for lease in leases])
             .select(list(definition.columns))
             .filter(scope & pl.col("trade_date").is_between(start, end, closed="both"))
             .cast(definition.columns)
             .sort(list(definition.sort_key))
+            .map_batches(_verify_partition_leases(leases))
         )
 
     def financials_as_of(
@@ -354,6 +363,129 @@ def _validate_catalog_partition_identities(
             )
         paths.add(path)
         content_hashes.add(partition.content_hash)
+
+
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    """Stable file identity needed to keep a lazy scan snapshot-bound."""
+
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    link_count: int
+
+    def same_content_file(self, other: _FileIdentity) -> bool:
+        """Ignore the expected source-to-lease hard-link count transition."""
+        return (
+            self.device,
+            self.inode,
+            self.size,
+            self.modified_ns,
+            self.changed_ns,
+        ) == (
+            other.device,
+            other.inode,
+            other.size,
+            other.modified_ns,
+            other.changed_ns,
+        )
+
+
+class _SnapshotPartitionLease:
+    """Own one immutable scan input for the lifetime of a lazy daily-bar plan."""
+
+    def __init__(self, source: Path) -> None:
+        self._source = source.resolve()
+        source_identity = _capture_regular_file_identity(self._source)
+        if source_identity.link_count != 1:
+            raise ValueError("published partition must not have additional hard links")
+        self._directory = tempfile.TemporaryDirectory(
+            prefix=".snapshot-scan-", dir=str(self._source.parent)
+        )
+        self.path = Path(self._directory.name) / "partition.parquet"
+        try:
+            self._link_or_copy(source_identity)
+        except BaseException:
+            self._directory.cleanup()
+            raise
+
+    def verify(self) -> None:
+        """Fail closed if the owned scan input changed while Polars executed."""
+        observed = _capture_regular_file_identity(self.path)
+        if not self._identity.same_content_file(observed):
+            raise QuantError(
+                ErrorDetail(
+                    code="SNAPSHOT_PARTITION_IDENTITY_CHANGED",
+                    severity=Severity.FATAL,
+                    message="published partition identity changed during lazy scan",
+                    context={"path": self._source.as_posix()},
+                    remediation="retry from the published immutable snapshot",
+                    retryable=True,
+                )
+            )
+        if observed.link_count not in {1, self._expected_link_count}:
+            raise QuantError(
+                ErrorDetail(
+                    code="SNAPSHOT_PARTITION_IDENTITY_CHANGED",
+                    severity=Severity.FATAL,
+                    message="published partition gained an unexpected hard link",
+                    context={"path": self._source.as_posix()},
+                    remediation="retry from the published immutable snapshot",
+                    retryable=True,
+                )
+            )
+
+    def _link_or_copy(self, source_identity: _FileIdentity) -> None:
+        try:
+            os.link(self._source, self.path)
+            copied = False
+        except OSError:
+            shutil.copyfile(self._source, self.path)
+            copied = True
+        after = _capture_regular_file_identity(self._source)
+        if not source_identity.same_content_file(after):
+            raise ValueError("published partition identity changed while leasing")
+        self._identity = _capture_regular_file_identity(self.path)
+        if copied:
+            self._expected_link_count = 1
+            return
+        if not source_identity.same_content_file(self._identity):
+            raise ValueError("published partition lease identity does not match source")
+        self._expected_link_count = 2
+
+
+def _verify_partition_leases(
+    leases: tuple[_SnapshotPartitionLease, ...],
+) -> Callable[[pl.DataFrame], pl.DataFrame]:
+    """Retain leases in the query closure and validate after the lazy scan reads."""
+
+    def verify(frame: pl.DataFrame) -> pl.DataFrame:
+        for lease in leases:
+            lease.verify()
+        return frame
+
+    return verify
+
+
+def _capture_regular_file_identity(path: Path) -> _FileIdentity:
+    """Reject indirection and return portable replace/delete detection metadata."""
+    try:
+        observed = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("published partition is unavailable") from error
+    reparse_point = getattr(observed, "st_file_attributes", 0) & 0x400
+    if path.is_symlink() or reparse_point or not stat.S_ISREG(observed.st_mode):
+        raise ValueError("published partition must be a regular non-link file")
+    return _FileIdentity(
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        size=observed.st_size,
+        modified_ns=observed.st_mtime_ns,
+        changed_ns=observed.st_ctime_ns,
+        link_count=observed.st_nlink,
+    )
 
 
 def _raise_snapshot_not_published(snapshot_id: SnapshotId) -> Never:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -141,6 +142,104 @@ def test_bars_remain_a_lazy_parquet_scan_until_the_consumer_collects(
     )
 
     assert result["trade_date"].to_list() == [date(2024, 4, 28), date(2024, 4, 29)]
+
+
+def test_bars_never_follows_a_partition_replaced_between_lazy_plan_and_collect(
+    tmp_path: Path,
+) -> None:
+    """A lazy plan must not silently follow a replaced published partition."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    record = catalog.get_dataset_version(
+        catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions["daily_bar"]
+    )
+    path = record.partitions[0].path
+    planned = SnapshotResearchRepository(catalog).bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+    replacement = path.with_name("bars-replacement.parquet")
+    pl.read_parquet(path).with_columns(pl.lit(999.0).alias("close")).write_parquet(
+        replacement
+    )
+    replacement.replace(path)
+
+    assert planned.collect()["close"].to_list() == [10.0, 11.0]
+
+
+def test_bars_plan_keeps_predicates_pushed_to_the_parquet_scan(tmp_path: Path) -> None:
+    """Snapshot integrity fencing must not force an eager or unfiltered read."""
+    fixture = point_in_time_fixture(tmp_path)
+
+    plan = (
+        SnapshotResearchRepository(fixture.repository)
+        .bars(
+            fixture.early_snapshot_id,
+            [InstrumentId.parse("SSE:600000")],
+            date(2024, 4, 28),
+            date(2024, 4, 28),
+        )
+        .explain(optimized=True)
+    )
+
+    assert "Parquet SCAN" in plan
+    assert "SELECTION:" in plan
+    assert "2024-04-28" in plan
+
+
+def test_bars_remains_bound_when_the_source_partition_is_deleted(
+    tmp_path: Path,
+) -> None:
+    """The scan lease owns its input instead of depending on the catalog pathname."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    path = (
+        catalog.get_dataset_version(
+            catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+                "daily_bar"
+            ]
+        )
+        .partitions[0]
+        .path
+    )
+    planned = SnapshotResearchRepository(catalog).bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+    path.unlink()
+
+    assert planned.collect()["close"].to_list() == [10.0, 11.0]
+
+
+def test_bars_rejects_an_extra_hard_link_to_its_owned_scan_input(
+    tmp_path: Path,
+) -> None:
+    """A third link would permit an untracked writer to mutate a leased input."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    path = (
+        catalog.get_dataset_version(
+            catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+                "daily_bar"
+            ]
+        )
+        .partitions[0]
+        .path
+    )
+    planned = SnapshotResearchRepository(catalog).bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+    os.link(path, path.with_name("untracked-bars-link.parquet"))
+
+    with pytest.raises(Exception, match="unexpected hard link"):
+        planned.collect()
 
 
 def test_corporate_actions_as_of_excludes_actions_available_after_shanghai_close(
