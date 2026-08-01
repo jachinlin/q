@@ -17,6 +17,7 @@ from quant_core.data.repository import ResearchDataRepository
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 
 _INT64_MAX = 2**63 - 1
+FORWARD_LOG_RETURN_COLUMN = "forward_log_return"
 FORWARD_RETURN_INDEX_COLUMN = "forward_return_index"
 _FORWARD_PRICE_COLUMNS = ("open", "high", "low", "close", "preclose")
 ADJUSTMENT_EVENT_COMPONENTS_DTYPE = pl.List(
@@ -216,7 +217,8 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
     if ordered.is_empty():
         return (
             ordered.with_columns(
-                pl.Series(FORWARD_RETURN_INDEX_COLUMN, [], dtype=pl.Float64)
+                pl.Series(FORWARD_LOG_RETURN_COLUMN, [], dtype=pl.Float64),
+                pl.Series(FORWARD_RETURN_INDEX_COLUMN, [], dtype=pl.Float64),
             ),
             [],
         )
@@ -234,6 +236,11 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
         .then(pl.col("close"))
         .otherwise(pl.col("close") / pl.col("preclose"))
         .alias("_forward_return_ratio"),
+        pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
+        .then(pl.lit(None, dtype=pl.Float64))
+        .otherwise((pl.col("close") / pl.col("preclose")).log())
+        .cast(pl.Float64)
+        .alias(FORWARD_LOG_RETURN_COLUMN),
     ).with_columns(
         pl.col("_forward_log_ratio")
         .reverse()
@@ -256,6 +263,9 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
     return_index = pl.col(FORWARD_RETURN_INDEX_COLUMN)
     if _has_any(calculated, ~return_index.is_finite() | (return_index <= 0)):
         raise ValueError("forward return index must be finite and positive")
+    log_return = pl.col(FORWARD_LOG_RETURN_COLUMN)
+    if _has_any(calculated, log_return.is_not_null() & ~log_return.is_finite()):
+        raise ValueError("forward log return must be finite when non-null")
 
     filtered = calculated.filter(pl.col("trade_date") <= end)
     filtered_factors = cast(list[float], filtered["_forward_factor"].to_list())

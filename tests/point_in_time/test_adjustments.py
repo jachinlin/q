@@ -14,6 +14,7 @@ import pytest
 
 from quant_core.data.adjustments import (
     ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+    FORWARD_LOG_RETURN_COLUMN,
     AdjustmentMode,
     PriceAdjustmentService,
     _forward_adjust,
@@ -150,6 +151,26 @@ def test_raw_mode_preserves_raw_ohlcv_values(tmp_path: Path) -> None:
     assert result["adjustment_as_of"].to_list() == [_DAYS[-1]] * 5
 
 
+def test_raw_and_backward_modes_do_not_expose_forward_log_returns(
+    tmp_path: Path,
+) -> None:
+    """The row-local return contract belongs only to FORWARD research reads."""
+    fixture = _adjustment_fixture(tmp_path, [])
+    service = PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+
+    for mode in (AdjustmentMode.RAW, AdjustmentMode.BACKWARD):
+        result = service.bars(
+            fixture.snapshot_id,
+            [_INSTRUMENT],
+            _DAYS[0],
+            _DAYS[-1],
+            mode,
+            _DAYS[-1],
+        ).collect()
+
+        assert FORWARD_LOG_RETURN_COLUMN not in result.columns
+
+
 def test_forward_adjustment_uses_baostock_preclose_without_action_dataset(
     tmp_path: Path,
 ) -> None:
@@ -205,6 +226,12 @@ def test_forward_adjustment_uses_baostock_preclose_without_action_dataset(
     assert result["adjustment_event_components"].to_list() == [[], [], []]
     assert result.schema["forward_return_index"] == pl.Float64
     assert result["forward_return_index"].to_list() == pytest.approx([10.0, 12.0, 12.6])
+    assert result.schema[FORWARD_LOG_RETURN_COLUMN] == pl.Float64
+    assert result[FORWARD_LOG_RETURN_COLUMN].to_list() == [
+        None,
+        log(12.0 / 10.0),
+        log(8.4 / 8.0),
+    ]
 
 
 def test_forward_adjustment_sorts_and_isolates_instruments() -> None:
@@ -306,8 +333,11 @@ def test_forward_adjustment_empty_bars_preserves_schema() -> None:
 
     result, factors = _forward_adjust(frame, _DAYS[-1])
 
-    assert result.drop("forward_return_index").schema == frame.schema
+    assert result.drop("forward_return_index", FORWARD_LOG_RETURN_COLUMN).schema == (
+        frame.schema
+    )
     assert result.schema["forward_return_index"] == pl.Float64
+    assert result.schema[FORWARD_LOG_RETURN_COLUMN] == pl.Float64
     assert result.is_empty()
     assert factors == []
 
@@ -364,6 +394,8 @@ def test_forward_adjustment_accepts_valid_first_preclose(
     )
 
     assert result["preclose"].item(0) == first_preclose
+    expected_log_return = None if not first_preclose else log(10.0 / first_preclose)
+    assert result[FORWARD_LOG_RETURN_COLUMN].item(0) == expected_log_return
 
 
 @pytest.mark.parametrize("column", ["open", "high", "low"])
@@ -478,6 +510,136 @@ def test_forward_adjustment_rejects_forward_return_index_underflow_to_zero() -> 
         _forward_adjust(frame, _DAYS[1])
 
 
+@pytest.mark.parametrize(
+    ("close", "preclose"),
+    [
+        (1e308, 1e-308),
+        (float.fromhex("0x0.0000000000001p-1022"), 1e308),
+    ],
+)
+def test_forward_adjustment_rejects_nonfinite_row_log_return(
+    close: float, preclose: float
+) -> None:
+    """Finite positive inputs must fail if their direct ratio log is non-finite."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], close, preclose),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="forward log return must be finite"):
+        _forward_adjust(frame, _DAYS[0])
+
+
+def test_forward_log_return_uses_raw_prices_before_adjustment() -> None:
+    """Deriving the row return from rounded adjusted prices changes its bytes."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 100.0, 0.0),
+            ("SSE:600000", _DAYS[1], 101.0, 100.0),
+            ("SSE:600000", _DAYS[2], 102.0, 101.0),
+            ("SSE:600000", _DAYS[3], 103.0, 0.7 * 102.0),
+        ]
+    )
+
+    result, factors = _forward_adjust(frame, _DAYS[3])
+
+    expected = 0.009950330853168092
+    adjusted_derived = log(
+        (frame["close"].item(1) * factors[1]) / (frame["preclose"].item(1) * factors[1])
+    )
+    assert result[FORWARD_LOG_RETURN_COLUMN].item(1) == expected
+    assert adjusted_derived != expected
+
+
+def test_forward_log_return_is_not_reconstructed_from_return_index() -> None:
+    """Cumulative-index division introduces a different rounding path."""
+    start = date(2024, 1, 1)
+    close_preclose = [
+        (417.2032526727958, 0.0),
+        (11.159000287611292, 63.693106442399056),
+        (825.3813027444894, 649.1346331055908),
+        (299.3412153443932, 973.2343656088159),
+        (369.0432777989872, 142.6340933148375),
+        (194.46768769602917, 559.5773370292396),
+        (566.4421605601324, 897.9650208542995),
+        (162.52613610543884, 264.49172948091484),
+        (125.14261739924663, 210.79839988840118),
+        (433.503331741906, 718.0093727295953),
+        (562.516409587767, 794.5188785368044),
+    ]
+    frame = _forward_frame(
+        [
+            ("SSE:600000", start + timedelta(days=index), close, preclose)
+            for index, (close, preclose) in enumerate(close_preclose)
+        ]
+    )
+
+    result, _ = _forward_adjust(frame, start + timedelta(days=10))
+
+    expected = -0.3453164409724669
+    index_derived = log(
+        result["forward_return_index"].item(10) / result["forward_return_index"].item(9)
+    )
+    assert result[FORWARD_LOG_RETURN_COLUMN].item(10) == expected
+    assert index_derived != expected
+
+
+def test_forward_log_return_is_byte_stable_across_request_starts() -> None:
+    """Overlapping raw rows must have identical returns across request starts."""
+    start = date(2024, 1, 7)
+    frame = _forward_frame(
+        [
+            ("SSE:600001", start + timedelta(days=3), 203.0, 0.7 * 201.0),
+            ("SSE:600000", start, 102.87106291432033, 0.0),
+            ("SSE:600001", start + timedelta(days=1), 199.0, 140.0),
+            (
+                "SSE:600000",
+                start + timedelta(days=1),
+                101.65705717852148,
+                72.00974404002423,
+            ),
+            ("SSE:600001", start, 200.0, None),
+            (
+                "SSE:600000",
+                start + timedelta(days=3),
+                103.0,
+                0.7 * 101.51431209232835,
+            ),
+            ("SSE:600001", start + timedelta(days=2), 201.0, 199.0),
+            (
+                "SSE:600000",
+                start + timedelta(days=2),
+                101.51431209232835,
+                101.65705717852148,
+            ),
+        ]
+    )
+    later_start = start + timedelta(days=1)
+
+    full, _ = _forward_adjust(frame, start + timedelta(days=3))
+    later, _ = _forward_adjust(
+        frame.filter(pl.col("trade_date") >= later_start),
+        start + timedelta(days=3),
+    )
+    overlap = full.filter(pl.col("trade_date") >= later_start)
+
+    assert later.schema[FORWARD_LOG_RETURN_COLUMN] == pl.Float64
+    assert later[FORWARD_LOG_RETURN_COLUMN].null_count() == 0
+    assert (
+        overlap[FORWARD_LOG_RETURN_COLUMN].to_numpy().tobytes()
+        == later[FORWARD_LOG_RETURN_COLUMN].to_numpy().tobytes()
+    )
+    assert later[FORWARD_LOG_RETURN_COLUMN].to_list() == [
+        log(101.65705717852148 / 72.00974404002423),
+        log(101.51431209232835 / 101.65705717852148),
+        log(103.0 / (0.7 * 101.51431209232835)),
+        log(199.0 / 140.0),
+        log(201.0 / 199.0),
+        log(203.0 / (0.7 * 201.0)),
+    ]
+
+
 def test_forward_return_index_is_byte_stable_after_nonbinary_future_jumps() -> None:
     """A 0.7 future jump must not change any earlier research-price bytes."""
     prefix = _forward_frame(
@@ -507,6 +669,12 @@ def test_forward_return_index_is_byte_stable_after_nonbinary_future_jumps() -> N
     assert (
         short["forward_return_index"].to_numpy().tobytes()
         == extended["forward_return_index"].to_numpy().tobytes()
+    )
+    assert short[FORWARD_LOG_RETURN_COLUMN].item(0) is None
+    assert extended[FORWARD_LOG_RETURN_COLUMN].item(0) is None
+    assert (
+        short[FORWARD_LOG_RETURN_COLUMN].slice(1).to_numpy().tobytes()
+        == extended[FORWARD_LOG_RETURN_COLUMN].slice(1).to_numpy().tobytes()
     )
 
 
@@ -551,6 +719,7 @@ def test_forward_adjustment_uses_vectorized_path_at_research_scale() -> None:
     assert result.height == row_count
     assert len(factors) == row_count
     assert result["forward_return_index"].is_finite().all()
+    assert result[FORWARD_LOG_RETURN_COLUMN].drop_nulls().is_finite().all()
 
 
 @pytest.mark.parametrize(
