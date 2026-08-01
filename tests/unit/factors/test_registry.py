@@ -13,6 +13,10 @@ import pytest
 from quant_core.data.contracts import JsonValue
 from quant_core.domain.identifiers import SnapshotId
 from quant_core.factors import FactorContext, FactorRegistry, FactorSpec
+from quant_core.factors.builtin.code_hash import (
+    _hash_source_bundle,
+    builtin_source_hash,
+)
 
 
 class StubFactor:
@@ -259,3 +263,24 @@ def test_registry_snapshots_the_immutable_spec_at_registration() -> None:
 
     assert registry.resolve("momentum") == "momentum@1.0.0"
     assert registry.spec("momentum@1.0.0").canonical_ref == "momentum@1.0.0"
+
+
+def test_builtin_source_hash_is_deterministic_and_sensitive_to_source_and_spec() -> (
+    None
+):
+    spec = make_spec("builtin", parameters={"mode": "FORWARD"})
+    sources = {"quant_core/data/adjustments.py": b"a", "builtin/momentum.py": b"b"}
+
+    baseline = _hash_source_bundle(spec, sources)
+
+    assert baseline == _hash_source_bundle(spec, dict(sources))
+    assert baseline != _hash_source_bundle(
+        spec, {**sources, "quant_core/data/adjustments.py": b"A"}
+    )
+    assert baseline != _hash_source_bundle(
+        spec, {**sources, "builtin/momentum.py": b"B"}
+    )
+    assert baseline != _hash_source_bundle(
+        make_spec("builtin", parameters={"mode": "BACKWARD"}), sources
+    )
+    assert len(builtin_source_hash(spec)) == 64

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 
 from quant_core.domain.identifiers import InstrumentId
@@ -14,6 +13,7 @@ from quant_core.factors.builtin.auxiliary import (
     LogMarketCapFactor,
     PitValueProvider,
 )
+from quant_core.factors.builtin.code_hash import builtin_source_hash
 from quant_core.factors.builtin.momentum import (
     AdjustedBarService,
     Momentum12020Factor,
@@ -33,8 +33,19 @@ from quant_core.factors.builtin.risk import (
 from quant_core.factors.builtin.valuation import BookToPriceFactor, EarningsYieldFactor
 from quant_core.factors.registry import FactorRegistry
 
-_IMPLEMENTATION_REVISION = "etf-market-factors:task6:v1.2:2026-08-01"
-_STOCK_IMPLEMENTATION_REVISION = "mvp-stock-factors:task7:v1:2026-08-01"
+
+def register_builtin(registry: FactorRegistry, factor: Factor) -> None:
+    """Register a bundled factor once, rejecting divergent same-ref code."""
+    expected_hash = builtin_source_hash(factor.spec)
+    try:
+        existing_ref = registry.resolve(factor.spec.canonical_ref)
+    except ValueError:
+        registry.register(factor, code_hash=expected_hash)
+        return
+    if registry.code_hash(existing_ref) != expected_hash:
+        raise ValueError(
+            f"conflicting built-in implementation: {factor.spec.canonical_ref}"
+        )
 
 
 def register_etf_factors(
@@ -51,11 +62,7 @@ def register_etf_factors(
         Volatility60dFactor(price_service, instruments),
     )
     for factor in factors:
-        material = (
-            f"{_IMPLEMENTATION_REVISION}|{factor.spec.canonical_ref}|"
-            f"{factor.spec.parameters}"
-        ).encode()
-        registry.register(factor, code_hash=hashlib.sha256(material).hexdigest())
+        register_builtin(registry, factor)
 
 
 def register_stock_factors(
@@ -91,14 +98,7 @@ def register_stock_factors(
         ),
     )
     for factor in factors:
-        try:
-            registry.resolve(factor.spec.canonical_ref)
-        except ValueError:
-            material = (
-                f"{_STOCK_IMPLEMENTATION_REVISION}|{factor.spec.canonical_ref}|"
-                f"{factor.spec.parameters}"
-            ).encode()
-            registry.register(factor, code_hash=hashlib.sha256(material).hexdigest())
+        register_builtin(registry, factor)
 
 
 __all__ = [
@@ -107,6 +107,7 @@ __all__ = [
     "ReturnFactor",
     "Trend120dFactor",
     "Volatility60dFactor",
+    "register_builtin",
     "register_etf_factors",
     "register_stock_factors",
 ]

@@ -1,4 +1,4 @@
-"""Backward-adjusted ETF market risk factors."""
+"""Forward-adjusted ETF market risk factors."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class Volatility60dFactor(_MarketFactor):
                 dependencies=(),
                 direction=-1,
                 parameters={
-                    "adjustment_mode": AdjustmentMode.BACKWARD.value,
+                    "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "annualization_sessions": 252,
                     "ddof": 1,
                     "formula": "std(log(close[t])-log(close[t-1]),ddof=1)*sqrt(252)",
@@ -63,7 +63,7 @@ class DownsideVolatility60dFactor(_MarketFactor):
                 dependencies=(),
                 direction=-1,
                 parameters={
-                    "adjustment_mode": AdjustmentMode.BACKWARD.value,
+                    "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "annualization_sessions": 252,
                     "eligible_for_alpha": True,
                     "formula": "sqrt(mean(min(log_return,0)^2))*sqrt(252)",
@@ -92,7 +92,7 @@ class MaxDrawdown120dFactor(_MarketFactor):
                 dependencies=(),
                 direction=-1,
                 parameters={
-                    "adjustment_mode": AdjustmentMode.BACKWARD.value,
+                    "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
                     "formula": "max(1-close/running_peak)",
                     "window_prices": 120,

@@ -96,7 +96,7 @@ class ActionAwarePriceService:
         mode: AdjustmentMode,
         as_of: date,
     ) -> pl.LazyFrame:
-        assert mode is AdjustmentMode.BACKWARD
+        assert mode is AdjustmentMode.FORWARD
         instrument_ids = [instrument.canonical() for instrument in instruments]
         applicable = [
             action
@@ -357,6 +357,29 @@ def test_invalid_price_anywhere_in_window_invalidates_signal(
     assert result["is_valid"].item() is False
 
 
+@pytest.mark.parametrize("bad_factor", [None, 0.0, -1.0, float("nan"), float("inf")])
+def test_malformed_forward_adjustment_factor_invalidates_signal(
+    bad_factor: float | None,
+) -> None:
+    bars = _bars(_SSE, [10.0 + index for index in range(21)]).with_columns(
+        pl.Series(
+            "adjustment_factor",
+            [1.0] * 10 + [bad_factor] + [1.0] * 10,
+            dtype=pl.Float64,
+        )
+    )
+    day = bars["trade_date"][-1]
+
+    result = (
+        ReturnFactor(RecordingPriceService(bars), [_SSE], 20)
+        .compute(_context(day, day))
+        .collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
+
+
 def test_trend_zero_log_mean_is_invalid() -> None:
     """Dividing a zero normalization mean must not publish infinity or NaN."""
     closes = np.exp(np.linspace(-1.0, 1.0, 120)).tolist()
@@ -389,7 +412,7 @@ def test_windows_are_isolated_by_instrument_and_input_order_is_normalized() -> N
     ]
 
 
-def test_factor_requests_backward_adjusted_history_and_clips_output_scope() -> None:
+def test_factor_requests_forward_adjusted_history_and_clips_output_scope() -> None:
     """Starting at ctx.start or returning warm-up rows would violate window scope."""
     bars = _bars(_SSE, [50.0 + index for index in range(25)])
     start = bars["trade_date"][-2]
@@ -404,7 +427,7 @@ def test_factor_requests_backward_adjusted_history_and_clips_output_scope() -> N
     assert instruments == (_SSE,)
     assert history_start < start
     assert requested_end == end
-    assert mode is AdjustmentMode.BACKWARD
+    assert mode is AdjustmentMode.FORWARD
     assert as_of == end
 
 
@@ -436,7 +459,7 @@ def test_long_trading_gap_falls_back_to_older_observed_sessions() -> None:
     assert service.calls[-1][2] == date.min
 
 
-def test_signal_never_reads_or_changes_from_prices_after_context_end() -> None:
+def test_signal_uses_context_end_as_forward_anchor() -> None:
     """Including a future close would introduce look-ahead into a completed signal."""
     bars = _bars(_SSE, [100.0 + index for index in range(22)])
     signal_day = bars["trade_date"][-2]
@@ -461,6 +484,7 @@ def test_signal_never_reads_or_changes_from_prices_after_context_end() -> None:
 
     assert baseline["value"].item() == changed_future["value"].item()
     assert baseline_service.calls[0][3] == signal_day
+    assert baseline_service.calls[0][5] == signal_day
 
 
 def test_available_at_is_latest_required_input_availability() -> None:
@@ -484,23 +508,37 @@ def test_available_at_is_latest_required_input_availability() -> None:
     assert result["available_at"].item() == delayed
 
 
-@pytest.mark.parametrize("event_offset", [100, 120])
-def test_extending_context_end_does_not_change_earlier_trend(
-    event_offset: int,
-) -> None:
-    """Global end-anchored adjustment would leak a later action into an early trend."""
+def test_unknown_window_availability_invalidates_signal() -> None:
+    bars = _bars(_SSE, [100.0 + index for index in range(21)]).with_columns(
+        pl.when(pl.col("trade_date") == date(2024, 1, 8))
+        .then(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
+        .otherwise(pl.col("available_at"))
+        .alias("available_at")
+    )
+    day = bars["trade_date"][-1]
+
+    result = (
+        ReturnFactor(RecordingPriceService(bars), [_SSE], 20)
+        .compute(_context(day, day))
+        .collect()
+    )
+
+    assert result["available_at"].item() is None
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
+
+
+def test_signal_local_rebase_makes_early_trend_independent_of_later_jump() -> None:
+    """A global forward anchor changes older closes; each signal must rebase locally."""
     closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
     bars = _bars(_SSE, closes)
     signal_day = bars["trade_date"][119]
     extended_end = bars["trade_date"][124]
-    action_available = datetime.combine(
-        bars["trade_date"][120], datetime.min.time(), tzinfo=UTC
-    )
+
     service = ActionAwarePriceService(
         bars,
-        [(bars["trade_date"][event_offset], 0.5, action_available)],
+        [(bars["trade_date"][120], 0.5, datetime(2024, 4, 30, tzinfo=UTC))],
     )
-
     short = (
         Trend120dFactor(service, [_SSE])
         .compute(_context(signal_day, signal_day))
@@ -511,182 +549,10 @@ def test_extending_context_end_does_not_change_earlier_trend(
         .compute(_context(signal_day, extended_end))
         .collect()
     )
-    extended_early = extended.filter(pl.col("trade_date") == signal_day)
 
-    assert extended_early["value"].item() == pytest.approx(short["value"].item())
-    assert extended_early["available_at"].item() == short["available_at"].item()
-
-
-def test_actual_adjustment_action_availability_propagates_to_factor() -> None:
-    """Using only bar timestamps would publish an adjusted signal too early."""
-    closes = np.exp(2.0 + 0.003 * np.arange(120)).tolist()
-    bars = _bars(_SSE, closes).with_columns(
-        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
-    )
-    signal_day = bars["trade_date"][-1]
-    action_available = datetime.combine(
-        signal_day, datetime.min.time(), tzinfo=UTC
-    ) + timedelta(hours=12)
-    service = ActionAwarePriceService(
-        bars,
-        [(signal_day, 0.5, action_available)],
-    )
-
-    result = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(signal_day, signal_day))
-        .collect()
-    )
-
-    assert result["is_valid"].item() is True
-    assert result["available_at"].item() == action_available
-
-
-def test_same_day_partial_known_components_are_anchored_per_signal() -> None:
-    """A max timestamp must not hide the same-day cash component known earlier."""
-    closes = np.exp(3.0 + 0.002 * np.arange(125)).tolist()
-    bars = _bars(_SSE, closes).with_columns(
-        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
-    )
-    ex_date = bars["trade_date"][100]
-    early_signal = bars["trade_date"][119]
-    late_signal = bars["trade_date"][124]
-    cash_available = datetime.combine(
-        bars["trade_date"][90], datetime.min.time(), tzinfo=UTC
-    )
-    share_available = datetime.combine(
-        bars["trade_date"][120], datetime.min.time(), tzinfo=UTC
-    )
-    service = SameDayComponentPriceService(
-        bars,
-        [
-            (ex_date, "cash", 0.2, 0.0, cash_available),
-            (ex_date, "bonus", 0.0, 0.5, share_available),
-        ],
-    )
-
-    short = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(early_signal, early_signal))
-        .collect()
-    )
-    extended = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(early_signal, late_signal))
-        .collect()
-    )
-    extended_early = extended.filter(pl.col("trade_date") == early_signal)
-    extended_late = extended.filter(pl.col("trade_date") == late_signal)
-
-    assert extended_early["value"].item() == pytest.approx(short["value"].item())
-    assert extended_early["available_at"].item() == cash_available
-    assert short["available_at"].item() == cash_available
-    late_window = np.asarray(closes[5:125], dtype=np.float64)
-    preclose = closes[99]
-    combined_factor = (preclose - 0.2) / (preclose * 1.5)
-    late_window[:95] *= combined_factor
-    x = np.arange(120, dtype=np.float64)
-    y = np.log(late_window)
-    slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[0][1]
-    assert extended_late["value"].item() == pytest.approx(slope / np.mean(y))
-    assert extended_late["available_at"].item() == share_available
-
-
-def test_null_component_availability_invalidates_signal() -> None:
-    """Unknown component lineage must not be silently treated as no action."""
-    bars = _bars(_SSE, np.exp(2.0 + 0.003 * np.arange(120)).tolist())
-    signal_day = bars["trade_date"][-1]
-    components = [[] for _ in range(120)]
-    components[-1] = [
-        {
-            "action_type": "cash",
-            "cash_per_share": 0.2,
-            "share_ratio": 0.0,
-            "available_at": None,
-        }
-    ]
-    bars = bars.with_columns(
-        pl.lit(1.0).alias("adjustment_factor"),
-        pl.Series("adjustment_event_factor", [1.0] * 119 + [0.99], dtype=pl.Float64),
-        pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
-            "adjustment_event_available_at"
-        ),
-        pl.Series(
-            "adjustment_event_components",
-            components,
-            dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
-        ),
-    )
-
-    result = (
-        Trend120dFactor(RecordingPriceService(bars), [_SSE])
-        .compute(_context(signal_day, signal_day))
-        .collect()
-    )
-
-    assert result["value"].item() is None
-    assert result["is_valid"].item() is False
-
-
-def test_same_day_components_with_same_availability_use_joint_factor() -> None:
-    """Multiplying component factors separately would double-use the event preclose."""
-    closes = np.exp(3.0 + 0.002 * np.arange(120)).tolist()
-    bars = _bars(_SSE, closes).with_columns(
-        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
-    )
-    ex_date = bars["trade_date"][100]
-    signal_day = bars["trade_date"][-1]
-    available = datetime.combine(
-        bars["trade_date"][90], datetime.min.time(), tzinfo=UTC
-    )
-    service = SameDayComponentPriceService(
-        bars,
-        [
-            (ex_date, "cash", 0.2, 0.0, available),
-            (ex_date, "bonus", 0.0, 0.5, available),
-        ],
-    )
-
-    result = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(signal_day, signal_day))
-        .collect()
-    )
-
-    expected_prices = np.asarray(closes, dtype=np.float64)
-    joint_factor = (closes[99] - 0.2) / (closes[99] * 1.5)
-    expected_prices[:100] *= joint_factor
-    x = np.arange(120, dtype=np.float64)
-    y = np.log(expected_prices)
-    slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[0][1]
-    assert result["value"].item() == pytest.approx(slope / np.mean(y))
-    assert result["available_at"].item() == available
-
-
-def test_event_on_first_window_row_does_not_pollute_value_or_lineage() -> None:
-    """An event at the earliest constituent adjusts no close inside the window."""
-    closes = np.exp(2.0 + 0.003 * np.arange(120)).tolist()
-    bars = _bars(_SSE, closes).with_columns(
-        pl.lit(datetime(2024, 1, 1, tzinfo=UTC)).alias("available_at")
-    )
-    signal_day = bars["trade_date"][-1]
-    action_available = datetime(2024, 1, 2, tzinfo=UTC)
-    service = SameDayComponentPriceService(
-        bars,
-        [(bars["trade_date"][0], "bonus", 0.0, 0.5, action_available)],
-    )
-
-    result = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(signal_day, signal_day))
-        .collect()
-    )
-
-    x = np.arange(120, dtype=np.float64)
-    y = np.log(np.asarray(closes, dtype=np.float64))
-    slope = np.linalg.lstsq(np.column_stack((np.ones(120), x)), y, rcond=None)[0][1]
-    assert result["value"].item() == pytest.approx(slope / np.mean(y))
-    assert result["available_at"].item() == datetime(2024, 1, 1, tzinfo=UTC)
+    assert extended.filter(pl.col("trade_date") == signal_day)[
+        "value"
+    ].item() == pytest.approx(short["value"].item())
 
 
 def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
@@ -778,8 +644,18 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
         assert spec.lookback_sessions == lookback
         assert spec.direction == direction
         assert spec.dependencies == ()
-        assert spec.parameters["adjustment_mode"] == "BACKWARD"
+        assert spec.parameters["adjustment_mode"] == "FORWARD"
         assert len(registry.code_hash(reference)) == 64
+
+
+def test_builtin_registration_rejects_same_ref_with_a_different_hash() -> None:
+    bars = _bars(_SSE, [10.0])
+    registry = FactorRegistry()
+    existing = Volatility60dFactor(RecordingPriceService(bars), [_SSE])
+    registry.register(existing, code_hash="0" * 64)
+
+    with pytest.raises(ValueError, match="conflicting built-in implementation"):
+        register_etf_factors(registry, RecordingPriceService(bars), [_SSE])
 
 
 @pytest.mark.parametrize("window", [0, -1, 21, 59, 61, 119, 121, True])

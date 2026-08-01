@@ -8,10 +8,7 @@ from pathlib import Path
 
 import polars as pl
 
-from quant_core.data.adjustments import (
-    ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
-    AdjustmentMode,
-)
+from quant_core.data.adjustments import AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorEngine, FactorRegistry, FeatureCache
 from quant_core.factors.builtin import register_stock_factors
@@ -61,16 +58,9 @@ class CountingBars:
         result = self.frame.filter(
             pl.col("trade_date").is_between(start, end, closed="both")
         )
-        if mode is AdjustmentMode.BACKWARD:
+        if mode is AdjustmentMode.FORWARD:
             result = result.with_columns(
                 pl.lit(1.0).alias("adjustment_factor"),
-                pl.lit(1.0).alias("adjustment_event_factor"),
-                pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
-                    "adjustment_event_available_at"
-                ),
-                pl.lit([], dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE).alias(
-                    "adjustment_event_components"
-                ),
             )
         return result.lazy()
 

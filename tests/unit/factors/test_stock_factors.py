@@ -10,12 +10,11 @@ import polars as pl
 import pytest
 
 from quant_core.data.adjustments import (
-    ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
     AdjustmentMode,
 )
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorRegistry
-from quant_core.factors.builtin import register_stock_factors
+from quant_core.factors.builtin import register_etf_factors, register_stock_factors
 from quant_core.factors.builtin.auxiliary import (
     AvgAmount20dFactor,
     IndustryCodePitFactor,
@@ -57,19 +56,9 @@ class BarService:
             pl.col("instrument_id").is_in(ids)
             & pl.col("trade_date").is_between(start, end, closed="both")
         )
-        if (
-            mode is AdjustmentMode.BACKWARD
-            and "adjustment_factor" not in result.columns
-        ):
+        if mode is AdjustmentMode.FORWARD and "adjustment_factor" not in result.columns:
             result = result.with_columns(
                 pl.lit(1.0).alias("adjustment_factor"),
-                pl.lit(1.0).alias("adjustment_event_factor"),
-                pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
-                    "adjustment_event_available_at"
-                ),
-                pl.lit([], dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE).alias(
-                    "adjustment_event_components"
-                ),
             )
         return result.lazy()
 
@@ -616,6 +605,34 @@ def test_all_stock_factors_register_once_with_alpha_metadata() -> None:
             assert spec.parameters["eligible_for_alpha"] is False
         else:
             assert spec.parameters.get("eligible_for_alpha", True) is True
+            if factor_id in {
+                "momentum_120_20_v1",
+                "volatility_60d_v1",
+                "downside_volatility_60d_v1",
+                "max_drawdown_120d_v1",
+            }:
+                assert spec.parameters["adjustment_mode"] == "FORWARD"
+
+
+@pytest.mark.parametrize("etf_first", [True, False])
+def test_market_factor_registration_is_order_independent(etf_first: bool) -> None:
+    bars = _bars([10.0] * 121)
+    registry = FactorRegistry()
+    etf = lambda: register_etf_factors(registry, BarService(bars), [_ID])
+    stock = lambda: register_stock_factors(
+        registry,
+        BarService(bars),
+        Financials(_empty_financials()),
+        [_ID],
+        price_service=BarService(bars),
+    )
+
+    (etf if etf_first else stock)()
+    (stock if etf_first else etf)()
+
+    assert registry.code_hash("volatility_60d_v1@1.0.0") == registry.code_hash(
+        "volatility_60d_v1"
+    )
 
 
 def _ctx(start: date, end: date) -> FactorContext:
