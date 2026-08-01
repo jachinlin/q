@@ -379,6 +379,39 @@ def test_etf_target_keeps_context_signal_and_execution_dates() -> None:
 @pytest.mark.parametrize(
     "override",
     [
+        {
+            "return_factor_weights": {
+                _RETURN_REFS[0]: 0.2,
+                _RETURN_REFS[1]: 0.3,
+                _RETURN_REFS[2]: float("inf"),
+            }
+        },
+        {
+            "etf_pool": (
+                InstrumentId.parse(_ETF_B),
+                InstrumentId.parse(_ETF_A),
+                InstrumentId.parse(_ETF_C),
+            )
+        },
+        {
+            "etf_pool": (
+                "SSE:510001",
+                InstrumentId.parse(_ETF_B),
+                InstrumentId.parse(_ETF_C),
+            )
+        },
+    ],
+)
+def test_etf_config_rejects_infinite_weight_unsorted_or_noninstrument_pool(
+    override: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _config(**override)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
         {"top_n": 0},
         {
             "return_factor_weights": {

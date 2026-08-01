@@ -292,3 +292,29 @@ def test_portfolio_state_direct_construction_rejects_core_invariants(
 def test_context_rejects_execute_not_after_signal() -> None:
     with pytest.raises(ValueError, match="execute_date"):
         StrategyContext(_SNAPSHOT, _DAY, _DAY, (_DAY,), _Data(), PortfolioConstructor())
+
+
+def test_adapter_rejects_non_ref_and_non_snapshot_inputs() -> None:
+    adapter = _adapter(_Strategy())
+    with pytest.raises(TypeError, match="StrategyRef"):
+        adapter.generate_target("round3", _SNAPSHOT, _DAY, _NEXT, _account())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="AccountSnapshot"):
+        adapter.generate_target(
+            StrategyRef("round3", "1"), _SNAPSHOT, _DAY, _NEXT, object()
+        )  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        (_DAY, 1.0, 100, 0, (), 1.0),
+        (_DAY, 100, 1.0, 0, (), 1.0),
+        (_DAY, 100, 100, -1, (), 1.0),
+        (_DAY, 100, 100, 0, (object(),), 1.0),
+    ],
+)
+def test_state_rejects_each_direct_numeric_and_position_invariant(
+    state: tuple[object, object, object, object, object, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        PortfolioState(*state)  # type: ignore[arg-type]
