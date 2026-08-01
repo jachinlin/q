@@ -475,8 +475,10 @@ selected_batches = client.fetch_daily_bars(
 #### 研究价格口径
 
 ETF 与股票的市场行情因子在 MVP 统一使用 BaoStock 原始 `close/preclose`
-推导的涨跌幅前复权价格。前复权以每个信号日独立锚定：只使用该信号日
-及此前可见的日线，避免后续跳变改变既有信号。该口径只调整
+推导的 `baostock_return_index_v1` 收益指数：首个观测值取原始收盘价，之后按
+`I(t)=I(t-1)×close(t)/preclose(t)` 递推。指数只依赖当前及过去数据，因此追加
+未来跳变不会改变既有信号行的数值和内容哈希。展示与其他研究场景仍可使用
+同一涨跌幅链条生成的前复权价格；该口径只调整
 `open/high/low/close/preclose`；`volume` 与 `amount` 保持供应商原始值。
 
 `BACKWARD` 保留为兼容接口，不是 MVP 市场因子的默认研究口径。公司行动
@@ -828,7 +830,7 @@ MVP 因子用于验证行情因子、时点财务因子、横截面处理、缓�
 | `trend_120d_v1` | `P(t) / MA120(t) - 1` | 越高越好 | 120日 | 趋势过滤 |
 | `volatility_60d_v1` | `std(log_return, 60) × sqrt(252)` | 越低越好 | 61日 | 波动率惩罚 |
 
-`P` 由统一价格服务按实验指定复权口径提供。ETF 基线策略使用三个收益因子形成动量分数，以 `trend_120d_v1 > 0` 作为趋势过滤，并对 `volatility_60d_v1` 施加惩罚。具体权重属于策略配置，不写入因子实现。
+`P` 在市场因子中固定为统一价格服务输出的 `baostock_return_index_v1`，其字段名为 `forward_return_index`。ETF 基线策略使用三个收益因子形成动量分数，以 `trend_120d_v1 > 0` 作为趋势过滤，并对 `volatility_60d_v1` 施加惩罚。具体权重属于策略配置，不写入因子实现。
 
 #### 股票 Alpha 因子
 
@@ -838,10 +840,10 @@ MVP 因子用于验证行情因子、时点财务因子、横截面处理、缓�
 | 估值 | `book_to_price_mrq_v1` | 当 `pbMRQ > 0` 时取 `1 / pbMRQ`，否则为 `null` | 越高越好 | 日频估值字段 |
 | 质量 | `roe_avg_pit_v1` | `available_at <= signal_at` 的最新报告平均 ROE | 越高越好 | 时点财务数据 |
 | 质量 | `cfo_to_np_pit_v1` | 最新可用报告的经营现金流/净利润 | 越高越好 | 时点现金流数据 |
-| 动量 | `momentum_120_20_v1` | `P(t-20) / P(t-120) - 1` | 越高越好 | 复权收盘价 |
-| 风险 | `volatility_60d_v1` | 60 日对数收益标准差年化 | 越低越好 | 复权收盘价 |
-| 风险 | `downside_volatility_60d_v1` | `sqrt(mean(min(log_return, 0)^2)) × sqrt(252)` | 越低越好 | 复权收盘价 |
-| 风险 | `max_drawdown_120d_v1` | 120 日内最大回撤的正数损失幅度 | 越低越好 | 复权收盘价 |
+| 动量 | `momentum_120_20_v1` | `P(t-20) / P(t-120) - 1` | 越高越好 | `baostock_return_index_v1` |
+| 风险 | `volatility_60d_v1` | 60 日对数收益标准差年化 | 越低越好 | `baostock_return_index_v1` |
+| 风险 | `downside_volatility_60d_v1` | `sqrt(mean(min(log_return, 0)^2)) × sqrt(252)` | 越低越好 | `baostock_return_index_v1` |
+| 风险 | `max_drawdown_120d_v1` | 120 日内最大回撤的正数损失幅度 | 越低越好 | `baostock_return_index_v1` |
 
 估值因子不得将负 PE、零 PB 或缺失值转换成正常分数。`cfo_to_np_pit_v1` 在净利润绝对值低于配置阈值时输出 `null`，防止分母接近零产生无意义极值。财务因子必须通过 `financials_as_of()` 查询；缺少可靠公告时间的数据不得使用报告期末日期替代。
 

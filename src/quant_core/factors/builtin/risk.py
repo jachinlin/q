@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from math import isfinite, log, sqrt
 
-from quant_core.data.adjustments import AdjustmentMode
+from quant_core.data.adjustments import FORWARD_RETURN_INDEX_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.factors.base import FactorSpec
 from quant_core.factors.builtin.momentum import AdjustedBarService, _MarketFactor
 
 _VERSION = "1.0.0"
+_PRICE_BASIS = "baostock_return_index_v1"
 
 
 class Volatility60dFactor(_MarketFactor):
@@ -35,8 +36,12 @@ class Volatility60dFactor(_MarketFactor):
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "annualization_sessions": 252,
                     "ddof": 1,
-                    "formula": "std(log(close[t])-log(close[t-1]),ddof=1)*sqrt(252)",
-                    "price_field": "close",
+                    "formula": (
+                        "std(log(forward_return_index[t])-"
+                        "log(forward_return_index[t-1]),ddof=1)*sqrt(252)"
+                    ),
+                    "price_basis": _PRICE_BASIS,
+                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
                     "window_prices": 61,
                     "window_returns": 60,
                 },
@@ -67,6 +72,8 @@ class DownsideVolatility60dFactor(_MarketFactor):
                     "annualization_sessions": 252,
                     "eligible_for_alpha": True,
                     "formula": "sqrt(mean(min(log_return,0)^2))*sqrt(252)",
+                    "price_basis": _PRICE_BASIS,
+                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
                     "window_prices": 61,
                 },
             ),
@@ -94,7 +101,9 @@ class MaxDrawdown120dFactor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
-                    "formula": "max(1-close/running_peak)",
+                    "formula": "max(1-forward_return_index/running_peak)",
+                    "price_basis": _PRICE_BASIS,
+                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
                     "window_prices": 120,
                 },
             ),

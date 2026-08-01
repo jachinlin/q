@@ -1,4 +1,4 @@
-"""ETF market factors over point-in-time backward-adjusted close histories."""
+"""ETF market factors over point-in-time forward return-index histories."""
 
 from __future__ import annotations
 
@@ -12,16 +12,18 @@ import pytest
 
 from quant_core.data.adjustments import (
     ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+    FORWARD_RETURN_INDEX_COLUMN,
     AdjustmentMode,
 )
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
-from quant_core.factors import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorRegistry
-from quant_core.factors.builtin import register_etf_factors
-from quant_core.factors.builtin.momentum import (
-    ReturnFactor,
-    Trend120dFactor,
-    _signal_local_closes,
+from quant_core.factors import (
+    FACTOR_OUTPUT_SCHEMA,
+    FactorContext,
+    FactorRegistry,
 )
+from quant_core.factors.base import factor_table_content_hash
+from quant_core.factors.builtin import register_etf_factors
+from quant_core.factors.builtin.momentum import ReturnFactor, Trend120dFactor
 from quant_core.factors.builtin.risk import Volatility60dFactor
 
 _SSE = InstrumentId.parse("SSE:510300")
@@ -77,6 +79,10 @@ class RecordingPriceService:
                     "adjustment_event_components"
                 ),
             )
+        if FORWARD_RETURN_INDEX_COLUMN not in result.columns:
+            result = result.with_columns(
+                pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN)
+            )
         return result.lazy()
 
 
@@ -119,7 +125,9 @@ class ActionAwarePriceService:
                 dtype=np.float64,
             ).item()
             events = [action for action in applicable if action[0] == trade_date]
-            row["close"] = float(row["close"]) * adjustment_factor
+            raw_close = float(row["close"])
+            row[FORWARD_RETURN_INDEX_COLUMN] = raw_close
+            row["close"] = raw_close * adjustment_factor
             row["preclose"] = float(row["preclose"]) * adjustment_factor
             row["adjustment_factor"] = adjustment_factor
             row["adjustment_event_factor"] = (
@@ -146,6 +154,7 @@ class ActionAwarePriceService:
             "adjustment_event_factor": pl.Float64,
             "adjustment_event_available_at": pl.Datetime("us", "UTC"),
             "adjustment_event_components": ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
+            FORWARD_RETURN_INDEX_COLUMN: pl.Float64,
         }
         return pl.DataFrame(rows, schema=schema).lazy()
 
@@ -361,14 +370,16 @@ def test_invalid_price_anywhere_in_window_invalidates_signal(
     assert result["is_valid"].item() is False
 
 
-@pytest.mark.parametrize("bad_factor", [None, 0.0, -1.0, float("nan"), float("inf")])
-def test_malformed_forward_adjustment_factor_invalidates_signal(
-    bad_factor: float | None,
+@pytest.mark.parametrize("bad_index", [None, 0.0, -1.0, float("nan"), float("inf")])
+def test_malformed_forward_return_index_invalidates_signal(
+    bad_index: float | None,
 ) -> None:
     bars = _bars(_SSE, [10.0 + index for index in range(21)]).with_columns(
         pl.Series(
-            "adjustment_factor",
-            [1.0] * 10 + [bad_factor] + [1.0] * 10,
+            FORWARD_RETURN_INDEX_COLUMN,
+            [10.0 + index for index in range(10)]
+            + [bad_index]
+            + [20.0 + index for index in range(10)],
             dtype=pl.Float64,
         )
     )
@@ -542,10 +553,10 @@ def test_unknown_window_availability_invalidates_signal() -> None:
         (lambda service: Volatility60dFactor(service, [_SSE]), "volatility_60d_v1"),
     ],
 )
-def test_signal_local_rebase_keeps_all_etf_market_factors_stable_after_future_jump(
+def test_return_index_keeps_all_etf_market_factors_stable_after_future_jump(
     make_factor: object, factor_id: str
 ) -> None:
-    """Every market factor must rebase a global forward series at each signal."""
+    """Every market factor must consume the prefix-stable forward return index."""
     closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
     bars = _bars(_SSE, closes)
     signal_day = bars["trade_date"][119]
@@ -566,8 +577,8 @@ def test_signal_local_rebase_keeps_all_etf_market_factors_stable_after_future_ju
     assert early["available_at"].item() == short["available_at"].item()
 
 
-def test_trend_signal_local_rebase_rejects_a_global_forward_scale() -> None:
-    """Removing `/ signal_factor` would publish the different global-scale trend."""
+def test_trend_return_index_rejects_the_global_forward_price_scale() -> None:
+    """Using globally adjusted close would publish the wrong scaled trend."""
     closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
     bars = _bars(_SSE, closes)
     signal_day = bars["trade_date"][119]
@@ -604,7 +615,7 @@ def test_trend_signal_local_rebase_rejects_a_global_forward_scale() -> None:
         lambda service: Volatility60dFactor(service, [_SSE]),
     ],
 )
-def test_signal_local_rebase_has_exact_stable_values_for_nonbinary_future_scale(
+def test_return_index_has_exact_stable_values_for_nonbinary_future_scale(
     make_factor: object,
 ) -> None:
     """A 0.7 forward factor must not perturb bytes of earlier factor observations."""
@@ -625,18 +636,49 @@ def test_signal_local_rebase_has_exact_stable_values_for_nonbinary_future_scale(
 
     assert early["value"].item() == short["value"].item()
     assert early["available_at"].item() == short["available_at"].item()
+    assert factor_table_content_hash(early.to_arrow()) == factor_table_content_hash(
+        short.to_arrow()
+    )
 
 
-def test_signal_local_close_canonicalization_limits_rounding_to_15_significant_digits() -> (
-    None
-):
-    """Canonical local prices remove arithmetic residue without changing market meaning."""
-    raw_close = 123.45678901234567
+@pytest.mark.parametrize(
+    "make_factor",
+    [
+        lambda service, scope: ReturnFactor(service, scope, 20),
+        lambda service, scope: ReturnFactor(service, scope, 60),
+        lambda service, scope: ReturnFactor(service, scope, 120),
+        lambda service, scope: Trend120dFactor(service, scope),
+        lambda service, scope: Volatility60dFactor(service, scope),
+    ],
+)
+def test_return_index_is_byte_stable_for_wide_multi_instrument_histories(
+    make_factor: object,
+) -> None:
+    first = _bars(_SSE, [1e-8 * 1.01**index for index in range(122)])
+    second = _bars(_SZSE, [1e8 * 0.999**index for index in range(122)])
+    bars = pl.concat([first, second])
+    signal_day = first["trade_date"][120]
+    future_day = first["trade_date"][121]
+    service = ActionAwarePriceService(
+        bars,
+        [(future_day, 0.7, datetime(2024, 5, 1, tzinfo=UTC))],
+    )
+    scope = [_SSE, _SZSE]
 
-    result = _signal_local_closes([{"close": raw_close, "adjustment_factor": 1.0}])
+    short = (
+        make_factor(service, scope).compute(_context(signal_day, signal_day)).collect()
+    )  # type: ignore[operator]
+    extended = (
+        make_factor(service, scope)
+        .compute(_context(signal_day, future_day))
+        .collect()
+        .filter(pl.col("trade_date") == signal_day)
+    )  # type: ignore[operator]
 
-    assert result == [float(f"{raw_close:.15g}")]
-    assert abs(result[0] - raw_close) / raw_close < 5e-15  # type: ignore[index]
+    assert extended.rows() == short.rows()
+    assert factor_table_content_hash(extended.to_arrow()) == factor_table_content_hash(
+        short.to_arrow()
+    )
 
 
 def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
@@ -729,6 +771,8 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
         assert spec.direction == direction
         assert spec.dependencies == ()
         assert spec.parameters["adjustment_mode"] == "FORWARD"
+        assert spec.parameters["price_basis"] == "baostock_return_index_v1"
+        assert spec.parameters["price_field"] == FORWARD_RETURN_INDEX_COLUMN
         assert len(registry.code_hash(reference)) == 64
 
 

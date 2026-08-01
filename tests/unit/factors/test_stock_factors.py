@@ -10,6 +10,7 @@ import polars as pl
 import pytest
 
 from quant_core.data.adjustments import (
+    FORWARD_RETURN_INDEX_COLUMN,
     AdjustmentMode,
 )
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
@@ -59,6 +60,7 @@ class BarService:
         if mode is AdjustmentMode.FORWARD and "adjustment_factor" not in result.columns:
             result = result.with_columns(
                 pl.lit(1.0).alias("adjustment_factor"),
+                pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN),
             )
         return result.lazy()
 
@@ -612,19 +614,25 @@ def test_all_stock_factors_register_once_with_alpha_metadata() -> None:
                 "max_drawdown_120d_v1",
             }:
                 assert spec.parameters["adjustment_mode"] == "FORWARD"
+                assert spec.parameters["price_basis"] == "baostock_return_index_v1"
+                assert spec.parameters["price_field"] == FORWARD_RETURN_INDEX_COLUMN
 
 
 @pytest.mark.parametrize("etf_first", [True, False])
-def test_market_factor_registration_is_order_independent(etf_first: bool) -> None:
+def test_shared_market_factor_registration_is_idempotent_for_equivalent_runtime(
+    etf_first: bool,
+) -> None:
     bars = _bars([10.0] * 121)
     registry = FactorRegistry()
-    etf = lambda: register_etf_factors(registry, BarService(bars), [_ID])
+    service = BarService(bars)
+    financials = Financials(_empty_financials())
+    etf = lambda: register_etf_factors(registry, service, [_ID])
     stock = lambda: register_stock_factors(
         registry,
-        BarService(bars),
-        Financials(_empty_financials()),
+        service,
+        financials,
         [_ID],
-        price_service=BarService(bars),
+        price_service=service,
     )
 
     (etf if etf_first else stock)()
@@ -633,6 +641,38 @@ def test_market_factor_registration_is_order_independent(etf_first: bool) -> Non
     assert registry.code_hash("volatility_60d_v1@1.0.0") == registry.code_hash(
         "volatility_60d_v1"
     )
+
+
+@pytest.mark.parametrize("etf_first", [True, False])
+def test_shared_market_factor_registration_rejects_different_provider_and_domain(
+    etf_first: bool,
+) -> None:
+    etf_id = InstrumentId.parse("SSE:510300")
+    stock_bars = _bars([100.0 + index for index in range(121)])
+    etf_bars = stock_bars.with_columns(
+        pl.lit(etf_id.canonical()).alias("instrument_id")
+    )
+    stock_service = BarService(stock_bars)
+    etf_service = BarService(etf_bars)
+    financials = Financials(_empty_financials())
+    registry = FactorRegistry()
+    etf = lambda: register_etf_factors(registry, etf_service, [etf_id])
+    stock = lambda: register_stock_factors(
+        registry,
+        stock_service,
+        financials,
+        [_ID],
+        price_service=stock_service,
+    )
+
+    (etf if etf_first else stock)()
+    with pytest.raises(ValueError, match="conflicting built-in runtime dependencies"):
+        (stock if etf_first else etf)()
+
+    day = stock_bars["trade_date"][-1]
+    result = registry.factor("volatility_60d_v1").compute(_ctx(day, day)).collect()
+    expected = etf_id.canonical() if etf_first else _ID.canonical()
+    assert result["instrument_id"].to_list() == [expected]
 
 
 def _ctx(start: date, end: date) -> FactorContext:

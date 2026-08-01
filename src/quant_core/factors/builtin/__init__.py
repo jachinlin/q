@@ -33,6 +33,34 @@ from quant_core.factors.builtin.risk import (
 from quant_core.factors.builtin.valuation import BookToPriceFactor, EarningsYieldFactor
 from quant_core.factors.registry import FactorRegistry
 
+_RUNTIME_DEPENDENCY_ATTRIBUTES = (
+    "_price_service",
+    "_repository",
+    "_service",
+    "_provider",
+    "_calendar",
+)
+
+
+def _builtin_runtime_identity(factor: Factor) -> tuple[object, ...]:
+    """Identify the concrete providers and instrument domain captured by a factor."""
+    identity: list[object] = [type(factor).__module__, type(factor).__qualname__]
+    instruments = getattr(factor, "_instruments", ())
+    identity.append(
+        tuple(
+            instrument.canonical()
+            if isinstance(instrument, InstrumentId)
+            else instrument
+            for instrument in instruments
+        )
+    )
+    identity.extend(
+        (attribute, id(getattr(factor, attribute)))
+        for attribute in _RUNTIME_DEPENDENCY_ATTRIBUTES
+        if hasattr(factor, attribute)
+    )
+    return tuple(identity)
+
 
 def register_builtin(registry: FactorRegistry, factor: Factor) -> None:
     """Register a bundled factor once, rejecting divergent same-ref code."""
@@ -45,6 +73,11 @@ def register_builtin(registry: FactorRegistry, factor: Factor) -> None:
     if registry.code_hash(existing_ref) != expected_hash:
         raise ValueError(
             f"conflicting built-in implementation: {factor.spec.canonical_ref}"
+        )
+    existing = registry.factor(existing_ref)
+    if _builtin_runtime_identity(existing) != _builtin_runtime_identity(factor):
+        raise ValueError(
+            f"conflicting built-in runtime dependencies: {factor.spec.canonical_ref}"
         )
 
 

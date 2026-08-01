@@ -9,14 +9,14 @@ from typing import Protocol
 
 import polars as pl
 
-from quant_core.data.adjustments import AdjustmentMode
+from quant_core.data.adjustments import FORWARD_RETURN_INDEX_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorSpec
 
 _VERSION = "1.0.0"
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
-_LOCAL_CLOSE_SIGNIFICANT_DIGITS = 15
+_PRICE_BASIS = "baostock_return_index_v1"
 
 
 class AdjustedBarService(Protocol):
@@ -72,9 +72,8 @@ class _MarketFactor:
             rows = instrument_frame.select(
                 "trade_date",
                 "instrument_id",
-                "close",
+                FORWARD_RETURN_INDEX_COLUMN,
                 "available_at",
-                "adjustment_factor",
             ).to_dicts()
             for index, row in enumerate(rows):
                 trade_date = row["trade_date"]
@@ -88,7 +87,7 @@ class _MarketFactor:
                 available_at = bar_available_at
                 value: float | None = None
                 if start_index >= 0 and len(window) == self._required_prices:
-                    closes = _signal_local_closes(window)
+                    closes = _forward_return_index_values(window)
                     if closes is not None and available_at is not None:
                         value = self._evaluator(closes)
                         if value is not None and not isfinite(value):
@@ -151,8 +150,9 @@ class ReturnFactor(_MarketFactor):
                 direction=1,
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
-                    "formula": "close[t]/close[t-n]-1",
-                    "price_field": "close",
+                    "formula": "forward_return_index[t]/forward_return_index[t-n]-1",
+                    "price_basis": _PRICE_BASIS,
+                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
                     "window_sessions": window,
                 },
             ),
@@ -181,9 +181,13 @@ class Trend120dFactor(_MarketFactor):
                 direction=1,
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
-                    "formula": "ols_slope(log(close),x=0..119)/mean(log(close))",
+                    "formula": (
+                        "ols_slope(log(forward_return_index),x=0..119)/"
+                        "mean(log(forward_return_index))"
+                    ),
                     "include_intercept": True,
-                    "price_field": "close",
+                    "price_basis": _PRICE_BASIS,
+                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
                     "window_prices": 120,
                 },
             ),
@@ -213,7 +217,11 @@ class Momentum12020Factor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
-                    "formula": "close[t-20]/close[t-120]-1",
+                    "formula": (
+                        "forward_return_index[t-20]/forward_return_index[t-120]-1"
+                    ),
+                    "price_basis": _PRICE_BASIS,
+                    "price_field": FORWARD_RETURN_INDEX_COLUMN,
                     "skip_recent_sessions": 20,
                     "window_prices": 121,
                 },
@@ -287,9 +295,8 @@ def _validate_adjusted_bars(frame: pl.DataFrame) -> None:
     required = {
         "instrument_id": pl.String,
         "trade_date": pl.Date,
-        "close": pl.Float64,
         "available_at": pl.Datetime("us", "UTC"),
-        "adjustment_factor": pl.Float64,
+        FORWARD_RETURN_INDEX_COLUMN: pl.Float64,
     }
     missing = sorted(set(required) - set(frame.columns))
     if missing:
@@ -310,25 +317,16 @@ def _positive_finite(value: object) -> float | None:
     return float(value)
 
 
-def _signal_local_closes(window: Sequence[dict[str, object]]) -> list[float] | None:
-    signal_factor = _positive_finite(window[-1]["adjustment_factor"])
-    if signal_factor is None:
-        return None
-    closes: list[float] = []
+def _forward_return_index_values(
+    window: Sequence[dict[str, object]],
+) -> list[float] | None:
+    values: list[float] = []
     for row in window:
-        adjusted = _positive_finite(row["close"])
-        factor = _positive_finite(row["adjustment_factor"])
-        if adjusted is None or factor is None:
+        value = _positive_finite(row[FORWARD_RETURN_INDEX_COLUMN])
+        if value is None:
             return None
-        value = adjusted / signal_factor
-        if not isfinite(value) or value <= 0:
-            return None
-        # Division cancels the forward anchor mathematically, but its binary
-        # representation can leave a cache-visible residue (for example 0.7).
-        # Fifteen significant decimal digits remain far below market precision
-        # while making identical signal-local histories deterministic.
-        closes.append(float(f"{value:.{_LOCAL_CLOSE_SIGNIFICANT_DIGITS}g}"))
-    return closes
+        values.append(value)
+    return values
 
 
 def _latest_available_at(
