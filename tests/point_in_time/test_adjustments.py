@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from inspect import getsource
+from math import exp, log
 from pathlib import Path
+from random import Random
 
 import polars as pl
 import pytest
@@ -228,6 +230,60 @@ def test_forward_adjustment_sorts_and_isolates_instruments() -> None:
     assert factors == pytest.approx([0.8, 1.0, 0.5, 1.0])
 
 
+def test_forward_adjustment_uses_original_reverse_recurrence_order() -> None:
+    """A total-minus-prefix rewrite must not change the deterministic recurrence."""
+    start = date(2020, 1, 1)
+    log_gaps = [700.0 if index % 2 == 0 else -699.999999 for index in range(200)]
+    frame = _forward_frame(
+        [
+            ("SSE:600000", start, 1.0, 0.0),
+            *[
+                (
+                    "SSE:600000",
+                    start + timedelta(days=index),
+                    1.0,
+                    exp(log_gap),
+                )
+                for index, log_gap in enumerate(log_gaps, start=1)
+            ],
+        ]
+    )
+
+    _, factors = _forward_adjust(frame, start + timedelta(days=200))
+
+    assert factors == _trusted_reverse_forward_factors(frame)
+    assert factors[-1] == 1.0
+
+
+def test_forward_adjustment_anchor_is_exact_one_for_every_instrument() -> None:
+    """Every independently grouped anchor is the unscaled raw observation exactly."""
+    start = date(2020, 1, 1)
+    random = Random(20260801)
+    rows: list[tuple[str, date, float | None, float | None]] = []
+    for instrument_id, count in (("SSE:600000", 500), ("SSE:600001", 137)):
+        rows.append((instrument_id, start, 1.0, 0.0))
+        rows.extend(
+            (
+                instrument_id,
+                start + timedelta(days=index),
+                1.0,
+                random.uniform(0.95, 1.05),
+            )
+            for index in range(1, count)
+        )
+
+    result, factors = _forward_adjust(
+        _forward_frame(list(reversed(rows))), start + timedelta(days=499)
+    )
+
+    anchors = (
+        result.with_columns(pl.Series("factor", factors))
+        .group_by("instrument_id", maintain_order=True)
+        .agg(pl.col("factor").last())
+    )
+    assert anchors["factor"].to_list() == [1.0, 1.0]
+
+
 def test_forward_adjustment_accepts_ipo_preclose_and_missing_sessions() -> None:
     """Only non-initial observed rows require a positive preclose."""
     result, factors = _forward_adjust(
@@ -364,6 +420,62 @@ def test_forward_adjustment_rejects_adjusted_price_overflow(tmp_path: Path) -> N
             AdjustmentMode.FORWARD,
             _DAYS[-1],
         )
+
+
+def test_forward_adjustment_rejects_adjusted_price_underflow_to_zero(
+    tmp_path: Path,
+) -> None:
+    """A positive raw price must not silently become a zero adjusted price."""
+    smallest_positive = float.fromhex("0x0.0000000000001p-1022")
+    underflowing = [
+        (smallest_positive, 1.0, smallest_positive, 1.0, 0.0, 100, 100.0),
+        (1.0, 1.0, 1.0, 1.0, 0.5, 100, 100.0),
+        (1.0, 1.0, 1.0, 1.0, 1.0, 100, 100.0),
+        (1.0, 1.0, 1.0, 1.0, 1.0, 100, 100.0),
+        (1.0, 1.0, 1.0, 1.0, 1.0, 100, 100.0),
+    ]
+    fixture = _adjustment_fixture(tmp_path, [], bar_values=underflowing)
+
+    with pytest.raises(ValueError, match="adjusted open must be finite and positive"):
+        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+            fixture.snapshot_id,
+            [_INSTRUMENT],
+            _DAYS[0],
+            _DAYS[-1],
+            AdjustmentMode.FORWARD,
+            _DAYS[-1],
+        )
+
+
+def test_forward_adjustment_rejects_forward_return_index_overflow() -> None:
+    """A finite factor cannot make an infinite chained return index acceptable."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 1.0, 0.0),
+            ("SSE:600000", _DAYS[1], 1e308, 1e-308),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="forward return index"):
+        _forward_adjust(frame, _DAYS[1])
+
+
+def test_forward_adjustment_rejects_forward_return_index_underflow_to_zero() -> None:
+    """A positive raw return ratio must not silently collapse the index to zero."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 1.0, 0.0),
+            (
+                "SSE:600000",
+                _DAYS[1],
+                float.fromhex("0x0.0000000000001p-1022"),
+                1e308,
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="forward return index"):
+        _forward_adjust(frame, _DAYS[1])
 
 
 def test_forward_return_index_is_byte_stable_after_nonbinary_future_jumps() -> None:
@@ -1087,6 +1199,25 @@ def _forward_frame(
             "preclose",
         )
     )
+
+
+def _trusted_reverse_forward_factors(frame: pl.DataFrame) -> list[float]:
+    """Mirror the original last-to-first scalar recurrence as a test oracle."""
+    expected: list[float] = []
+    ordered = frame.sort("instrument_id", "trade_date")
+    for instrument in ordered.partition_by("instrument_id", maintain_order=True):
+        rows = instrument.select("close", "preclose").rows()
+        factors = [1.0] * len(rows)
+        log_factor = 0.0
+        for index in range(len(rows) - 1, 0, -1):
+            previous_close = rows[index - 1][0]
+            current_preclose = rows[index][1]
+            assert previous_close is not None
+            assert current_preclose is not None
+            log_factor += log(current_preclose) - log(previous_close)
+            factors[index - 1] = exp(log_factor)
+        expected.extend(factors)
+    return expected
 
 
 _BAR_VALUES = [

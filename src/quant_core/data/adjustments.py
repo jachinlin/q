@@ -235,10 +235,13 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
         .otherwise(pl.col("close") / pl.col("preclose"))
         .alias("_forward_return_ratio"),
     ).with_columns(
-        (
-            pl.col("_forward_log_ratio").sum().over("instrument_id")
-            - pl.col("_forward_log_ratio").cum_sum().over("instrument_id")
-        )
+        pl.col("_forward_log_ratio")
+        .reverse()
+        .cum_sum()
+        .reverse()
+        .shift(-1)
+        .fill_null(0.0)
+        .over("instrument_id")
         .exp()
         .alias("_forward_factor"),
         pl.col("_forward_return_ratio")
