@@ -7,6 +7,8 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import date
+from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from quant_core.backtest.accounting import AccountSnapshot
 from quant_core.backtest.models import ExecutionBatch, FillResult
+from quant_core.domain.identifiers import InstrumentId
 from quant_core.portfolio.constructor import TargetPortfolio
 
 _COMPRESSION = "zstd"
@@ -86,6 +89,14 @@ _SCHEMAS = {
 }
 
 
+class WriterState(StrEnum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    VALIDATED = "VALIDATED"
+    PUBLISHED = "PUBLISHED"
+    ABORTED = "ABORTED"
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactEntry:
     path: str
@@ -137,14 +148,19 @@ class BacktestArtifactWriter:
         self._staging_dir = Path(
             tempfile.mkdtemp(prefix=f".staging-{experiment_id}-", dir=artifact_root)
         )
-        self._writers = {
-            name: pq.ParquetWriter(
-                self._staging_dir / name, schema, compression=_COMPRESSION
-            )
-            for name, schema in _SCHEMAS.items()
-        }
-        self._closed = False
-        self._published = False
+        self._writers: dict[str, Any] = {}
+        self._state = WriterState.OPEN
+        self._entries: dict[str, ArtifactEntry] | None = None
+        try:
+            for name, schema in _SCHEMAS.items():
+                self._writers[name] = pq.ParquetWriter(
+                    self._staging_dir / name, schema, compression=_COMPRESSION
+                )
+        except BaseException as error:
+            self._close_all()
+            self._state = WriterState.ABORTED
+            self._safe_diagnostic(error)
+            raise
 
     @property
     def staging_dir(self) -> Path:
@@ -153,6 +169,10 @@ class BacktestArtifactWriter:
     @property
     def artifact_dir(self) -> Path:
         return self._final_dir
+
+    @property
+    def state(self) -> WriterState:
+        return self._state
 
     def append_snapshot(
         self, snapshot: AccountSnapshot, benchmark_close: float
@@ -271,42 +291,31 @@ class BacktestArtifactWriter:
         self._append("costs.parquet", costs)
 
     def close(self) -> None:
-        if self._closed:
-            return
-        first_error: BaseException | None = None
-        for writer in self._writers.values():
-            try:
-                writer.close()
-            except BaseException as error:  # noqa: BLE001 - close every writer.
-                if first_error is None:
-                    first_error = error
-        self._closed = True
+        self._require(WriterState.OPEN, "close")
+        first_error = self._close_all()
+        self._state = WriterState.CLOSED
         if first_error is not None:
             raise first_error
 
     def abort(self, error: BaseException) -> None:
-        close_error: BaseException | None = None
-        try:
-            self.close()
-        except BaseException as caught:  # noqa: BLE001 - preserve original error.
-            close_error = caught
-        diagnostic: dict[str, object] = {
-            "error_type": type(error).__name__,
-            "message": str(error),
-        }
-        if close_error is not None:
-            diagnostic["close_error_type"] = type(close_error).__name__
-            diagnostic["close_error"] = str(close_error)
-        _write_json(
-            self._staging_dir / "diagnostic.json",
-            diagnostic,
-        )
+        if self._state is WriterState.PUBLISHED:
+            return
+        close_error = None
+        if self._state is WriterState.OPEN:
+            close_error = self._close_all()
+        self._state = WriterState.ABORTED
+        self._safe_diagnostic(error, close_error)
 
-    def validate(self, expected_sessions: int) -> dict[str, ArtifactEntry]:
-        if not self._closed:
-            raise ValueError("artifacts must be closed before validation")
-        if type(expected_sessions) is not int or expected_sessions <= 0:
-            raise ValueError("expected_sessions must be a positive integer")
+    def validate(self, expected_sessions: tuple[date, ...]) -> dict[str, ArtifactEntry]:
+        self._require(WriterState.CLOSED, "validate")
+        if not isinstance(expected_sessions, tuple) or not expected_sessions:
+            raise ValueError("expected_sessions must be a nonempty tuple of dates")
+        if any(not isinstance(value, date) for value in expected_sessions):
+            raise TypeError("expected_sessions must contain dates")
+        if expected_sessions != tuple(sorted(expected_sessions)) or len(
+            set(expected_sessions)
+        ) != len(expected_sessions):
+            raise ValueError("expected_sessions must be strictly ascending and unique")
         entries: dict[str, ArtifactEntry] = {}
         for name, expected_schema in _SCHEMAS.items():
             path = self._staging_dir / name
@@ -322,29 +331,62 @@ class BacktestArtifactWriter:
                 path.stat().st_size,
                 _sha256(path),
             )
-        if entries["nav.parquet"].row_count != expected_sessions:
-            raise ValueError("nav row count must equal completed sessions")
-        _validate_content(self._staging_dir)
-        return entries
+        _validate_content(self._staging_dir, expected_sessions)
+        self._entries = entries
+        self._state = WriterState.VALIDATED
+        return dict(entries)
 
     def publish(self, manifest: dict[str, object]) -> Path:
-        if not self._closed:
-            raise ValueError("artifacts must be closed before publish")
-        if self._published:
-            raise ValueError("artifacts have already been published")
+        self._require(WriterState.VALIDATED, "publish")
+        _validate_manifest(manifest, self._entries)
         if (self._final_dir / "manifest.json").exists() or self._final_dir.exists():
             raise FileExistsError("experiment artifact directory already exists")
         os.replace(self._staging_dir, self._final_dir)
         manifest_path = self._final_dir / "manifest.json"
-        _write_json(manifest_path, manifest)
-        self._published = True
+        try:
+            _write_json(manifest_path, manifest)
+        except BaseException as error:
+            try:
+                os.replace(self._final_dir, self._staging_dir)
+            except BaseException as restore_error:  # noqa: BLE001
+                error.add_note(f"failed to restore staging: {restore_error}")
+            raise
+        self._state = WriterState.PUBLISHED
         return manifest_path
 
     def _append(self, name: str, rows: list[dict[str, Any]]) -> None:
-        if self._closed:
-            raise ValueError("cannot append closed artifacts")
+        self._require(WriterState.OPEN, "append")
         table = pa.Table.from_pylist(rows, schema=_SCHEMAS[name])
         self._writers[name].write_table(table)
+
+    def _require(self, expected: WriterState, action: str) -> None:
+        if self._state is not expected:
+            raise ValueError(f"{action} requires {expected.value} state")
+
+    def _close_all(self) -> BaseException | None:
+        first_error: BaseException | None = None
+        for writer in self._writers.values():
+            try:
+                writer.close()
+            except BaseException as error:  # noqa: BLE001 - close every writer.
+                if first_error is None:
+                    first_error = error
+        return first_error
+
+    def _safe_diagnostic(
+        self, error: BaseException, close_error: BaseException | None = None
+    ) -> None:
+        diagnostic: dict[str, object] = {
+            "error_type": type(error).__name__,
+            "message": str(error),
+        }
+        if close_error is not None:
+            diagnostic["close_error_type"] = type(close_error).__name__
+            diagnostic["close_error"] = str(close_error)
+        try:
+            _write_json(self._staging_dir / "diagnostic.json", diagnostic)
+        except BaseException as diagnostic_error:  # noqa: BLE001
+            error.add_note(f"failed to write diagnostic: {diagnostic_error}")
 
 
 def _sha256(path: Path) -> str:
@@ -368,18 +410,93 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _validate_content(staging_dir: Path) -> None:
+def _validate_manifest(
+    manifest: object, entries: dict[str, ArtifactEntry] | None
+) -> None:
+    if entries is None or not isinstance(manifest, dict):
+        raise ValueError("manifest must match validated artifacts")
+    required = {
+        "schema_version",
+        "experiment_id",
+        "snapshot_id",
+        "strategy",
+        "start_date",
+        "end_date",
+        "benchmark",
+        "initial_cash_fen",
+        "rulebook_version",
+        "execution_config",
+        "completed_sessions",
+        "artifacts",
+    }
+    if set(manifest) != required:
+        raise ValueError("manifest has invalid fields")
+    if (
+        type(manifest["schema_version"]) is not int
+        or type(manifest["initial_cash_fen"]) is not int
+        or type(manifest["completed_sessions"]) is not int
+        or manifest["completed_sessions"] <= 0
+        or any(
+            not isinstance(manifest[name], str) or not manifest[name]
+            for name in (
+                "experiment_id",
+                "snapshot_id",
+                "start_date",
+                "end_date",
+                "benchmark",
+                "rulebook_version",
+            )
+        )
+        or not isinstance(manifest["strategy"], dict)
+        or not isinstance(manifest["execution_config"], dict)
+        or not isinstance(manifest["artifacts"], dict)
+    ):
+        raise ValueError("manifest metadata is invalid")
+    strategy = manifest["strategy"]
+    execution_config = manifest["execution_config"]
+    if (
+        set(strategy) != {"strategy_id", "version"}
+        or any(not isinstance(value, str) or not value for value in strategy.values())
+        or set(execution_config)
+        != {"reference_price", "slippage_bps", "max_volume_participation"}
+        or execution_config["reference_price"] not in {"OPEN", "CLOSE"}
+        or any(
+            not isinstance(execution_config[key], float)
+            or not isfinite(execution_config[key])
+            for key in ("slippage_bps", "max_volume_participation")
+        )
+    ):
+        raise ValueError("manifest strategy or execution config is invalid")
+    artifacts = manifest["artifacts"]
+    if set(artifacts) != set(entries):
+        raise ValueError("manifest artifacts do not match validation")
+    for name, entry in entries.items():
+        value = artifacts[name]
+        expected = {
+            "path": entry.path,
+            "schema": entry.schema,
+            "row_count": entry.row_count,
+            "size_bytes": entry.size_bytes,
+            "sha256": entry.sha256,
+        }
+        if value != expected:
+            raise ValueError("manifest artifact entry does not match validation")
+
+
+def _validate_content(staging_dir: Path, expected_sessions: tuple[date, ...]) -> None:
     nav = pq.read_table(staging_dir / "nav.parquet").to_pylist()
     holdings = pq.read_table(staging_dir / "holdings.parquet").to_pylist()
     targets = pq.read_table(staging_dir / "targets.parquet").to_pylist()
     fills = pq.read_table(staging_dir / "fills.parquet").to_pylist()
     costs = pq.read_table(staging_dir / "costs.parquet").to_pylist()
-    previous_date: object | None = None
+    if tuple(row["trade_date"] for row in nav) != expected_sessions:
+        raise ValueError("nav trade dates must exactly equal expected sessions")
+    nav_by_date: dict[date, dict[str, Any]] = {}
     for row in nav:
         trade_date = row["trade_date"]
-        if previous_date is not None and trade_date <= previous_date:
-            raise ValueError("nav trade dates must be strictly ascending")
-        previous_date = trade_date
+        if not isinstance(trade_date, date):
+            raise TypeError("nav trade dates are invalid")
+        nav_by_date[trade_date] = row
         if row["nav_fen"] != row["cash_fen"] + row["market_value_fen"]:
             raise ValueError("nav identity is invalid")
         benchmark = row["benchmark_close"]
@@ -389,15 +506,27 @@ def _validate_content(staging_dir: Path) -> None:
             or benchmark <= 0
         ):
             raise ValueError("nav benchmark close is invalid")
-    _validate_holdings(holdings)
+    _validate_holdings(holdings, nav_by_date)
     _validate_targets(targets)
     _validate_execution(fills, costs)
 
 
-def _validate_holdings(rows: list[dict[str, Any]]) -> None:
-    previous: tuple[object, str] | None = None
+def _validate_holdings(
+    rows: list[dict[str, Any]], nav_by_date: dict[date, dict[str, Any]]
+) -> None:
+    previous: tuple[date, str] | None = None
+    values_by_date: dict[date, int] = {trade_date: 0 for trade_date in nav_by_date}
     for row in rows:
-        key = (row["trade_date"], row["instrument_id"])
+        trade_date = row["trade_date"]
+        raw_id = row["instrument_id"]
+        if not isinstance(trade_date, date) or not isinstance(raw_id, str):
+            raise TypeError("holding date or instrument is invalid")
+        try:
+            if InstrumentId.parse(raw_id).canonical() != raw_id:
+                raise ValueError("holding instrument is not canonical")
+        except (TypeError, ValueError) as error:
+            raise ValueError("holding instrument is not canonical") from error
+        key = (trade_date, raw_id)
         if previous is not None and key <= previous:
             raise ValueError("holdings must be date and canonical-ID sorted uniquely")
         previous = key
@@ -407,6 +536,10 @@ def _validate_holdings(rows: list[dict[str, Any]]) -> None:
             raise ValueError("holding sellable quantity is invalid")
         if row["cost_basis_fen"] < 0 or row["market_value_fen"] < 0:
             raise ValueError("holding monetary values are invalid")
+        values_by_date[trade_date] += row["market_value_fen"]
+    for trade_date, market_value in values_by_date.items():
+        if market_value != nav_by_date[trade_date]["market_value_fen"]:
+            raise ValueError("holdings market values must equal nav")
 
 
 def _validate_targets(rows: list[dict[str, Any]]) -> None:
@@ -414,6 +547,14 @@ def _validate_targets(rows: list[dict[str, Any]]) -> None:
     for row in rows:
         grouped.setdefault((row["signal_date"], row["execute_date"]), []).append(row)
     for rows_for_target in grouped.values():
+        signal_date = rows_for_target[0]["signal_date"]
+        execute_date = rows_for_target[0]["execute_date"]
+        if (
+            not isinstance(signal_date, date)
+            or not isinstance(execute_date, date)
+            or execute_date <= signal_date
+        ):
+            raise ValueError("target dates are invalid")
         cash_rows = [row for row in rows_for_target if row["instrument_id"] is None]
         if len(cash_rows) != 1 or cash_rows[0]["reason_code"] != "CASH":
             raise ValueError("target requires exactly one CASH row")
@@ -425,6 +566,37 @@ def _validate_targets(rows: list[dict[str, Any]]) -> None:
             raise ValueError("target CASH position index is invalid")
         if cash["target_weight"] != cash["cash_weight"] or cash["score"] is not None:
             raise ValueError("target CASH row is invalid")
+        seen: set[str] = set()
+        for row in positions:
+            raw_id = row["instrument_id"]
+            weight = row["target_weight"]
+            score = row["score"]
+            if (
+                not isinstance(raw_id, str)
+                or raw_id in seen
+                or not isinstance(weight, float)
+                or not isfinite(weight)
+                or weight < 0
+                or (
+                    score is not None
+                    and (
+                        not isinstance(score, float) or not isfinite(score) or score < 0
+                    )
+                )
+            ):
+                raise ValueError("target position is invalid")
+            try:
+                if InstrumentId.parse(raw_id).canonical() != raw_id:
+                    raise ValueError("target instrument is not canonical")
+            except (TypeError, ValueError) as error:
+                raise ValueError("target instrument is not canonical") from error
+            seen.add(raw_id)
+        if (
+            not isinstance(cash["cash_weight"], float)
+            or not isfinite(cash["cash_weight"])
+            or cash["cash_weight"] < 0
+        ):
+            raise ValueError("target cash weight is invalid")
         total = sum(row["target_weight"] for row in positions) + cash["cash_weight"]
         if abs(total - 1.0) > 1e-10:
             raise ValueError("target weights are invalid")
@@ -434,17 +606,43 @@ def _validate_execution(
     fills: list[dict[str, Any]], costs: list[dict[str, Any]]
 ) -> None:
     filled_keys: set[tuple[object, int]] = set()
-    previous: tuple[object, int] | None = None
+    previous: tuple[date, int] | None = None
+    expected_index: dict[date, int] = {}
     for row in fills:
-        key = (row["trade_date"], row["result_index"])
+        trade_date = row["trade_date"]
+        if not isinstance(trade_date, date) or not isinstance(row["result_index"], int):
+            raise TypeError("execution index is invalid")
+        key = (trade_date, row["result_index"])
         if previous is not None and key <= previous:
             raise ValueError("fills must be ordered and uniquely indexed")
         previous = key
+        if row["result_index"] != expected_index.get(trade_date, 0):
+            raise ValueError("execution result indexes must be contiguous")
+        expected_index[trade_date] = row["result_index"] + 1
+        try:
+            if (
+                InstrumentId.parse(row["instrument_id"]).canonical()
+                != row["instrument_id"]
+            ):
+                raise ValueError("fill instrument is not canonical")
+        except (TypeError, ValueError) as error:
+            raise ValueError("fill instrument is not canonical") from error
         if row["price"] is None:
-            if row["filled_quantity"] != 0 or row["gross_value_fen"] != 0:
+            if (
+                row["filled_quantity"] != 0
+                or row["gross_value_fen"] != 0
+                or row["requested_quantity"] != row["unfilled_quantity"]
+            ):
                 raise ValueError("reject fill rows must have zero execution values")
             continue
-        if row["filled_quantity"] <= 0 or row["unfilled_quantity"] < 0:
+        if (
+            not isinstance(row["price"], float)
+            or not isfinite(row["price"])
+            or row["price"] <= 0
+            or row["gross_value_fen"] <= 0
+            or row["filled_quantity"] <= 0
+            or row["unfilled_quantity"] < 0
+        ):
             raise ValueError("filled quantities are invalid")
         if (
             row["requested_quantity"]
@@ -458,6 +656,16 @@ def _validate_execution(
         if key in cost_keys or key not in filled_keys:
             raise ValueError("cost rows must map one-to-one to fills")
         cost_keys.add(key)
+        if any(
+            not isinstance(row[name], int) or row[name] < 0
+            for name in (
+                "commission_fen",
+                "stamp_tax_fen",
+                "transfer_fee_fen",
+                "total_fees_fen",
+            )
+        ):
+            raise ValueError("cost fees are invalid")
         if row["total_fees_fen"] != (
             row["commission_fen"] + row["stamp_tax_fen"] + row["transfer_fee_fen"]
         ):

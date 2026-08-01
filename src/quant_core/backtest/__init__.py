@@ -10,13 +10,18 @@ from quant_core.backtest.accounting import (
     PortfolioAccount,
     PositionSnapshot,
 )
-from quant_core.backtest.artifacts import ArtifactEntry, BacktestArtifactWriter
+from quant_core.backtest.artifacts import (
+    ArtifactEntry,
+    BacktestArtifactWriter,
+    WriterState,
+)
 from quant_core.backtest.calendar import TradingCalendar
 from quant_core.backtest.engine import (
     BacktestCancelled,
     BacktestEngine,
     BacktestRequest,
     BacktestResult,
+    SnapshotMarketSlice,
     StrategyRef,
 )
 from quant_core.backtest.execution import ExecutionModel
@@ -71,6 +76,8 @@ __all__ = [
     "SecurityStatus",
     "Side",
     "SimulatedFill",
+    "SnapshotMarketSlice",
     "StrategyRef",
     "TradingCalendar",
+    "WriterState",
 ]

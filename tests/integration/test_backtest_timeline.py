@@ -1,21 +1,30 @@
 """Integration contracts for the daily backtest event loop."""
 
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from uuid import UUID
 
 import polars as pl
 import pyarrow.parquet as pq
+import pytest
 
+import quant_core.backtest.engine as engine_module
 from quant_core.backtest.accounting import CorporateAction
 from quant_core.backtest.calendar import TradingCalendar
-from quant_core.backtest.engine import BacktestEngine, BacktestRequest, StrategyRef
+from quant_core.backtest.engine import (
+    BacktestEngine,
+    BacktestRequest,
+    SnapshotMarketSlice,
+    StrategyRef,
+)
 from quant_core.backtest.models import ExecutionConfig, ExecutionPrice, MarketSlice
 from quant_core.backtest.rulebook import FeeBreakdown
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.portfolio import RebalancePlanner, TargetPortfolio, TargetPosition
 
 _SNAPSHOT = UUID("00000000-0000-0000-0000-000000000001")
+_WRONG_SNAPSHOT = UUID("00000000-0000-0000-0000-000000000099")
 _EXPERIMENT = UUID("00000000-0000-0000-0000-000000000002")
 _BENCHMARK = InstrumentId.parse("SSE:000001")
 _STOCK = InstrumentId.parse("SSE:600001")
@@ -34,7 +43,7 @@ class _RuleBook:
         return None
 
     def fees(self, *args: object) -> FeeBreakdown:
-        return FeeBreakdown(0, 0, 0, 0)
+        return FeeBreakdown(100, 0, 0, 100)
 
 
 class _Data:
@@ -52,9 +61,9 @@ class _Data:
         assert (snapshot_id, start, end) == (_SNAPSHOT, _FRIDAY, _TUESDAY)
         return self.calendar_value
 
-    def market_slice(self, snapshot_id: UUID, trade_date: date) -> MarketSlice:
+    def market_slice(self, snapshot_id: UUID, trade_date: date) -> SnapshotMarketSlice:
         assert snapshot_id == _SNAPSHOT
-        return self.slices[trade_date]
+        return SnapshotMarketSlice(_SNAPSHOT, self.slices[trade_date])
 
     def corporate_actions(
         self, snapshot_id: UUID, trade_date: date
@@ -78,7 +87,7 @@ class _Targets:
         assert (strategy.strategy_id, snapshot_id) == ("timeline", _SNAPSHOT)
         self.calls.append((signal_date, execute_date))
         if signal_date != _FRIDAY:
-            return None
+            return TargetPortfolio(signal_date, execute_date, (), 1.0)
         return TargetPortfolio(
             signal_date,
             execute_date,
@@ -155,8 +164,12 @@ def test_engine_generates_after_close_and_executes_on_next_session(
     assert [(row["signal_date"], row["execute_date"]) for row in targets_rows] == [
         (_FRIDAY, _MONDAY),
         (_FRIDAY, _MONDAY),
+        (_MONDAY, _TUESDAY),
     ]
-    assert [(row["trade_date"], row["price"]) for row in fills] == [(_MONDAY, 12.0)]
+    assert [(row["trade_date"], row["price"]) for row in fills] == [
+        (_MONDAY, 12.0),
+        (_TUESDAY, 11.0),
+    ]
     assert [(row["trade_date"], row["benchmark_close"]) for row in nav] == [
         (_FRIDAY, 3.0),
         (_MONDAY, 3.0),
@@ -168,3 +181,95 @@ def test_engine_generates_after_close_and_executes_on_next_session(
         (3, 3, _TUESDAY),
     ]
     assert result.sessions_completed == 3
+
+
+def test_engine_rejects_same_date_slice_from_another_snapshot(tmp_path: Path) -> None:
+    class WrongSnapshotData(_Data):
+        def market_slice(
+            self, snapshot_id: UUID, trade_date: date
+        ) -> SnapshotMarketSlice:
+            return SnapshotMarketSlice(_WRONG_SNAPSHOT, self.slices[trade_date])
+
+    with pytest.raises(ValueError, match="snapshot"):
+        BacktestEngine(
+            WrongSnapshotData(),
+            _Targets(),
+            _RuleBook(),
+            RebalancePlanner(),
+            artifact_root=tmp_path,
+        ).run(_request(), _Progress(), _NeverCancelled())
+
+    assert not list(tmp_path.glob("experiment_id=*/manifest.json"))
+    assert list(tmp_path.glob(".staging-*/diagnostic.json"))
+
+
+def test_engine_uses_next_session_open_when_configured(tmp_path: Path) -> None:
+    request = replace(
+        _request(),
+        experiment_id=UUID("00000000-0000-0000-0000-000000000007"),
+        execution_config=ExecutionConfig(ExecutionPrice.OPEN, 0.0, 1.0),
+    )
+    result = BacktestEngine(
+        _Data(), _Targets(), _RuleBook(), RebalancePlanner(), artifact_root=tmp_path
+    ).run(request, _Progress(), _NeverCancelled())
+
+    fills = pq.read_table(result.artifact_dir / "fills.parquet").to_pylist()
+    assert [(row["trade_date"], row["price"]) for row in fills] == [
+        (_MONDAY, 11.0),
+        (_TUESDAY, 10.0),
+    ]
+
+
+def test_engine_orders_begin_execution_mark_then_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, date]] = []
+    begin = engine_module.PortfolioAccount.begin_session
+    execute = engine_module.ExecutionModel.execute
+    mark = engine_module.PortfolioAccount.mark_to_market
+
+    def record_begin(self: object, trade_date: date, actions: object) -> None:
+        events.append(("begin", trade_date))
+        begin(self, trade_date, actions)
+
+    def record_execute(self: object, *args: object, **kwargs: object):
+        market = args[1]
+        assert isinstance(market, MarketSlice)
+        events.append(("execute", market.trade_date))
+        return execute(self, *args, **kwargs)
+
+    def record_mark(self: object, trade_date: date, closes: object):
+        events.append(("mark", trade_date))
+        return mark(self, trade_date, closes)
+
+    class RecordingTargets(_Targets):
+        def generate_target(
+            self, *args: object, **kwargs: object
+        ) -> TargetPortfolio | None:
+            events.append(("target", args[2]))
+            return super().generate_target(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module.PortfolioAccount, "begin_session", record_begin)
+    monkeypatch.setattr(engine_module.ExecutionModel, "execute", record_execute)
+    monkeypatch.setattr(engine_module.PortfolioAccount, "mark_to_market", record_mark)
+    BacktestEngine(
+        _Data(),
+        RecordingTargets(),
+        _RuleBook(),
+        RebalancePlanner(),
+        artifact_root=tmp_path,
+    ).run(_request(), _Progress(), _NeverCancelled())
+
+    assert events == [
+        ("begin", _FRIDAY),
+        ("execute", _FRIDAY),
+        ("mark", _FRIDAY),
+        ("target", _FRIDAY),
+        ("begin", _MONDAY),
+        ("execute", _MONDAY),
+        ("mark", _MONDAY),
+        ("target", _MONDAY),
+        ("begin", _TUESDAY),
+        ("execute", _TUESDAY),
+        ("mark", _TUESDAY),
+    ]

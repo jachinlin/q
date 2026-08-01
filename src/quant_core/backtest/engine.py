@@ -100,12 +100,28 @@ class BacktestResult:
             raise TypeError("final_snapshot must be an AccountSnapshot")
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotMarketSlice:
+    """A market slice bound to the immutable snapshot that supplied it."""
+
+    snapshot_id: UUID
+    market: MarketSlice
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.snapshot_id, UUID):
+            raise TypeError("snapshot_id must be a UUID")
+        if not isinstance(self.market, MarketSlice):
+            raise TypeError("market must be a MarketSlice")
+
+
 class BacktestMarketData(Protocol):
     def calendar(
         self, snapshot_id: UUID, start: date, end: date
     ) -> TradingCalendar: ...
 
-    def market_slice(self, snapshot_id: UUID, trade_date: date) -> MarketSlice: ...
+    def market_slice(
+        self, snapshot_id: UUID, trade_date: date
+    ) -> SnapshotMarketSlice: ...
 
     def corporate_actions(
         self, snapshot_id: UUID, trade_date: date
@@ -187,20 +203,23 @@ class BacktestEngine:
             raise ValueError(
                 "request rulebook_version does not match injected rulebook"
             )
-        calendar = self._market_data.calendar(
-            request.snapshot_id, request.start_date, request.end_date
-        )
-        sessions = _validate_calendar(calendar, request)
         writer = self._writer_factory(self._root, request.experiment_id)
         completed = 0
         try:
+            calendar = self._market_data.calendar(
+                request.snapshot_id, request.start_date, request.end_date
+            )
+            sessions = _validate_calendar(calendar, request)
             account = PortfolioAccount(request.initial_cash_fen, calendar)
             pending: TargetPortfolio | None = None
             final_snapshot: AccountSnapshot | None = None
             for index, trade_date in enumerate(sessions):
                 if cancellation.is_cancelled():
                     raise BacktestCancelled(writer.staging_dir, completed)
-                market = self._market_data.market_slice(request.snapshot_id, trade_date)
+                bound_market = self._market_data.market_slice(
+                    request.snapshot_id, trade_date
+                )
+                market = _validate_bound_market(bound_market, request, trade_date)
                 closes, benchmark_close = _validate_market(market, request, trade_date)
                 actions = self._market_data.corporate_actions(
                     request.snapshot_id, trade_date
@@ -265,7 +284,7 @@ class BacktestEngine:
             if final_snapshot is None:
                 raise RuntimeError("no final snapshot was produced")
             writer.close()
-            artifacts = writer.validate(completed)
+            artifacts = writer.validate(sessions)
             manifest = _manifest(request, completed, artifacts)
             manifest_path = writer.publish(manifest)
             return BacktestResult(
@@ -314,6 +333,18 @@ def _validate_market(
     if not isfinite(benchmark) or benchmark <= 0:
         raise ValueError("benchmark close must be finite and positive")
     return closes, benchmark
+
+
+def _validate_bound_market(
+    bound_market: object, request: BacktestRequest, trade_date: date
+) -> MarketSlice:
+    if not isinstance(bound_market, SnapshotMarketSlice):
+        raise TypeError("market data must return a SnapshotMarketSlice")
+    if bound_market.snapshot_id != request.snapshot_id:
+        raise ValueError("market slice snapshot does not match request")
+    if bound_market.market.trade_date != trade_date:
+        raise ValueError("market slice trade_date does not match session")
+    return bound_market.market
 
 
 def _execution_prices(
