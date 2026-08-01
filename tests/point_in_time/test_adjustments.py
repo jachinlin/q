@@ -13,6 +13,7 @@ from quant_core.data.adjustments import (
     ADJUSTMENT_EVENT_COMPONENTS_DTYPE,
     AdjustmentMode,
     PriceAdjustmentService,
+    _forward_adjust,
 )
 from quant_core.data.repository import SnapshotResearchRepository
 from quant_core.domain.enums import DatasetKind
@@ -144,6 +145,194 @@ def test_raw_mode_preserves_raw_ohlcv_values(tmp_path: Path) -> None:
     ]
     assert result["adjustment_mode"].to_list() == ["RAW"] * 5
     assert result["adjustment_as_of"].to_list() == [_DAYS[-1]] * 5
+
+
+def test_forward_adjustment_uses_baostock_preclose_without_action_dataset(
+    tmp_path: Path,
+) -> None:
+    """Forward prices must follow raw preclose gaps without corporate-action lineage."""
+    raw_values = [
+        (9.0, 11.0, 8.0, 10.0, 0.0, 100, 1000.0),
+        (11.0, 13.0, 10.0, 12.0, 10.0, 110, 1320.0),
+        (8.0, 9.0, 7.0, 8.4, 8.0, 120, 1008.0),
+        (8.5, 9.5, 8.0, 9.0, 8.4, 130, 1170.0),
+    ]
+    base = point_in_time_fixture(tmp_path)
+    bars = _write_dataset(
+        tmp_path,
+        "forward-bars",
+        DatasetKind.DAILY_BAR,
+        [
+            _bar_row(day, values)
+            for day, values in zip(_DAYS[:4], raw_values, strict=True)
+        ],
+    )
+    snapshot_id = base.repository.bind_dataset(
+        base.late_snapshot_id, DatasetKind.DAILY_BAR, bars
+    )
+
+    result = (
+        PriceAdjustmentService(SnapshotResearchRepository(base.repository))
+        .bars(
+            snapshot_id,
+            [_INSTRUMENT],
+            _DAYS[0],
+            _DAYS[2],
+            AdjustmentMode.FORWARD,
+            _DAYS[3],
+        )
+        .collect()
+    )
+
+    expected_factors = [2.0 / 3.0, 2.0 / 3.0, 1.0]
+    assert result["adjustment_factor"].to_list() == pytest.approx(expected_factors)
+    assert result["close"].to_list() == pytest.approx([20.0 / 3.0, 8.0, 8.4])
+    assert result["preclose"].to_list() == pytest.approx([0.0, 20.0 / 3.0, 8.0])
+    assert result["close"].to_list()[:2] == pytest.approx(
+        result["preclose"].to_list()[1:]
+    )
+    assert result["volume"].to_list() == [100, 110, 120]
+    assert result["amount"].to_list() == [1000.0, 1320.0, 1008.0]
+    assert result["adjustment_mode"].unique().to_list() == ["FORWARD"]
+    assert result.schema["adjustment_event_components"] == (
+        ADJUSTMENT_EVENT_COMPONENTS_DTYPE
+    )
+    assert result["adjustment_event_factor"].to_list() == [1.0, 1.0, 1.0]
+    assert result["adjustment_event_available_at"].to_list() == [None, None, None]
+    assert result["adjustment_event_components"].to_list() == [[], [], []]
+
+
+def test_forward_adjustment_sorts_and_isolates_instruments() -> None:
+    """Cross-instrument ordering must not let one close set another's factor."""
+    result, factors = _forward_adjust(
+        _forward_frame(
+            [
+                ("SSE:600001", _DAYS[1], 30.0, 10.0),
+                ("SSE:600000", _DAYS[1], 12.0, 8.0),
+                ("SSE:600001", _DAYS[0], 20.0, 0.0),
+                ("SSE:600000", _DAYS[0], 10.0, None),
+            ]
+        ),
+        _DAYS[1],
+    )
+
+    assert result.select("instrument_id", "trade_date").rows() == [
+        ("SSE:600000", _DAYS[0]),
+        ("SSE:600000", _DAYS[1]),
+        ("SSE:600001", _DAYS[0]),
+        ("SSE:600001", _DAYS[1]),
+    ]
+    assert factors == pytest.approx([0.8, 1.0, 0.5, 1.0])
+
+
+def test_forward_adjustment_accepts_ipo_preclose_and_missing_sessions() -> None:
+    """Only non-initial observed rows require a positive preclose."""
+    result, factors = _forward_adjust(
+        _forward_frame(
+            [
+                ("SSE:600000", _DAYS[0], 10.0, None),
+                ("SSE:600000", _DAYS[2], 11.0, 9.0),
+            ]
+        ),
+        _DAYS[2],
+    )
+
+    assert result["trade_date"].to_list() == [_DAYS[0], _DAYS[2]]
+    assert factors == pytest.approx([0.9, 1.0])
+
+
+def test_forward_adjustment_empty_bars_preserves_schema() -> None:
+    """Empty reads need the same price columns for metadata construction."""
+    frame = _forward_frame([])
+
+    result, factors = _forward_adjust(frame, _DAYS[-1])
+
+    assert result.schema == frame.schema
+    assert result.is_empty()
+    assert factors == []
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[0], 11.0, 10.0),
+            ],
+            "duplicate daily bar key",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, None),
+            ],
+            "preclose must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, -1.0),
+            ],
+            "preclose must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, float("nan")),
+            ],
+            "preclose must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, float("inf")),
+            ],
+            "preclose must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], None, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ],
+            "close must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], -1.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ],
+            "close must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], float("nan"), 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ],
+            "close must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], float("inf"), 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ],
+            "close must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 1e-308, 0.0),
+                ("SSE:600000", _DAYS[1], 1.0, 1e308),
+            ],
+            "forward adjustment factor must be finite and positive",
+        ),
+    ],
+)
+def test_forward_adjustment_rejects_invalid_factor_inputs(
+    rows: list[tuple[str, date, float | None, float | None]], message: str
+) -> None:
+    """Invalid observed gap inputs must fail rather than fabricate a factor."""
+    with pytest.raises(ValueError, match=message):
+        _forward_adjust(_forward_frame(rows), _DAYS[-1])
 
 
 def test_backward_adjustment_composes_multiple_events_in_ex_date_order(
@@ -600,7 +789,7 @@ def test_adjustment_request_rejects_invalid_time_bounds(
             [_INSTRUMENT],
             start,
             end,
-            AdjustmentMode.RAW,
+            AdjustmentMode.FORWARD,
             as_of,
         )
 
@@ -649,6 +838,21 @@ def _backward_bars(fixture: AdjustmentFixture, start: date, end: date, as_of: da
             as_of,
         )
         .collect()
+    )
+
+
+def _forward_frame(
+    rows: list[tuple[str, date, float | None, float | None]],
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        rows,
+        schema={
+            "instrument_id": pl.String,
+            "trade_date": pl.Date,
+            "close": pl.Float64,
+            "preclose": pl.Float64,
+        },
+        orient="row",
     )
 
 

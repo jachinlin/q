@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
-from math import isfinite
+from math import exp, isfinite, log
+from typing import cast
 
 import polars as pl
 
@@ -33,6 +34,7 @@ class AdjustmentMode(StrEnum):
 
     RAW = "RAW"
     BACKWARD = "BACKWARD"
+    FORWARD = "FORWARD"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +57,7 @@ class _AdjustmentEvent:
 
 
 class PriceAdjustmentService:
-    """Serve raw or backward-adjusted bars from one immutable snapshot."""
+    """Serve raw, backward-adjusted, or forward-adjusted snapshot bars."""
 
     def __init__(self, repository: ResearchDataRepository) -> None:
         self._repository = repository
@@ -80,6 +82,25 @@ class PriceAdjustmentService:
         if mode is AdjustmentMode.RAW:
             raw = self._repository.bars(snapshot_id, instruments, start, end).collect()
             return _with_metadata(raw, mode, as_of).lazy()
+
+        if mode is AdjustmentMode.FORWARD:
+            raw = self._repository.bars(
+                snapshot_id, instruments, start, as_of
+            ).collect()
+            adjusted, price_factors = _forward_adjust(raw, end)
+            if adjusted.is_empty():
+                return _with_metadata(adjusted, mode, as_of).lazy()
+            factor_column = pl.Series("_price_factor", price_factors, dtype=pl.Float64)
+            adjusted_prices = [
+                (pl.col(column) * factor_column).alias(column)
+                for column in ("open", "high", "low", "close", "preclose")
+            ]
+            return _with_metadata(
+                adjusted.with_columns(adjusted_prices),
+                mode,
+                as_of,
+                adjustment_factors=price_factors,
+            ).lazy()
 
         actions = self._repository.corporate_actions_as_of(
             snapshot_id, instruments, as_of
@@ -123,6 +144,65 @@ def _validate_request(start: date, end: date, as_of: date) -> None:
         raise ValueError("start must not follow end")
     if as_of < end:
         raise ValueError("as_of must not precede end")
+
+
+def _required_positive(value: object, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{field} must be finite and positive")
+    return float(value)
+
+
+def _validate_unique_bar_keys(frame: pl.DataFrame) -> None:
+    if frame.select(
+        pl.struct("instrument_id", "trade_date").is_duplicated().any()
+    ).item():
+        raise ValueError("duplicate daily bar key")
+
+
+def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[float]]:
+    ordered = frame.sort("instrument_id", "trade_date")
+    _validate_unique_bar_keys(ordered)
+    factors_by_key: dict[tuple[str, date], float] = {}
+    for group in ordered.partition_by("instrument_id", maintain_order=True):
+        rows = group.select(
+            "instrument_id", "trade_date", "close", "preclose"
+        ).to_dicts()
+        log_factor = 0.0
+        last = len(rows) - 1
+        factors = [1.0] * len(rows)
+        for index in range(last, 0, -1):
+            previous_close = _required_positive(rows[index - 1]["close"], "close")
+            current_preclose = _required_positive(rows[index]["preclose"], "preclose")
+            log_factor += log(current_preclose) - log(previous_close)
+            try:
+                factor = exp(log_factor)
+            except OverflowError as error:
+                raise ValueError(
+                    "forward adjustment factor must be finite and positive"
+                ) from error
+            if not isfinite(factor) or factor <= 0:
+                raise ValueError(
+                    "forward adjustment factor must be finite and positive"
+                )
+            factors[index - 1] = factor
+        for row, factor in zip(rows, factors, strict=True):
+            factors_by_key[
+                (
+                    cast(str, row["instrument_id"]),
+                    cast(date, row["trade_date"]),
+                )
+            ] = factor
+    filtered = ordered.filter(pl.col("trade_date") <= end)
+    filtered_factors = [
+        factors_by_key[(cast(str, row["instrument_id"]), cast(date, row["trade_date"]))]
+        for row in filtered.select("instrument_id", "trade_date").to_dicts()
+    ]
+    return filtered, filtered_factors
 
 
 def _with_metadata(
