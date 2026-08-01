@@ -1,0 +1,33 @@
+version: a-share-v1
+commission:
+  rate: "0.0003"
+  minimum_cents: 500
+price_limits:
+  - {board: MAIN, status: NORMAL, start: 2005-01-24, end: null, rate: "0.10"}
+  - {board: MAIN, status: ST, start: 2005-01-24, end: 2026-07-05, rate: "0.05"}
+  - {board: MAIN, status: ST, start: 2026-07-06, end: null, rate: "0.10"}
+  - {board: CHINEXT, status: NORMAL, start: 2005-01-24, end: 2020-08-23, rate: "0.10"}
+  - {board: CHINEXT, status: NORMAL, start: 2020-08-24, end: null, rate: "0.20"}
+  - {board: CHINEXT, status: ST, start: 2005-01-24, end: 2020-08-23, rate: "0.05"}
+  - {board: CHINEXT, status: ST, start: 2020-08-24, end: null, rate: "0.20"}
+  # IPO/relisting/delisting no-limit exceptions need lifecycle inputs and are not inferred.
+  - {board: STAR, status: NORMAL, start: 2005-01-24, end: null, rate: "0.20"}
+  - {board: STAR, status: ST, start: 2005-01-24, end: null, rate: "0.20"}
+stamp_duty:
+  - {side: BUY, start: 2005-01-24, end: 2007-05-29, rate: "0.001"}
+  - {side: BUY, start: 2007-05-30, end: 2008-04-23, rate: "0.003"}
+  - {side: BUY, start: 2008-04-24, end: 2008-09-18, rate: "0.001"}
+  - {side: BUY, start: 2008-09-19, end: null, rate: "0"}
+  - {side: SELL, start: 2005-01-24, end: 2007-05-29, rate: "0.001"}
+  - {side: SELL, start: 2007-05-30, end: 2008-04-23, rate: "0.003"}
+  - {side: SELL, start: 2008-04-24, end: 2023-08-27, rate: "0.001"}
+  - {side: SELL, start: 2023-08-28, end: null, rate: "0.0005"}
+transfer_fee:
+  - {exchange: SSE, start: 2005-01-24, end: 2012-05-31, basis: face_value, rate: "0.0005"}
+  - {exchange: SSE, start: 2012-06-01, end: 2012-08-31, basis: face_value, rate: "0.000375"}
+  - {exchange: SSE, start: 2012-09-01, end: 2015-07-31, basis: face_value, rate: "0.0003"}
+  - {exchange: SSE, start: 2015-08-01, end: 2022-04-28, basis: turnover, rate: "0.00002"}
+  - {exchange: SSE, start: 2022-04-29, end: null, basis: turnover, rate: "0.00001"}
+  - {exchange: SZSE, start: 2005-01-24, end: 2015-07-31, basis: turnover, rate: "0.0000255"}
+  - {exchange: SZSE, start: 2015-08-01, end: 2022-04-28, basis: turnover, rate: "0.00002"}
+  - {exchange: SZSE, start: 2022-04-29, end: null, basis: turnover, rate: "0.00001"}
