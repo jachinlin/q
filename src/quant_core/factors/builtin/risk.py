@@ -8,7 +8,11 @@ from math import expm1, fsum, isfinite, sqrt
 from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.factors.base import FactorSpec
-from quant_core.factors.builtin.momentum import AdjustedBarService, _MarketFactor
+from quant_core.factors.builtin.momentum import (
+    AdjustedBarService,
+    MarketBarsCache,
+    _MarketFactor,
+)
 
 _VERSION = "2.1.0"
 _PRICE_BASIS = "baostock_forward_log_return_v2"
@@ -24,6 +28,8 @@ class Volatility60dFactor(_MarketFactor):
         self,
         price_service: AdjustedBarService,
         instruments: Sequence[InstrumentId],
+        *,
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         super().__init__(
             price_service,
@@ -50,6 +56,7 @@ class Volatility60dFactor(_MarketFactor):
             ),
             required_prices=61,
             evaluator=_volatility_value,
+            market_bars=market_bars,
         )
 
 
@@ -57,7 +64,11 @@ class DownsideVolatility60dFactor(_MarketFactor):
     """Annualized root-mean-square of negative log returns."""
 
     def __init__(
-        self, price_service: AdjustedBarService, instruments: Sequence[InstrumentId]
+        self,
+        price_service: AdjustedBarService,
+        instruments: Sequence[InstrumentId],
+        *,
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         super().__init__(
             price_service,
@@ -85,6 +96,7 @@ class DownsideVolatility60dFactor(_MarketFactor):
             ),
             required_prices=61,
             evaluator=_downside_volatility_value,
+            market_bars=market_bars,
         )
 
 
@@ -92,7 +104,11 @@ class MaxDrawdown120dFactor(_MarketFactor):
     """Largest peak-to-later-close loss in the latest 120 prices."""
 
     def __init__(
-        self, price_service: AdjustedBarService, instruments: Sequence[InstrumentId]
+        self,
+        price_service: AdjustedBarService,
+        instruments: Sequence[InstrumentId],
+        *,
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         super().__init__(
             price_service,
@@ -117,6 +133,7 @@ class MaxDrawdown120dFactor(_MarketFactor):
             ),
             required_prices=120,
             evaluator=_max_drawdown_value,
+            market_bars=market_bars,
         )
 
 

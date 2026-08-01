@@ -6,13 +6,14 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from math import isfinite
 from types import MappingProxyType
 from typing import Protocol, cast
 
 import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from quant_core.data.contracts import JsonScalar, JsonValue, canonical_json_bytes
 from quant_core.data.schemas import PolarsDataType
@@ -182,11 +183,12 @@ def factor_table_content_hash(table: pa.Table) -> str:
 def _factor_table_ipc_bytes(table: pa.Table) -> bytes:
     combined = table.combine_chunks()
     # Arrow does not define bytes beneath null validity bits.  Parquet is free to
-    # rewrite those invisible bytes, so hash a logical reconstruction instead of
-    # allocator-dependent buffers.
+    # rewrite those invisible bytes, so replace just those physical values with a
+    # fixed Arrow scalar while retaining the original null bitmap.  This stays in
+    # Arrow instead of allocating one Python object per research-scale table cell.
     canonical = pa.table(
         [
-            pa.array(combined.column(index).to_pylist(), type=field.type)
+            _canonical_null_buffers(combined.column(index).combine_chunks(), field)
             for index, field in enumerate(combined.schema)
         ],
         schema=combined.schema,
@@ -195,6 +197,36 @@ def _factor_table_ipc_bytes(table: pa.Table) -> bytes:
     with pa.ipc.new_stream(sink, canonical.schema) as writer:
         writer.write_table(canonical)
     return cast(bytes, sink.getvalue().to_pybytes())
+
+
+def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
+    if array.null_count == 0:
+        return array
+    filled = pc.fill_null(array, _null_fill_scalar(field.type))
+    return pa.Array.from_buffers(
+        field.type,
+        len(array),
+        [array.buffers()[0], *filled.buffers()[1:]],
+        null_count=array.null_count,
+    )
+
+
+def _null_fill_scalar(data_type: pa.DataType) -> pa.Scalar:
+    if pa.types.is_string(data_type):
+        value: object = ""
+    elif pa.types.is_boolean(data_type):
+        value = False
+    elif pa.types.is_floating(data_type):
+        value = 0.0
+    elif pa.types.is_integer(data_type):
+        value = 0
+    elif pa.types.is_date(data_type):
+        value = date(1970, 1, 1)
+    elif pa.types.is_timestamp(data_type):
+        value = datetime(1970, 1, 1, tzinfo=UTC)
+    else:
+        raise TypeError(f"unsupported factor hash dtype: {data_type}")
+    return pa.scalar(value, type=data_type)
 
 
 def _owned_read_only_table(table: pa.Table) -> pa.Table:

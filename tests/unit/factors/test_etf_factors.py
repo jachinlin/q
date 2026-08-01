@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from inspect import getsource
 from math import sqrt
 
 import numpy as np
@@ -24,13 +25,22 @@ from quant_core.factors import (
 )
 from quant_core.factors.base import factor_table_content_hash
 from quant_core.factors.builtin import register_etf_factors
-from quant_core.factors.builtin.momentum import ReturnFactor, Trend120dFactor
+from quant_core.factors.builtin.momentum import (
+    ReturnFactor,
+    Trend120dFactor,
+    _MarketFactor,
+)
 from quant_core.factors.builtin.risk import Volatility60dFactor
 
 _SSE = InstrumentId.parse("SSE:510300")
 _SZSE = InstrumentId.parse("SZSE:159919")
 _SNAPSHOT = SnapshotId.parse("00000000-0000-0000-0000-000000000006")
 _UNIVERSE_HASH = "6" * 64
+
+
+def test_market_factor_execution_does_not_materialize_row_dictionaries() -> None:
+    """Long histories must not allocate a Python mapping for every market row."""
+    assert "to_dicts" not in getsource(_MarketFactor.compute)
 
 
 class RecordingPriceService:

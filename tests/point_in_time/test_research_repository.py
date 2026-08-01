@@ -11,6 +11,7 @@ import polars as pl
 import pytest
 from sqlalchemy import text
 
+from quant_core.data import repository as repository_module
 from quant_core.data.quality.models import QualityRunSpec
 from quant_core.data.repository import (
     SnapshotDatasetMissing,
@@ -115,6 +116,31 @@ def test_bars_are_snapshot_bound_range_reads_with_canonical_sort(
 
     assert result["trade_date"].to_list() == [date(2024, 4, 28), date(2024, 4, 29)]
     assert result.schema == CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR].columns
+
+
+def test_bars_remain_a_lazy_parquet_scan_until_the_consumer_collects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daily market reads must not eagerly stage DuckDB/Arrow before filtering."""
+    fixture = point_in_time_fixture(tmp_path)
+
+    def eager_duckdb_is_forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("daily bars must use a lazy Parquet scan")
+
+    monkeypatch.setattr(repository_module.duckdb, "connect", eager_duckdb_is_forbidden)
+
+    result = (
+        SnapshotResearchRepository(fixture.repository)
+        .bars(
+            fixture.early_snapshot_id,
+            [InstrumentId.parse("SSE:600000")],
+            date(2024, 4, 28),
+            date(2024, 4, 29),
+        )
+        .collect()
+    )
+
+    assert result["trade_date"].to_list() == [date(2024, 4, 28), date(2024, 4, 29)]
 
 
 def test_corporate_actions_as_of_excludes_actions_available_after_shanghai_close(

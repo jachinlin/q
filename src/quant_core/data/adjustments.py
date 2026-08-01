@@ -302,8 +302,20 @@ def _with_metadata(
     normalized = frame.with_columns(
         pl.Series("adjustment_factor", factors, dtype=pl.Float64)
     ).sort("instrument_id", "trade_date")
+    if not events:
+        return normalized.with_columns(
+            pl.lit(mode.value, dtype=pl.String).alias("adjustment_mode"),
+            pl.lit(as_of, dtype=pl.Date).alias("adjustment_as_of"),
+            pl.lit(1.0, dtype=pl.Float64).alias("adjustment_event_factor"),
+            pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(
+                "adjustment_event_available_at"
+            ),
+            pl.lit([], dtype=ADJUSTMENT_EVENT_COMPONENTS_DTYPE).alias(
+                "adjustment_event_components"
+            ),
+        )
     event_factors, event_available, event_components = _event_metadata(
-        normalized, events or {}
+        normalized, events
     )
     return normalized.with_columns(
         pl.lit(mode.value, dtype=pl.String).alias("adjustment_mode"),

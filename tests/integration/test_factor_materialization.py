@@ -206,6 +206,7 @@ def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
         "trend_120d_v1@2.1.0",
         "volatility_60d_v1@2.1.0",
     }
+    assert calls == 1
     assert bars.calls == calls
     assert _cache_state(cache.root) == cache_state
     assert {key: artifact.content_hash for key, artifact in second.items()} == {

@@ -18,6 +18,7 @@ from quant_core.data.adjustments import (
     AdjustmentMode,
     PriceAdjustmentService,
     _forward_adjust,
+    _with_metadata,
 )
 from quant_core.data.repository import SnapshotResearchRepository
 from quant_core.domain.enums import DatasetKind
@@ -832,6 +833,38 @@ def test_forward_adjustment_uses_vectorized_path_at_research_scale() -> None:
     assert len(factors) == row_count
     assert result["forward_return_index"].is_finite().all()
     assert result[FORWARD_LOG_RETURN_COLUMN].drop_nulls().is_finite().all()
+
+
+def test_forward_metadata_does_not_materialize_empty_action_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FORWARD has unit/empty action lineage and must not build row dictionaries."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 10.0, 0.0),
+            ("SSE:600000", _DAYS[1], 11.0, 10.0),
+        ]
+    )
+    adjusted, factors = _forward_adjust(frame, _DAYS[-1])
+
+    def action_materialization_is_forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("FORWARD must not materialize empty action lineage")
+
+    monkeypatch.setattr(
+        "quant_core.data.adjustments._event_metadata",
+        action_materialization_is_forbidden,
+    )
+
+    result = _with_metadata(
+        adjusted,
+        AdjustmentMode.FORWARD,
+        _DAYS[-1],
+        adjustment_factors=factors,
+    )
+
+    assert result["adjustment_event_factor"].to_list() == [1.0, 1.0]
+    assert result["adjustment_event_available_at"].null_count() == 2
+    assert result["adjustment_event_components"].to_list() == [[], []]
 
 
 @pytest.mark.parametrize(

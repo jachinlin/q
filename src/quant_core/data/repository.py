@@ -116,17 +116,23 @@ class SnapshotResearchRepository:
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """Return inclusive daily bars in canonical primary-key order."""
+        """Return inclusive daily bars as one catalog-bound lazy Parquet scan."""
         if start > end:
             raise ValueError("start must not follow end")
-        predicates, parameters = _instrument_predicate(instruments)
-        predicates.extend(("trade_date >= ?", "trade_date <= ?"))
-        parameters.extend((start, end))
-        return self._read(
-            snapshot_id,
-            DatasetKind.DAILY_BAR,
-            " AND ".join(predicates),
-            parameters,
+        record = self._dataset_record(snapshot_id, DatasetKind.DAILY_BAR)
+        definition = CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR]
+        instrument_ids = [instrument.canonical() for instrument in instruments]
+        scope = (
+            pl.col("instrument_id").is_in(instrument_ids)
+            if instrument_ids
+            else pl.lit(False)
+        )
+        return (
+            pl.scan_parquet([partition.path for partition in record.partitions])
+            .select(list(definition.columns))
+            .filter(scope & pl.col("trade_date").is_between(start, end, closed="both"))
+            .cast(definition.columns)
+            .sort(list(definition.sort_key))
         )
 
     def financials_as_of(

@@ -16,6 +16,7 @@ from quant_core.factors.builtin.auxiliary import (
 from quant_core.factors.builtin.code_hash import builtin_source_hash
 from quant_core.factors.builtin.momentum import (
     AdjustedBarService,
+    MarketBarsCache,
     Momentum12020Factor,
     ReturnFactor,
     Trend120dFactor,
@@ -87,12 +88,13 @@ def register_etf_factors(
     instruments: Sequence[InstrumentId],
 ) -> None:
     """Register the five exact Task 6 ETF market-factor identities."""
+    market_bars = MarketBarsCache(price_service, instruments, max_lookback_sessions=120)
     factors: tuple[Factor, ...] = (
-        ReturnFactor(price_service, instruments, 20),
-        ReturnFactor(price_service, instruments, 60),
-        ReturnFactor(price_service, instruments, 120),
-        Trend120dFactor(price_service, instruments),
-        Volatility60dFactor(price_service, instruments),
+        ReturnFactor(price_service, instruments, 20, market_bars=market_bars),
+        ReturnFactor(price_service, instruments, 60, market_bars=market_bars),
+        ReturnFactor(price_service, instruments, 120, market_bars=market_bars),
+        Trend120dFactor(price_service, instruments, market_bars=market_bars),
+        Volatility60dFactor(price_service, instruments, market_bars=market_bars),
     )
     for factor in factors:
         register_builtin(registry, factor)
@@ -110,15 +112,18 @@ def register_stock_factors(
     min_abs_net_profit: float = 1e-12,
 ) -> None:
     """Register all Task 7 alpha and auxiliary identities exactly once."""
+    market_bars = MarketBarsCache(price_service, instruments, max_lookback_sessions=120)
     factors: tuple[Factor, ...] = (
         EarningsYieldFactor(bar_repository, instruments),
         BookToPriceFactor(bar_repository, instruments),
         RoeAvgPitFactor(financial_provider, instruments),
         CfoToNetProfitFactor(financial_provider, instruments, min_abs_net_profit),
-        Momentum12020Factor(price_service, instruments),
-        Volatility60dFactor(price_service, instruments),
-        DownsideVolatility60dFactor(price_service, instruments),
-        MaxDrawdown120dFactor(price_service, instruments),
+        Momentum12020Factor(price_service, instruments, market_bars=market_bars),
+        Volatility60dFactor(price_service, instruments, market_bars=market_bars),
+        DownsideVolatility60dFactor(
+            price_service, instruments, market_bars=market_bars
+        ),
+        MaxDrawdown120dFactor(price_service, instruments, market_bars=market_bars),
         AvgAmount20dFactor(bar_repository, instruments),
         LogMarketCapFactor(
             bar_repository,

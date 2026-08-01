@@ -35,6 +35,50 @@ class AdjustedBarService(Protocol):
     ) -> pl.LazyFrame: ...
 
 
+class MarketBarsCache:
+    """Share one immutable adjusted market-bar read across sibling factors."""
+
+    def __init__(
+        self,
+        price_service: AdjustedBarService,
+        instruments: Sequence[InstrumentId],
+        *,
+        max_lookback_sessions: int,
+    ) -> None:
+        if type(max_lookback_sessions) is not int or max_lookback_sessions < 0:
+            raise ValueError("max_lookback_sessions must be a nonnegative integer")
+        self._price_service = price_service
+        self._instruments = _canonical_instrument_scope(instruments)
+        self._max_lookback_sessions = max_lookback_sessions
+        self._ctx: FactorContext | None = None
+        self._bars: pl.DataFrame | None = None
+
+    def load(self, ctx: FactorContext) -> pl.DataFrame:
+        """Return the one normalized price frame for the active factor context."""
+        if self._ctx != ctx or self._bars is None:
+            history_start = _expanded_history_start(
+                ctx.start, self._max_lookback_sessions
+            )
+            bars = _load_adjusted_bars(
+                self._price_service,
+                self._instruments,
+                ctx,
+                history_start,
+            )
+            if history_start != date.min and _needs_full_history(
+                bars, ctx, self._max_lookback_sessions + 1
+            ):
+                bars = _load_adjusted_bars(
+                    self._price_service,
+                    self._instruments,
+                    ctx,
+                    date.min,
+                )
+            self._ctx = ctx
+            self._bars = bars
+        return self._bars
+
+
 class _MarketFactor:
     """Shared deterministic window execution over row-level log returns."""
 
@@ -45,12 +89,14 @@ class _MarketFactor:
         spec: FactorSpec,
         required_prices: int,
         evaluator: Callable[[Sequence[float], Sequence[float]], float | None],
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         self._price_service = price_service
         self._instruments = _canonical_instrument_scope(instruments)
         self._spec = spec
         self._required_prices = required_prices
         self._evaluator = evaluator
+        self._market_bars = market_bars
 
     @property
     def spec(self) -> FactorSpec:
@@ -58,76 +104,103 @@ class _MarketFactor:
 
     def compute(self, ctx: FactorContext) -> pl.LazyFrame:
         """Compute rows inside ``ctx`` using request-stable row log returns."""
-        history_start = _expanded_history_start(ctx.start, self.spec.lookback_sessions)
-        normalized = self._load_bars(ctx, history_start)
-        if history_start != date.min and _needs_full_history(
-            normalized, ctx, self._required_prices
-        ):
-            normalized = self._load_bars(ctx, date.min)
+        if self._market_bars is None:
+            history_start = _expanded_history_start(
+                ctx.start, self.spec.lookback_sessions
+            )
+            normalized = self._load_bars(ctx, history_start)
+            if history_start != date.min and _needs_full_history(
+                normalized, ctx, self._required_prices
+            ):
+                normalized = self._load_bars(ctx, date.min)
+        else:
+            normalized = self._market_bars.load(ctx)
         if normalized.is_empty():
             return _empty_factor_output().lazy()
 
-        output: list[dict[str, object]] = []
+        output_dates: list[date] = []
+        output_instruments: list[str] = []
+        output_values: list[float | None] = []
+        output_available_at: list[datetime | None] = []
         for instrument_frame in normalized.partition_by(
             "instrument_id", maintain_order=True
         ):
-            rows = instrument_frame.select(
-                "trade_date",
-                "instrument_id",
-                FORWARD_LOG_RETURN_COLUMN,
-                "available_at",
-            ).to_dicts()
-            for index, row in enumerate(rows):
-                trade_date = row["trade_date"]
+            trade_dates = instrument_frame["trade_date"].to_list()
+            instrument_ids = instrument_frame["instrument_id"].to_list()
+            log_returns = instrument_frame[FORWARD_LOG_RETURN_COLUMN].to_list()
+            availability = instrument_frame["available_at"].to_list()
+            for index, trade_date in enumerate(trade_dates):
                 if not isinstance(trade_date, date):
                     raise TypeError("adjusted bar trade_date must be a date")
                 if trade_date < ctx.start or trade_date > ctx.end:
                     continue
                 start_index = index - self._required_prices + 1
-                window = rows[max(0, start_index) : index + 1]
-                bar_available_at = _latest_available_at(window)
-                available_at = bar_available_at
+                window_start = max(0, start_index)
+                window_availability = availability[window_start : index + 1]
+                available_at = _latest_available_at(window_availability)
                 value: float | None = None
-                if start_index >= 0 and len(window) == self._required_prices:
-                    log_window = _relative_log_window(window)
+                if (
+                    start_index >= 0
+                    and len(window_availability) == self._required_prices
+                ):
+                    log_window = _relative_log_window(
+                        log_returns[window_start : index + 1]
+                    )
                     if log_window is not None and available_at is not None:
-                        relative_log_path, log_returns = log_window
-                        value = self._evaluator(relative_log_path, log_returns)
+                        relative_log_path, window_returns = log_window
+                        value = self._evaluator(relative_log_path, window_returns)
                         if value is not None and not isfinite(value):
                             value = None
-                output.append(
-                    {
-                        "trade_date": trade_date,
-                        "instrument_id": row["instrument_id"],
-                        "factor_id": self.spec.factor_id,
-                        "factor_version": self.spec.version,
-                        "value": value,
-                        "available_at": available_at,
-                        "is_valid": value is not None,
-                    }
-                )
+                instrument_id = instrument_ids[index]
+                if not isinstance(instrument_id, str):
+                    raise TypeError("adjusted bar instrument_id must be a string")
+                output_dates.append(trade_date)
+                output_instruments.append(instrument_id)
+                output_values.append(value)
+                output_available_at.append(available_at)
+        count = len(output_dates)
         return (
-            pl.DataFrame(output, schema=FACTOR_OUTPUT_SCHEMA)
+            pl.DataFrame(
+                {
+                    "trade_date": output_dates,
+                    "instrument_id": output_instruments,
+                    "factor_id": [self.spec.factor_id] * count,
+                    "factor_version": [self.spec.version] * count,
+                    "value": output_values,
+                    "available_at": output_available_at,
+                    "is_valid": [value is not None for value in output_values],
+                },
+                schema=FACTOR_OUTPUT_SCHEMA,
+            )
             .sort("trade_date", "instrument_id")
             .lazy()
         )
 
     def _load_bars(self, ctx: FactorContext, start: date) -> pl.DataFrame:
-        bars = self._price_service.bars(
-            ctx.snapshot_id,
-            self._instruments,
-            start,
-            ctx.end,
-            AdjustmentMode.FORWARD,
-            ctx.end,
-        ).collect()
-        _validate_adjusted_bars(bars)
-        normalized = bars.sort("instrument_id", "trade_date")
-        if normalized.select(
-            pl.struct("instrument_id", "trade_date").is_duplicated().any()
-        ).item():
-            raise ValueError("duplicate adjusted bar key")
-        return normalized
+        return _load_adjusted_bars(self._price_service, self._instruments, ctx, start)
+
+
+def _load_adjusted_bars(
+    price_service: AdjustedBarService,
+    instruments: Sequence[InstrumentId],
+    ctx: FactorContext,
+    start: date,
+) -> pl.DataFrame:
+    bars = price_service.bars(
+        ctx.snapshot_id,
+        instruments,
+        start,
+        ctx.end,
+        AdjustmentMode.FORWARD,
+        ctx.end,
+    ).collect()
+    _validate_adjusted_bars(bars)
+    normalized = bars.sort("instrument_id", "trade_date")
+    if normalized.select(
+        pl.struct("instrument_id", "trade_date").is_duplicated().any()
+    ).item():
+        raise ValueError("duplicate adjusted bar key")
+    return normalized
 
 
 class ReturnFactor(_MarketFactor):
@@ -138,6 +211,8 @@ class ReturnFactor(_MarketFactor):
         price_service: AdjustedBarService,
         instruments: Sequence[InstrumentId],
         window: int,
+        *,
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         if type(window) is not int or window not in _RETURN_WINDOWS:
             raise ValueError("window must be one of 20, 60, 120")
@@ -163,6 +238,7 @@ class ReturnFactor(_MarketFactor):
             ),
             required_prices=window + 1,
             evaluator=_return_value,
+            market_bars=market_bars,
         )
 
 
@@ -173,6 +249,8 @@ class Trend120dFactor(_MarketFactor):
         self,
         price_service: AdjustedBarService,
         instruments: Sequence[InstrumentId],
+        *,
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         super().__init__(
             price_service,
@@ -200,6 +278,7 @@ class Trend120dFactor(_MarketFactor):
             ),
             required_prices=120,
             evaluator=_trend_value,
+            market_bars=market_bars,
         )
 
 
@@ -210,6 +289,8 @@ class Momentum12020Factor(_MarketFactor):
         self,
         price_service: AdjustedBarService,
         instruments: Sequence[InstrumentId],
+        *,
+        market_bars: MarketBarsCache | None = None,
     ) -> None:
         super().__init__(
             price_service,
@@ -235,6 +316,7 @@ class Momentum12020Factor(_MarketFactor):
             ),
             required_prices=121,
             evaluator=_momentum_120_20_value,
+            market_bars=market_bars,
         )
 
 
@@ -329,13 +411,13 @@ def _finite_log_return(value: object) -> float | None:
 
 
 def _relative_log_window(
-    window: Sequence[dict[str, object]],
+    window_log_returns: Sequence[object],
 ) -> tuple[list[float], list[float]] | None:
     relative_log_path = [0.0]
     log_returns: list[float] = []
     cumulative = 0.0
-    for row in window[1:]:
-        value = _finite_log_return(row[FORWARD_LOG_RETURN_COLUMN])
+    for raw_value in window_log_returns[1:]:
+        value = _finite_log_return(raw_value)
         if value is None:
             return None
         log_returns.append(value)
@@ -355,19 +437,18 @@ def _finite_expm1(value: float) -> float | None:
 
 
 def _latest_available_at(
-    window: Sequence[dict[str, object]],
+    values: Sequence[object],
 ) -> datetime | None:
-    values: list[datetime] = []
-    for row in window:
-        value = row["available_at"]
+    timestamps: list[datetime] = []
+    for value in values:
         if value is None:
             return None
         if not isinstance(value, datetime):
             raise TypeError("adjusted bar available_at must be a datetime")
-        values.append(value)
-    if not values:
+        timestamps.append(value)
+    if not timestamps:
         return None
-    return max(values)
+    return max(timestamps)
 
 
 def _empty_factor_output() -> pl.DataFrame:

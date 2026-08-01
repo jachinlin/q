@@ -12,6 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, date, datetime
+from inspect import getsource
 from pathlib import Path
 
 import polars as pl
@@ -29,6 +30,7 @@ from quant_core.factors import (
     FeatureCache,
     build_cache_key,
 )
+from quant_core.factors.base import _factor_table_ipc_bytes
 
 
 def digest(label: str) -> str:
@@ -383,6 +385,11 @@ def test_publish_canonicalizes_arrow_chunks_before_content_hashing(
     artifact = publish(FeatureCache(tmp_path), multi_chunk_frame.lazy())
 
     assert artifact.row_count == 2
+
+
+def test_factor_content_hash_normalizes_null_buffers_without_python_row_lists() -> None:
+    """Research-size artifacts must not create one Python object per cell to hash."""
+    assert "to_pylist" not in getsource(_factor_table_ipc_bytes)
 
 
 def test_publish_manifest_is_canonical_and_binds_every_cache_key_input(
