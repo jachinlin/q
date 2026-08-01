@@ -14,8 +14,21 @@ import quant_core.backtest.artifacts as artifacts_module
 from quant_core.backtest.accounting import AccountSnapshot
 from quant_core.backtest.artifacts import BacktestArtifactWriter, ManifestContext
 from quant_core.backtest.engine import BacktestEngine
+from quant_core.backtest.models import (
+    ExecutionBatch,
+    ExecutionReason,
+    FillResult,
+    RejectResult,
+)
+from quant_core.backtest.rulebook import FeeBreakdown
 from quant_core.domain.identifiers import InstrumentId
-from quant_core.portfolio import RebalancePlanner, TargetPortfolio, TargetPosition
+from quant_core.portfolio import (
+    OrderIntent,
+    OrderSide,
+    RebalancePlanner,
+    TargetPortfolio,
+    TargetPosition,
+)
 from tests.integration.test_backtest_timeline import (
     _Data,
     _NeverCancelled,
@@ -404,3 +417,79 @@ def test_parquet_row_validator_rejects_execution_cost_and_cash_tampering(
     else:
         with pytest.raises((TypeError, ValueError)):
             artifacts_module._validate_execution(fills, costs)
+
+
+def test_artifact_execution_roundtrip_records_reject_and_partial_fill(
+    tmp_path: Path,
+) -> None:
+    experiment = UUID("00000000-0000-0000-0000-000000000011")
+    instrument = InstrumentId.parse("SSE:600001")
+    reject = RejectResult(
+        OrderIntent(instrument, OrderSide.BUY, 100, "TEST"),
+        date(2024, 1, 5),
+        100,
+        ExecutionReason.VOLUME_CAP,
+    )
+    partial = FillResult(
+        OrderIntent(instrument, OrderSide.BUY, 100, "TEST"),
+        date(2024, 1, 5),
+        100,
+        50,
+        50,
+        10.0,
+        5_000,
+        FeeBreakdown(3, 0, 0, 3),
+        ExecutionReason.VOLUME_CAP,
+    )
+    writer = BacktestArtifactWriter(tmp_path, experiment)
+    writer.append_snapshot(AccountSnapshot(date(2024, 1, 5), 100, (), 0, 100), 1.0)
+    writer.append_execution(ExecutionBatch(date(2024, 1, 5), (reject, partial), 100))
+    writer.close()
+    writer.validate((date(2024, 1, 5),), _context(experiment, one_day=True))
+    path = writer.publish()
+    fills = pq.read_table(path.parent / "fills.parquet").to_pylist()
+    costs = pq.read_table(path.parent / "costs.parquet").to_pylist()
+    assert [
+        (
+            row["result_index"],
+            row["requested_quantity"],
+            row["filled_quantity"],
+            row["unfilled_quantity"],
+            row["reason_code"],
+        )
+        for row in fills
+    ] == [(0, 100, 0, 100, "VOLUME_CAP"), (1, 100, 50, 50, "VOLUME_CAP")]
+    assert costs == [
+        {
+            "trade_date": date(2024, 1, 5),
+            "result_index": 1,
+            "instrument_id": "SSE:600001",
+            "commission_fen": 3,
+            "stamp_tax_fen": 0,
+            "transfer_fee_fen": 0,
+            "total_fees_fen": 3,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "nav.parquet",
+        "holdings.parquet",
+        "targets.parquet",
+        "fills.parquet",
+        "costs.parquet",
+    ],
+)
+def test_validate_rejects_each_missing_required_artifact(
+    tmp_path: Path, name: str
+) -> None:
+    experiment = UUID("00000000-0000-0000-0000-000000000012")
+    writer = BacktestArtifactWriter(tmp_path, experiment)
+    writer.append_snapshot(AccountSnapshot(date(2024, 1, 5), 100, (), 0, 100), 1.0)
+    writer.close()
+    (writer.staging_dir / name).unlink()
+    with pytest.raises(ValueError, match="missing artifact"):
+        writer.validate((date(2024, 1, 5),), _context(experiment, one_day=True))
+    assert writer.state.value == "CLOSED"
