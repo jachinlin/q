@@ -146,6 +146,8 @@ def _execute_one(
             return _reject(intent, market, ExecutionReason.INSUFFICIENT_CASH), cash
         fees = _fees(rulebook, intent, market, filled, price)
     gross = filled * price_fen
+    if intent.side is OrderSide.SELL and cash + gross < fees.total_cents:
+        return _reject(intent, market, ExecutionReason.INSUFFICIENT_CASH), cash
     unfilled = intent.quantity - filled
     reason = _fill_reason(intent, filled, candidate, capacity, sellable)
     result = FillResult(

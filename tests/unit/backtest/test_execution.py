@@ -15,7 +15,7 @@ from quant_core.backtest.models import (
     MarketSlice,
     RejectResult,
 )
-from quant_core.backtest.rulebook import AShareRuleBook
+from quant_core.backtest.rulebook import AShareRuleBook, FeeBreakdown, SimulatedFill
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.portfolio.rebalance import OrderIntent, OrderSide
 
@@ -25,6 +25,26 @@ _B = InstrumentId.parse("SSE:600002")
 _RULEBOOK = AShareRuleBook.load(
     __import__("pathlib").Path("configs/rules/a_share_v1.yaml")
 )
+
+
+class _NoBandMinimumFeeRuleBook:
+    """Minimal real-value rulebook fixture for the negative sell proceeds edge."""
+
+    def lot_size(self, instrument: InstrumentId, trade_date: date) -> int:
+        return 100
+
+    def price_limits(
+        self,
+        instrument: InstrumentId,
+        trade_date: date,
+        prev_close: float,
+        status: object,
+    ) -> None:
+        return None
+
+    def fees(self, fill: SimulatedFill) -> FeeBreakdown:
+        fee = 500 if fill.instrument == _A else 0
+        return FeeBreakdown(fee, 0, 0, fee)
 
 
 def _intent(
@@ -229,6 +249,39 @@ def test_execution_limits_buy_by_cash_after_slippage_and_fees() -> None:
         100,
         ExecutionReason.INSUFFICIENT_CASH,
     )
+
+
+def test_execution_rejects_sell_when_minimum_fee_exceeds_cash_and_proceeds() -> None:
+    low_price_market = _market(
+        {
+            "instrument_id": _A.canonical(),
+            "open": 0.01,
+            "high": 0.01,
+            "low": 0.01,
+            "close": 0.01,
+            "preclose": 0.01,
+        },
+        {
+            "instrument_id": _B.canonical(),
+            "open": 0.01,
+            "high": 0.01,
+            "low": 0.01,
+            "close": 0.01,
+            "preclose": 0.01,
+        },
+    )
+    batch = ExecutionModel().execute(
+        [_intent(_A, OrderSide.SELL), _intent(_B, OrderSide.SELL)],
+        low_price_market,
+        AccountView(0, {_A: 100, _B: 100}),
+        _NoBandMinimumFeeRuleBook(),
+        _config(),
+    )
+
+    assert [type(result) for result in batch.results] == [RejectResult, FillResult]
+    assert batch.results[0].reason_code is ExecutionReason.INSUFFICIENT_CASH
+    assert batch.results[1].reason_code is ExecutionReason.FILLED
+    assert batch.ending_cash_fen == 100
 
 
 def test_execution_uses_preclose_rulebook_band_not_intraday_range_alone() -> None:
