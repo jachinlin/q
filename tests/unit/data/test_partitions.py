@@ -450,6 +450,73 @@ def test_partition_lock_serializes_a_competing_publisher(tmp_path: Path) -> None
         result.get_nowait()
 
 
+def test_partition_lock_times_out_without_sleeping_when_clock_reaches_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deadline reached between attempts must not schedule another retry."""
+    from quant_core.data import partitions
+
+    lock = partitions._PartitionLock(
+        tmp_path / ".partition.lock", timeout_seconds=1.0, poll_seconds=0.25
+    )
+    clock = iter((100.0, 101.0))
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(partitions.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(lock, "_install_under_guard", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(partitions.time, "sleep", sleep_calls.append)
+
+    with pytest.raises(TimeoutError, match="timed out waiting for partition lock"):
+        lock.__enter__()
+
+    assert sleep_calls == []
+
+
+def test_partition_lock_rechecks_delay_before_sleep_when_clock_jumps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-check clock jump must not pass a negative duration to sleep."""
+    from quant_core.data import partitions
+
+    lock = partitions._PartitionLock(
+        tmp_path / ".partition.lock", timeout_seconds=1.0, poll_seconds=0.25
+    )
+    clock = iter((100.0, 100.0, 102.0))
+    sleep_calls: list[float] = []
+
+    def record_sleep(duration: float) -> None:
+        sleep_calls.append(duration)
+        raise AssertionError(f"sleep received {duration}")
+
+    monkeypatch.setattr(partitions.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(lock, "_install_under_guard", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(partitions.time, "sleep", record_sleep)
+
+    with pytest.raises(TimeoutError, match="timed out waiting for partition lock"):
+        lock.__enter__()
+
+    assert sleep_calls == []
+
+
+def test_acquisition_guard_polls_with_a_positive_capped_delay_under_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard contention uses one bounded positive poll without a real wait."""
+    from quant_core.data import partitions
+
+    guard = partitions._AcquisitionGuard(
+        tmp_path / ".partition.lock", deadline=101.0, poll_seconds=0.25
+    )
+    clock = iter((100.0, 100.0))
+    attempts = iter((False, True))
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(partitions.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(guard, "_try_acquire_os_guard", lambda: next(attempts))
+    monkeypatch.setattr(partitions.time, "sleep", sleep_calls.append)
+
+    with guard:
+        assert sleep_calls == [0.25]
+
+
 def test_partition_guard_is_released_automatically_when_a_process_crashes(
     tmp_path: Path,
 ) -> None:

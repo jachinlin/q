@@ -241,7 +241,12 @@ class _PartitionLock:
                 raise TimeoutError(
                     f"timed out waiting for partition lock: {self._path}"
                 )
-            time.sleep(min(self._poll_seconds, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for partition lock: {self._path}"
+                )
+            time.sleep(min(self._poll_seconds, remaining))
 
     def __exit__(self, *_: object) -> None:
         """Release this owner, waiting until the crash-safe guard is available."""
