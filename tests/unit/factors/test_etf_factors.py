@@ -7,7 +7,7 @@ from concurrent.futures import Future, InvalidStateError
 from datetime import UTC, date, datetime, timedelta
 from inspect import getsource
 from math import sqrt
-from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
+from threading import Barrier, BrokenBarrierError, Event, Lock, Thread, get_ident
 
 import numpy as np
 import polars as pl
@@ -276,6 +276,112 @@ def test_market_bars_cache_allows_different_context_recursive_load(
     monkeypatch.setattr(momentum_module, "_load_adjusted_bars", reentrant_load)
 
     assert cache.load(first_ctx) is first_frame
+
+
+def test_market_bars_cache_ignores_completed_wait_edge_before_waiter_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed wait edge must not make a later non-cycle fail fast."""
+    import quant_core.factors.builtin.momentum as momentum_module
+
+    first_owner_started = Event()
+    second_owner_started = Event()
+    first_waiting_for_second = Event()
+    completed_waiter_paused = Event()
+    release_completed_waiter = Event()
+    second_attempt_started = Event()
+    second_attempt_decided = Event()
+    first_owner_thread_id: int | None = None
+    completed_wait_future: Future[pl.DataFrame] | None = None
+
+    class PausedCompletedWaiterFuture(Future[pl.DataFrame]):
+        def result(self, timeout: float | None = None) -> pl.DataFrame:
+            nonlocal completed_wait_future
+            if get_ident() == first_owner_thread_id:
+                first_waiting_for_second.set()
+                frame = super().result(timeout)
+                completed_wait_future = self
+                completed_waiter_paused.set()
+                assert release_completed_waiter.wait(timeout=2)
+                return frame
+            second_attempt_decided.set()
+            return super().result(timeout)
+
+    first_ctx = _context(date.min, date.min)
+    second_ctx = FactorContext(
+        snapshot_id=_SNAPSHOT,
+        universe_hash="7" * 64,
+        start=date.min,
+        end=date.min,
+    )
+    first_frame = pl.DataFrame({"context": ["first"]})
+    second_frame = pl.DataFrame({"context": ["second"]})
+    cache = MarketBarsCache(object(), [_SSE], max_lookback_sessions=120)  # type: ignore[arg-type]
+    results: dict[str, pl.DataFrame] = {}
+    errors: list[AssertionError | RuntimeError] = []
+
+    def nested_load(
+        _service: object,
+        _instruments: object,
+        ctx: FactorContext,
+        _start: date,
+    ) -> pl.DataFrame:
+        nonlocal first_owner_thread_id
+        if ctx == first_ctx:
+            first_owner_thread_id = get_ident()
+            first_owner_started.set()
+            assert second_owner_started.wait(timeout=2)
+            assert cache.load(second_ctx) is second_frame
+            return first_frame
+        second_owner_started.set()
+        assert first_waiting_for_second.wait(timeout=2)
+        return second_frame
+
+    def run_first() -> None:
+        try:
+            results["first"] = cache.load(first_ctx)
+        except (AssertionError, RuntimeError) as error:
+            errors.append(error)
+
+    def run_second() -> None:
+        try:
+            results["second"] = cache.load(second_ctx)
+            assert completed_waiter_paused.wait(timeout=2)
+            second_attempt_started.set()
+            results["nested_first"] = cache.load(first_ctx)
+        except (AssertionError, RuntimeError) as error:
+            errors.append(error)
+        finally:
+            second_attempt_decided.set()
+
+    monkeypatch.setattr(momentum_module, "Future", PausedCompletedWaiterFuture)
+    monkeypatch.setattr(momentum_module, "_load_adjusted_bars", nested_load)
+    first = Thread(target=run_first)
+    second = Thread(target=run_second)
+    first.start()
+    assert first_owner_started.wait(timeout=2)
+    second.start()
+    try:
+        assert completed_waiter_paused.wait(timeout=2)
+        assert second_attempt_started.wait(timeout=2)
+        assert second_attempt_decided.wait(timeout=2)
+        assert completed_wait_future is not None
+        assert completed_wait_future.done()
+        assert first_owner_thread_id is not None
+        with cache._lock:
+            assert first_owner_thread_id in cache._waiting_for_owner
+    finally:
+        release_completed_waiter.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert results["first"] is first_frame
+    assert results["second"] is second_frame
+    assert results["nested_first"] is first_frame
+    assert cache._inflight == {}
+    assert cache._waiting_for_owner == {}
 
 
 def test_market_bars_cache_rejects_two_thread_wait_cycle_and_recovers(

@@ -55,7 +55,7 @@ class MarketBarsCache:
         self._ctx: FactorContext | None = None
         self._bars: pl.DataFrame | None = None
         self._inflight: dict[FactorContext, tuple[Future[pl.DataFrame], int]] = {}
-        self._waiting_for_owner: dict[int, int] = {}
+        self._waiting_for_owner: dict[int, tuple[int, Future[pl.DataFrame]]] = {}
         self._lock = Lock()
 
     def matches(
@@ -94,7 +94,8 @@ class MarketBarsCache:
                     owner_thread_id, active_owner_thread_id
                 ):
                     raise RuntimeError("cyclic market bar cache wait detected")
-                self._waiting_for_owner[owner_thread_id] = active_owner_thread_id
+                wait_edge = (active_owner_thread_id, future)
+                self._waiting_for_owner[owner_thread_id] = wait_edge
                 owns_load = False
 
         if not owns_load:
@@ -102,10 +103,7 @@ class MarketBarsCache:
                 return future.result()
             finally:
                 with self._lock:
-                    if (
-                        self._waiting_for_owner.get(owner_thread_id)
-                        == active_owner_thread_id
-                    ):
+                    if self._waiting_for_owner.get(owner_thread_id) == wait_edge:
                         del self._waiting_for_owner[owner_thread_id]
 
         try:
@@ -149,8 +147,11 @@ class MarketBarsCache:
             if current == waiter:
                 return True
             visited.add(current)
-            waiting_for = self._waiting_for_owner.get(current)
-            if waiting_for is None:
+            wait_edge = self._waiting_for_owner.get(current)
+            if wait_edge is None:
+                return False
+            waiting_for, future = wait_edge
+            if future.done():
                 return False
             current = waiting_for
         return False
