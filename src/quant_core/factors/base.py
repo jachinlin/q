@@ -201,7 +201,11 @@ def _factor_table_ipc_bytes(table: pa.Table) -> bytes:
     return cast(bytes, sink.getvalue().to_pybytes())
 
 
-def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
+def _canonical_null_buffers(
+    array: pa.Array,
+    field: pa.Field,
+    parent_validity: pa.Array | None = None,
+) -> pa.Array:
     """Rebuild logical Arrow values without allocator-dependent null payloads."""
     data_type = field.type
     if pa.types.is_dictionary(data_type):
@@ -226,15 +230,35 @@ def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
         values = array.values.slice(
             array.offset * data_type.list_size, len(array) * data_type.list_size
         )
-        parent_validity = pa.array(
+        own_validity = array.is_valid()
+        own_value_validity = pa.array(
             np.repeat(
-                array.is_valid().to_numpy(zero_copy_only=False),
+                own_validity.to_numpy(zero_copy_only=False),
                 data_type.list_size,
             )
         )
         visible_values = pc.if_else(
-            parent_validity, values, pa.scalar(None, type=data_type.value_type)
+            own_value_validity, values, pa.scalar(None, type=data_type.value_type)
         )
+        if parent_validity is not None:
+            visible_parents = pc.and_(own_validity, parent_validity)
+            visible_value_validity = pa.array(
+                np.repeat(
+                    visible_parents.to_numpy(zero_copy_only=False),
+                    data_type.list_size,
+                )
+            )
+            parent_value_validity = pa.array(
+                np.repeat(
+                    parent_validity.to_numpy(zero_copy_only=False),
+                    data_type.list_size,
+                )
+            )
+            visible_values = pc.if_else(
+                parent_value_validity,
+                visible_values,
+                _null_fill_scalar(data_type.value_type, values, visible_value_validity),
+            )
         values = _canonical_null_buffers(
             visible_values, pa.field("item", data_type.value_type)
         )
@@ -259,8 +283,11 @@ def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
         )
     if pa.types.is_struct(data_type):
         filled = _filled_nulls(array, data_type)
+        visible = array.is_valid()
+        if parent_validity is not None:
+            visible = pc.and_(visible, parent_validity)
         children = [
-            _canonical_null_buffers(filled.field(index), child)
+            _canonical_null_buffers(filled.field(index), child, visible)
             for index, child in enumerate(data_type)
         ]
         return pa.Array.from_buffers(

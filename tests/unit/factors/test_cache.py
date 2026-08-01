@@ -500,6 +500,69 @@ def test_factor_content_hash_ignores_dictionary_values_hidden_by_parent_nulls() 
     assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
 
 
+def test_factor_content_hash_ignores_fixed_list_dictionary_values_hidden_by_parent_nulls() -> (
+    None
+):
+    """A nullable struct must hide categories stored in its fixed-list child."""
+    category_type = pa.dictionary(pa.int8(), pa.string())
+    fixed_type = pa.list_(category_type, 2)
+    categories = pa.array(["hidden-a", "hidden-b", "alpha", "beta"], type=category_type)
+    fixed = pa.FixedSizeListArray.from_arrays(categories, 2)
+    nested = pa.StructArray.from_arrays(
+        [fixed],
+        fields=[pa.field("categories", fixed_type)],
+        mask=pa.array([True, False]),
+    )
+    table = pa.table({"nested": nested})
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
+def test_factor_content_hash_propagates_parent_nulls_through_deep_chunked_fixed_lists() -> (
+    None
+):
+    """Ancestor nulls survive deeper structs, sliced chunks, and absent null buffers."""
+    category_type = pa.dictionary(pa.int8(), pa.string())
+    fixed_type = pa.list_(category_type, 2)
+    inner_type = pa.struct([pa.field("categories", fixed_type)])
+    outer_type = pa.struct([pa.field("inner", inner_type)])
+
+    def make_chunk(
+        values: list[str],
+        outer_mask: list[bool] | None,
+        inner_mask: list[bool] | None,
+    ) -> pa.StructArray:
+        categories = pa.array(values, type=category_type)
+        fixed = pa.FixedSizeListArray.from_arrays(categories, 2)
+        inner = pa.StructArray.from_arrays(
+            [fixed],
+            fields=list(inner_type),
+            mask=None if inner_mask is None else pa.array(inner_mask),
+        )
+        return pa.StructArray.from_arrays(
+            [inner],
+            fields=list(outer_type),
+            mask=None if outer_mask is None else pa.array(outer_mask),
+        )
+
+    prefix = make_chunk(
+        ["ignored-a", "ignored-b", "hidden-a", "hidden-b", "alpha", "beta"],
+        [False, True, False],
+        [False, False, False],
+    )
+    suffix = make_chunk(
+        ["gamma", "delta", "ignored-c", "ignored-d"],
+        None,
+        None,
+    )
+    assert suffix.buffers()[0] is None
+    assert suffix.field(0).buffers()[0] is None
+    chunked = pa.chunked_array([prefix.slice(1), suffix.slice(0, 1)], type=outer_type)
+    table = pa.table({"nested": chunked})
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
 def test_factor_content_hash_matches_legacy_fixed_list_and_map_bytes() -> None:
     """Fixed-size lists and maps retain exact pre-optimization IPC semantics."""
     fixed_type = pa.list_(pa.int32(), 2)
