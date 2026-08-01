@@ -268,7 +268,12 @@ class SnapshotResearchRepository:
         parameters: Sequence[object],
     ) -> pl.LazyFrame:
         record = self._dataset_record(snapshot_id, dataset)
-        source_query, source_parameters = _parquet_sources(record)
+        leases = tuple(
+            self._partition_leases.acquire(partition) for partition in record.partitions
+        )
+        source_query, source_parameters = _parquet_sources(
+            [lease.path for lease in leases]
+        )
         connection = duckdb.connect(":memory:")
         try:
             result = connection.execute(
@@ -321,12 +326,12 @@ def _value_predicate(
     return [column + " IN (" + ", ".join("?" for _ in values) + ")"], list(values)
 
 
-def _parquet_sources(record: DatasetVersionRecord) -> tuple[str, list[object]]:
-    if not record.partitions:
+def _parquet_sources(paths: Sequence[Path]) -> tuple[str, list[object]]:
+    if not paths:
         raise ValueError("dataset version must contain at least one partition")
     return (
-        " UNION ALL ".join("SELECT * FROM read_parquet(?)" for _ in record.partitions),
-        [partition.path.as_posix() for partition in record.partitions],
+        " UNION ALL ".join("SELECT * FROM read_parquet(?)" for _ in paths),
+        [path.as_posix() for path in paths],
     )
 
 
@@ -429,27 +434,40 @@ def _retain_partition_leases(
 
 def _validated_regular_partition_path(path: Path) -> Path:
     """Resolve a catalog path while rejecting symlink/reparse indirection."""
-    resolved = path.resolve()
-    try:
-        observed = resolved.stat(follow_symlinks=False)
-    except OSError as error:
-        raise ValueError("published partition is unavailable") from error
-    reparse_point = getattr(observed, "st_file_attributes", 0) & 0x400
-    if path.is_symlink() or reparse_point or not stat.S_ISREG(observed.st_mode):
+    absolute = path.absolute()
+    components = (*reversed(absolute.parents), absolute)
+    for component in components:
+        try:
+            observed = component.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ValueError("published partition is unavailable") from error
+        reparse_point = getattr(observed, "st_file_attributes", 0) & 0x400
+        if component.is_symlink() or reparse_point:
+            raise ValueError(
+                "published partition path contains a link or reparse point"
+            )
+    if not stat.S_ISREG(observed.st_mode):
         raise ValueError("published partition must be a regular non-link file")
-    return resolved
+    return absolute
 
 
 def _verify_owned_partition(path: Path, partition: DatasetPartitionRecord) -> None:
     """Bind copied bytes to all published logical catalog metadata."""
-    table = pq.read_table(path)
+    message = "published partition fails catalog integrity checks"
+    try:
+        table = pq.read_table(path)
+        content_hash = _arrow_table_content_hash(table)
+        schema_fingerprint = hashlib.sha256(
+            table.schema.serialize().to_pybytes()
+        ).hexdigest()
+    except Exception as error:
+        raise ValueError(message) from error
     if (
-        _arrow_table_content_hash(table) != partition.content_hash
-        or hashlib.sha256(table.schema.serialize().to_pybytes()).hexdigest()
-        != partition.schema_fingerprint
+        content_hash != partition.content_hash
+        or schema_fingerprint != partition.schema_fingerprint
         or table.num_rows != partition.row_count
     ):
-        raise ValueError("published partition fails catalog integrity checks")
+        raise ValueError(message)
 
 
 def _arrow_table_content_hash(table: pa.Table) -> str:

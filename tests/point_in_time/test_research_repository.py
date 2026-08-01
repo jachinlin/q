@@ -6,6 +6,7 @@ import gc
 import hashlib
 import os
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -101,6 +102,140 @@ def test_financials_exclude_a_metric_group_with_unknown_availability(
     )
 
     assert result.is_empty()
+
+
+def test_financials_fail_closed_when_published_partition_is_replaced(
+    tmp_path: Path,
+) -> None:
+    """A replacement file must not inherit the snapshot's published identity."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    record = catalog.get_dataset_version(
+        catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+            "financial_observation"
+        ]
+    )
+    path = record.partitions[0].path
+    replacement = path.with_name("financial-replacement.parquet")
+    pl.read_parquet(path).with_columns(pl.lit(999.0).alias("value")).write_parquet(
+        replacement
+    )
+    replacement.replace(path)
+
+    with pytest.raises(ValueError, match="catalog integrity"):
+        SnapshotResearchRepository(catalog).financials_as_of(
+            fixture.early_snapshot_id,
+            ["revenue"],
+            date(2024, 4, 29),
+        )
+
+
+def test_security_status_fail_closed_when_published_partition_is_deleted(
+    tmp_path: Path,
+) -> None:
+    """A missing status partition must fail before DuckDB observes its catalog path."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    record = catalog.get_dataset_version(
+        catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+            "security_status"
+        ]
+    )
+    record.partitions[0].path.unlink()
+
+    with pytest.raises(ValueError, match="published partition is unavailable"):
+        SnapshotResearchRepository(catalog).security_status(
+            fixture.early_snapshot_id,
+            date(2024, 4, 29),
+        )
+
+
+def test_instruments_fail_closed_when_published_partition_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Corrupt bytes must be rejected as a catalog-integrity failure."""
+    fixture = point_in_time_fixture(tmp_path)
+    instruments = _write_dataset(
+        tmp_path,
+        "immutable-instruments",
+        DatasetKind.INSTRUMENT,
+        [_instrument_row("published")],
+    )
+    snapshot_id = fixture.repository.bind_dataset(
+        fixture.early_snapshot_id, DatasetKind.INSTRUMENT, instruments
+    )
+    instruments.partitions[0].path.write_bytes(b"not parquet")
+
+    with pytest.raises(ValueError, match="catalog integrity"):
+        SnapshotResearchRepository(fixture.repository).instruments(snapshot_id)
+
+
+def test_trade_calendar_fail_closed_when_published_partition_is_replaced(
+    tmp_path: Path,
+) -> None:
+    """A valid replacement calendar cannot change a published snapshot query."""
+    fixture = point_in_time_fixture(tmp_path)
+    calendar = _write_dataset(
+        tmp_path,
+        "immutable-calendar",
+        DatasetKind.TRADE_CALENDAR,
+        [_calendar_row(is_trading_day=True)],
+    )
+    snapshot_id = fixture.repository.bind_dataset(
+        fixture.early_snapshot_id, DatasetKind.TRADE_CALENDAR, calendar
+    )
+    path = calendar.partitions[0].path
+    replacement = path.with_name("calendar-replacement.parquet")
+    pl.read_parquet(path).with_columns(
+        pl.lit(False).alias("is_trading_day")
+    ).write_parquet(replacement)
+    replacement.replace(path)
+
+    with pytest.raises(ValueError, match="catalog integrity"):
+        SnapshotResearchRepository(fixture.repository).trade_calendar(
+            snapshot_id,
+            date(2024, 4, 29),
+            date(2024, 4, 29),
+        )
+
+
+def test_read_query_rejects_a_partition_beneath_a_directory_link(
+    tmp_path: Path,
+) -> None:
+    """A symlink or Windows reparse point must not redirect an eager snapshot read."""
+    fixture = point_in_time_fixture(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    calendar = _write_dataset(
+        outside,
+        "linked-calendar",
+        DatasetKind.TRADE_CALENDAR,
+        [_calendar_row(is_trading_day=True)],
+    )
+    link = tmp_path / "linked"
+    _create_directory_link(link, outside)
+    linked_calendar = replace(
+        calendar,
+        id=type(calendar.id).new(),
+        partitions=(
+            replace(
+                calendar.partitions[0],
+                path=link / calendar.partitions[0].path.name,
+            ),
+        ),
+    )
+    snapshot_id = fixture.repository.bind_dataset(
+        fixture.early_snapshot_id,
+        DatasetKind.TRADE_CALENDAR,
+        linked_calendar,
+    )
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        SnapshotResearchRepository(fixture.repository).trade_calendar(
+            snapshot_id,
+            date(2024, 4, 29),
+            date(2024, 4, 29),
+        )
 
 
 def test_bars_are_snapshot_bound_range_reads_with_canonical_sort(
@@ -646,6 +781,61 @@ def _corporate_action_row(
         "pit_usable": True,
         "ingested_at": datetime(2024, 4, 30, tzinfo=UTC),
     }
+
+
+def _instrument_row(name: str) -> dict[str, object]:
+    available_at = datetime(2024, 4, 29, tzinfo=UTC)
+    return {
+        "instrument_id": "SSE:600000",
+        "exchange": "SSE",
+        "board": "MAIN",
+        "name": name,
+        "instrument_type": "STOCK",
+        "listing_status": "LISTED",
+        "list_date": date(2020, 1, 1),
+        "delist_date": None,
+        "source": "fixture",
+        "source_version": "v1",
+        "available_at": available_at,
+        "availability_source": "announcement",
+        "pit_usable": True,
+        "ingested_at": datetime(2024, 4, 30, tzinfo=UTC),
+    }
+
+
+def _calendar_row(*, is_trading_day: bool) -> dict[str, object]:
+    available_at = datetime(2024, 4, 29, tzinfo=UTC)
+    return {
+        "trade_date": date(2024, 4, 29),
+        "is_trading_day": is_trading_day,
+        "source": "fixture",
+        "source_version": "v1",
+        "available_at": available_at,
+        "availability_source": "announcement",
+        "pit_usable": True,
+        "ingested_at": datetime(2024, 4, 30, tzinfo=UTC),
+    }
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    f"New-Item -ItemType Junction -Path '{link}' -Target '{target}' "
+                    "| Out-Null"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+        )
 
 
 def test_research_sorts_distinct_catalog_partitions_and_rejects_duplicates(
