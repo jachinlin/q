@@ -1,20 +1,19 @@
-# Task 2 — BaoStock forward adjustment core
+# Task 2 - BaoStock forward adjustment core
 
 ## Scope delivered
 
 - Added `AdjustmentMode.FORWARD` and the `PriceAdjustmentService.bars()` branch.
 - FORWARD reads raw bars through `as_of`, computes factors on the complete context,
   and returns only rows through `end`.
-- It never reads `corporate_actions_as_of()`.  Its event metadata remains the
-  existing typed empty lineage schema: unit event factors, null availability, and
-  empty components.
-- Only `open`, `high`, `low`, `close`, and `preclose` are scaled.  Volume,
-  amount, and all other non-price fields remain raw.
+- It never reads `corporate_actions_as_of()`. Its event metadata retains typed
+  empty lineage: unit event factors, null availability, and empty components.
+- Only `open`, `high`, `low`, `close`, and `preclose` are scaled. Volume, amount,
+  and all other non-price fields remain raw.
 - Added `_required_positive`, `_validate_unique_bar_keys`, and log-domain
   `_forward_adjust` with finite/positive checks and a stable cumulative-overflow
   error.
 
-## TDD evidence
+## Initial TDD evidence
 
 ### RED
 
@@ -22,57 +21,65 @@
 
 Result: `1 failed, 20 deselected`; expected failure was
 `AttributeError: type object 'AdjustmentMode' has no attribute 'FORWARD'`.
-
-After adding the additional helper tests, the forward test collection also failed
-as expected on missing `_forward_adjust`.
+After adding the helper tests, collection also failed as expected on missing
+`_forward_adjust`.
 
 ### GREEN
 
-The final target run was:
+The original target run passed 34 tests. After Fix Round 1, the final target run
+passes 38 tests. Coverage includes the fixed no-corporate-action snapshot,
+`end < as_of`, stable empty metadata, independent two-instrument factors with
+shuffled input, empty bars, IPO `preclose=None`, missing sessions, duplicate
+keys, null/zero/signed-zero/negative/NaN/infinite non-initial preclose and prior
+close values, cumulative overflow, and invalid time bounds.
 
-`uv run pytest tests/point_in_time/test_adjustments.py -v --basetemp=C:\t\fwd2-final`
+### Reciprocal mutation evidence
 
-Result: `34 passed`.
+Temporarily reversing the formula from
+`log(preclose) - log(previous_close)` to its reciprocal made the fixed sample
+fail with factors `1.5` where it asserts `2/3`. The source was restored before
+final verification.
 
-The tests cover the fixed no-corporate-action snapshot, `end < as_of`, stable
-empty metadata, independent two-instrument factors with shuffled input, empty
-bars, IPO `preclose=None`, missing sessions, duplicate keys, null/negative/NaN/
-infinite non-initial preclose and prior close values, cumulative overflow, and
-invalid time bounds.
+## Fix Round 1
 
-### Mutation evidence
+The reviewer showed that changing `_required_positive` from `value <= 0` to
+`value < 0` survived the original test suite. Four parameterized cases now
+directly cover non-initial `preclose=0.0/-0.0` and previous-session
+`close=0.0/-0.0`.
 
-Temporarily reversed the formula from
-`log(preclose) - log(previous_close)` to its reciprocal and ran:
+### RED
 
-`uv run pytest tests/point_in_time/test_adjustments.py -k "uses_baostock_preclose" -v --basetemp=C:\t\fwd2-mutant`
+With the temporary `< 0` mutation:
 
-Result: expected failure. The fixed sample produced factors `1.5` where it
-asserts `2/3`. The source was immediately restored before final verification.
+`uv run pytest tests/point_in_time/test_adjustments.py -k "invalid_factor_inputs" -v --basetemp=C:\t\fwd2-fix1-red`
+
+Result: `4 failed, 10 passed, 24 deselected`. All four zero cases reached
+`math domain error` instead of the required stable field-specific `ValueError`.
+
+### GREEN
+
+After restoring `value <= 0`, the same selected suite with
+`--basetemp=C:\t\fwd2-fix1-green` passed all 14 cases.
+
+The report's former numerical-conflict concern was also removed. The confirmed
+brief now consistently specifies factors `[2/3, 2/3, 1, 1]` and adjusted second
+close `8.0`.
 
 ## Final verification
 
-- `uv run pytest tests/point_in_time -v --basetemp=C:\t\fwd2-pit-final` — 80 passed.
-- `uv run ruff format --check src/quant_core/data/adjustments.py tests/point_in_time/test_adjustments.py` — 2 files already formatted.
-- `uv run ruff check src/quant_core/data/adjustments.py tests/point_in_time/test_adjustments.py` — all checks passed.
-- `uv run mypy src` — success, 53 source files.
-- `git diff --check` — clean.
-- `uv run pytest -q --basetemp=C:\t\fwd2-full` — 485 passed, 2 failed (see concerns).
+- `uv run pytest tests/point_in_time/test_adjustments.py -v --basetemp=C:\t\fwd2-fix1` - 38 passed.
+- `uv run pytest tests/point_in_time -v --basetemp=C:\t\fwd2-fix1-pit` - 84 passed.
+- `uv run ruff format --check src/quant_core/data/adjustments.py tests/point_in_time/test_adjustments.py` - clean.
+- `uv run ruff check src/quant_core/data/adjustments.py tests/point_in_time/test_adjustments.py` - clean.
+- `uv run mypy src` - clean for 53 source files.
+- `git diff --check` - clean.
+- `uv run pytest -q --basetemp=C:\t\fwd2-fix1-full` - 491 passed.
 
-## Commit
+## Commits
 
-`feat: add BaoStock forward price adjustment` (the final revision is reported by
-the task handoff to avoid a self-referential commit hash in this committed file).
+- Initial Task 2: `bdbdd40` (`feat: add BaoStock forward price adjustment`).
+- Fix Round 1: recorded in the task handoff after commit.
 
 ## Concerns
 
-1. The brief's fixed numerical sample is internally inconsistent. Its prescribed
-   formula with `close=[10, 12, 8.4, 9]` and `preclose=[0, 10, 8, 8.4]` yields
-   `[2/3, 2/3, 1, 1]`, rather than `[0.8, 0.8, 1, 1]`; additionally its specified
-   `close[1]=9.6` cannot equal its specified `preclose[2]=8.0`. The implementation
-   and tests follow the supplied pseudocode formula and its adjusted-price
-   continuity invariant.
-2. The full suite's two failures are pre-existing Task 1 availability baseline
-   mismatches, not Task 2 paths: `test_fake_tushare_runs_through_same_pipeline_and_canonical_contract` and
-   `test_offline_snapshot_matches_reviewed_semantic_golden` disagree on
-   BaoStock daily-bar availability/content hashes.
+None in Task 2.

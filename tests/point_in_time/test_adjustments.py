@@ -272,6 +272,20 @@ def test_forward_adjustment_empty_bars_preserves_schema() -> None:
         (
             [
                 ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 0.0),
+            ],
+            "preclose must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, -0.0),
+            ],
+            "preclose must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 10.0, 0.0),
                 ("SSE:600000", _DAYS[1], 12.0, -1.0),
             ],
             "preclose must be finite and positive",
@@ -293,6 +307,20 @@ def test_forward_adjustment_empty_bars_preserves_schema() -> None:
         (
             [
                 ("SSE:600000", _DAYS[0], None, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ],
+            "close must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], 0.0, 0.0),
+                ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ],
+            "close must be finite and positive",
+        ),
+        (
+            [
+                ("SSE:600000", _DAYS[0], -0.0, 0.0),
                 ("SSE:600000", _DAYS[1], 12.0, 10.0),
             ],
             "close must be finite and positive",
