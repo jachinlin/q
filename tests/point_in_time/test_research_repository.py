@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -24,7 +27,6 @@ from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.errors import QuantError
 from quant_core.persistence.database import create_sqlite_engine, upgrade_database
 from quant_core.persistence.repositories import (
-    DatasetPartitionRecord,
     DatasetPartitionSpec,
     DatasetVersionSpec,
     MetadataRepository,
@@ -215,10 +217,10 @@ def test_bars_remains_bound_when_the_source_partition_is_deleted(
     assert planned.collect()["close"].to_list() == [10.0, 11.0]
 
 
-def test_bars_rejects_an_extra_hard_link_to_its_owned_scan_input(
+def test_bars_ignores_a_source_hard_link_after_owning_scan_bytes(
     tmp_path: Path,
 ) -> None:
-    """A third link would permit an untracked writer to mutate a leased input."""
+    """A source hard-link writer cannot mutate an already leased scan input."""
     fixture = point_in_time_fixture(tmp_path)
     catalog = fixture.repository
     path = (
@@ -236,10 +238,177 @@ def test_bars_rejects_an_extra_hard_link_to_its_owned_scan_input(
         date(2024, 4, 28),
         date(2024, 4, 29),
     )
-    os.link(path, path.with_name("untracked-bars-link.parquet"))
+    alias = path.with_name("untracked-bars-link.parquet")
+    os.link(path, alias)
+    replacement = path.with_name("hard-link-replacement.parquet")
+    pl.read_parquet(path).with_columns(pl.lit(77.0).alias("close")).write_parquet(
+        replacement
+    )
+    alias.write_bytes(replacement.read_bytes())
 
-    with pytest.raises(Exception, match="unexpected hard link"):
-        planned.collect()
+    assert planned.collect()["close"].to_list() == [10.0, 11.0]
+
+
+def test_bars_rejects_source_content_that_differs_from_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """A valid replacement Parquet cannot borrow the published catalog identity."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    path = (
+        catalog.get_dataset_version(
+            catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+                "daily_bar"
+            ]
+        )
+        .partitions[0]
+        .path
+    )
+    replacement = path.with_name("catalog-mismatch.parquet")
+    pl.read_parquet(path).with_columns(pl.lit(88.0).alias("close")).write_parquet(
+        replacement
+    )
+    replacement.replace(path)
+
+    with pytest.raises(ValueError, match="catalog integrity"):
+        SnapshotResearchRepository(catalog).bars(
+            fixture.early_snapshot_id,
+            [InstrumentId.parse("SSE:600000")],
+            date(2024, 4, 28),
+            date(2024, 4, 29),
+        )
+
+
+def test_bars_repeated_collect_reuses_the_same_owned_bytes(tmp_path: Path) -> None:
+    """Re-executing one lazy plan stays bound to its verified materialization."""
+    fixture = point_in_time_fixture(tmp_path)
+    planned = SnapshotResearchRepository(fixture.repository).bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+
+    assert planned.collect()["close"].to_list() == [10.0, 11.0]
+    assert planned.collect()["close"].to_list() == [10.0, 11.0]
+
+
+def test_bars_supports_two_live_plans_for_the_same_partition(tmp_path: Path) -> None:
+    """One live lazy plan must not make the same published partition unavailable."""
+    fixture = point_in_time_fixture(tmp_path)
+    repository = SnapshotResearchRepository(fixture.repository)
+
+    first = repository.bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+    second = repository.bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+
+    assert first.collect()["close"].to_list() == [10.0, 11.0]
+    assert second.collect()["close"].to_list() == [10.0, 11.0]
+
+
+def test_bars_owns_bytes_across_same_length_in_place_source_write(
+    tmp_path: Path,
+) -> None:
+    """Restored timestamps cannot hide a same-size write through the source path."""
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    path = (
+        catalog.get_dataset_version(
+            catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+                "daily_bar"
+            ]
+        )
+        .partitions[0]
+        .path
+    )
+    planned = SnapshotResearchRepository(catalog).bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+    before = path.stat()
+    replacement = path.with_name("same-size-replacement.parquet")
+    pl.read_parquet(path).with_columns(pl.lit(99.0).alias("close")).write_parquet(
+        replacement
+    )
+    assert replacement.stat().st_size == before.st_size
+    path.write_bytes(replacement.read_bytes())
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    assert planned.collect()["close"].to_list() == [10.0, 11.0]
+
+
+def test_bars_concurrent_plans_share_one_verified_owned_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent same-content plans perform one bounded copy and both collect."""
+    fixture = point_in_time_fixture(tmp_path)
+    repository = SnapshotResearchRepository(fixture.repository)
+    copyfile = shutil.copyfile
+    copies = 0
+
+    def recording_copy(source: Path, target: Path) -> str:
+        nonlocal copies
+        copies += 1
+        return str(copyfile(source, target))
+
+    monkeypatch.setattr(repository_module.shutil, "copyfile", recording_copy)
+
+    def collect() -> list[float]:
+        return (
+            repository.bars(
+                fixture.early_snapshot_id,
+                [InstrumentId.parse("SSE:600000")],
+                date(2024, 4, 28),
+                date(2024, 4, 29),
+            )
+            .collect()["close"]
+            .to_list()
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: collect(), range(2)))
+
+    assert results == [[10.0, 11.0], [10.0, 11.0]]
+    assert copies == 1
+
+
+def test_bars_owned_copy_lifetime_follows_the_last_lazy_plan(tmp_path: Path) -> None:
+    """Dropping the last plan releases its private immutable scan materialization."""
+    fixture = point_in_time_fixture(tmp_path)
+    source = (
+        fixture.repository.get_dataset_version(
+            fixture.repository.get_snapshot(fixture.early_snapshot_id).dataset_versions[
+                "daily_bar"
+            ]
+        )
+        .partitions[0]
+        .path
+    )
+    repository = SnapshotResearchRepository(fixture.repository)
+    planned = repository.bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    )
+    owned_directories = tuple(source.parent.glob(".snapshot-scan-*"))
+    assert len(owned_directories) == 1
+
+    del planned
+    gc.collect()
+
+    assert not owned_directories[0].exists()
 
 
 def test_corporate_actions_as_of_excludes_actions_available_after_shanghai_close(
@@ -489,12 +658,18 @@ def test_research_sorts_distinct_catalog_partitions_and_rejects_duplicates(
         catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions["daily_bar"]
     )
     source = pl.read_parquet(original.partitions[0].path)
-    early_path = tmp_path / "bars-early.parquet"
-    late_path = tmp_path / "bars-late.parquet"
-    source.filter(pl.col("trade_date") == date(2024, 4, 28)).write_parquet(early_path)
-    source.filter(pl.col("trade_date") == date(2024, 4, 29)).write_parquet(late_path)
-    early = DatasetPartitionRecord("d" * 64, early_path, "e" * 64, 1)
-    late = DatasetPartitionRecord("f" * 64, late_path, "g" * 64, 1)
+    early = _write_dataset(
+        tmp_path,
+        "bars-early",
+        DatasetKind.DAILY_BAR,
+        source.filter(pl.col("trade_date") == date(2024, 4, 28)).to_dicts(),
+    ).partitions[0]
+    late = _write_dataset(
+        tmp_path,
+        "bars-late",
+        DatasetKind.DAILY_BAR,
+        source.filter(pl.col("trade_date") == date(2024, 4, 29)).to_dicts(),
+    ).partitions[0]
     multiple = replace(
         original,
         id=type(original.id).new(),

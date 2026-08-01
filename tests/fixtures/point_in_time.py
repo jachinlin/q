@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from quant_core.data.schemas import CANONICAL_SCHEMAS
 from quant_core.domain.enums import DatasetKind, SnapshotStatus
@@ -237,6 +240,13 @@ def _write_dataset(
 ) -> DatasetVersionRecord:
     path = tmp_path / f"{name}.parquet"
     pl.DataFrame(rows, schema=CANONICAL_SCHEMAS[dataset].columns).write_parquet(path)
+    table = pq.read_table(path)
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    schema_fingerprint = hashlib.sha256(
+        table.schema.serialize().to_pybytes()
+    ).hexdigest()
     return DatasetVersionRecord(
         id=DatasetVersionId.new(),
         dataset=dataset,
@@ -245,9 +255,9 @@ def _write_dataset(
         status="PUBLISHED",
         partitions=(
             DatasetPartitionRecord(
-                content_hash="b" * 64,
+                content_hash=hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest(),
                 path=path,
-                schema_fingerprint="c" * 64,
+                schema_fingerprint=schema_fingerprint,
                 row_count=len(rows),
             ),
         ),

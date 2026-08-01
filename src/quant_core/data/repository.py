@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import os
+import hashlib
 import shutil
 import stat
 import tempfile
+import threading
+import weakref
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Never, Protocol, cast
@@ -15,12 +16,18 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from quant_core.data.schemas import CANONICAL_SCHEMAS, CanonicalSchema
 from quant_core.domain.enums import DatasetKind, Severity, SnapshotStatus
 from quant_core.domain.identifiers import DatasetVersionId, InstrumentId, SnapshotId
 from quant_core.errors import ErrorDetail, QuantError
-from quant_core.persistence.repositories import DatasetVersionRecord, SnapshotRecord
+from quant_core.persistence.repositories import (
+    DatasetPartitionRecord,
+    DatasetVersionRecord,
+    SnapshotRecord,
+)
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -96,6 +103,7 @@ class SnapshotResearchRepository:
 
     def __init__(self, catalog: SnapshotCatalog) -> None:
         self._catalog = catalog
+        self._partition_leases = _SnapshotPartitionLeasePool()
 
     def instruments(self, snapshot_id: SnapshotId) -> pl.LazyFrame:
         """Return every canonical instrument bound to ``snapshot_id``."""
@@ -133,7 +141,7 @@ class SnapshotResearchRepository:
             else pl.lit(False)
         )
         leases = tuple(
-            _SnapshotPartitionLease(partition.path) for partition in record.partitions
+            self._partition_leases.acquire(partition) for partition in record.partitions
         )
         return (
             pl.scan_parquet([lease.path for lease in leases])
@@ -141,7 +149,7 @@ class SnapshotResearchRepository:
             .filter(scope & pl.col("trade_date").is_between(start, end, closed="both"))
             .cast(definition.columns)
             .sort(list(definition.sort_key))
-            .map_batches(_verify_partition_leases(leases))
+            .map_batches(_retain_partition_leases(leases))
         )
 
     def financials_as_of(
@@ -365,127 +373,90 @@ def _validate_catalog_partition_identities(
         content_hashes.add(partition.content_hash)
 
 
-@dataclass(frozen=True, slots=True)
-class _FileIdentity:
-    """Stable file identity needed to keep a lazy scan snapshot-bound."""
-
-    device: int
-    inode: int
-    size: int
-    modified_ns: int
-    changed_ns: int
-    link_count: int
-
-    def same_content_file(self, other: _FileIdentity) -> bool:
-        """Ignore the expected source-to-lease hard-link count transition."""
-        return (
-            self.device,
-            self.inode,
-            self.size,
-            self.modified_ns,
-            self.changed_ns,
-        ) == (
-            other.device,
-            other.inode,
-            other.size,
-            other.modified_ns,
-            other.changed_ns,
-        )
-
-
 class _SnapshotPartitionLease:
     """Own one immutable scan input for the lifetime of a lazy daily-bar plan."""
 
-    def __init__(self, source: Path) -> None:
-        self._source = source.resolve()
-        source_identity = _capture_regular_file_identity(self._source)
-        if source_identity.link_count != 1:
-            raise ValueError("published partition must not have additional hard links")
+    def __init__(self, partition: DatasetPartitionRecord) -> None:
+        source = _validated_regular_partition_path(partition.path)
         self._directory = tempfile.TemporaryDirectory(
-            prefix=".snapshot-scan-", dir=str(self._source.parent)
+            prefix=".snapshot-scan-", dir=str(source.parent)
         )
-        self.path = Path(self._directory.name) / "partition.parquet"
+        self.path = Path(self._directory.name) / f"{partition.content_hash}.parquet"
         try:
-            self._link_or_copy(source_identity)
+            shutil.copyfile(source, self.path)
+            _verify_owned_partition(self.path, partition)
+            self.path.chmod(stat.S_IREAD)
         except BaseException:
             self._directory.cleanup()
             raise
 
-    def verify(self) -> None:
-        """Fail closed if the owned scan input changed while Polars executed."""
-        observed = _capture_regular_file_identity(self.path)
-        if not self._identity.same_content_file(observed):
-            raise QuantError(
-                ErrorDetail(
-                    code="SNAPSHOT_PARTITION_IDENTITY_CHANGED",
-                    severity=Severity.FATAL,
-                    message="published partition identity changed during lazy scan",
-                    context={"path": self._source.as_posix()},
-                    remediation="retry from the published immutable snapshot",
-                    retryable=True,
-                )
-            )
-        if observed.link_count not in {1, self._expected_link_count}:
-            raise QuantError(
-                ErrorDetail(
-                    code="SNAPSHOT_PARTITION_IDENTITY_CHANGED",
-                    severity=Severity.FATAL,
-                    message="published partition gained an unexpected hard link",
-                    context={"path": self._source.as_posix()},
-                    remediation="retry from the published immutable snapshot",
-                    retryable=True,
-                )
-            )
 
-    def _link_or_copy(self, source_identity: _FileIdentity) -> None:
-        try:
-            os.link(self._source, self.path)
-            copied = False
-        except OSError:
-            shutil.copyfile(self._source, self.path)
-            copied = True
-        after = _capture_regular_file_identity(self._source)
-        if not source_identity.same_content_file(after):
-            raise ValueError("published partition identity changed while leasing")
-        self._identity = _capture_regular_file_identity(self.path)
-        if copied:
-            self._expected_link_count = 1
-            return
-        if not source_identity.same_content_file(self._identity):
-            raise ValueError("published partition lease identity does not match source")
-        self._expected_link_count = 2
+class _SnapshotPartitionLeasePool:
+    """Single-flight weak pool of verified content-addressed scan copies."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._leases: weakref.WeakValueDictionary[
+            tuple[str, str, int], _SnapshotPartitionLease
+        ] = weakref.WeakValueDictionary()
+
+    def acquire(self, partition: DatasetPartitionRecord) -> _SnapshotPartitionLease:
+        key = (
+            partition.content_hash,
+            partition.schema_fingerprint,
+            partition.row_count,
+        )
+        with self._lock:
+            lease = self._leases.get(key)
+            if lease is None:
+                lease = _SnapshotPartitionLease(partition)
+                self._leases[key] = lease
+            return lease
 
 
-def _verify_partition_leases(
+def _retain_partition_leases(
     leases: tuple[_SnapshotPartitionLease, ...],
 ) -> Callable[[pl.DataFrame], pl.DataFrame]:
-    """Retain leases in the query closure and validate after the lazy scan reads."""
+    """Keep verified owned files alive for every execution of the lazy plan."""
 
-    def verify(frame: pl.DataFrame) -> pl.DataFrame:
-        for lease in leases:
-            lease.verify()
+    def retain(frame: pl.DataFrame) -> pl.DataFrame:
+        if not leases:
+            raise ValueError("daily-bar dataset must contain a partition")
         return frame
 
-    return verify
+    return retain
 
 
-def _capture_regular_file_identity(path: Path) -> _FileIdentity:
-    """Reject indirection and return portable replace/delete detection metadata."""
+def _validated_regular_partition_path(path: Path) -> Path:
+    """Resolve a catalog path while rejecting symlink/reparse indirection."""
+    resolved = path.resolve()
     try:
-        observed = path.stat(follow_symlinks=False)
+        observed = resolved.stat(follow_symlinks=False)
     except OSError as error:
         raise ValueError("published partition is unavailable") from error
     reparse_point = getattr(observed, "st_file_attributes", 0) & 0x400
     if path.is_symlink() or reparse_point or not stat.S_ISREG(observed.st_mode):
         raise ValueError("published partition must be a regular non-link file")
-    return _FileIdentity(
-        device=observed.st_dev,
-        inode=observed.st_ino,
-        size=observed.st_size,
-        modified_ns=observed.st_mtime_ns,
-        changed_ns=observed.st_ctime_ns,
-        link_count=observed.st_nlink,
-    )
+    return resolved
+
+
+def _verify_owned_partition(path: Path, partition: DatasetPartitionRecord) -> None:
+    """Bind copied bytes to all published logical catalog metadata."""
+    table = pq.read_table(path)
+    if (
+        _arrow_table_content_hash(table) != partition.content_hash
+        or hashlib.sha256(table.schema.serialize().to_pybytes()).hexdigest()
+        != partition.schema_fingerprint
+        or table.num_rows != partition.row_count
+    ):
+        raise ValueError("published partition fails catalog integrity checks")
+
+
+def _arrow_table_content_hash(table: pa.Table) -> str:
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
 
 
 def _raise_snapshot_not_published(snapshot_id: SnapshotId) -> Never:
