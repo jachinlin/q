@@ -1299,6 +1299,67 @@ def test_factor_artifact_direct_construction_enforces_scope_and_pit(
 
 
 @pytest.mark.parametrize(
+    ("column", "dtype"),
+    [("trade_date", pl.Date), ("is_valid", pl.Boolean)],
+)
+def test_factor_artifact_direct_construction_rejects_null_required_fields(
+    column: str,
+    dtype: pl.DataType,
+) -> None:
+    """Nullable Arrow schema fields cannot bypass required output identities."""
+    table = (
+        single_factor_frame(
+            date(2025, 1, 2),
+            datetime(2025, 1, 2, 8, tzinfo=UTC),
+        )
+        .with_columns(pl.lit(None, dtype=dtype).alias(column))
+        .select(FACTOR_OUTPUT_SCHEMA.names())
+        .collect()
+        .to_arrow()
+    )
+
+    with pytest.raises(ValueError, match="identity and audit fields.*null"):
+        FactorArtifact(
+            factor_ref="momentum@1.0.0",
+            cache_key=digest("cache"),
+            content_hash=factor_table_content_hash(table),
+            row_count=table.num_rows,
+            snapshot_id=make_context().snapshot_id,
+            universe_hash=digest("universe"),
+            start=date(2025, 1, 2),
+            end=date(2025, 1, 31),
+            table=table,
+        )
+
+
+def test_factor_artifact_direct_construction_preserves_empty_table() -> None:
+    """A zero-row exact-schema factor remains a legal artifact."""
+    table = (
+        single_factor_frame(
+            date(2025, 1, 2),
+            datetime(2025, 1, 2, 8, tzinfo=UTC),
+        )
+        .limit(0)
+        .collect()
+        .to_arrow()
+    )
+
+    artifact = FactorArtifact(
+        factor_ref="momentum@1.0.0",
+        cache_key=digest("cache"),
+        content_hash=factor_table_content_hash(table),
+        row_count=0,
+        snapshot_id=make_context().snapshot_id,
+        universe_hash=digest("universe"),
+        start=date(2025, 1, 2),
+        end=date(2025, 1, 31),
+        table=table,
+    )
+
+    assert artifact.row_count == 0
+
+
+@pytest.mark.parametrize(
     ("value", "available_at", "is_valid", "expected"),
     [
         (None, datetime(2025, 1, 2, 8, tzinfo=UTC), True, "finite"),

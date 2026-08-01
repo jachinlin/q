@@ -194,6 +194,15 @@ def validate_factor_output_scope(
     frame: pl.DataFrame, *, start: date, end: date
 ) -> None:
     """Reject output rows outside the complete artifact PIT contract."""
+    required_non_null = (
+        "trade_date",
+        "instrument_id",
+        "factor_id",
+        "factor_version",
+        "is_valid",
+    )
+    if any(frame.select(required_non_null).null_count().row(0)):
+        raise ValueError("factor output identity and audit fields must not be null")
     date_range, future_availability = _factor_scope_violation_expressions(start, end)
     invalid_value = (
         pl.col("value").is_null()
