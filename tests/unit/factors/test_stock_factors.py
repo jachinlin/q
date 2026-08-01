@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import polars as pl
@@ -15,14 +16,15 @@ from quant_core.data.adjustments import (
     AdjustmentMode,
 )
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
-from quant_core.factors import FactorContext, FactorRegistry
+from quant_core.factors import FactorContext, FactorRegistry, FactorSpec
 from quant_core.factors.base import factor_table_content_hash
 from quant_core.factors.builtin import register_etf_factors, register_stock_factors
-from quant_core.factors.builtin._stock_common import trading_signal_dates
+from quant_core.factors.builtin._stock_common import output_frame, trading_signal_dates
 from quant_core.factors.builtin.auxiliary import (
     AvgAmount20dFactor,
     IndustryCodePitFactor,
     LogMarketCapFactor,
+    _provider_values,
     assert_alpha_eligible,
 )
 from quant_core.factors.builtin.momentum import Momentum12020Factor
@@ -203,6 +205,76 @@ class RevisionFinancials(Financials):
             .unique(subset=["instrument_id", "report_period", "metric"], keep="last")
             .lazy()
         )
+
+
+def test_output_frame_invalidates_availability_after_shanghai_signal_day() -> None:
+    """Public producer output cannot turn a future-known value into a valid signal."""
+    day = date(2025, 1, 2)
+    boundary = datetime(
+        2025,
+        1,
+        2,
+        23,
+        59,
+        59,
+        999999,
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    )
+    future = datetime(2025, 1, 2, 16, tzinfo=UTC)
+    spec = FactorSpec("direct", "1.0.0", "daily", 0, (), 1, {})
+
+    result = output_frame(
+        spec,
+        [
+            (day, "SSE:600000", 1.0, boundary),
+            (day, "SSE:600001", 2.0, future),
+        ],
+    ).collect()
+
+    assert result["value"].to_list() == [1.0, None]
+    assert result["is_valid"].to_list() == [True, False]
+    assert result["available_at"].to_list()[1] == future
+
+
+@pytest.mark.parametrize(
+    ("available_at", "is_visible"),
+    [
+        (
+            datetime(
+                2025,
+                1,
+                2,
+                23,
+                59,
+                59,
+                999999,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+            True,
+        ),
+        (datetime(2025, 1, 2, 16, tzinfo=UTC), False),
+    ],
+)
+def test_provider_values_enforce_shanghai_signal_day_cutoff(
+    available_at: datetime,
+    is_visible: bool,
+) -> None:
+    """Provider offsets are converted to Shanghai before signal-day visibility."""
+    day = date(2025, 1, 2)
+    provider = PitValues(
+        pl.DataFrame(
+            {
+                "signal_date": [day],
+                "instrument_id": [_ID.canonical()],
+                "value": [1.0],
+                "available_at": [available_at],
+            }
+        )
+    )
+
+    result = _provider_values(provider, _SNAPSHOT, day, [_ID])
+
+    assert (_ID.canonical() in result) is is_visible
 
 
 def test_valuation_factors_use_positive_finite_snapshot_bar_multiples() -> None:

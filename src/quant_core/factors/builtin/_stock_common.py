@@ -10,7 +10,11 @@ from typing import Protocol
 import polars as pl
 
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
-from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorSpec
+from quant_core.factors.base import (
+    FACTOR_OUTPUT_SCHEMA,
+    FactorSpec,
+    is_available_on_signal_day,
+)
 
 
 class BarRepository(Protocol):
@@ -34,8 +38,12 @@ def output_frame(
 ) -> pl.LazyFrame:
     materialized = []
     for day, instrument, value, available_at in rows:
+        available_on_day = is_available_on_signal_day(available_at, day)
         valid = (
-            value is not None and isfinite(value) and _known_availability(available_at)
+            value is not None
+            and isfinite(value)
+            and _known_availability(available_at)
+            and available_on_day
         )
         materialized.append(
             {

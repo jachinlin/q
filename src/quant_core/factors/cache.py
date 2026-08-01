@@ -27,9 +27,11 @@ from quant_core.factors.base import (
     FactorArtifact,
     FactorContext,
     FactorSpec,
+    _factor_scope_violation_expressions,
     canonical_factor_ref,
     factor_table_content_hash,
     thaw_json,
+    validate_factor_output_scope,
     validate_sha256,
 )
 
@@ -142,6 +144,8 @@ class FeatureCache:
                 data_path,
                 factor_id=metadata.factor_ref.partition("@")[0],
                 factor_version=metadata.factor_ref.partition("@")[2],
+                start=metadata.start,
+                end=metadata.end,
             )
         except (
             OSError,
@@ -190,6 +194,8 @@ class FeatureCache:
             canonical_plan,
             factor_id=spec.factor_id,
             factor_version=spec.version,
+            start=ctx.start,
+            end=ctx.end,
         )
         entry_path = self._root / cache_key
         lock_path = self._root / f".{cache_key}.lock"
@@ -229,6 +235,8 @@ class FeatureCache:
                     data_path,
                     factor_id=spec.factor_id,
                     factor_version=spec.version,
+                    start=ctx.start,
+                    end=ctx.end,
                 )
                 row_count = written.num_rows
                 content_hash = _content_hash(written)
@@ -450,7 +458,12 @@ def _parse_manifest(
 
 
 def _validated_frame(
-    frame: pl.DataFrame, *, factor_id: str, factor_version: str
+    frame: pl.DataFrame,
+    *,
+    factor_id: str,
+    factor_version: str,
+    start: date,
+    end: date,
 ) -> pl.DataFrame:
     if frame.schema != FACTOR_OUTPUT_SCHEMA:
         raise ValueError(f"factor output schema must be exactly {FACTOR_OUTPUT_SCHEMA}")
@@ -486,11 +499,17 @@ def _validated_frame(
         raise ValueError(
             "null available_at is allowed only for a null invalid factor value"
         )
+    validate_factor_output_scope(frame, start=start, end=end)
     return frame.sort(_PRIMARY_KEY, maintain_order=True)
 
 
 def _read_validated_parquet(
-    data_path: Path, *, factor_id: str, factor_version: str
+    data_path: Path,
+    *,
+    factor_id: str,
+    factor_version: str,
+    start: date,
+    end: date,
 ) -> pa.Table:
     """Stream row groups, enforcing canonical keys across every batch boundary."""
     parquet = pq.ParquetFile(data_path)
@@ -503,7 +522,11 @@ def _read_validated_parquet(
             raise ValueError("feature cache Parquet schema changes across batches")
         frame = cast(pl.DataFrame, pl.from_arrow(batch))
         canonical = _validated_frame(
-            frame, factor_id=factor_id, factor_version=factor_version
+            frame,
+            factor_id=factor_id,
+            factor_version=factor_version,
+            start=start,
+            end=end,
         )
         if not frame.select(_PRIMARY_KEY).equals(canonical.select(_PRIMARY_KEY)):
             raise ValueError("feature cache Parquet is not canonically sorted")
@@ -535,7 +558,12 @@ def _batch_primary_key(batch: pa.RecordBatch, row_index: int) -> tuple[object, .
 
 
 def _validate_lazy_plan(
-    frame: pl.LazyFrame, *, factor_id: str, factor_version: str
+    frame: pl.LazyFrame,
+    *,
+    factor_id: str,
+    factor_version: str,
+    start: date,
+    end: date,
 ) -> None:
     """Reduce full semantic validation to one scalar streaming result."""
     required_non_null = (
@@ -553,6 +581,7 @@ def _validate_lazy_plan(
         | pl.col("value").is_nan()
         | pl.col("value").is_infinite()
     )
+    date_range, future_availability = _factor_scope_violation_expressions(start, end)
     checks = (
         frame.select(
             pl.any_horizontal(
@@ -574,6 +603,8 @@ def _validate_lazy_plan(
             )
             .any()
             .alias("invalid_availability"),
+            date_range,
+            future_availability,
         )
         .collect(engine="streaming")
         .row(0, named=True)
@@ -593,6 +624,12 @@ def _validate_lazy_plan(
     if checks["invalid_availability"]:
         raise ValueError(
             "null available_at is allowed only for a null invalid factor value"
+        )
+    if checks["date_range"]:
+        raise ValueError("factor output trade_date is outside context range")
+    if checks["future_availability"]:
+        raise ValueError(
+            "valid factor output available_at is after the Shanghai signal-day end"
         )
 
 

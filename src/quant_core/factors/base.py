@@ -11,6 +11,7 @@ from decimal import Decimal
 from math import isfinite
 from types import MappingProxyType
 from typing import Protocol, cast
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import polars as pl
@@ -27,6 +28,7 @@ type FrozenJsonValue = (
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 _FACTOR_OUTPUT_COLUMNS: dict[str, PolarsDataType] = {
     "trade_date": pl.Date,
@@ -140,6 +142,7 @@ class FactorArtifact:
             raise TypeError("artifact start and end must be dates")
         if self.start > self.end:
             raise ValueError("artifact start must not follow end")
+        validate_factor_output_scope(frame, start=self.start, end=self.end)
         object.__setattr__(self, "table", table)
 
     def lazy_frame(self) -> pl.LazyFrame:
@@ -175,6 +178,74 @@ def validate_sha256(value: str, field: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise ValueError(f"{field} must be a 64-character lowercase SHA-256 hash")
     return value
+
+
+def is_available_on_signal_day(value: datetime | None, signal_day: date) -> bool:
+    """Return whether an aware timestamp is visible by Shanghai's signal-day end."""
+    return (
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.utcoffset() is not None
+        and value.astimezone(_SHANGHAI).date() <= signal_day
+    )
+
+
+def validate_factor_output_scope(
+    frame: pl.DataFrame, *, start: date, end: date
+) -> None:
+    """Reject output rows outside the complete artifact PIT contract."""
+    date_range, future_availability = _factor_scope_violation_expressions(start, end)
+    invalid_value = (
+        pl.col("value").is_null()
+        | pl.col("value").is_nan()
+        | pl.col("value").is_infinite()
+    )
+    checks = frame.select(
+        date_range,
+        future_availability,
+        (pl.col("is_valid") & invalid_value).any().alias("valid_value"),
+        (pl.col("is_valid") & pl.col("available_at").is_null())
+        .any()
+        .alias("valid_availability"),
+        (
+            ~pl.col("is_valid")
+            & pl.col("value").is_not_null()
+            & pl.col("available_at").is_null()
+        )
+        .any()
+        .alias("invalid_availability"),
+    ).row(0, named=True)
+    if checks["valid_value"]:
+        raise ValueError("valid factor output value must be finite")
+    if checks["valid_availability"]:
+        raise ValueError("valid factor output available_at must not be null")
+    if checks["invalid_availability"]:
+        raise ValueError(
+            "null available_at is allowed only for a null invalid factor value"
+        )
+    if checks["date_range"]:
+        raise ValueError("factor output trade_date is outside context range")
+    if checks["future_availability"]:
+        raise ValueError(
+            "valid factor output available_at is after the Shanghai signal-day end"
+        )
+
+
+def _factor_scope_violation_expressions(
+    start: date, end: date
+) -> tuple[pl.Expr, pl.Expr]:
+    """Build native Polars checks shared by eager and streaming validators."""
+    out_of_range = (
+        (pl.col("trade_date") < pl.lit(start)) | (pl.col("trade_date") > pl.lit(end))
+    ).any()
+    after_shanghai_day = pl.col("available_at").dt.convert_time_zone(
+        "Asia/Shanghai"
+    ).dt.date() > pl.col("trade_date")
+    future_availability = (pl.col("is_valid") & after_shanghai_day).any()
+    return (
+        out_of_range.alias("date_range"),
+        future_availability.alias("future_availability"),
+    )
 
 
 def factor_table_content_hash(table: pa.Table) -> str:

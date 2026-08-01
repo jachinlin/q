@@ -11,16 +11,17 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from inspect import getsource
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from quant_core.data.contracts import ProviderCapabilities
+from quant_core.data.contracts import ProviderCapabilities, canonical_json_bytes
 from quant_core.domain.identifiers import SnapshotId
 from quant_core.factors import (
     FACTOR_OUTPUT_SCHEMA,
@@ -96,6 +97,27 @@ def make_frame(
                 datetime(2025, 1, 2, 8, tzinfo=UTC),
             ],
             "is_valid": validity,
+        },
+        schema=FACTOR_OUTPUT_SCHEMA,
+    ).lazy()
+
+
+def single_factor_frame(
+    day: date,
+    available_at: datetime | None,
+    *,
+    value: float | None = 0.1,
+    is_valid: bool = True,
+) -> pl.LazyFrame:
+    return pl.DataFrame(
+        {
+            "trade_date": [day],
+            "instrument_id": ["SSE:600000"],
+            "factor_id": ["momentum"],
+            "factor_version": ["1.0.0"],
+            "value": [value],
+            "available_at": [available_at],
+            "is_valid": [is_valid],
         },
         schema=FACTOR_OUTPUT_SCHEMA,
     ).lazy()
@@ -1100,6 +1122,56 @@ def test_publish_rejects_semantically_invalid_factor_rows(
 
 
 @pytest.mark.parametrize(
+    ("day", "available_at", "expected"),
+    [
+        (
+            date(2025, 1, 1),
+            datetime(2025, 1, 1, 8, tzinfo=UTC),
+            "range",
+        ),
+        (
+            date(2025, 2, 1),
+            datetime(2025, 2, 1, 8, tzinfo=UTC),
+            "range",
+        ),
+        (
+            date(2025, 1, 2),
+            datetime(2025, 1, 2, 16, tzinfo=UTC),
+            "available_at|future",
+        ),
+    ],
+)
+def test_publish_rejects_rows_outside_context_or_after_shanghai_day_end(
+    tmp_path: Path,
+    day: date,
+    available_at: datetime,
+    expected: str,
+) -> None:
+    """Context range and Shanghai-local PIT cutoff are mandatory cache inputs."""
+    with pytest.raises(ValueError, match=expected):
+        publish(FeatureCache(tmp_path), single_factor_frame(day, available_at))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_publish_accepts_availability_exactly_at_shanghai_day_end(
+    tmp_path: Path,
+) -> None:
+    """The inclusive Shanghai end-of-day boundary remains a valid observation."""
+    day = date(2025, 1, 2)
+    boundary = datetime.combine(
+        day, time.max, tzinfo=ZoneInfo("Asia/Shanghai")
+    ).astimezone(UTC)
+
+    artifact = publish(
+        FeatureCache(tmp_path),
+        single_factor_frame(day, boundary),
+    )
+
+    assert artifact.lazy_frame().collect()["is_valid"].item() is True
+
+
+@pytest.mark.parametrize(
     "column,dtype",
     [
         ("trade_date", pl.Date),
@@ -1187,6 +1259,155 @@ def test_invalid_null_with_unknown_availability_round_trips_through_manifest(
         None,
         False,
     )
+
+
+@pytest.mark.parametrize(
+    ("day", "available_at", "expected"),
+    [
+        (
+            date(2025, 1, 1),
+            datetime(2025, 1, 1, 8, tzinfo=UTC),
+            "range",
+        ),
+        (
+            date(2025, 1, 2),
+            datetime(2025, 1, 2, 16, tzinfo=UTC),
+            "available_at|future",
+        ),
+    ],
+)
+def test_factor_artifact_direct_construction_enforces_scope_and_pit(
+    day: date,
+    available_at: datetime,
+    expected: str,
+) -> None:
+    """Direct artifact construction cannot bypass cache publish validation."""
+    table = single_factor_frame(day, available_at).collect().to_arrow()
+
+    with pytest.raises(ValueError, match=expected):
+        FactorArtifact(
+            factor_ref="momentum@1.0.0",
+            cache_key=digest("cache"),
+            content_hash=factor_table_content_hash(table),
+            row_count=table.num_rows,
+            snapshot_id=make_context().snapshot_id,
+            universe_hash=digest("universe"),
+            start=date(2025, 1, 2),
+            end=date(2025, 1, 31),
+            table=table,
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "available_at", "is_valid", "expected"),
+    [
+        (None, datetime(2025, 1, 2, 8, tzinfo=UTC), True, "finite"),
+        (math.nan, datetime(2025, 1, 2, 8, tzinfo=UTC), True, "finite"),
+        (1.0, None, True, "available_at|null"),
+        (1.0, None, False, "available_at|null"),
+    ],
+)
+def test_factor_artifact_direct_construction_enforces_valid_row_contract(
+    value: float | None,
+    available_at: datetime | None,
+    is_valid: bool,
+    expected: str,
+) -> None:
+    """Direct construction retains the cache's finite/known-availability contract."""
+    table = (
+        single_factor_frame(
+            date(2025, 1, 2),
+            available_at,
+            value=value,
+            is_valid=is_valid,
+        )
+        .collect()
+        .to_arrow()
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        FactorArtifact(
+            factor_ref="momentum@1.0.0",
+            cache_key=digest("cache"),
+            content_hash=factor_table_content_hash(table),
+            row_count=table.num_rows,
+            snapshot_id=make_context().snapshot_id,
+            universe_hash=digest("universe"),
+            start=date(2025, 1, 2),
+            end=date(2025, 1, 31),
+            table=table,
+        )
+
+
+def test_factor_artifact_direct_construction_preserves_capability_missing_row() -> None:
+    """An invalid null row with unknown availability remains a legal artifact."""
+    table = (
+        single_factor_frame(
+            date(2025, 1, 2),
+            None,
+            value=None,
+            is_valid=False,
+        )
+        .collect()
+        .to_arrow()
+    )
+
+    artifact = FactorArtifact(
+        factor_ref="momentum@1.0.0",
+        cache_key=digest("cache"),
+        content_hash=factor_table_content_hash(table),
+        row_count=table.num_rows,
+        snapshot_id=make_context().snapshot_id,
+        universe_hash=digest("universe"),
+        start=date(2025, 1, 2),
+        end=date(2025, 1, 31),
+        table=table,
+    )
+
+    assert artifact.lazy_frame().collect().row(0)[4:] == (None, None, False)
+
+
+@pytest.mark.parametrize(
+    ("row_index", "out_of_range_day"),
+    [(0, date(2025, 1, 1)), (2, date(2025, 2, 1))],
+)
+def test_load_uses_manifest_scope_across_parquet_batch_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    row_index: int,
+    out_of_range_day: date,
+) -> None:
+    """The first or last streamed Parquet batch cannot escape manifest range."""
+    from quant_core.factors import cache as cache_module
+
+    monkeypatch.setattr(cache_module, "_PUBLISH_BATCH_ROWS", 2)
+    cache = FeatureCache(tmp_path)
+    artifact = publish(cache, large_factor_frame(3))
+    data_path, manifest_path = entry_paths(cache, artifact)
+    changed = (
+        pl.read_parquet(data_path)
+        .with_row_index("_row")
+        .with_columns(
+            pl.when(pl.col("_row") == row_index)
+            .then(pl.lit(out_of_range_day, dtype=pl.Date))
+            .otherwise(pl.col("trade_date"))
+            .alias("trade_date")
+        )
+        .drop("_row")
+    )
+    pq.write_table(changed.to_arrow(), data_path, row_group_size=2)
+    table = pq.read_table(data_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["content_hash"] = factor_table_content_hash(table)
+    manifest["row_count"] = table.num_rows
+    manifest["schema_fingerprint"] = hashlib.sha256(
+        table.schema.serialize().to_pybytes()
+    ).hexdigest()
+    manifest_path.write_bytes(canonical_json_bytes(manifest))  # type: ignore[arg-type]
+    assert pq.ParquetFile(data_path).num_row_groups == 2
+
+    with pytest.raises(ValueError, match="range|Parquet"):
+        cache.load(artifact.cache_key)
 
 
 def test_load_revalidates_parquet_content_and_fails_closed(tmp_path: Path) -> None:

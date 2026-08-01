@@ -12,7 +12,11 @@ import polars as pl
 from quant_core.data.adjustments import AdjustmentMode
 from quant_core.data.contracts import JsonValue
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
-from quant_core.factors.base import FactorContext, FactorSpec
+from quant_core.factors.base import (
+    FactorContext,
+    FactorSpec,
+    is_available_on_signal_day,
+)
 from quant_core.factors.builtin._stock_common import (
     BarRepository,
     TradeCalendarProvider,
@@ -273,7 +277,7 @@ def _provider_values(
             if require_positive
             else _finite_number(row["value"])
         )
-        if valid_value and _known_availability(row["available_at"]):
+        if valid_value and is_available_on_signal_day(row["available_at"], day):
             result[row["instrument_id"]] = (float(row["value"]), row["available_at"])
     return result
 
