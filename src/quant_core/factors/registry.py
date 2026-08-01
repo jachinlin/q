@@ -123,14 +123,15 @@ class FactorRegistry:
     def runnable_references(
         self, capabilities: ProviderCapabilities
     ) -> tuple[str, ...]:
-        """Return registered factors whose declared source inputs are available."""
-        return tuple(
-            canonical_ref
-            for canonical_ref in sorted(self._registrations)
-            if not capabilities.missing(
-                _required_capabilities(self.spec(canonical_ref))
-            )
-        )
+        """Return factors whose complete dependency closures are available."""
+        runnable: list[str] = []
+        for canonical_ref in sorted(self._registrations):
+            try:
+                self.preflight((canonical_ref,), capabilities)
+            except FactorCapabilityUnavailable:
+                continue
+            runnable.append(canonical_ref)
+        return tuple(runnable)
 
     def preflight(
         self, references: Sequence[str], capabilities: ProviderCapabilities

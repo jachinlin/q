@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -842,6 +842,37 @@ def test_engine_requires_an_explicit_capability_profile(tmp_path: Path) -> None:
         FactorRegistry(),
         FeatureCache(tmp_path),
         capabilities=ProviderCapabilities.complete(),
+    )
+
+
+def test_runnable_references_require_supported_dependency_closure() -> None:
+    """Checking only a root's metadata would mislabel signal -> quality runnable."""
+    calls: list[str] = []
+    registry = FactorRegistry()
+    for spec in (
+        make_spec(
+            factor_id="quality",
+            parameters={"required_capabilities": ["financials_with_announcement_date"]},
+        ),
+        make_spec(factor_id="price", parameters={}),
+        make_spec(
+            factor_id="signal",
+            parameters={},
+            dependencies=("quality@1.0.0", "price@1.0.0"),
+        ),
+    ):
+        registry.register(
+            RecordingFactor(spec, calls), code_hash=digest(spec.factor_id)
+        )
+    without_financials = replace(
+        ProviderCapabilities.complete(), financials_with_announcement_date=False
+    )
+
+    assert registry.runnable_references(without_financials) == ("price@1.0.0",)
+    assert registry.runnable_references(ProviderCapabilities.complete()) == (
+        "price@1.0.0",
+        "quality@1.0.0",
+        "signal@1.0.0",
     )
 
 
