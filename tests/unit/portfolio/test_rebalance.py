@@ -80,6 +80,17 @@ def test_rebalance_scales_buys_to_available_cash_and_keeps_residual_cash() -> No
     assert result.projected_cash_fen == 500
 
 
+def test_rebalance_rejects_positive_prices_that_round_to_zero_fen() -> None:
+    with pytest.raises(ValueError, match="price"):
+        RebalancePlanner().plan(
+            _target(_position(_A, 1.0)),
+            {},
+            cash_fen=10_000,
+            execution_prices={_A: 0.001},
+            lot_sizes={_A: 100},
+        )
+
+
 def test_rebalance_nets_each_instrument_to_at_most_one_intent() -> None:
     result = RebalancePlanner().plan(
         _target(_position(_A, 0.5), _position(_B, 0.5)),

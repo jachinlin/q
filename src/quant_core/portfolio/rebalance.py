@@ -143,7 +143,12 @@ def _price_fen(
         or price <= 0
     ):
         raise ValueError("price must be finite and positive")
-    return int((Decimal(str(price)) * Decimal(100)).quantize(Decimal(1), ROUND_HALF_UP))
+    price_fen = int(
+        (Decimal(str(price)) * Decimal(100)).quantize(Decimal(1), ROUND_HALF_UP)
+    )
+    if price_fen <= 0:
+        raise ValueError("price must round to at least one fen")
+    return price_fen
 
 
 def _lot_size(
