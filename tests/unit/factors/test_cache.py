@@ -270,12 +270,12 @@ def test_load_returns_owned_content_when_data_is_replaced_after_read(
     cache = FeatureCache(tmp_path / "cache")
     published = publish(cache)
     data_path, _ = entry_paths(cache, published)
-    read_table = cache_module.pq.read_table
+    read_validated = cache_module._read_validated_parquet
     replaced = False
 
-    def read_then_replace(path: Path) -> object:
+    def read_then_replace(path: Path, **kwargs: object) -> object:
         nonlocal replaced
-        table = read_table(path)
+        table = read_validated(path, **kwargs)
         if Path(path) == data_path and not replaced:
             replacement = data_path.with_suffix(".replacement")
             replacement.write_bytes(b"corrupt parquet")
@@ -283,7 +283,7 @@ def test_load_returns_owned_content_when_data_is_replaced_after_read(
             replaced = True
         return table
 
-    monkeypatch.setattr(cache_module.pq, "read_table", read_then_replace)
+    monkeypatch.setattr(cache_module, "_read_validated_parquet", read_then_replace)
 
     artifact = cache.load(published.cache_key)
 
@@ -379,7 +379,11 @@ def test_load_hashes_the_table_returned_by_the_parquet_reader(
         .sort("trade_date", "instrument_id", "factor_id", "factor_version")
         .to_arrow()
     )
-    monkeypatch.setattr(cache_module.pq, "read_table", lambda path: different)
+    monkeypatch.setattr(
+        cache_module,
+        "_read_validated_parquet",
+        lambda path, **kwargs: different,
+    )
 
     with pytest.raises(ValueError, match="integrity metadata differs"):
         cache.load(artifact.cache_key)
@@ -927,6 +931,70 @@ def test_publish_streams_canonical_parquet_in_bounded_row_groups(
     )
 
 
+def test_load_uses_iter_batches_and_rejects_cross_batch_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canonical primary keys must remain strictly increasing between batches."""
+    from quant_core.factors import cache as cache_module
+
+    row_count = 65_537
+    artifact = publish(FeatureCache(tmp_path), large_factor_frame(row_count))
+    data_path, _ = entry_paths(FeatureCache(tmp_path), artifact)
+    table = pq.read_table(data_path)
+    duplicate = pa.concat_tables(
+        [table.slice(0, 65_536), table.slice(65_535, 1)],
+        promote_options="none",
+    )
+    pq.write_table(duplicate, data_path, row_group_size=65_536)
+    calls = 0
+    parquet_file = cache_module.pq.ParquetFile
+
+    class RecordingParquetFile:
+        def __init__(self, path: Path) -> None:
+            self._delegate = parquet_file(path)
+            self.schema_arrow = self._delegate.schema_arrow
+
+        def iter_batches(self, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            return self._delegate.iter_batches(**kwargs)
+
+    monkeypatch.setattr(cache_module.pq, "ParquetFile", RecordingParquetFile)
+
+    with pytest.raises(ValueError, match="Parquet"):
+        FeatureCache(tmp_path).load(artifact.cache_key)
+    assert calls == 1
+
+
+def test_streamed_parquet_validation_rejects_schema_change_between_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every yielded batch must retain the file's exact factor schema."""
+    from quant_core.factors import cache as cache_module
+
+    artifact = publish(FeatureCache(tmp_path), large_factor_frame(65_537))
+    parquet_file = cache_module.pq.ParquetFile
+
+    class SchemaChangingParquetFile:
+        def __init__(self, path: Path) -> None:
+            self._delegate = parquet_file(path)
+            self.schema_arrow = self._delegate.schema_arrow
+
+        def iter_batches(self, **kwargs: object) -> object:
+            for index, batch in enumerate(self._delegate.iter_batches(**kwargs)):
+                if index == 1:
+                    yield batch.rename_columns(
+                        [*batch.schema.names[:-1], "changed_is_valid"]
+                    )
+                else:
+                    yield batch
+
+    monkeypatch.setattr(cache_module.pq, "ParquetFile", SchemaChangingParquetFile)
+
+    with pytest.raises(ValueError, match="Parquet"):
+        FeatureCache(tmp_path).load(artifact.cache_key)
+
+
 def test_directory_flush_failure_before_rename_leaves_no_visible_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -955,7 +1023,9 @@ def test_publish_recovers_stale_same_key_staging_after_dead_owner(
     ctx = make_context()
     dependencies = {"price@1.0.0": digest("price")}
     key = build_cache_key(spec, ctx, digest("implementation"), dependencies)
-    stale = tmp_path / f".{key}.{'0' * 32}.tmp"
+    from quant_core.factors.cache import _compact_sha256
+
+    stale = tmp_path / f".{_compact_sha256(key)}.{'0' * 16}.tmp"
     stale.mkdir()
     (stale / "data.parquet").write_bytes(b"interrupted")
     (stale / "manifest.json").write_bytes(b"interrupted")
@@ -1186,19 +1256,19 @@ def test_load_revalidates_paths_after_a_read_time_directory_swap(
     outside = tmp_path / "outside"
     parked = tmp_path / "parked"
     shutil.copytree(entry, outside)
-    read_table = cache_module.pq.read_table
+    read_validated = cache_module._read_validated_parquet
     swapped = False
 
-    def read_then_swap(path: Path) -> object:
+    def read_then_swap(path: Path, **kwargs: object) -> object:
         nonlocal swapped
-        table = read_table(path)
+        table = read_validated(path, **kwargs)
         if not swapped:
             entry.rename(parked)
             _create_directory_link(entry, outside)
             swapped = True
         return table
 
-    monkeypatch.setattr(cache_module.pq, "read_table", read_then_swap)
+    monkeypatch.setattr(cache_module, "_read_validated_parquet", read_then_swap)
 
     with pytest.raises(ValueError, match="link|reparse"):
         cache.load(artifact.cache_key)

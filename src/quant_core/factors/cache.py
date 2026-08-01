@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -137,18 +138,20 @@ class FeatureCache:
         except (TypeError, ValueError) as error:
             raise ValueError("feature cache manifest is invalid") from error
         try:
-            table = pq.read_table(data_path)
-            frame = cast(pl.DataFrame, pl.from_arrow(table))
-            canonical_frame = _validated_frame(
-                frame,
+            table = _read_validated_parquet(
+                data_path,
                 factor_id=metadata.factor_ref.partition("@")[0],
                 factor_version=metadata.factor_ref.partition("@")[2],
             )
-        except (OSError, pa.ArrowException, TypeError, ValueError) as error:
+        except (
+            OSError,
+            pa.ArrowException,
+            pl.exceptions.PolarsError,
+            TypeError,
+            ValueError,
+        ) as error:
             raise ValueError("feature cache Parquet integrity check failed") from error
         self._validate_entry_paths(entry_path, data_path, manifest_path)
-        if not frame.select(_PRIMARY_KEY).equals(canonical_frame.select(_PRIMARY_KEY)):
-            raise ValueError("feature cache Parquet is not canonically sorted")
         schema_fingerprint = _schema_fingerprint(table.schema)
         content_hash = _content_hash(table)
         expected_schema = _manifest_string(manifest, "schema_fingerprint")
@@ -195,13 +198,21 @@ class FeatureCache:
 
         with _PartitionLock(lock_path):
             self._recover_stale_staging(cache_key)
-            staging_path = self._root / f".{cache_key}.{uuid.uuid4().hex}.tmp"
+            staging_token = _compact_sha256(cache_key)
+            while True:
+                staging_path = self._root / (
+                    f".{staging_token}.{uuid.uuid4().hex[:16]}.tmp"
+                )
+                validate_storage_path(self._root, staging_path)
+                try:
+                    staging_path.mkdir()
+                except FileExistsError:
+                    continue
+                break
             data_path = staging_path / "data.parquet"
             manifest_path = staging_path / "manifest.json"
             installed = False
             try:
-                validate_storage_path(self._root, staging_path)
-                staging_path.mkdir()
                 validate_storage_path(self._root, staging_path)
                 validate_storage_path(self._root, data_path)
                 validate_storage_path(self._root, manifest_path)
@@ -214,19 +225,11 @@ class FeatureCache:
                 )
                 validate_storage_path(self._root, data_path, require_file=True)
                 _fsync_file(data_path)
-                written = pq.read_table(data_path)
-                written_frame = cast(pl.DataFrame, pl.from_arrow(written))
-                validated = _validated_frame(
-                    written_frame,
+                written = _read_validated_parquet(
+                    data_path,
                     factor_id=spec.factor_id,
                     factor_version=spec.version,
                 )
-                if not written_frame.select(_PRIMARY_KEY).equals(
-                    validated.select(_PRIMARY_KEY)
-                ):
-                    raise ValueError(
-                        "written feature Parquet is not canonically sorted"
-                    )
                 row_count = written.num_rows
                 content_hash = _content_hash(written)
                 schema_fingerprint = _schema_fingerprint(written.schema)
@@ -266,10 +269,13 @@ class FeatureCache:
                 installed = True
                 validate_storage_path(self._root, entry_path)
                 _fsync_directory(self._root)
-                artifact = self.load(cache_key)
-                if artifact is None:
-                    raise ValueError("published feature cache entry is not visible")
-                return artifact
+                installed_data = entry_path / "data.parquet"
+                installed_manifest = entry_path / "manifest.json"
+                self._validate_entry_paths(
+                    entry_path, installed_data, installed_manifest
+                )
+                metadata = _parse_manifest(manifest, cache_key)
+                return metadata.artifact(written)
             finally:
                 if not installed:
                     data_path.unlink(missing_ok=True)
@@ -281,7 +287,9 @@ class FeatureCache:
 
     def _recover_stale_staging(self, cache_key: str) -> None:
         """Remove only dead same-key staging directories while holding its lock."""
-        staging_name = re.compile(rf"\.{re.escape(cache_key)}\.[0-9a-f]{{32}}\.tmp\Z")
+        staging_name = re.compile(
+            rf"\.{re.escape(_compact_sha256(cache_key))}\.[0-9a-f]{{16}}\.tmp\Z"
+        )
         recovered = False
         for path in self._root.iterdir():
             if staging_name.fullmatch(path.name) is None:
@@ -481,6 +489,51 @@ def _validated_frame(
     return frame.sort(_PRIMARY_KEY, maintain_order=True)
 
 
+def _read_validated_parquet(
+    data_path: Path, *, factor_id: str, factor_version: str
+) -> pa.Table:
+    """Stream row groups, enforcing canonical keys across every batch boundary."""
+    parquet = pq.ParquetFile(data_path)
+    schema = parquet.schema_arrow
+    batches: list[pa.RecordBatch] = []
+    previous_key: tuple[object, ...] | None = None
+    row_count = 0
+    for batch in parquet.iter_batches(batch_size=_PUBLISH_BATCH_ROWS):
+        if batch.schema != schema:
+            raise ValueError("feature cache Parquet schema changes across batches")
+        frame = cast(pl.DataFrame, pl.from_arrow(batch))
+        canonical = _validated_frame(
+            frame, factor_id=factor_id, factor_version=factor_version
+        )
+        if not frame.select(_PRIMARY_KEY).equals(canonical.select(_PRIMARY_KEY)):
+            raise ValueError("feature cache Parquet is not canonically sorted")
+        if batch.num_rows:
+            first_key = _batch_primary_key(batch, 0)
+            if previous_key is not None and first_key <= previous_key:
+                raise ValueError(
+                    "feature cache Parquet primary key is not strictly increasing"
+                )
+            previous_key = _batch_primary_key(batch, batch.num_rows - 1)
+        batches.append(batch)
+        row_count += batch.num_rows
+    table = pa.Table.from_batches(batches, schema=schema)
+    if table.num_rows != row_count:
+        raise ValueError("feature cache Parquet batch row count differs")
+    if (
+        cast(pl.DataFrame, pl.from_arrow(table.slice(0, 0))).schema
+        != FACTOR_OUTPUT_SCHEMA
+    ):
+        raise ValueError(f"factor output schema must be exactly {FACTOR_OUTPUT_SCHEMA}")
+    return table
+
+
+def _batch_primary_key(batch: pa.RecordBatch, row_index: int) -> tuple[object, ...]:
+    return tuple(
+        batch.column(batch.schema.get_field_index(column))[row_index].as_py()
+        for column in _PRIMARY_KEY
+    )
+
+
 def _validate_lazy_plan(
     frame: pl.LazyFrame, *, factor_id: str, factor_version: str
 ) -> None:
@@ -549,6 +602,12 @@ def _content_hash(table: pa.Table) -> str:
 
 def _schema_fingerprint(schema: pa.Schema) -> str:
     return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+
+
+def _compact_sha256(value: str) -> str:
+    """Encode every digest bit in a shorter filesystem-safe token."""
+    validate_sha256(value, "SHA-256 value")
+    return base64.urlsafe_b64encode(bytes.fromhex(value)).decode("ascii").rstrip("=")
 
 
 def _fsync_file(path: Path) -> None:

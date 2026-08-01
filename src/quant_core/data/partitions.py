@@ -211,9 +211,12 @@ class _PartitionLock:
         token = uuid.uuid4().hex
         deadline = time.monotonic() + self._timeout_seconds
         while True:
-            temporary_path = self._path.parent / f".locktmp-{token}-{uuid.uuid4().hex}"
+            temporary_path = self._path.parent / f".locktmp-{uuid.uuid4().hex[:16]}"
             try:
                 temporary_path.mkdir()
+            except FileExistsError:
+                continue
+            try:
                 self._owner_path_for(temporary_path).write_text(
                     json.dumps(
                         {"pid": os.getpid(), "token": token},
@@ -259,8 +262,8 @@ class _PartitionLock:
         token = self._token
         if token is None:
             raise RuntimeError("partition lock ownership token is missing")
-        tombstone = self._path.parent / f"{self._path.name}.release-{token}"
         detached = False
+        tombstone: Path | None = None
         try:
             with _AcquisitionGuard(
                 self._path, deadline=None, poll_seconds=self._poll_seconds
@@ -278,8 +281,10 @@ class _PartitionLock:
                     or self._read_owner(self._path) != owner
                 ):
                     raise RuntimeError("partition lock identity changed before release")
-                self._path.rename(tombstone)
+                tombstone = self._detach_to_private_path(".release-")
                 detached = True
+            if tombstone is None:
+                raise RuntimeError("partition lock release tombstone is missing")
             self._remove_token_directory(tombstone, token)
         finally:
             if detached:
@@ -338,14 +343,22 @@ class _PartitionLock:
             or self._read_owner(self._path) != owner
         ):
             return None
-        tombstone = self._path.parent / (
-            f"{self._path.name}.stale-{claimant_token}-{uuid.uuid4().hex}"
-        )
+        del claimant_token
         try:
-            self._path.rename(tombstone)
+            tombstone = self._detach_to_private_path(".stale-")
         except FileNotFoundError:
             return None
         return tombstone, owner
+
+    def _detach_to_private_path(self, prefix: str) -> Path:
+        """Detach to a short random name; owner.json retains the full token."""
+        while True:
+            target = self._path.parent / f"{prefix}{uuid.uuid4().hex[:16]}"
+            try:
+                self._path.rename(target)
+            except FileExistsError:
+                continue
+            return target
 
     @classmethod
     def _remove_detached_stale_directory(
