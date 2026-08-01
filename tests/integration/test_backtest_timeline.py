@@ -309,3 +309,36 @@ def test_manifest_retains_non_session_request_boundary(tmp_path: Path) -> None:
         "2024-01-06",
         "2024-01-09",
     )
+
+
+def test_engine_none_targets_writes_empty_rebalance_artifacts(tmp_path: Path) -> None:
+    class NoneTargets:
+        def generate_target(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    result = BacktestEngine(
+        _Data(), NoneTargets(), _RuleBook(), RebalancePlanner(), artifact_root=tmp_path
+    ).run(_request(), _Progress(), _NeverCancelled())
+    for name in ("targets.parquet", "fills.parquet", "costs.parquet"):
+        assert pq.read_table(result.artifact_dir / name).num_rows == 0
+
+
+def test_engine_cash_target_writes_cash_row_without_orders(tmp_path: Path) -> None:
+    class CashTargets:
+        def generate_target(
+            self,
+            strategy: object,
+            snapshot: object,
+            signal: date,
+            execute: date,
+            current: object,
+        ) -> TargetPortfolio:
+            del strategy, snapshot, current
+            return TargetPortfolio(signal, execute, (), 1.0)
+
+    result = BacktestEngine(
+        _Data(), CashTargets(), _RuleBook(), RebalancePlanner(), artifact_root=tmp_path
+    ).run(_request(), _Progress(), _NeverCancelled())
+    targets = pq.read_table(result.artifact_dir / "targets.parquet").to_pylist()
+    assert len(targets) == 2 and all(row["instrument_id"] is None for row in targets)
+    assert pq.read_table(result.artifact_dir / "fills.parquet").num_rows == 0

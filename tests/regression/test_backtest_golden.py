@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -12,8 +12,13 @@ import pytest
 
 import quant_core.backtest.artifacts as artifacts_module
 from quant_core.backtest.accounting import AccountSnapshot
-from quant_core.backtest.artifacts import BacktestArtifactWriter, ManifestContext
-from quant_core.backtest.engine import BacktestEngine
+from quant_core.backtest.artifacts import (
+    ArtifactEntry,
+    BacktestArtifactWriter,
+    ManifestContext,
+    WriterState,
+)
+from quant_core.backtest.engine import BacktestEngine, BacktestRequest, StrategyRef
 from quant_core.backtest.models import (
     ExecutionBatch,
     ExecutionReason,
@@ -493,3 +498,43 @@ def test_validate_rejects_each_missing_required_artifact(
     with pytest.raises(ValueError, match="missing artifact"):
         writer.validate((date(2024, 1, 5),), _context(experiment, one_day=True))
     assert writer.state.value == "CLOSED"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: StrategyRef("", "1"),
+        lambda: StrategyRef("x", 1),
+        lambda: BacktestRequest(
+            "x",
+            _request().snapshot_id,
+            _request().strategy,
+            _request().start_date,
+            _request().end_date,
+            _request().benchmark,
+            0,
+            "v",
+            _request().execution_config,
+        ),
+        lambda: ArtifactEntry("../x", "x", 0, 0, "0" * 64),
+        lambda: ManifestContext(
+            UUID(int=1),
+            UUID(int=2),
+            "s",
+            "v",
+            datetime(2024, 1, 1, tzinfo=UTC),
+            date(2024, 1, 2),
+            InstrumentId.parse("SSE:600001"),
+            0,
+            "v",
+            _request().execution_config,
+        ),
+        lambda: WriterState("INVALID"),
+    ],
+)
+def test_public_models_fail_closed_for_invalid_direct_construction(
+    factory: object,
+) -> None:
+    assert callable(factory)
+    with pytest.raises((TypeError, ValueError)):
+        factory()
