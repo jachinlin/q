@@ -365,6 +365,9 @@ class BaoStockClient:
     ) -> Iterable[RawBatch]:
         """Yield the existing instrument-range batches for explicit selections."""
 
+        _, open_dates = self._load_trade_calendar(start, end)
+        for trading_day in open_dates:
+            self._require_completed_session(trading_day)
         scope, resolved = self._resolve_instruments(start, end, instruments)
         canonical_ids = tuple(item.canonical() for item in resolved)
         resolved_hash = hashlib.sha256("\n".join(canonical_ids).encode()).hexdigest()

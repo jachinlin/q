@@ -557,6 +557,49 @@ def test_all_market_daily_route_requires_completed_open_sessions_only() -> None:
     assert completed_gateway.daily_market_calls == ["2024-04-26"]
 
 
+def test_selected_daily_route_requires_completed_open_sessions_only() -> None:
+    """Selected history queries must not fetch an open session before its close."""
+    shanghai = ZoneInfo("Asia/Shanghai")
+    trading_day = date(2024, 4, 26)
+    selected = [instrument(Exchange.SSE, "600000")]
+    gateway = FakeGateway()
+    gateway.trade_dates_cursor = FakeCursor(
+        [[("2024-04-26", "1"), ("2024-04-27", "0")]],
+        fields=("calendar_date", "is_trading_day"),
+    )
+    client = make_client(
+        gateway,
+        clock=lambda: datetime(2024, 4, 26, 14, 59, tzinfo=shanghai),
+    )
+    client.login()
+
+    with pytest.raises(ValueError, match="daily market session is not complete"):
+        tuple(client.fetch_daily_bars(trading_day, date(2024, 4, 27), selected))
+
+    assert gateway.trade_date_calls == [
+        {"start_date": "2024-04-26", "end_date": "2024-04-27"}
+    ]
+    assert gateway.query_calls == []
+
+    completed_gateway = FakeGateway()
+    completed_gateway.trade_dates_cursor = FakeCursor(
+        [[("2024-04-26", "1"), ("2024-04-27", "0")]],
+        fields=("calendar_date", "is_trading_day"),
+    )
+    completed = make_client(
+        completed_gateway,
+        clock=lambda: datetime(2024, 4, 26, 15, 0, tzinfo=shanghai),
+    )
+    completed.login()
+
+    batches = tuple(
+        completed.fetch_daily_bars(trading_day, date(2024, 4, 27), selected)
+    )
+
+    assert len(batches) == 1
+    assert [call["code"] for call in completed_gateway.query_calls] == ["sh.600000"]
+
+
 def test_selected_instruments_keep_range_api_only() -> None:
     """Routing selected instruments to the market endpoint loses caller selection."""
     gateway = FakeGateway()
