@@ -248,3 +248,47 @@ def test_factor_matrix_rejects_duplicate_primary_key() -> None:
 def test_universe_matrix_rejects_one_contract_violation(frame: pl.DataFrame) -> None:
     with pytest.raises((TypeError, ValueError)):
         validated_stock_universe(frame, signal_date=_DAY)
+
+
+def test_adapter_rejects_signal_only_provider_mismatch_and_accepts_valid_target() -> (
+    None
+):
+    provider = lambda *args: StrategyContext(
+        _SNAPSHOT,
+        date(2026, 7, 30),
+        _NEXT,
+        (date(2026, 7, 30), _NEXT),
+        _Data(),
+        PortfolioConstructor(),
+    )
+    with pytest.raises(ValueError, match="mismatched"):
+        _adapter(_Strategy(), provider).generate_target(
+            StrategyRef("round3", "1"), _SNAPSHOT, _DAY, _NEXT, _account()
+        )
+    target = _adapter(_Strategy()).generate_target(
+        StrategyRef("round3", "1"), _SNAPSHOT, _DAY, _NEXT, _account()
+    )
+    assert target == TargetPortfolio(_DAY, _NEXT, (), 1.0)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        (datetime(2026, 7, 31, tzinfo=UTC), 100, 100, 0, (), 1.0),
+        (_DAY, -1, 100, 0, (), 1.0),
+        (_DAY, 100, 0, 0, (), 1.0),
+        (_DAY, 100, 100, 1, (), 1.0),
+        (_DAY, 100, 100, 0, [], 1.0),
+        (_DAY, 100, 100, 0, (), 0.9),
+    ],
+)
+def test_portfolio_state_direct_construction_rejects_core_invariants(
+    state: tuple[object, object, object, object, object, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        PortfolioState(*state)  # type: ignore[arg-type]
+
+
+def test_context_rejects_execute_not_after_signal() -> None:
+    with pytest.raises(ValueError, match="execute_date"):
+        StrategyContext(_SNAPSHOT, _DAY, _DAY, (_DAY,), _Data(), PortfolioConstructor())

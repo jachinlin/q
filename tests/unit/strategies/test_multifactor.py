@@ -303,3 +303,44 @@ def test_multifactor_audits_insufficient_factor_coverage_with_source_reason() ->
     )
     assert decision.reason_code == "INSUFFICIENT_FACTOR_COVERAGE"
     assert decision.factor_reasons[_ALPHA_REFS[0]] == "SOURCE_INVALID"
+
+
+def test_multifactor_accepts_exactly_six_valid_factors_with_category_coverage() -> None:
+    factors, universe = _frames()
+    factors = factors.filter(
+        ~(
+            (pl.col("instrument_id") == _IDS[0])
+            & pl.col("factor_ref").is_in((_ALPHA_REFS[0], _ALPHA_REFS[2]))
+        )
+    )
+    decisions: list[MultifactorDecision] = []
+    MultifactorStrategy(_config(), audit_sink=decisions.extend).generate_targets(
+        _context(_Data(factors, universe)),
+        _SIGNAL,
+        PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0),
+    )
+    decision = next(
+        item for item in decisions if item.instrument_id.canonical() == _IDS[0]
+    )
+    assert decision.reason_code == "MULTIFACTOR_SELECTED"
+    assert decision.score is not None
+
+
+def test_multifactor_rejects_seven_factor_coverage_without_momentum_category() -> None:
+    factors, universe = _frames()
+    factors = factors.filter(
+        ~(
+            (pl.col("instrument_id") == _IDS[0])
+            & (pl.col("factor_ref") == _ALPHA_REFS[4])
+        )
+    )
+    decisions: list[MultifactorDecision] = []
+    MultifactorStrategy(_config(), audit_sink=decisions.extend).generate_targets(
+        _context(_Data(factors, universe)),
+        _SIGNAL,
+        PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0),
+    )
+    decision = next(
+        item for item in decisions if item.instrument_id.canonical() == _IDS[0]
+    )
+    assert decision.reason_code == "INSUFFICIENT_FACTOR_COVERAGE"

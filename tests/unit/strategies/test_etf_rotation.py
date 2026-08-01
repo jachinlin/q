@@ -314,6 +314,71 @@ def test_etf_config_rejects_unknown_enums_and_nonfinite_values(
 @pytest.mark.parametrize(
     "override",
     [
+        {"top_n": 4},
+        {"volatility_penalty": -0.1},
+        {"volatility_penalty": float("nan")},
+        {"trend_factor_ref": "other@1"},
+        {"volatility_factor_ref": "other@1"},
+        {
+            "return_factor_weights": {
+                _RETURN_REFS[0]: -0.1,
+                _RETURN_REFS[1]: 0.5,
+                _RETURN_REFS[2]: 0.6,
+            }
+        },
+        {
+            "return_factor_weights": {
+                _RETURN_REFS[0]: float("nan"),
+                _RETURN_REFS[1]: 0.5,
+                _RETURN_REFS[2]: 0.5,
+            }
+        },
+    ],
+)
+def test_etf_config_rejects_remaining_numeric_and_ref_boundaries(
+    override: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _config(**override)
+
+
+def test_etf_target_keeps_context_signal_and_execution_dates() -> None:
+    data = _Data(
+        _factor_frame(
+            {
+                _ETF_A: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: 0.1,
+                    _RETURN_REFS[2]: 0.1,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_B: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: 0.1,
+                    _RETURN_REFS[2]: 0.1,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+                _ETF_C: {
+                    _RETURN_REFS[0]: 0.1,
+                    _RETURN_REFS[1]: 0.1,
+                    _RETURN_REFS[2]: 0.1,
+                    _TREND_REF: 1.0,
+                    _VOL_REF: 0.1,
+                },
+            }
+        )
+    )
+    target = EtfRotationStrategy(_config()).generate_targets(
+        _context(data), _SIGNAL, _empty_state()
+    )
+    assert (target.signal_date, target.execute_date) == (_SIGNAL, _EXECUTE)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
         {"top_n": 0},
         {
             "return_factor_weights": {
