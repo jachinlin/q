@@ -8,7 +8,11 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from quant_core.data.contracts import RawBatch
+from quant_core.data.mappers.baostock import BaoStockMapper
+from quant_core.data.partitions import RawPartitionStore
 from quant_core.data.repository import SnapshotResearchRepository
+from quant_core.data.sources.baostock import DAILY_BAR_FIELDS
 from quant_core.domain.enums import Board, DatasetKind
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.universe import UniverseBuilder, UniverseRules
@@ -102,6 +106,87 @@ def test_build_fail_closes_each_row_when_as_of_is_not_a_trading_day(
 
     assert result["eligible"].to_list() == [False] * len(_IDS)
     assert result["reason_codes"].to_list() == [["AS_OF_NOT_TRADING_DAY"]] * len(_IDS)
+
+
+def test_baostock_mapped_historical_daily_rows_are_visible_at_market_close(
+    tmp_path: Path,
+) -> None:
+    """Using 2026 retrieval time would otherwise hide a valid 2024 status at its close."""
+    as_of = date(2024, 4, 26)
+    trading_days = _trading_days_ending_at(as_of, count=20)
+    mapped = _mapped_baostock_daily_frames(
+        tmp_path,
+        "complete",
+        trading_days,
+        retrieved_at=datetime(2026, 8, 1, 2, tzinfo=UTC),
+    )
+    base = point_in_time_fixture(tmp_path)
+    instruments = _write_dataset(
+        tmp_path,
+        "baostock-instruments",
+        DatasetKind.INSTRUMENT,
+        [_instrument_row("SSE:600000", "eligible")],
+    )
+    calendar = _write_dataset(
+        tmp_path,
+        "baostock-calendar",
+        DatasetKind.TRADE_CALENDAR,
+        [_calendar_row(day) for day in trading_days],
+    )
+    statuses = _write_dataset(
+        tmp_path,
+        "baostock-statuses",
+        DatasetKind.SECURITY_STATUS,
+        mapped[DatasetKind.SECURITY_STATUS].to_dicts(),
+    )
+    bars = _write_dataset(
+        tmp_path,
+        "baostock-bars",
+        DatasetKind.DAILY_BAR,
+        mapped[DatasetKind.DAILY_BAR].to_dicts(),
+    )
+    with_instruments = base.repository.bind_dataset(
+        base.early_snapshot_id, DatasetKind.INSTRUMENT, instruments
+    )
+    with_calendar = base.repository.bind_dataset(
+        with_instruments, DatasetKind.TRADE_CALENDAR, calendar
+    )
+    with_status = base.repository.bind_dataset(
+        with_calendar, DatasetKind.SECURITY_STATUS, statuses
+    )
+    snapshot_id = base.repository.bind_dataset(with_status, DatasetKind.DAILY_BAR, bars)
+
+    result = UniverseBuilder(SnapshotResearchRepository(base.repository)).build(
+        snapshot_id,
+        as_of,
+        UniverseRules(min_listing_days=0, min_avg_amount_20d=100.0),
+    )
+
+    assert result.rows() == [("SSE:600000", as_of, True, [])]
+
+    pre_close = _mapped_baostock_daily_frames(
+        tmp_path,
+        "pre-close",
+        [as_of],
+        retrieved_at=datetime(2024, 4, 26, 6, 59, tzinfo=UTC),
+    )
+    pre_close_status = _write_dataset(
+        tmp_path,
+        "baostock-pre-close-status",
+        DatasetKind.SECURITY_STATUS,
+        pre_close[DatasetKind.SECURITY_STATUS].to_dicts(),
+    )
+    pre_close_snapshot = base.repository.bind_dataset(
+        snapshot_id, DatasetKind.SECURITY_STATUS, pre_close_status
+    )
+
+    invisible = (
+        SnapshotResearchRepository(base.repository)
+        .security_status(pre_close_snapshot, as_of)
+        .collect()
+    )
+
+    assert invisible.is_empty()
 
 
 @pytest.mark.parametrize(
@@ -573,6 +658,62 @@ def _universe_fixture(
     )
     snapshot_id = base.repository.bind_dataset(with_status, DatasetKind.DAILY_BAR, bars)
     return base.repository, snapshot_id
+
+
+def _trading_days_ending_at(end: date, *, count: int) -> list[date]:
+    days: list[date] = []
+    candidate = end
+    while len(days) < count:
+        if candidate.weekday() < 5:
+            days.append(candidate)
+        candidate -= timedelta(days=1)
+    return list(reversed(days))
+
+
+def _mapped_baostock_daily_frames(
+    tmp_path: Path,
+    name: str,
+    trading_days: list[date],
+    *,
+    retrieved_at: datetime,
+) -> dict[DatasetKind, pl.DataFrame]:
+    raw = RawBatch(
+        provider="baostock",
+        dataset="daily_bars",
+        request={"fixture": name},
+        retrieved_at=retrieved_at,
+        schema=DAILY_BAR_FIELDS,
+        rows=[_baostock_daily_row(day) for day in trading_days],
+    )
+    partition = RawPartitionStore(tmp_path / "baostock-raw").publish(
+        raw, run_id=f"universe-{name}"
+    )
+    return {
+        batch.dataset: batch.frame for batch in BaoStockMapper().normalize(partition)
+    }
+
+
+def _baostock_daily_row(day: date) -> dict[str, str]:
+    return {
+        "date": day.isoformat(),
+        "code": "sh.600000",
+        "open": "10.00",
+        "high": "10.80",
+        "low": "9.90",
+        "close": "10.50",
+        "preclose": "9.95",
+        "volume": "123400",
+        "amount": "200.00",
+        "adjustflag": "3",
+        "turn": "0.42",
+        "tradestatus": "1",
+        "pctChg": "5.53",
+        "peTTM": "8.10",
+        "pbMRQ": "1.20",
+        "psTTM": "2.30",
+        "pcfNcfTTM": "4.50",
+        "isST": "0",
+    }
 
 
 def _instrument_row(identifier: str, key: str) -> dict[str, object]:

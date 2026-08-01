@@ -54,6 +54,7 @@ BAOSTOCK_RAW_SCHEMAS: dict[str, tuple[str, ...]] = {
 
 _INTEGER = re.compile(r"[+-]?[0-9]+\Z")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_DAILY_MARKET_CLOSE = time(15, 0)
 _TYPE_NAMES = {
     "1": "STOCK",
     "2": "INDEX",
@@ -243,7 +244,7 @@ def _daily_rows(
         trade_date = _required_date(partition, row, "date")
         trade_status = _flag(partition, row, "tradestatus")
         risk_warning = _flag(partition, row, "isST")
-        audit = _raw_availability(partition)
+        audit = _daily_availability(partition, trade_date)
         bars.append(
             {
                 "instrument_id": code,
@@ -390,6 +391,26 @@ def _raw_availability(partition: PublishedPartition) -> dict[str, object | None]
         "available_at": retrieved_at,
         "availability_source": "RAW_RETRIEVED_AT",
         "pit_usable": True,
+        "ingested_at": retrieved_at,
+    }
+
+
+def _daily_availability(
+    partition: PublishedPartition, trade_date: date
+) -> dict[str, object | None]:
+    retrieved_at = partition.retrieved_at.astimezone(UTC)
+    market_close = datetime.combine(
+        trade_date, _DAILY_MARKET_CLOSE, _SHANGHAI
+    ).astimezone(UTC)
+    complete = retrieved_at >= market_close
+    return {
+        "source": partition.provider,
+        "source_version": partition.content_hash,
+        "available_at": market_close if complete else None,
+        "availability_source": (
+            "MARKET_CLOSE_DERIVED" if complete else "MARKET_SESSION_INCOMPLETE"
+        ),
+        "pit_usable": complete,
         "ingested_at": retrieved_at,
     }
 

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import ClassVar
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -106,6 +107,7 @@ class FakeGateway:
         self.logout_calls = 0
         self.query_calls: list[dict[str, str]] = []
         self.daily_market_calls: list[str] = []
+        self.trade_date_calls: list[dict[str, str]] = []
         self.login_outcomes: deque[FakeResponse | Exception] = deque()
         self.logout_outcomes: deque[FakeResponse | Exception] = deque()
         self.query_outcomes: dict[tuple[str, str, str], deque[QueryOutcome]] = {}
@@ -188,6 +190,7 @@ class FakeGateway:
 
     def query_trade_dates(self, *, start_date: str, end_date: str) -> FakeCursor:
         assert start_date <= end_date
+        self.trade_date_calls.append({"start_date": start_date, "end_date": end_date})
         return FakeCursor(
             self.trade_dates_cursor._pages,
             fields=self.trade_dates_cursor.fields,
@@ -269,13 +272,14 @@ def make_client(
     source_config: BaoStockConfig | None = None,
     sleep: object | None = None,
     logger: logging.Logger | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> BaoStockClient:
     sleep_function = sleep if callable(sleep) else lambda _: None
     return BaoStockClient(
         gateway,
         catalog or FakeCatalog(),
         source_config or config(),
-        clock=lambda: FIXED_TIME,
+        clock=clock or (lambda: FIXED_TIME),
         sleep=sleep_function,
         logger=logger,
     )
@@ -511,6 +515,46 @@ def test_all_market_selection_uses_daily_api_only(selection: object) -> None:
     assert [batch.request["api"] for batch in batches] == [
         "query_daily_history_k_AStock"
     ]
+
+
+def test_all_market_daily_route_requires_completed_open_sessions_only() -> None:
+    """Fetching before close would publish an incomplete daily market snapshot."""
+    shanghai = ZoneInfo("Asia/Shanghai")
+    trading_day = date(2024, 4, 26)
+    gateway = FakeGateway()
+    gateway.trade_dates_cursor = FakeCursor(
+        [[("2024-04-26", "1"), ("2024-04-27", "0")]],
+        fields=("calendar_date", "is_trading_day"),
+    )
+    client = make_client(
+        gateway,
+        clock=lambda: datetime(2024, 4, 26, 14, 59, tzinfo=shanghai),
+    )
+    client.login()
+
+    with pytest.raises(ValueError, match="daily market session is not complete"):
+        tuple(client.fetch_daily_bars(trading_day, date(2024, 4, 27), None))
+
+    assert gateway.trade_date_calls == [
+        {"start_date": "2024-04-26", "end_date": "2024-04-27"}
+    ]
+    assert gateway.daily_market_calls == []
+
+    completed_gateway = FakeGateway()
+    completed_gateway.trade_dates_cursor = FakeCursor(
+        [[("2024-04-26", "1"), ("2024-04-27", "0")]],
+        fields=("calendar_date", "is_trading_day"),
+    )
+    completed = make_client(
+        completed_gateway,
+        clock=lambda: datetime(2024, 4, 26, 15, 0, tzinfo=shanghai),
+    )
+    completed.login()
+
+    batches = tuple(completed.fetch_daily_bars(trading_day, date(2024, 4, 27), None))
+
+    assert [batch.request["date"] for batch in batches] == ["2024-04-26"]
+    assert completed_gateway.daily_market_calls == ["2024-04-26"]
 
 
 def test_selected_instruments_keep_range_api_only() -> None:

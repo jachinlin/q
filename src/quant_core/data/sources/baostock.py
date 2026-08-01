@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from datetime import time as clock_time
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -45,6 +46,7 @@ INSTRUMENT_FIELDS = ("code", "code_name", "ipoDate", "outDate", "type", "status"
 TRADE_CALENDAR_FIELDS = ("calendar_date", "is_trading_day")
 _DAILY_BAR_FIELD_ARGUMENT = ",".join(DAILY_BAR_FIELDS)
 _BAOSTOCK_CODE = re.compile(r"(sh|sz)\.([0-9]{6})\Z")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class BaoStockResponse(Protocol):
@@ -421,6 +423,7 @@ class BaoStockClient:
         catalog_ids = sorted(item.canonical() for item in catalog_instruments)
         catalog_hash = hashlib.sha256("\n".join(catalog_ids).encode()).hexdigest()
         for index, trading_day in enumerate(open_dates, start=1):
+            self._require_completed_session(trading_day)
             rows = self._fetch_all_market_rows(trading_day)
             codes = sorted(cast(str, row["code"]) for row in rows)
             request: dict[str, JsonValue] = {
@@ -453,6 +456,12 @@ class BaoStockClient:
                 schema=DAILY_BAR_FIELDS,
                 rows=tuple(rows),
             )
+
+    def _require_completed_session(self, trading_day: date) -> None:
+        now = self._clock().astimezone(_SHANGHAI)
+        close_at = datetime.combine(trading_day, clock_time(15, 0), _SHANGHAI)
+        if now < close_at:
+            raise ValueError("daily market session is not complete")
 
     def fetch_instruments(self) -> Iterable[RawBatch]:
         """Yield the complete provider-native instrument directory once."""

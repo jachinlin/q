@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -75,12 +76,13 @@ def _publish(
     rows: Sequence[Mapping[str, JsonValue]],
     *,
     run_id: str = "mapping-test",
+    retrieved_at: datetime = RETRIEVED_AT,
 ) -> PublishedPartition:
     batch = RawBatch(
         provider="baostock",
         dataset=dataset,
         request={"fixture": dataset},
-        retrieved_at=RETRIEVED_AT,
+        retrieved_at=retrieved_at,
         schema=tuple(schema),
         rows=rows,
     )
@@ -321,6 +323,57 @@ def test_daily_raw_yields_typed_bars_and_security_status(tmp_path: Path) -> None
     ]
     _assert_audit_columns(bars, partition)
     _assert_audit_columns(statuses, partition)
+
+
+def test_daily_bars_use_market_close_availability_for_historical_rows(
+    tmp_path: Path,
+) -> None:
+    """Using retrieval time would make historical daily data invisible in its session."""
+    retrieved_at = datetime(2026, 8, 1, 2, tzinfo=UTC)
+    partition = _publish(
+        tmp_path,
+        "daily_bars",
+        DAILY_FIELDS,
+        [_daily_row("2024-04-26", "sh.600000")],
+        retrieved_at=retrieved_at,
+    )
+
+    outputs = _normalize(partition)
+    bars = outputs[DatasetKind.DAILY_BAR]
+    statuses = outputs[DatasetKind.SECURITY_STATUS]
+    expected_available = datetime(
+        2024, 4, 26, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    ).astimezone(UTC)
+
+    assert bars["available_at"].item() == expected_available
+    assert statuses["available_at"].item() == expected_available
+    assert bars["ingested_at"].item() == retrieved_at
+    assert bars["availability_source"].item() == "MARKET_CLOSE_DERIVED"
+    assert bars["pit_usable"].item() is True
+
+
+def test_daily_bars_mark_incomplete_session_before_market_close(
+    tmp_path: Path,
+) -> None:
+    """A pre-close daily row must not be usable even if malformed acquisition reaches mapping."""
+    partition = _publish(
+        tmp_path,
+        "daily_bars",
+        DAILY_FIELDS,
+        [_daily_row("2024-04-26", "sh.600000")],
+        retrieved_at=datetime(2024, 4, 26, 14, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    outputs = _normalize(partition)
+    bars = outputs[DatasetKind.DAILY_BAR]
+    statuses = outputs[DatasetKind.SECURITY_STATUS]
+
+    assert bars["available_at"].item() is None
+    assert statuses["available_at"].item() is None
+    assert bars["pit_usable"].item() is False
+    assert statuses["pit_usable"].item() is False
+    assert bars["availability_source"].item() == "MARKET_SESSION_INCOMPLETE"
+    assert statuses["availability_source"].item() == "MARKET_SESSION_INCOMPLETE"
 
 
 def test_financials_preserve_unknown_announcement_and_assign_revisions(
