@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from math import expm1, isfinite, sqrt
+from math import expm1, fsum, isfinite, sqrt
 
 from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
 from quant_core.domain.identifiers import InstrumentId
@@ -13,6 +13,7 @@ from quant_core.factors.builtin.momentum import AdjustedBarService, _MarketFacto
 _VERSION = "2.0.0"
 _PRICE_BASIS = "baostock_forward_log_return_v1"
 _PATH_CONSTRUCTION = "window_forward_cumsum_v1"
+_ANNUALIZATION_SCALE = sqrt(252.0)
 
 
 class Volatility60dFactor(_MarketFactor):
@@ -119,20 +120,41 @@ def _volatility_value(
     relative_log_path: Sequence[float], log_returns: Sequence[float]
 ) -> float | None:
     del relative_log_path
-    count = len(log_returns)
-    mean = sum(log_returns) / count
-    variance = sum((value - mean) ** 2 for value in log_returns) / (count - 1)
-    result = sqrt(variance) * sqrt(252.0)
-    return result if isfinite(result) else None
+    return _annualized_scaled_rms(
+        log_returns,
+        center=True,
+        denominator=len(log_returns) - 1,
+    )
 
 
 def _downside_volatility_value(
     relative_log_path: Sequence[float], log_returns: Sequence[float]
 ) -> float | None:
     del relative_log_path
-    result = sqrt(
-        sum(min(value, 0.0) ** 2 for value in log_returns) / len(log_returns)
-    ) * sqrt(252.0)
+    return _annualized_scaled_rms(
+        [min(value, 0.0) for value in log_returns],
+        center=False,
+        denominator=len(log_returns),
+    )
+
+
+def _annualized_scaled_rms(
+    values: Sequence[float], *, center: bool, denominator: int
+) -> float | None:
+    if not values or denominator <= 0 or any(not isfinite(value) for value in values):
+        return None
+    scale = max(abs(value) for value in values)
+    if scale == 0.0:
+        return 0.0
+    try:
+        normalized = [value / scale for value in values]
+        mean = fsum(normalized) / len(normalized) if center else 0.0
+        normalized_square_sum = fsum((value - mean) ** 2 for value in normalized)
+        result = (
+            scale * sqrt(normalized_square_sum / denominator) * _ANNUALIZATION_SCALE
+        )
+    except OverflowError:
+        return None
     return result if isfinite(result) else None
 
 

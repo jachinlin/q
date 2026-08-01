@@ -404,6 +404,92 @@ def test_market_formulas_and_exact_history_boundaries() -> None:
     )
 
 
+def test_downside_volatility_fails_closed_when_finite_returns_overflow_squares() -> (
+    None
+):
+    """Finite returns and path must not let an unrepresentable RMS escape."""
+    returns = [1e308, -1e308, *([0.0] * 58)]
+    bars = _bars([100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, *returns],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        DownsideVolatility60dFactor(BarService(bars), [_ID])
+        .compute(_ctx(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
+
+
+def test_flat_downside_volatility_is_zero_and_valid() -> None:
+    bars = _bars([100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, *([0.0] * 60)],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        DownsideVolatility60dFactor(BarService(bars), [_ID])
+        .compute(_ctx(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() == 0.0
+    assert result["is_valid"].item() is True
+
+
+def test_downside_volatility_preserves_finite_near_zero_result() -> None:
+    tiny = -1e-300
+    bars = _bars([100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, tiny, *([0.0] * 59)],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        DownsideVolatility60dFactor(BarService(bars), [_ID])
+        .compute(_ctx(signal_day, signal_day))
+        .collect()
+    )
+    expected = abs(tiny) / np.sqrt(60.0) * np.sqrt(252.0)
+
+    assert result["value"].item() == pytest.approx(expected, rel=1e-12, abs=0.0)
+    assert result["is_valid"].item() is True
+
+
+def test_nonfinite_downside_log_return_invalidates_without_evaluator_error() -> None:
+    bars = _bars([100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, float("inf"), *([0.0] * 59)],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        DownsideVolatility60dFactor(BarService(bars), [_ID])
+        .compute(_ctx(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
+
+
 @pytest.mark.parametrize(
     "make_factor",
     [

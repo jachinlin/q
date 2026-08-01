@@ -343,6 +343,52 @@ def test_constant_prices_have_zero_valid_volatility() -> None:
     assert result["is_valid"].item() is True
 
 
+def test_volatility_fails_closed_when_finite_returns_overflow_second_moment() -> None:
+    """Finite returns and path must not let an unrepresentable variance escape."""
+    returns = [1e308, -1e308, *([0.0] * 58)]
+    bars = _bars(_SSE, [100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, *returns],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        Volatility60dFactor(RecordingPriceService(bars), [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+
+    assert result["value"].item() is None
+    assert result["is_valid"].item() is False
+
+
+def test_volatility_preserves_finite_near_zero_second_moment() -> None:
+    """Squaring tiny returns directly must not underflow a representable result to zero."""
+    tiny = 1e-300
+    returns = [tiny, -tiny] * 30
+    bars = _bars(_SSE, [100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [None, *returns],
+            dtype=pl.Float64,
+        )
+    )
+    signal_day = bars["trade_date"][-1]
+
+    result = (
+        Volatility60dFactor(RecordingPriceService(bars), [_SSE])
+        .compute(_context(signal_day, signal_day))
+        .collect()
+    )
+    expected = tiny * sqrt(60.0 / 59.0) * sqrt(252.0)
+
+    assert result["value"].item() == pytest.approx(expected, rel=1e-12, abs=0.0)
+    assert result["is_valid"].item() is True
+
+
 @pytest.mark.parametrize(
     ("factor", "required"),
     [
