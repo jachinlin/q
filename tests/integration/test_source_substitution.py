@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -73,13 +73,15 @@ class FakeTushareCanonicalMapper:
 
     def normalize(self, raw_partition: PublishedPartition) -> Iterable[CanonicalBatch]:
         row = pq.read_table(raw_partition.data_path).to_pylist()[0]
-        common = {
+        lineage = {
             "source": "tushare",
             "source_version": raw_partition.content_hash,
+            "ingested_at": raw_partition.retrieved_at,
+        }
+        retrieval_availability = {
             "available_at": raw_partition.retrieved_at,
             "availability_source": "RAW_RETRIEVED_AT",
             "pit_usable": True,
-            "ingested_at": raw_partition.retrieved_at,
         }
         instrument = {
             "instrument_id": "SSE:600000",
@@ -90,10 +92,26 @@ class FakeTushareCanonicalMapper:
             "listing_status": "LISTED",
             "list_date": date.fromisoformat(row["listed_on"]),
             "delist_date": None,
-            **common,
+            **lineage,
+            **retrieval_availability,
         }
         trade_date = date.fromisoformat(row["trade_day"])
-        calendar = {"trade_date": trade_date, "is_trading_day": True, **common}
+        market_close = datetime.combine(
+            trade_date,
+            time(15),
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        ).astimezone(UTC)
+        daily_availability = {
+            "available_at": market_close,
+            "availability_source": "MARKET_CLOSE_DERIVED",
+            "pit_usable": raw_partition.retrieved_at >= market_close,
+        }
+        calendar = {
+            "trade_date": trade_date,
+            "is_trading_day": True,
+            **lineage,
+            **retrieval_availability,
+        }
         bar = {
             "instrument_id": "SSE:600000",
             "trade_date": trade_date,
@@ -111,7 +129,8 @@ class FakeTushareCanonicalMapper:
             "pb_mrq": 1.20,
             "ps_ttm": 2.30,
             "pcf_ncf_ttm": 4.50,
-            **common,
+            **lineage,
+            **daily_availability,
         }
         status = {
             "instrument_id": "SSE:600000",
@@ -122,7 +141,8 @@ class FakeTushareCanonicalMapper:
             "board": "MAIN",
             "price_limit_rule_id": "UNRESOLVED",
             "tradable_reason": "NORMAL",
-            **common,
+            **lineage,
+            **daily_availability,
         }
         for dataset, record in (
             (DatasetKind.INSTRUMENT, instrument),
@@ -169,38 +189,43 @@ def test_fake_tushare_runs_through_same_pipeline_and_canonical_contract(
         )
         bao_frame = pl.concat(
             bao_pipeline._curated_store.read_version(bao_version)
-        ).drop(
-            "source",
-            "source_version",
-            "available_at",
-            "availability_source",
-            "ingested_at",
-        )
+        ).drop("source", "source_version", "availability_source", "ingested_at")
         tushare_frame = pl.concat(
             tushare_pipeline._curated_store.read_version(tushare_version)
-        ).drop(
-            "source",
-            "source_version",
-            "available_at",
-            "availability_source",
-            "ingested_at",
-        )
+        ).drop("source", "source_version", "availability_source", "ingested_at")
         assert tushare_frame.equals(bao_frame)
 
+        bao_audit = pl.concat(bao_pipeline._curated_store.read_version(bao_version))
+        tushare_audit = pl.concat(
+            tushare_pipeline._curated_store.read_version(tushare_version)
+        )
         if dataset in {DatasetKind.DAILY_BAR, DatasetKind.SECURITY_STATUS}:
-            bao_audit = pl.concat(bao_pipeline._curated_store.read_version(bao_version))
-            tushare_audit = pl.concat(
-                tushare_pipeline._curated_store.read_version(tushare_version)
-            )
-            assert bao_audit.select("available_at", "availability_source").rows() == [
+            assert bao_audit.select(
+                "available_at", "availability_source", "ingested_at"
+            ).rows() == [
                 (
                     expected_baostock_available,
                     "MARKET_CLOSE_DERIVED",
+                    datetime(2026, 1, 6, tzinfo=UTC),
                 )
             ]
             assert tushare_audit.select(
-                "available_at", "availability_source"
-            ).rows() == [(datetime(2026, 1, 6, tzinfo=UTC), "RAW_RETRIEVED_AT")]
+                "available_at", "availability_source", "ingested_at"
+            ).rows() == [
+                (
+                    expected_baostock_available,
+                    "MARKET_CLOSE_DERIVED",
+                    datetime(2026, 1, 6, tzinfo=UTC),
+                )
+            ]
+        else:
+            expected_retrieval = datetime(2026, 1, 6, tzinfo=UTC)
+            assert bao_audit.select(
+                "available_at", "availability_source", "ingested_at"
+            ).rows() == [(expected_retrieval, "RAW_RETRIEVED_AT", expected_retrieval)]
+            assert tushare_audit.select(
+                "available_at", "availability_source", "ingested_at"
+            ).rows() == [(expected_retrieval, "RAW_RETRIEVED_AT", expected_retrieval)]
 
     manifest = json.loads(
         tushare_repository.get_snapshot(tushare.snapshot_id).manifest_path.read_text(

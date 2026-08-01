@@ -22,7 +22,7 @@ from quant_core.data.sources.baostock import DAILY_BAR_FIELDS, from_baostock_cod
 from quant_core.domain.enums import DatasetKind, Exchange, Severity
 from quant_core.errors import ErrorDetail, QuantError
 
-BAOSTOCK_MAPPER_VERSION = "baostock-canonical-mapper-v1"
+BAOSTOCK_MAPPER_VERSION = "baostock-canonical-mapper-v2"
 
 INSTRUMENT_FIELDS = ("code", "code_name", "ipoDate", "outDate", "type", "status")
 TRADE_CALENDAR_FIELDS = ("calendar_date", "is_trading_day")

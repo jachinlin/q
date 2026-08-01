@@ -13,6 +13,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -26,7 +27,7 @@ from quant_core.data.contracts import (
     RawBatch,
     canonical_json_bytes,
 )
-from quant_core.data.mappers.baostock import BaoStockMapper
+from quant_core.data.mappers.baostock import BAOSTOCK_MAPPER_VERSION, BaoStockMapper
 from quant_core.data.partitions import RawPartitionStore
 from quant_core.data.pipelines import curate as curate_module
 from quant_core.data.pipelines import publish as pipeline_module
@@ -44,7 +45,7 @@ from quant_core.data.sources.baostock import (
     BAOSTOCK_SOURCE_ADAPTER_VERSION,
     BaoStockConfig,
 )
-from quant_core.domain.enums import SnapshotStatus
+from quant_core.domain.enums import DatasetKind, SnapshotStatus
 from quant_core.domain.identifiers import DatasetVersionId, QualityRunId, SnapshotId
 from quant_core.errors import QuantError
 from quant_core.persistence.database import create_sqlite_engine, upgrade_database
@@ -333,6 +334,41 @@ class FailOnceMapper:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("simulated mapper crash")
+        return self._delegate.normalize(raw_partition)
+
+
+class RetrievalTimeBaoStockMapper:
+    """Emulate the pre-fix v1 mapper's daily availability semantics."""
+
+    def __init__(self) -> None:
+        self._delegate = BaoStockMapper()
+        self.calls = 0
+
+    def normalize(self, raw_partition: PublishedPartition) -> Iterable[CanonicalBatch]:
+        self.calls += 1
+        for batch in self._delegate.normalize(raw_partition):
+            if batch.dataset in {
+                DatasetKind.DAILY_BAR,
+                DatasetKind.SECURITY_STATUS,
+            }:
+                yield replace(
+                    batch,
+                    frame=batch.frame.with_columns(
+                        pl.lit(raw_partition.retrieved_at).alias("available_at"),
+                        pl.lit("RAW_RETRIEVED_AT").alias("availability_source"),
+                    ),
+                )
+            else:
+                yield batch
+
+
+class CountingBaoStockMapper:
+    def __init__(self) -> None:
+        self._delegate = BaoStockMapper()
+        self.calls = 0
+
+    def normalize(self, raw_partition: PublishedPartition) -> Iterable[CanonicalBatch]:
+        self.calls += 1
         return self._delegate.normalize(raw_partition)
 
 
@@ -709,8 +745,62 @@ def test_publish_checkpoint_revalidates_manifest_content(tmp_path: Path) -> None
     assert captured.value.detail.context["stage"] == "PUBLISH_SNAPSHOT"
 
 
-def test_daily_market_route_has_new_source_adapter_version() -> None:
-    assert BAOSTOCK_SOURCE_ADAPTER_VERSION == "baostock-source-adapter-v2"
+def test_baostock_availability_upgrade_does_not_reuse_pre_fix_snapshot(
+    tmp_path: Path,
+) -> None:
+    source = OfflineDailyMarketBaoStockSource()
+    old_mapper = RetrievalTimeBaoStockMapper()
+    old_versions = PipelineVersions(
+        source_adapter="baostock-source-adapter-v2",
+        mapper="baostock-canonical-mapper-v1",
+    )
+    old_pipeline, old_repository = make_pipeline(
+        tmp_path,
+        source,
+        mapper=old_mapper,
+        versions=old_versions,
+    )
+    old = old_pipeline.bootstrap()
+    new_mapper = CountingBaoStockMapper()
+    new_versions = replace(
+        old_versions,
+        source_adapter=BAOSTOCK_SOURCE_ADAPTER_VERSION,
+        mapper=BAOSTOCK_MAPPER_VERSION,
+    )
+    new_pipeline, new_repository = make_pipeline(
+        tmp_path,
+        source,
+        mapper=new_mapper,
+        versions=new_versions,
+    )
+
+    new = new_pipeline.bootstrap()
+
+    expected_available_at = datetime(
+        2026, 1, 5, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    ).astimezone(UTC)
+    assert new.run_id != old.run_id
+    assert new.snapshot_id != old.snapshot_id
+    assert source.fetch_calls == 2
+    assert old_mapper.calls > 0
+    assert new_mapper.calls > 0
+    assert new_versions.source_adapter != old_versions.source_adapter
+    assert new_versions.mapper != old_versions.mapper
+    for dataset in (DatasetKind.DAILY_BAR, DatasetKind.SECURITY_STATUS):
+        old_version = old_repository.get_dataset_version(
+            old.dataset_versions[dataset.value]
+        )
+        new_version = new_repository.get_dataset_version(
+            new.dataset_versions[dataset.value]
+        )
+        old_frame = pl.concat(old_pipeline._curated_store.read_version(old_version))
+        new_frame = pl.concat(new_pipeline._curated_store.read_version(new_version))
+        assert old_frame.select("available_at", "availability_source").rows() == [
+            (datetime(2026, 1, 6, tzinfo=UTC), "RAW_RETRIEVED_AT")
+        ]
+        assert new_frame.select("available_at", "availability_source").rows() == [
+            (expected_available_at, "MARKET_CLOSE_DERIVED")
+        ]
 
 
 def test_cli_fetch_config_fingerprints_both_routes_and_selected_limits() -> None:
