@@ -99,10 +99,11 @@ def _partial_fill(
     filled: int,
     unfilled: int,
     reason: ExecutionReason,
+    side: OrderSide = OrderSide.BUY,
     trade_date: date = _D2,
 ) -> FillResult:
     return FillResult(
-        OrderIntent(_A, OrderSide.BUY, requested, "TEST"),
+        OrderIntent(_A, side, requested, "TEST"),
         trade_date,
         requested,
         filled,
@@ -206,6 +207,31 @@ def test_apply_rejects_semantically_inconsistent_fill_results() -> None:
     )
     with pytest.raises(ValueError, match="fill"):
         account.apply(_batch(hard_reject, ending_cash=950))
+
+
+def test_apply_rejects_cross_side_partial_fill_reasons() -> None:
+    buy_account = PortfolioAccount(1_000, _calendar())
+    buy_account.begin_session(_D2, ())
+    buy_with_sell_reason = _partial_fill(
+        requested=100,
+        filled=50,
+        unfilled=50,
+        reason=ExecutionReason.INSUFFICIENT_SELLABLE,
+    )
+    with pytest.raises(ValueError, match="partial fill"):
+        buy_account.apply(_batch(buy_with_sell_reason, ending_cash=950))
+
+    sell_account = PortfolioAccount(1_000, _calendar())
+    sell_account.begin_session(_D2, ())
+    sell_with_buy_reason = _partial_fill(
+        requested=100,
+        filled=50,
+        unfilled=50,
+        reason=ExecutionReason.INSUFFICIENT_CASH,
+        side=OrderSide.SELL,
+    )
+    with pytest.raises(ValueError, match="partial fill"):
+        sell_account.apply(_batch(sell_with_buy_reason, ending_cash=1_050))
 
 
 def test_apply_preserves_multifill_cash_identity_and_rolls_back_second_failure() -> (
@@ -383,6 +409,36 @@ def test_state_machine_rejects_non_session_dates_wrong_batch_date_and_missing_cl
         account.mark_to_market(_D2, {})
     snapshot = account.mark_to_market(_D2, {_A: 1.0})
     assert snapshot.cash_fen == 900
+
+
+def test_state_machine_rejects_repeat_apply_wrong_mark_date_and_repeat_begin() -> None:
+    account = PortfolioAccount(1_000, _calendar())
+    account.begin_session(_D2, ())
+    account.apply(_batch(_fill(OrderSide.BUY, 1, 100), ending_cash=900))
+    ledger_after_apply = account.ledger
+    with pytest.raises(ValueError, match="apply"):
+        account.apply(_batch(ending_cash=900))
+    with pytest.raises(ValueError, match="trade_date"):
+        account.mark_to_market(_D3, {_A: 1.0})
+    marked = account.mark_to_market(_D2, {_A: 1.0})
+    with pytest.raises(ValueError, match="strictly increasing"):
+        account.begin_session(_D2, ())
+    account.begin_session(_D3, ())
+
+    assert (marked.cash_fen, account.ledger) == (900, ledger_after_apply)
+
+
+def test_account_snapshot_direct_construction_rejects_inconsistent_balances() -> None:
+    position = PositionSnapshot(_A, 1, 0, 0, 100)
+
+    with pytest.raises(ValueError, match="cash_fen"):
+        AccountSnapshot(_D2, -1, (), 0, 0)
+    with pytest.raises(ValueError, match="positions"):
+        AccountSnapshot(_D2, 0, (), 1, 1)
+    with pytest.raises(ValueError, match="total_market_value"):
+        AccountSnapshot(_D2, 0, (position,), 99, 99)
+    with pytest.raises(ValueError, match="nav_fen"):
+        AccountSnapshot(_D2, 0, (position,), 100, 99)
 
 
 def test_ledger_identity_uses_stable_namespaces_and_unique_source_ids() -> None:

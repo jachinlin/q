@@ -614,11 +614,12 @@ def _validate_fill(result: FillResult) -> None:
         if result.reason_code is not ExecutionReason.FILLED:
             raise ValueError("fill reason is inconsistent with complete fill")
         return
-    if result.unfilled_quantity <= 0 or result.reason_code not in {
-        ExecutionReason.INSUFFICIENT_CASH,
-        ExecutionReason.INSUFFICIENT_SELLABLE,
-        ExecutionReason.VOLUME_CAP,
-    }:
+    partial_reasons = (
+        {ExecutionReason.INSUFFICIENT_CASH, ExecutionReason.VOLUME_CAP}
+        if result.intent.side is OrderSide.BUY
+        else {ExecutionReason.INSUFFICIENT_SELLABLE, ExecutionReason.VOLUME_CAP}
+    )
+    if result.unfilled_quantity <= 0 or result.reason_code not in partial_reasons:
         raise ValueError("fill reason is inconsistent with partial fill")
 
 
