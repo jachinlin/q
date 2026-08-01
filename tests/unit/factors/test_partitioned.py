@@ -17,7 +17,11 @@ import pyarrow as pa
 import pytest
 
 from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
-from quant_core.data.contracts import JsonValue, canonical_json_bytes
+from quant_core.data.contracts import (
+    JsonValue,
+    ProviderCapabilities,
+    canonical_json_bytes,
+)
 from quant_core.data.sources.baostock import BAOSTOCK_CAPABILITIES
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import (
@@ -26,6 +30,8 @@ from quant_core.factors import (
     FactorArtifact,
     FactorContext,
     FactorEngine,
+    FactorExecutionDescriptor,
+    FactorExecutionNode,
     FactorRegistry,
     FactorSpec,
     FeatureCache,
@@ -83,6 +89,29 @@ class _FakeEngine:
         self._cache = cache
         self._state = state
 
+    def execution_descriptor(
+        self, factor_ids: Sequence[str]
+    ) -> FactorExecutionDescriptor:
+        factor_refs = tuple(sorted(factor_ids))
+        return FactorExecutionDescriptor(
+            requested_refs=factor_refs,
+            plan=tuple(
+                FactorExecutionNode(
+                    spec=FactorSpec(
+                        factor_id=factor_ref.partition("@")[0],
+                        version=factor_ref.partition("@")[2],
+                        frequency="daily",
+                        lookback_sessions=0,
+                        dependencies=(),
+                        direction=1,
+                        parameters={},
+                    ),
+                    code_hash=hashlib.sha256(f"code:{factor_ref}".encode()).hexdigest(),
+                )
+                for factor_ref in factor_refs
+            ),
+        )
+
     def compute(
         self, factor_ids: Sequence[str], ctx: FactorContext
     ) -> Mapping[str, FactorArtifact]:
@@ -120,6 +149,333 @@ class _ReleasingArtifacts(dict[str, FactorArtifact]):
 
     def __del__(self) -> None:
         self._state["live"] = int(self._state.get("live", 0)) - len(self)
+
+
+class _ConstantFactor:
+    def __init__(
+        self,
+        instruments: tuple[InstrumentId, ...],
+        *,
+        value: float,
+        state: dict[str, int],
+        factor_id: str = "stable_factor",
+        dependencies: tuple[str, ...] = (),
+        parameters: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        self._instruments = instruments
+        self._value = value
+        self._state = state
+        self._spec = FactorSpec(
+            factor_id,
+            "1.0.0",
+            "daily",
+            0,
+            dependencies,
+            1,
+            {} if parameters is None else parameters,
+        )
+
+    @property
+    def spec(self) -> FactorSpec:
+        return self._spec
+
+    def compute(self, ctx: FactorContext) -> pl.LazyFrame:
+        self._state["factor_computes"] = self._state.get("factor_computes", 0) + 1
+        return pl.DataFrame(
+            {
+                "trade_date": [ctx.start] * len(self._instruments),
+                "instrument_id": [item.canonical() for item in self._instruments],
+                "factor_id": [self.spec.factor_id] * len(self._instruments),
+                "factor_version": [self.spec.version] * len(self._instruments),
+                "value": [self._value] * len(self._instruments),
+                "available_at": [datetime(2025, 1, 2, 8, tzinfo=UTC)]
+                * len(self._instruments),
+                "is_valid": [True] * len(self._instruments),
+            },
+            schema=FACTOR_OUTPUT_SCHEMA,
+        ).lazy()
+
+
+def _constant_executor(
+    root: Path,
+    *,
+    code_label: str,
+    value: float,
+    state: dict[str, int],
+    maximum: int = 10,
+    parameters: Mapping[str, JsonValue] | None = None,
+) -> PartitionedFactorEngine:
+    def factory(
+        instruments: tuple[InstrumentId, ...], cache: FeatureCache
+    ) -> FactorEngine:
+        state["factory_calls"] = state.get("factory_calls", 0) + 1
+        registry = FactorRegistry()
+        registry.register(
+            _ConstantFactor(
+                instruments, value=value, state=state, parameters=parameters
+            ),
+            code_hash=hashlib.sha256(code_label.encode()).hexdigest(),
+        )
+        return FactorEngine(
+            registry, cache, capabilities=ProviderCapabilities.complete()
+        )
+
+    return PartitionedFactorEngine(root, factory, max_partition_size=maximum)
+
+
+def test_composite_identity_changes_with_same_ref_new_implementation(
+    tmp_path: Path,
+) -> None:
+    """A composite hit must not hide a same-version implementation change."""
+    instruments = _instruments(2)
+    state_a: dict[str, int] = {}
+    first = _constant_executor(
+        tmp_path, code_label="implementation-a", value=1.0, state=state_a
+    ).compute(("stable_factor@1.0.0",), instruments, _context())
+    first_ref = first.partitions[0].artifacts[0]
+
+    state_b: dict[str, int] = {}
+    second = _constant_executor(
+        tmp_path, code_label="implementation-b", value=2.0, state=state_b
+    ).compute(("stable_factor@1.0.0",), instruments, _context())
+    second_ref = second.partitions[0].artifacts[0]
+    second_artifact = FeatureCache(tmp_path / "artifacts").load(second_ref.cache_key)
+
+    assert state_b == {"factory_calls": 1, "factor_computes": 1}
+    assert second.composite_key != first.composite_key
+    assert second_ref.cache_key != first_ref.cache_key
+    assert second_ref.content_hash != first_ref.content_hash
+    assert second_artifact is not None
+    assert second_artifact.table.column("value").to_pylist() == [2.0, 2.0]
+
+
+def test_composite_identity_binds_full_factor_spec_parameters(tmp_path: Path) -> None:
+    first = _constant_executor(
+        tmp_path,
+        code_label="same-code",
+        value=1.0,
+        state={},
+        parameters={"window": 20, "nested": {"limits": [0.1, 0.9]}},
+    ).compute(("stable_factor@1.0.0",), _instruments(2), _context())
+    second = _constant_executor(
+        tmp_path,
+        code_label="same-code",
+        value=2.0,
+        state={},
+        parameters={"window": 60, "nested": {"limits": [0.2, 0.8]}},
+    ).compute(("stable_factor@1.0.0",), _instruments(2), _context())
+
+    assert second.composite_key != first.composite_key
+    assert (
+        second.partitions[0].artifacts[0].cache_key
+        != first.partitions[0].artifacts[0].cache_key
+    )
+
+
+def _dependency_executor(
+    root: Path, *, dependency_code: str, state: dict[str, int]
+) -> PartitionedFactorEngine:
+    def factory(
+        instruments: tuple[InstrumentId, ...], cache: FeatureCache
+    ) -> FactorEngine:
+        state["factory_calls"] = state.get("factory_calls", 0) + 1
+        registry = FactorRegistry()
+        registry.register(
+            _ConstantFactor(
+                instruments,
+                value=1.0,
+                state=state,
+                factor_id="dependency_factor",
+            ),
+            code_hash=hashlib.sha256(dependency_code.encode()).hexdigest(),
+        )
+        registry.register(
+            _ConstantFactor(
+                instruments,
+                value=3.0,
+                state=state,
+                factor_id="root_factor",
+                dependencies=("dependency_factor@1.0.0",),
+            ),
+            code_hash=hashlib.sha256(b"root-code").hexdigest(),
+        )
+        return FactorEngine(
+            registry, cache, capabilities=ProviderCapabilities.complete()
+        )
+
+    return PartitionedFactorEngine(root, factory, max_partition_size=10)
+
+
+def test_composite_identity_binds_dependency_implementation_hash(
+    tmp_path: Path,
+) -> None:
+    first = _dependency_executor(
+        tmp_path, dependency_code="dependency-a", state={}
+    ).compute(("root_factor@1.0.0",), _instruments(2), _context())
+    second = _dependency_executor(
+        tmp_path, dependency_code="dependency-b", state={}
+    ).compute(("root_factor@1.0.0",), _instruments(2), _context())
+
+    assert second.composite_key != first.composite_key
+    assert second.execution_descriptor_hash != first.execution_descriptor_hash
+
+
+def test_factor_request_order_canonicalizes_execution_descriptor_and_composite(
+    tmp_path: Path,
+) -> None:
+    state: dict[str, int] = {}
+
+    def factory(
+        instruments: tuple[InstrumentId, ...], cache: FeatureCache
+    ) -> FactorEngine:
+        state["factory_calls"] = state.get("factory_calls", 0) + 1
+        registry = FactorRegistry()
+        for factor_id, value in (("alpha_factor", 1.0), ("beta_factor", 2.0)):
+            registry.register(
+                _ConstantFactor(
+                    instruments,
+                    value=value,
+                    state=state,
+                    factor_id=factor_id,
+                ),
+                code_hash=hashlib.sha256(factor_id.encode()).hexdigest(),
+            )
+        return FactorEngine(
+            registry, cache, capabilities=ProviderCapabilities.complete()
+        )
+
+    executor = PartitionedFactorEngine(tmp_path, factory, max_partition_size=10)
+    first = executor.compute(
+        ("beta_factor@1.0.0", "alpha_factor@1.0.0"),
+        _instruments(2),
+        _context(),
+    )
+    second = executor.compute(
+        ("alpha_factor@1.0.0", "beta_factor@1.0.0"),
+        _instruments(2),
+        _context(),
+    )
+
+    assert second == first
+    assert first.factor_refs == ("alpha_factor@1.0.0", "beta_factor@1.0.0")
+    assert first.execution_descriptor.requested_refs == first.factor_refs
+
+
+def test_composite_hit_constructs_each_scope_but_never_computes_factor(
+    tmp_path: Path,
+) -> None:
+    state: dict[str, int] = {}
+    executor = _constant_executor(
+        tmp_path, code_label="stable", value=1.0, state=state, maximum=2
+    )
+    first = executor.compute(("stable_factor@1.0.0",), _instruments(5), _context())
+    assert state == {"factory_calls": 3, "factor_computes": 3}
+
+    repeated = executor.compute(
+        ("stable_factor@1.0.0",), tuple(reversed(_instruments(5))), _context()
+    )
+
+    assert repeated == first
+    assert state == {"factory_calls": 6, "factor_computes": 3}
+
+
+def test_partition_scope_descriptor_mismatch_fails_closed_on_hit(
+    tmp_path: Path,
+) -> None:
+    instruments = _instruments(4)
+    _constant_executor(
+        tmp_path, code_label="stable", value=1.0, state={}, maximum=2
+    ).compute(("stable_factor@1.0.0",), instruments, _context())
+    state: dict[str, int] = {}
+
+    def inconsistent_factory(
+        scope: tuple[InstrumentId, ...], cache: FeatureCache
+    ) -> FactorEngine:
+        state["factory_calls"] = state.get("factory_calls", 0) + 1
+        code_label = "stable" if scope[0] == instruments[0] else "changed"
+        registry = FactorRegistry()
+        registry.register(
+            _ConstantFactor(scope, value=1.0, state=state),
+            code_hash=hashlib.sha256(code_label.encode()).hexdigest(),
+        )
+        return FactorEngine(
+            registry, cache, capabilities=ProviderCapabilities.complete()
+        )
+
+    with pytest.raises(ValueError, match="execution descriptor"):
+        PartitionedFactorEngine(
+            tmp_path, inconsistent_factory, max_partition_size=2
+        ).compute(("stable_factor@1.0.0",), instruments, _context())
+
+    assert state.get("factor_computes", 0) == 0
+    assert state["factory_calls"] == 2
+
+
+def _legacy_v1_composite_manifest() -> tuple[str, dict[str, JsonValue]]:
+    ctx = _context()
+    key_payload: dict[str, JsonValue] = {
+        "content_hash_contract": "quant-core.ordered-partition-factor-artifacts.v1",
+        "end": ctx.end.isoformat(),
+        "factor_refs": ["stable_factor@1.0.0"],
+        "format_version": 1,
+        "instrument_ids": [],
+        "max_partition_size": 10,
+        "partition_size": 10,
+        "snapshot_id": str(ctx.snapshot_id),
+        "start": ctx.start.isoformat(),
+        "universe_hash": ctx.universe_hash,
+    }
+    composite_key = hashlib.sha256(canonical_json_bytes(key_payload)).hexdigest()
+    manifest = {
+        **key_payload,
+        "composite_key": composite_key,
+        "partitions": [],
+    }
+    manifest["content_hash"] = hashlib.sha256(
+        canonical_json_bytes(manifest)
+    ).hexdigest()
+    return composite_key, manifest
+
+
+def test_v1_composite_manifest_is_not_reused_by_descriptor_contract(
+    tmp_path: Path,
+) -> None:
+    v1_key, v1_manifest = _legacy_v1_composite_manifest()
+    v1_entry = tmp_path / "composites" / v1_key
+    v1_entry.mkdir(parents=True)
+    (v1_entry / "manifest.json").write_bytes(canonical_json_bytes(v1_manifest))
+    state: dict[str, int] = {}
+
+    current = _constant_executor(
+        tmp_path, code_label="current", value=1.0, state=state
+    ).compute(("stable_factor@1.0.0",), (), _context())
+
+    assert state == {"factory_calls": 1}
+    assert current.composite_key != v1_key
+    assert json.loads(current.manifest_path.read_bytes())["format_version"] == 2
+
+
+def test_manifest_requires_uncorrupted_execution_descriptor(tmp_path: Path) -> None:
+    executor = _constant_executor(tmp_path, code_label="stable", value=1.0, state={})
+    artifact = executor.compute(("stable_factor@1.0.0",), _instruments(2), _context())
+    original = artifact.manifest_path.read_bytes()
+    manifest = json.loads(original)
+    assert manifest["format_version"] == 2
+    assert manifest["execution_descriptor_hash"] == artifact.execution_descriptor_hash
+
+    for field in ("execution_descriptor", "execution_descriptor_hash"):
+        corrupted = json.loads(original)
+        corrupted.pop(field)
+        artifact.manifest_path.write_bytes(canonical_json_bytes(corrupted))
+        with pytest.raises(ValueError, match="composite manifest"):
+            executor.compute(("stable_factor@1.0.0",), _instruments(2), _context())
+        artifact.manifest_path.write_bytes(original)
+
+    corrupted = json.loads(original)
+    corrupted["execution_descriptor"]["plan"][0]["code_hash"] = "0" * 64
+    artifact.manifest_path.write_bytes(canonical_json_bytes(corrupted))
+    with pytest.raises(ValueError, match="composite manifest"):
+        executor.compute(("stable_factor@1.0.0",), _instruments(2), _context())
 
 
 def _executor(
@@ -202,7 +558,7 @@ def test_empty_single_and_multi_partition_manifests_round_trip(tmp_path: Path) -
     assert len(multi.partitions) == 2
     for artifact in (empty, single, multi):
         manifest = json.loads(artifact.manifest_path.read_text())
-        assert manifest["format_version"] == 1
+        assert manifest["format_version"] == 2
         assert manifest["content_hash_contract"] == artifact.content_hash_contract
         assert manifest["content_hash"] == artifact.content_hash
         assert [item["partition_id"] for item in manifest["partitions"]] == [
@@ -406,6 +762,12 @@ def test_five_market_factors_share_one_read_and_match_partition_oracle(
         item for partition in formal.partitions for item in partition.instrument_ids
     ] == [item.canonical() for item in instruments]
     formal_cache = FeatureCache(tmp_path / "formal" / "artifacts")
+    hit_call_count = len(service.calls)
+    repeated = PartitionedFactorEngine(
+        tmp_path / "formal", factory, max_partition_size=31
+    ).compute(_MARKET_FACTOR_REFS, instruments, ctx)
+    assert repeated == formal
+    assert len(service.calls) == hit_call_count
     formal_calls = len(service.calls)
     for partition in formal.partitions:
         scope = tuple(InstrumentId.parse(item) for item in partition.instrument_ids)

@@ -23,10 +23,11 @@ from quant_core.factors.base import (
 )
 from quant_core.factors.cache import FeatureCache
 from quant_core.factors.composite_cache import CompositeManifestCache
+from quant_core.factors.execution import FactorExecutionDescriptor
 from quant_core.factors.registry import FactorEngine
 
-_FORMAT_VERSION = 1
-_CONTENT_HASH_CONTRACT = "quant-core.ordered-partition-factor-artifacts.v1"
+_FORMAT_VERSION = 2
+_CONTENT_HASH_CONTRACT = "quant-core.ordered-partition-factor-artifacts.v2"
 _PARTITION_CONTRACT = "quant-core.factor-partition-scope.v1"
 _PARTITION_UNIVERSE_CONTRACT = "quant-core.factor-partition-universe.v1"
 _MANIFEST_FIELDS = frozenset(
@@ -35,6 +36,8 @@ _MANIFEST_FIELDS = frozenset(
         "content_hash",
         "content_hash_contract",
         "end",
+        "execution_descriptor",
+        "execution_descriptor_hash",
         "factor_refs",
         "format_version",
         "instrument_ids",
@@ -128,6 +131,7 @@ class CompositeFactorArtifact:
     composite_key: str
     content_hash: str
     content_hash_contract: str
+    execution_descriptor: FactorExecutionDescriptor
     snapshot_id: SnapshotId
     universe_hash: str
     start: date
@@ -144,6 +148,8 @@ class CompositeFactorArtifact:
         validate_sha256(self.content_hash, "composite content_hash")
         if self.content_hash_contract != _CONTENT_HASH_CONTRACT:
             raise ValueError("unsupported composite content hash contract")
+        if not isinstance(self.execution_descriptor, FactorExecutionDescriptor):
+            raise TypeError("execution_descriptor must be a FactorExecutionDescriptor")
         if not isinstance(self.snapshot_id, SnapshotId):
             raise TypeError("snapshot_id must be a SnapshotId")
         validate_sha256(self.universe_hash, "composite universe_hash")
@@ -167,6 +173,10 @@ class CompositeFactorArtifact:
     def row_count(self) -> int:
         """Return all rows represented without retaining any partition tables."""
         return sum(item.row_count for item in self.partitions)
+
+    @property
+    def execution_descriptor_hash(self) -> str:
+        return self.execution_descriptor.content_hash
 
 
 class PartitionedFactorEngine:
@@ -212,15 +222,31 @@ class PartitionedFactorEngine:
         size = self._max_partition_size if partition_size is None else partition_size
         _validated_partition_size(size, self._max_partition_size)
         instrument_ids = tuple(item.canonical() for item in canonical_instruments)
+        first_scope = canonical_instruments[:size]
+        first_engine = self._engine_factory(first_scope, self._feature_cache)
+        execution_descriptor = first_engine.execution_descriptor(factor_refs)
+        if execution_descriptor.requested_refs != factor_refs:
+            raise ValueError("partition execution descriptor roots differ")
         composite_key = _composite_key(
             factor_refs,
             instrument_ids,
             ctx,
             size,
             self._max_partition_size,
+            execution_descriptor.content_hash,
         )
         existing = self._load_composite(composite_key)
         if existing is not None:
+            if existing.execution_descriptor != execution_descriptor:
+                raise ValueError("composite execution descriptor differs")
+            for offset in range(size, len(canonical_instruments), size):
+                scope = canonical_instruments[offset : offset + size]
+                engine = self._engine_factory(scope, self._feature_cache)
+                self._validate_engine_descriptor(
+                    engine, factor_refs, execution_descriptor
+                )
+                del engine
+            del first_engine
             self._validate_artifact_references(existing)
             return existing
 
@@ -233,7 +259,12 @@ class PartitionedFactorEngine:
             partition_ctx = FactorContext(
                 ctx.snapshot_id, universe_hash, ctx.start, ctx.end
             )
-            engine = self._engine_factory(partition_instruments, self._feature_cache)
+            engine = (
+                first_engine
+                if index == 0
+                else self._engine_factory(partition_instruments, self._feature_cache)
+            )
+            self._validate_engine_descriptor(engine, factor_refs, execution_descriptor)
             artifacts = engine.compute(factor_refs, partition_ctx)
             if tuple(artifacts) != factor_refs:
                 raise ValueError(
@@ -264,6 +295,8 @@ class PartitionedFactorEngine:
                 )
             )
             del artifact, artifact_refs, artifacts, engine
+        if not canonical_instruments:
+            del first_engine
 
         manifest = _build_manifest(
             composite_key=composite_key,
@@ -272,12 +305,23 @@ class PartitionedFactorEngine:
             ctx=ctx,
             partition_size=size,
             max_partition_size=self._max_partition_size,
+            execution_descriptor=execution_descriptor,
             partitions=tuple(partition_metadata),
         )
         loaded_manifest, manifest_path = self._composite_cache.publish(manifest)
         composite = _parse_manifest(loaded_manifest, composite_key, manifest_path)
         self._validate_artifact_references(composite)
         return composite
+
+    @staticmethod
+    def _validate_engine_descriptor(
+        engine: FactorEngine,
+        factor_refs: tuple[str, ...],
+        expected: FactorExecutionDescriptor,
+    ) -> None:
+        actual = engine.execution_descriptor(factor_refs)
+        if actual != expected or actual.content_hash != expected.content_hash:
+            raise ValueError("partition execution descriptor differs across scopes")
 
     def _load_composite(self, composite_key: str) -> CompositeFactorArtifact | None:
         loaded = self._composite_cache.load(composite_key)
@@ -358,12 +402,15 @@ def _composite_key(
     ctx: FactorContext,
     partition_size: int,
     max_partition_size: int,
+    execution_descriptor_hash: str,
 ) -> str:
+    validate_sha256(execution_descriptor_hash, "execution_descriptor_hash")
     payload: dict[str, JsonValue] = {
         "content_hash_contract": _CONTENT_HASH_CONTRACT,
         "end": ctx.end.isoformat(),
         "factor_refs": list(factor_refs),
         "format_version": _FORMAT_VERSION,
+        "execution_descriptor_hash": execution_descriptor_hash,
         "instrument_ids": list(instrument_ids),
         "max_partition_size": max_partition_size,
         "partition_size": partition_size,
@@ -446,12 +493,15 @@ def _build_manifest(
     ctx: FactorContext,
     partition_size: int,
     max_partition_size: int,
+    execution_descriptor: FactorExecutionDescriptor,
     partitions: tuple[CompositeFactorPartition, ...],
 ) -> dict[str, JsonValue]:
     payload: dict[str, JsonValue] = {
         "composite_key": composite_key,
         "content_hash_contract": _CONTENT_HASH_CONTRACT,
         "end": ctx.end.isoformat(),
+        "execution_descriptor": execution_descriptor.json_value(),
+        "execution_descriptor_hash": execution_descriptor.content_hash,
         "factor_refs": list(factor_refs),
         "format_version": _FORMAT_VERSION,
         "instrument_ids": list(instrument_ids),
@@ -475,6 +525,17 @@ def _parse_manifest(
         raise ValueError("composite hash contract is unsupported")
     factor_refs = _string_tuple(manifest["factor_refs"], "factor_refs")
     factor_refs = _canonical_factor_refs(factor_refs)
+    execution_descriptor = FactorExecutionDescriptor.from_json_value(
+        manifest["execution_descriptor"]
+    )
+    execution_descriptor_hash = validate_sha256(
+        _required_string(manifest, "execution_descriptor_hash"),
+        "execution_descriptor_hash",
+    )
+    if execution_descriptor.content_hash != execution_descriptor_hash:
+        raise ValueError("composite execution descriptor hash differs")
+    if execution_descriptor.requested_refs != factor_refs:
+        raise ValueError("composite execution descriptor roots differ")
     instrument_ids = _string_tuple(manifest["instrument_ids"], "instrument_ids")
     parsed_instruments = tuple(InstrumentId.parse(item) for item in instrument_ids)
     if tuple(item.canonical() for item in parsed_instruments) != instrument_ids:
@@ -497,6 +558,7 @@ def _parse_manifest(
         ctx,
         partition_size,
         max_partition_size,
+        execution_descriptor_hash,
     )
     composite_key = _required_string(manifest, "composite_key")
     if composite_key != expected_key or composite_key != derived_key:
@@ -576,6 +638,7 @@ def _parse_manifest(
         composite_key=composite_key,
         content_hash=content_hash,
         content_hash_contract=_CONTENT_HASH_CONTRACT,
+        execution_descriptor=execution_descriptor,
         snapshot_id=snapshot_id,
         universe_hash=universe_hash,
         start=start,

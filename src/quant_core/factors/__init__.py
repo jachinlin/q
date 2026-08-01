@@ -8,6 +8,10 @@ from quant_core.factors.base import (
     FactorSpec,
 )
 from quant_core.factors.cache import FeatureCache, build_cache_key
+from quant_core.factors.execution import (
+    FactorExecutionDescriptor,
+    FactorExecutionNode,
+)
 from quant_core.factors.partitioned import (
     CompositeFactorArtifact,
     CompositeFactorPartition,
@@ -25,6 +29,8 @@ __all__ = [
     "FactorArtifact",
     "FactorContext",
     "FactorEngine",
+    "FactorExecutionDescriptor",
+    "FactorExecutionNode",
     "FactorRegistry",
     "FactorSpec",
     "FeatureCache",

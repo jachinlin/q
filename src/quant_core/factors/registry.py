@@ -17,6 +17,10 @@ from quant_core.factors.base import (
     validate_sha256,
 )
 from quant_core.factors.cache import FeatureCache, build_cache_key
+from quant_core.factors.execution import (
+    FactorExecutionDescriptor,
+    FactorExecutionNode,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +168,26 @@ class FactorEngine:
     def runnable_references(self) -> tuple[str, ...]:
         """List factors runnable under this engine's explicit capability profile."""
         return self._registry.runnable_references(self._capabilities)
+
+    def execution_descriptor(
+        self, factor_ids: Sequence[str]
+    ) -> FactorExecutionDescriptor:
+        """Describe the complete runnable DAG without computing factor data."""
+        requested = tuple(self._registry.resolve(reference) for reference in factor_ids)
+        if len(set(requested)) != len(requested):
+            raise ValueError("factor request contains duplicate logical identities")
+        ordered_requested = tuple(sorted(requested))
+        plan = self._registry.preflight(ordered_requested, self._capabilities)
+        return FactorExecutionDescriptor(
+            requested_refs=ordered_requested,
+            plan=tuple(
+                FactorExecutionNode(
+                    spec=self._registry.spec(factor_ref),
+                    code_hash=self._registry.code_hash(factor_ref),
+                )
+                for factor_ref in plan
+            ),
+        )
 
     def compute(
         self, factor_ids: Sequence[str], ctx: FactorContext
