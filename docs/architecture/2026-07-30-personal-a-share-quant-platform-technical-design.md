@@ -475,9 +475,12 @@ selected_batches = client.fetch_daily_bars(
 #### 研究价格口径
 
 ETF 与股票的市场行情因子在 MVP 统一使用 BaoStock 原始 `close/preclose`
-逐行推导的 `baostock_forward_log_return_v1`：当 `preclose` 为正数时，
-`r(t)=log(close(t)/preclose(t))`；查询首行的 `preclose` 为 null 或正负零时该字段
-为 null。每个因子窗口把首行对数价格设为 0，忽略首行自身的 `r`，并按固定
+逐行推导的 `baostock_forward_log_return_v2`：当 `close` 与 `preclose` 均为正数时，
+`r(t)=log(close(t))-log(preclose(t))`，其公式标识为
+`log_close_minus_log_preclose_v2`。该写法与 `log(close(t)/preclose(t))` 数学等价，
+但不构造中间比值，可避免极端价格尺度下比值先发生上溢或下溢；查询首行的
+`preclose` 为 null、任一输入为非正数或非有限值时，该字段为 null。每个因子窗口
+把首行对数价格设为 0，忽略首行自身的 `r`，并按固定
 顺序累加后续逐行收益形成相对对数价格路径。逐行收益不依赖请求起点或累计
 指数，因此跨请求起点、追加未来跳变时，既有信号行的数值和内容哈希保持字节
 稳定。`baostock_return_index_v1` 仍可用于展示与其他研究场景，但市场因子不再
@@ -843,10 +846,10 @@ MVP 因子用于验证行情因子、时点财务因子、横截面处理、缓�
 | 估值 | `book_to_price_mrq_v1` | 当 `pbMRQ > 0` 时取 `1 / pbMRQ`，否则为 `null` | 越高越好 | 日频估值字段 |
 | 质量 | `roe_avg_pit_v1` | `available_at <= signal_at` 的最新报告平均 ROE | 越高越好 | 时点财务数据 |
 | 质量 | `cfo_to_np_pit_v1` | 最新可用报告的经营现金流/净利润 | 越高越好 | 时点现金流数据 |
-| 动量 | `momentum_120_20_v1` | `expm1(sum(r[1:101]))` | 越高越好 | `baostock_forward_log_return_v1` |
-| 风险 | `volatility_60d_v1` | 60 日逐行对数收益标准差年化 | 越低越好 | `baostock_forward_log_return_v1` |
-| 风险 | `downside_volatility_60d_v1` | `sqrt(mean(min(r[1:61], 0)^2)) × sqrt(252)` | 越低越好 | `baostock_forward_log_return_v1` |
-| 风险 | `max_drawdown_120d_v1` | 相对对数价格路径的 120 日最大回撤 | 越低越好 | `baostock_forward_log_return_v1` |
+| 动量 | `momentum_120_20_v1` | `expm1(sum(r[1:101]))` | 越高越好 | `baostock_forward_log_return_v2` |
+| 风险 | `volatility_60d_v1` | 60 日逐行对数收益标准差年化 | 越低越好 | `baostock_forward_log_return_v2` |
+| 风险 | `downside_volatility_60d_v1` | `sqrt(mean(min(r[1:61], 0)^2)) × sqrt(252)` | 越低越好 | `baostock_forward_log_return_v2` |
+| 风险 | `max_drawdown_120d_v1` | 相对对数价格路径的 120 日最大回撤 | 越低越好 | `baostock_forward_log_return_v2` |
 
 估值因子不得将负 PE、零 PB 或缺失值转换成正常分数。`cfo_to_np_pit_v1` 在净利润绝对值低于配置阈值时输出 `null`，防止分母接近零产生无意义极值。财务因子必须通过 `financials_as_of()` 查询；缺少可靠公告时间的数据不得使用报告期末日期替代。
 

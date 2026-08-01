@@ -379,7 +379,31 @@ def test_etf_forward_factor_cache_and_future_jump_keep_prior_signal_rows_stable(
             registry.code_hash("return_20d_v1"),
             {},
         )
-        != first["return_20d_v1@2.0.0"].cache_key
+        != first["return_20d_v1@2.1.0"].cache_key
+    )
+
+    legacy_parameters = {
+        **thaw_json(spec.parameters),
+        "price_basis": "baostock_forward_log_return_v1",
+    }
+    legacy_parameters.pop("log_return_formula")
+    legacy_spec = FactorSpec(
+        spec.factor_id,
+        "2.0.0",
+        spec.frequency,
+        spec.lookback_sessions,
+        spec.dependencies,
+        spec.direction,
+        legacy_parameters,
+    )
+    assert (
+        build_cache_key(
+            legacy_spec,
+            original_ctx,
+            registry.code_hash("return_20d_v1"),
+            {},
+        )
+        != first["return_20d_v1@2.1.0"].cache_key
     )
 
     original_hashes = {

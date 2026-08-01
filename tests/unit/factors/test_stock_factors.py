@@ -70,7 +70,7 @@ class BarService:
                 additions.append(
                     pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
                     .then(pl.lit(None, dtype=pl.Float64))
-                    .otherwise((pl.col("close") / pl.col("preclose")).log())
+                    .otherwise(pl.col("close").log() - pl.col("preclose").log())
                     .cast(pl.Float64)
                     .alias(FORWARD_LOG_RETURN_COLUMN)
                 )
@@ -766,9 +766,13 @@ def test_all_stock_factors_register_once_with_alpha_metadata() -> None:
             }:
                 assert spec.parameters["adjustment_mode"] == "FORWARD"
                 assert (
-                    spec.parameters["price_basis"] == "baostock_forward_log_return_v1"
+                    spec.parameters["price_basis"] == "baostock_forward_log_return_v2"
                 )
                 assert spec.parameters["price_field"] == FORWARD_LOG_RETURN_COLUMN
+                assert (
+                    spec.parameters["log_return_formula"]
+                    == "log_close_minus_log_preclose_v2"
+                )
                 assert (
                     spec.parameters["path_construction"] == "window_forward_cumsum_v1"
                 )
@@ -794,7 +798,7 @@ def test_shared_market_factor_registration_is_idempotent_for_equivalent_runtime(
     (etf if etf_first else stock)()
     (stock if etf_first else etf)()
 
-    assert registry.code_hash("volatility_60d_v1@2.0.0") == registry.code_hash(
+    assert registry.code_hash("volatility_60d_v1@2.1.0") == registry.code_hash(
         "volatility_60d_v1"
     )
 

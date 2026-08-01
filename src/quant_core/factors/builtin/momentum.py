@@ -13,10 +13,11 @@ from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMod
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorSpec
 
-_VERSION = "2.0.0"
+_VERSION = "2.1.0"
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
-_PRICE_BASIS = "baostock_forward_log_return_v1"
+_PRICE_BASIS = "baostock_forward_log_return_v2"
+_LOG_RETURN_FORMULA = "log_close_minus_log_preclose_v2"
 _PATH_CONSTRUCTION = "window_forward_cumsum_v1"
 
 
@@ -153,6 +154,7 @@ class ReturnFactor(_MarketFactor):
                 parameters={
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "formula": ("expm1(forward_cumsum(forward_log_return[1:n+1])[-1])"),
+                    "log_return_formula": _LOG_RETURN_FORMULA,
                     "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_LOG_RETURN_COLUMN,
@@ -189,6 +191,7 @@ class Trend120dFactor(_MarketFactor):
                         "forward_log_return[1:120])],x=0..119)"
                     ),
                     "include_intercept": True,
+                    "log_return_formula": _LOG_RETURN_FORMULA,
                     "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_LOG_RETURN_COLUMN,
@@ -222,6 +225,7 @@ class Momentum12020Factor(_MarketFactor):
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
                     "formula": ("expm1(forward_cumsum(forward_log_return[1:101])[-1])"),
+                    "log_return_formula": _LOG_RETURN_FORMULA,
                     "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_LOG_RETURN_COLUMN,

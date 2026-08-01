@@ -10,8 +10,9 @@ from quant_core.domain.identifiers import InstrumentId
 from quant_core.factors.base import FactorSpec
 from quant_core.factors.builtin.momentum import AdjustedBarService, _MarketFactor
 
-_VERSION = "2.0.0"
-_PRICE_BASIS = "baostock_forward_log_return_v1"
+_VERSION = "2.1.0"
+_PRICE_BASIS = "baostock_forward_log_return_v2"
+_LOG_RETURN_FORMULA = "log_close_minus_log_preclose_v2"
 _PATH_CONSTRUCTION = "window_forward_cumsum_v1"
 _ANNUALIZATION_SCALE = sqrt(252.0)
 
@@ -39,6 +40,7 @@ class Volatility60dFactor(_MarketFactor):
                     "annualization_sessions": 252,
                     "ddof": 1,
                     "formula": "std(forward_log_return[1:61],ddof=1)*sqrt(252)",
+                    "log_return_formula": _LOG_RETURN_FORMULA,
                     "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_LOG_RETURN_COLUMN,
@@ -74,6 +76,7 @@ class DownsideVolatility60dFactor(_MarketFactor):
                     "formula": (
                         "sqrt(mean(min(forward_log_return[1:61],0)^2))*sqrt(252)"
                     ),
+                    "log_return_formula": _LOG_RETURN_FORMULA,
                     "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_LOG_RETURN_COLUMN,
@@ -105,6 +108,7 @@ class MaxDrawdown120dFactor(_MarketFactor):
                     "adjustment_mode": AdjustmentMode.FORWARD.value,
                     "eligible_for_alpha": True,
                     "formula": ("max(1-exp(relative_log_path-running_peak_log))"),
+                    "log_return_formula": _LOG_RETURN_FORMULA,
                     "path_construction": _PATH_CONSTRUCTION,
                     "price_basis": _PRICE_BASIS,
                     "price_field": FORWARD_LOG_RETURN_COLUMN,

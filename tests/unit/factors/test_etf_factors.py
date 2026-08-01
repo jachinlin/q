@@ -1,4 +1,4 @@
-"""ETF market factors over point-in-time forward return-index histories."""
+"""ETF market factors over point-in-time row log-return histories."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ class RecordingPriceService:
             result = result.with_columns(
                 pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
                 .then(pl.lit(None, dtype=pl.Float64))
-                .otherwise((pl.col("close") / pl.col("preclose")).log())
+                .otherwise(pl.col("close").log() - pl.col("preclose").log())
                 .cast(pl.Float64)
                 .alias(FORWARD_LOG_RETURN_COLUMN)
             )
@@ -146,7 +146,9 @@ class ActionAwarePriceService:
             )
             return_indices[instrument_id] = return_index
             row[FORWARD_RETURN_INDEX_COLUMN] = return_index
-            row[FORWARD_LOG_RETURN_COLUMN] = float(np.log(raw_close / raw_preclose))
+            row[FORWARD_LOG_RETURN_COLUMN] = float(
+                np.log(raw_close) - np.log(raw_preclose)
+            )
             row["close"] = raw_close * adjustment_factor
             row["preclose"] = raw_preclose * adjustment_factor
             row["adjustment_factor"] = adjustment_factor
@@ -178,104 +180,6 @@ class ActionAwarePriceService:
             FORWARD_LOG_RETURN_COLUMN: pl.Float64,
         }
         return pl.DataFrame(rows, schema=schema).lazy()
-
-
-class SameDayComponentPriceService:
-    """Produce aggregate prices while retaining independently timed components."""
-
-    def __init__(
-        self,
-        raw_bars: pl.DataFrame,
-        actions: Sequence[tuple[date, str, float, float, datetime]],
-    ) -> None:
-        self._raw_bars = raw_bars
-        self._actions = actions
-
-    def bars(
-        self,
-        snapshot_id: SnapshotId,
-        instruments: Sequence[InstrumentId],
-        start: date,
-        end: date,
-        mode: AdjustmentMode,
-        as_of: date,
-    ) -> pl.LazyFrame:
-        assert mode is AdjustmentMode.BACKWARD
-        instrument_ids = [instrument.canonical() for instrument in instruments]
-        applicable = [
-            action
-            for action in self._actions
-            if action[0] <= as_of and action[4].date() <= as_of
-        ]
-        source = self._raw_bars.filter(
-            pl.col("instrument_id").is_in(instrument_ids)
-            & pl.col("trade_date").is_between(start, end, closed="both")
-        ).sort("instrument_id", "trade_date")
-        raw_rows = source.to_dicts()
-        previous_close: dict[str, float] = {}
-        rows: list[dict[str, object]] = []
-        for row in raw_rows:
-            trade_date = row["trade_date"]
-            instrument = row["instrument_id"]
-            assert isinstance(trade_date, date)
-            assert isinstance(instrument, str)
-            raw_close = float(row["close"])
-            preclose = previous_close.get(instrument, raw_close)
-            previous_close[instrument] = raw_close
-            event_components = [
-                action for action in applicable if action[0] == trade_date
-            ]
-            cash = sum(action[2] for action in event_components)
-            share = sum(action[3] for action in event_components)
-            event_factor = (preclose - cash) / (preclose * (1.0 + share))
-            future_components = [
-                action for action in applicable if trade_date < action[0]
-            ]
-            factor = 1.0
-            for ex_date in sorted({action[0] for action in future_components}):
-                ex_components = [
-                    action for action in future_components if action[0] == ex_date
-                ]
-                ex_row = next(
-                    item for item in raw_rows if item["trade_date"] == ex_date
-                )
-                ex_index = raw_rows.index(ex_row)
-                ex_preclose = float(raw_rows[ex_index - 1]["close"])
-                ex_cash = sum(action[2] for action in ex_components)
-                ex_share = sum(action[3] for action in ex_components)
-                factor *= (ex_preclose - ex_cash) / (ex_preclose * (1.0 + ex_share))
-            row["close"] = raw_close * factor
-            row["preclose"] = preclose * factor
-            row["adjustment_factor"] = factor
-            row["adjustment_event_factor"] = event_factor
-            row["adjustment_event_available_at"] = (
-                max(action[4] for action in event_components)
-                if event_components
-                else None
-            )
-            row["adjustment_event_components"] = [
-                {
-                    "action_type": action[1],
-                    "cash_per_share": action[2],
-                    "share_ratio": action[3],
-                    "available_at": action[4],
-                }
-                for action in event_components
-            ]
-            rows.append(row)
-        return (
-            pl.DataFrame(rows, infer_schema_length=None)
-            .with_columns(
-                pl.col("instrument_id").cast(pl.String),
-                pl.col("trade_date").cast(pl.Date),
-                pl.col("close", "preclose").cast(pl.Float64),
-                pl.col("available_at", "adjustment_event_available_at").cast(
-                    pl.Datetime("us", "UTC")
-                ),
-                pl.col("adjustment_factor", "adjustment_event_factor").cast(pl.Float64),
-            )
-            .lazy()
-        )
 
 
 def test_return_factors_use_exact_lagged_close_formula() -> None:
@@ -860,9 +764,13 @@ def test_row_log_returns_are_byte_stable_for_wide_multi_instrument_histories(
 
 def test_nonfinite_row_log_return_invalidates_volatility() -> None:
     """A provider boundary that exposes an infinite row return must fail closed."""
-    smallest = float.fromhex("0x0.0000000000001p-1022")
-    closes = [smallest, *([1e308] * 60)]
-    bars = _bars(_SSE, closes)
+    bars = _bars(_SSE, [100.0] * 61).with_columns(
+        pl.Series(
+            FORWARD_LOG_RETURN_COLUMN,
+            [0.0] * 60 + [float("inf")],
+            dtype=pl.Float64,
+        )
+    )
     signal_day = bars["trade_date"][-1]
 
     result = (
@@ -921,7 +829,7 @@ def test_output_schema_sorting_identity_and_availability_are_exact() -> None:
         result.select("trade_date", "instrument_id").rows()
     )
     assert result["factor_id"].unique().to_list() == ["return_20d_v1"]
-    assert result["factor_version"].unique().to_list() == ["2.0.0"]
+    assert result["factor_version"].unique().to_list() == ["2.1.0"]
     assert result["available_at"].null_count() == 0
 
 
@@ -933,11 +841,11 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
     register_etf_factors(registry, RecordingPriceService(bars), [_SSE])
 
     expected = {
-        "return_20d_v1@2.0.0": (20, 1),
-        "return_60d_v1@2.0.0": (60, 1),
-        "return_120d_v1@2.0.0": (120, 1),
-        "trend_120d_v1@2.0.0": (120, 1),
-        "volatility_60d_v1@2.0.0": (60, -1),
+        "return_20d_v1@2.1.0": (20, 1),
+        "return_60d_v1@2.1.0": (60, 1),
+        "return_120d_v1@2.1.0": (120, 1),
+        "trend_120d_v1@2.1.0": (120, 1),
+        "volatility_60d_v1@2.1.0": (60, -1),
     }
     for reference, (lookback, direction) in expected.items():
         spec = registry.spec(reference)
@@ -946,8 +854,11 @@ def test_builtin_registration_exposes_exact_specs_and_stable_code_hashes() -> No
         assert spec.direction == direction
         assert spec.dependencies == ()
         assert spec.parameters["adjustment_mode"] == "FORWARD"
-        assert spec.parameters["price_basis"] == "baostock_forward_log_return_v1"
+        assert spec.parameters["price_basis"] == "baostock_forward_log_return_v2"
         assert spec.parameters["price_field"] == FORWARD_LOG_RETURN_COLUMN
+        assert (
+            spec.parameters["log_return_formula"] == "log_close_minus_log_preclose_v2"
+        )
         assert spec.parameters["path_construction"] == "window_forward_cumsum_v1"
         assert len(registry.code_hash(reference)) == 64
 
