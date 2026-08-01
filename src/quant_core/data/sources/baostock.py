@@ -15,12 +15,23 @@ from datetime import time as clock_time
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
-from quant_core.data.contracts import JsonValue, RawBatch
+from quant_core.data.contracts import JsonValue, ProviderCapabilities, RawBatch
 from quant_core.domain.enums import Exchange, Severity
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.errors import ErrorDetail, QuantError
 
 BAOSTOCK_SOURCE_ADAPTER_VERSION = "baostock-source-adapter-v3"
+BAOSTOCK_CAPABILITIES = ProviderCapabilities(
+    daily_bars=True,
+    trade_calendar=True,
+    instruments=True,
+    security_status=True,
+    financials_with_announcement_date=False,
+    corporate_actions=False,
+    adjustment_factors=False,
+    pit_total_shares=False,
+    pit_industry_classification=False,
+)
 
 DAILY_BAR_FIELDS = (
     "date",
@@ -282,6 +293,8 @@ def _utc_now() -> datetime:
 
 class BaoStockClient:
     """Acquire BaoStock daily bars as deterministic provider-native Raw batches."""
+
+    capabilities = BAOSTOCK_CAPABILITIES
 
     def __init__(
         self,

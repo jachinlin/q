@@ -88,13 +88,62 @@ def test_constant_or_single_pair_rank_ic_is_invalid_not_zero() -> None:
 def test_quantiles_stably_break_ties_and_allow_empty_groups() -> None:
     factors = _factors([(0, "C", 1.0, True), (0, "A", 1.0, True), (0, "B", 1.0, True)])
     assigned = assign_quantiles(factors, 5)
-    assert assigned.select("instrument_id", "quantile").rows() == [
-        ("A", 1),
-        ("B", 2),
-        ("C", 4),
+    assert assigned.select(
+        "instrument_id", "quantile", "bucket_count", "is_empty"
+    ).rows() == [
+        ("A", 1, 1, False),
+        ("B", 2, 1, False),
+        (None, 3, 0, True),
+        ("C", 4, 1, False),
+        (None, 5, 0, True),
     ]
     with pytest.raises(ValueError, match="at least 2"):
         assign_quantiles(factors, 1)
+
+
+def test_small_cross_section_retains_quantile_domain_and_invalidates_long_short() -> (
+    None
+):
+    """Deleting empty-domain rows or terminal validation would hide n < Q failure."""
+    factors = _factors([(0, "A", 1.0, True), (0, "B", 2.0, True), (0, "C", 3.0, True)])
+    future = _future([(0, "A", 0.01), (0, "B", 0.02), (0, "C", 0.03)])
+
+    assignments = assign_quantiles(factors, 5)
+    quantiles = quantile_future_returns(factors, future, 5)
+    long_short = long_short_returns(quantiles)
+
+    assert assignments["quantile"].to_list() == [1, 2, 3, 4, 5]
+    assert assignments.filter(pl.col("is_empty")).select(
+        "instrument_id", "value", "quantile", "bucket_count"
+    ).rows() == [(None, None, 3, 0), (None, None, 5, 0)]
+    assert quantiles.select("quantile", "count", "mean_return", "is_empty").rows() == [
+        (1, 1, pytest.approx(0.01), False),
+        (2, 1, pytest.approx(0.02), False),
+        (3, 0, None, True),
+        (4, 1, pytest.approx(0.03), False),
+        (5, 0, None, True),
+    ]
+    assert long_short.row(0) == (
+        _day(0),
+        None,
+        False,
+        "MISSING_TERMINAL_QUANTILE_OBSERVATIONS",
+    )
+
+
+def test_all_invalid_cross_section_still_exposes_every_empty_quantile_bucket() -> None:
+    """Iterating only valid rows would erase the n=0<Q diagnostic domain."""
+    factors = _factors([(0, "A", None, False)])
+
+    assignments = assign_quantiles(factors, 3)
+
+    assert assignments.select(
+        "quantile", "instrument_id", "bucket_count", "is_empty"
+    ).rows() == [
+        (1, None, 0, True),
+        (2, None, 0, True),
+        (3, None, 0, True),
+    ]
 
 
 def test_quantile_and_long_short_returns_align_exact_signal_keys() -> None:

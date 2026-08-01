@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import cast
 
+from quant_core.data.contracts import ProviderCapabilities
 from quant_core.factors.base import (
     Factor,
     FactorArtifact,
@@ -22,6 +24,17 @@ class _Registration:
     factor: Factor
     spec: FactorSpec
     code_hash: str
+
+
+class FactorCapabilityUnavailable(ValueError):
+    """A requested factor needs source inputs absent from the runtime profile."""
+
+    def __init__(self, factor_ref: str, missing: tuple[str, ...]) -> None:
+        self.factor_ref = factor_ref
+        self.missing = missing
+        super().__init__(
+            f"factor {factor_ref} requires unavailable capabilities: {', '.join(missing)}"
+        )
 
 
 class FactorRegistry:
@@ -67,6 +80,10 @@ class FactorRegistry:
         """Return the registered implementation SHA-256 for a factor reference."""
         return self._registrations[self.resolve(reference)].code_hash
 
+    def registered_references(self) -> tuple[str, ...]:
+        """Return every registered canonical reference in deterministic order."""
+        return tuple(sorted(self._registrations))
+
     def spec(self, reference: str) -> FactorSpec:
         """Return the immutable contract captured when a factor was registered."""
         return self._registrations[self.resolve(reference)].spec
@@ -103,13 +120,51 @@ class FactorRegistry:
             visit(root)
         return tuple(ordered)
 
+    def runnable_references(
+        self, capabilities: ProviderCapabilities
+    ) -> tuple[str, ...]:
+        """Return registered factors whose declared source inputs are available."""
+        return tuple(
+            canonical_ref
+            for canonical_ref in sorted(self._registrations)
+            if not capabilities.missing(
+                _required_capabilities(self.spec(canonical_ref))
+            )
+        )
+
+    def preflight(
+        self, references: Sequence[str], capabilities: ProviderCapabilities
+    ) -> tuple[str, ...]:
+        """Resolve a request and reject unavailable data requirements before compute."""
+        plan = self.topological_order(tuple(references))
+        for canonical_ref in plan:
+            missing = capabilities.missing(
+                _required_capabilities(self.spec(canonical_ref))
+            )
+            if missing:
+                raise FactorCapabilityUnavailable(canonical_ref, missing)
+        return plan
+
 
 class FactorEngine:
     """Compute a dependency closure once and materialize verified cache artifacts."""
 
-    def __init__(self, registry: FactorRegistry, cache: FeatureCache) -> None:
+    def __init__(
+        self,
+        registry: FactorRegistry,
+        cache: FeatureCache,
+        *,
+        capabilities: ProviderCapabilities | None = None,
+    ) -> None:
         self._registry = registry
         self._cache = cache
+        self._capabilities = capabilities
+
+    def runnable_references(self) -> tuple[str, ...]:
+        """List factors runnable under this engine's explicit capability profile."""
+        if self._capabilities is None:
+            return self._registry.registered_references()
+        return self._registry.runnable_references(self._capabilities)
 
     def compute(
         self, factor_ids: Sequence[str], ctx: FactorContext
@@ -118,7 +173,11 @@ class FactorEngine:
         requested = tuple(self._registry.resolve(reference) for reference in factor_ids)
         if len(set(requested)) != len(requested):
             raise ValueError("factor request contains duplicate logical identities")
-        plan = self._registry.topological_order(requested)
+        plan = (
+            self._registry.preflight(requested, self._capabilities)
+            if self._capabilities is not None
+            else self._registry.topological_order(requested)
+        )
         computed: dict[str, FactorArtifact] = {}
         for canonical_ref in plan:
             factor = self._registry.factor(canonical_ref)
@@ -147,3 +206,13 @@ class FactorEngine:
         return MappingProxyType(
             {canonical_ref: computed[canonical_ref] for canonical_ref in requested}
         )
+
+
+def _required_capabilities(spec: FactorSpec) -> tuple[str, ...]:
+    value = spec.parameters.get("required_capabilities", ())
+    if not isinstance(value, tuple):
+        raise TypeError("required_capabilities must be a list of capability names")
+    requirements = cast(tuple[object, ...], value)
+    if not all(isinstance(item, str) for item in requirements):
+        raise ValueError("required_capabilities must be a list of capability names")
+    return cast(tuple[str, ...], requirements)

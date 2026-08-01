@@ -71,25 +71,45 @@ def spearman_rank_ic(
 
 
 def assign_quantiles(factors: pl.DataFrame, quantiles: int) -> pl.DataFrame:
-    """Assign 1=lowest through Q=highest with stable instrument tie-breaking."""
+    """Assign 1=lowest through Q=highest and retain empty bucket diagnostics."""
     if type(quantiles) is not int or quantiles < 2:
         raise ValueError("quantiles must be an integer of at least 2")
     _unique(factors, "factors")
     valid = _valid_factors(factors)
     rows = []
-    for group in valid.partition_by("signal_date", maintain_order=False):
-        ordered = group.sort("value", "instrument_id")
+    for signal_date in sorted(set(factors["signal_date"].to_list())):
+        ordered = valid.filter(pl.col("signal_date") == signal_date).sort(
+            "value", "instrument_id"
+        )
         count = ordered.height
+        bucket_counts = [0] * quantiles
         for index, row in enumerate(ordered.to_dicts()):
+            bucket = index * quantiles // count + 1
+            bucket_counts[bucket - 1] += 1
             rows.append(
                 (
                     row["signal_date"],
                     row["instrument_id"],
                     row["value"],
-                    index * quantiles // count + 1,
+                    bucket,
                     quantiles,
+                    1,
+                    False,
                 )
             )
+        for bucket, bucket_count in enumerate(bucket_counts, start=1):
+            if bucket_count == 0:
+                rows.append(
+                    (
+                        signal_date,
+                        None,
+                        None,
+                        bucket,
+                        quantiles,
+                        0,
+                        True,
+                    )
+                )
     return pl.DataFrame(
         rows,
         schema={
@@ -98,9 +118,11 @@ def assign_quantiles(factors: pl.DataFrame, quantiles: int) -> pl.DataFrame:
             "value": pl.Float64,
             "quantile": pl.Int64,
             "quantiles": pl.Int64,
+            "bucket_count": pl.Int64,
+            "is_empty": pl.Boolean,
         },
         orient="row",
-    ).sort("signal_date", "instrument_id")
+    ).sort("signal_date", "quantile", "instrument_id")
 
 
 def quantile_future_returns(
@@ -128,6 +150,7 @@ def quantile_future_returns(
                     len(values),
                     sum(values) / len(values) if values else None,
                     quantiles,
+                    not values,
                 )
             )
     return pl.DataFrame(
@@ -138,6 +161,7 @@ def quantile_future_returns(
             "count": pl.Int64,
             "mean_return": pl.Float64,
             "quantiles": pl.Int64,
+            "is_empty": pl.Boolean,
         },
         orient="row",
     ).sort("signal_date", "quantile")
@@ -147,23 +171,39 @@ def long_short_returns(quantile_returns: pl.DataFrame) -> pl.DataFrame:
     """Return the fixed Q-minus-1 portfolio return for each signal date."""
     _require(
         quantile_returns,
-        {"signal_date", "quantile", "mean_return", "quantiles"},
+        {"signal_date", "quantile", "count", "mean_return", "quantiles"},
         "quantile returns",
     )
-    rows = []
+    rows: list[tuple[object, float | None, bool, str | None]] = []
     for group in quantile_returns.partition_by("signal_date", maintain_order=False):
         day = group["signal_date"].item(0)
         q = group["quantiles"].item(0)
-        low = group.filter(pl.col("quantile") == 1)["mean_return"].item()
-        high = group.filter(pl.col("quantile") == q)["mean_return"].item()
-        value = high - low if high is not None and low is not None else None
-        rows.append((day, value, value is not None))
+        domain = set(group["quantile"].to_list())
+        if domain != set(range(1, q + 1)):
+            rows.append((day, None, False, "INCOMPLETE_QUANTILE_DOMAIN"))
+            continue
+        low = group.filter(pl.col("quantile") == 1)
+        high = group.filter(pl.col("quantile") == q)
+        low_value, high_value = low["mean_return"].item(), high["mean_return"].item()
+        if (
+            low["count"].item() == 0
+            or high["count"].item() == 0
+            or not isinstance(low_value, (int, float))
+            or not isinstance(high_value, (int, float))
+            or not isfinite(low_value)
+            or not isfinite(high_value)
+        ):
+            rows.append((day, None, False, "MISSING_TERMINAL_QUANTILE_OBSERVATIONS"))
+            continue
+        value: float | None = float(high_value) - float(low_value)
+        rows.append((day, value, True, None))
     return pl.DataFrame(
         rows,
         schema={
             "signal_date": pl.Date,
             "long_short_return": pl.Float64,
             "is_valid": pl.Boolean,
+            "invalid_reason": pl.String,
         },
         orient="row",
     ).sort("signal_date")

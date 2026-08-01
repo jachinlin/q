@@ -8,15 +8,19 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from quant_core.data.adjustments import (
     FORWARD_LOG_RETURN_COLUMN,
     FORWARD_RETURN_INDEX_COLUMN,
     AdjustmentMode,
 )
+from quant_core.data.contracts import ProviderCapabilities
+from quant_core.data.sources.baostock import BAOSTOCK_CAPABILITIES
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
 from quant_core.factors import FactorContext, FactorEngine, FactorRegistry, FeatureCache
 from quant_core.factors.builtin import register_etf_factors, register_stock_factors
+from quant_core.factors.registry import FactorCapabilityUnavailable
 
 _ID = InstrumentId.parse("SSE:600000")
 
@@ -228,6 +232,45 @@ def test_etf_forward_factors_materialize_once_and_record_forward_price_contract(
         == "log_close_minus_log_preclose_v2"
         for artifact in first.values()
     )
+
+
+def test_baostock_capability_preflight_rejects_unsupported_pit_factors_but_allows_market(
+    tmp_path: Path,
+) -> None:
+    """A disabled capability must fail before a provider can emit placeholder rows."""
+    bars, financials = CountingBars(), CountingFinancials()
+    registry = FactorRegistry()
+    register_stock_factors(registry, bars, financials, [_ID], price_service=bars)
+    cache = FeatureCache(tmp_path / "features")
+    day = bars.frame["trade_date"][-1]
+    ctx = FactorContext(
+        SnapshotId.parse("00000000-0000-0000-0000-000000000079"), "d" * 64, day, day
+    )
+    production = FactorEngine(registry, cache, capabilities=BAOSTOCK_CAPABILITIES)
+
+    runnable = set(production.runnable_references())
+    assert {
+        "roe_avg_pit_v1@1.0.0",
+        "cfo_to_np_pit_v1@1.0.0",
+        "log_market_cap_v1@1.0.0",
+        "industry_code_pit_v1@1.0.0",
+    }.isdisjoint(runnable)
+    assert "avg_amount_20d_v1@1.0.0" in runnable
+    with pytest.raises(
+        FactorCapabilityUnavailable,
+        match="financials_with_announcement_date",
+    ):
+        production.compute(("roe_avg_pit_v1",), ctx)
+    assert financials.calls == 0
+
+    market = production.compute(("volatility_60d_v1",), ctx)
+    assert market["volatility_60d_v1@2.1.0"].row_count == 1
+
+    research = FactorEngine(
+        registry, cache, capabilities=ProviderCapabilities.complete()
+    )
+    quality = research.compute(("roe_avg_pit_v1",), ctx)
+    assert quality["roe_avg_pit_v1@1.0.0"].row_count == 1
 
 
 def _cache_state(root: Path) -> dict[str, tuple[int, int, int]]:

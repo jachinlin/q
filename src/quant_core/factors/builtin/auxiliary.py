@@ -150,6 +150,7 @@ class LogMarketCapFactor:
                 "formula": "log(raw_close*total_shares)",
                 "capability": "pit_total_shares_provider",
                 "missing_reason": "CAPABILITY_OR_DATA_UNAVAILABLE",
+                "required_capabilities": ["pit_total_shares"],
             },
         )
 
@@ -216,6 +217,7 @@ class IndustryCodePitFactor:
                 "taxonomy": "provider_numeric_code",
                 "capability": "pit_industry_provider",
                 "missing_reason": "CAPABILITY_OR_DATA_UNAVAILABLE",
+                "required_capabilities": ["pit_industry_classification"],
             },
         )
 

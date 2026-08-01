@@ -42,6 +42,33 @@ class ProviderCapabilities:
     financials_with_announcement_date: bool
     corporate_actions: bool
     adjustment_factors: bool
+    pit_total_shares: bool = False
+    pit_industry_classification: bool = False
+
+    @classmethod
+    def complete(cls) -> "ProviderCapabilities":
+        """Return an explicit research profile with every supported input enabled."""
+        return cls(
+            daily_bars=True,
+            trade_calendar=True,
+            instruments=True,
+            security_status=True,
+            financials_with_announcement_date=True,
+            corporate_actions=True,
+            adjustment_factors=True,
+            pit_total_shares=True,
+            pit_industry_classification=True,
+        )
+
+    def missing(self, required: Sequence[str]) -> tuple[str, ...]:
+        """Return declared capability names that this provider does not support."""
+        missing: list[str] = []
+        for name in required:
+            if not isinstance(name, str) or not hasattr(self, name):
+                raise ValueError(f"unknown provider capability: {name!r}")
+            if not getattr(self, name):
+                missing.append(name)
+        return tuple(missing)
 
 
 @dataclass(frozen=True, slots=True)

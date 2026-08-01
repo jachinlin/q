@@ -91,6 +91,7 @@ class RoeAvgPitFactor(_PitFinancialFactor):
                     "source_metric": "roe_avg",
                     "selection": "latest_report_period_as_of_signal",
                     "eligible_for_alpha": True,
+                    "required_capabilities": ["financials_with_announcement_date"],
                 },
             ),
         )
@@ -139,6 +140,7 @@ class CfoToNetProfitFactor(_PitFinancialFactor):
                     "same_report_period": True,
                     "min_abs_net_profit": self._minimum,
                     "eligible_for_alpha": True,
+                    "required_capabilities": ["financials_with_announcement_date"],
                 },
             ),
         )
