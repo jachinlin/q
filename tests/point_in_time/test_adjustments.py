@@ -398,6 +398,7 @@ def test_forward_adjustment_accepts_valid_first_preclose(
         None if not first_preclose else log(10.0) - log(first_preclose)
     )
     assert result[FORWARD_LOG_RETURN_COLUMN].item(0) == expected_log_return
+    assert result["forward_return_index"].item(0) == 10.0
 
 
 @pytest.mark.parametrize("column", ["open", "high", "low"])
@@ -510,6 +511,82 @@ def test_forward_adjustment_rejects_forward_return_index_underflow_to_zero() -> 
 
     with pytest.raises(ValueError, match="forward return index"):
         _forward_adjust(frame, _DAYS[1])
+
+
+def test_forward_service_preserves_representable_subnormal_return_index(
+    tmp_path: Path,
+) -> None:
+    """A daily ratio may underflow even when the final index is representable."""
+    smallest_positive = float.fromhex("0x0.0000000000001p-1022")
+    bars = [
+        (1e308, 1e308, 1e308, 1e308, 0.0, 100, 100.0),
+        (
+            smallest_positive,
+            smallest_positive,
+            smallest_positive,
+            smallest_positive,
+            1e308,
+            100,
+            100.0,
+        ),
+        *[
+            (
+                smallest_positive,
+                smallest_positive,
+                smallest_positive,
+                smallest_positive,
+                smallest_positive,
+                100,
+                100.0,
+            )
+            for _ in range(len(_DAYS) - 2)
+        ],
+    ]
+    fixture = _adjustment_fixture(tmp_path, [], bar_values=bars)
+
+    result = (
+        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        .bars(
+            fixture.snapshot_id,
+            [_INSTRUMENT],
+            _DAYS[0],
+            _DAYS[-1],
+            AdjustmentMode.FORWARD,
+            _DAYS[-1],
+        )
+        .collect()
+    )
+
+    assert result["adjustment_factor"].to_list() == [1.0] * len(_DAYS)
+    assert result["forward_return_index"].to_list() == [
+        1e308,
+        smallest_positive,
+        smallest_positive,
+        smallest_positive,
+        smallest_positive,
+    ]
+    assert result[FORWARD_LOG_RETURN_COLUMN].item(1) == -1453.6362805635472
+
+
+def test_forward_return_index_matches_fixed_order_log_domain_oracle() -> None:
+    """The prefix scan must match scalar left-to-right log accumulation exactly."""
+    frame = _forward_frame(
+        [
+            ("SSE:600000", _DAYS[0], 10.0, 0.0),
+            ("SSE:600000", _DAYS[1], 12.0, 10.0),
+            ("SSE:600000", _DAYS[2], 8.4, 8.0),
+            ("SSE:600000", _DAYS[3], 9.0, 8.4),
+        ]
+    )
+
+    result, _ = _forward_adjust(frame, _DAYS[3])
+
+    assert result["forward_return_index"].to_list() == [
+        10.0,
+        12.0,
+        12.600000000000003,
+        13.500000000000005,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -701,6 +778,10 @@ def test_forward_return_index_is_byte_stable_after_nonbinary_future_jumps() -> N
         short["forward_return_index"].to_numpy().tobytes()
         == extended["forward_return_index"].to_numpy().tobytes()
     )
+    anchors = short.group_by("instrument_id", maintain_order=True).agg(
+        pl.col("forward_return_index").first()
+    )
+    assert anchors["forward_return_index"].to_list() == [100.0, 200.0]
     assert short[FORWARD_LOG_RETURN_COLUMN].item(0) is None
     assert extended[FORWARD_LOG_RETURN_COLUMN].item(0) is None
     assert (

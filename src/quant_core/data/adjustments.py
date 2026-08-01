@@ -224,38 +224,47 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
         )
 
     first = pl.col("instrument_id").is_first_distinct()
-    calculated = ordered.with_columns(
-        pl.when(first)
-        .then(0.0)
-        .otherwise(
-            pl.col("preclose").log()
-            - pl.col("close").shift(1).over("instrument_id").log()
+    calculated = (
+        ordered.with_columns(
+            pl.when(first)
+            .then(0.0)
+            .otherwise(
+                pl.col("preclose").log()
+                - pl.col("close").shift(1).over("instrument_id").log()
+            )
+            .alias("_forward_log_ratio"),
+            pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col("close").log() - pl.col("preclose").log())
+            .cast(pl.Float64)
+            .alias(FORWARD_LOG_RETURN_COLUMN),
         )
-        .alias("_forward_log_ratio"),
-        pl.when(first)
-        .then(pl.col("close"))
-        .otherwise(pl.col("close") / pl.col("preclose"))
-        .alias("_forward_return_ratio"),
-        pl.when(pl.col("preclose").is_null() | (pl.col("preclose") == 0))
-        .then(pl.lit(None, dtype=pl.Float64))
-        .otherwise(pl.col("close").log() - pl.col("preclose").log())
-        .cast(pl.Float64)
-        .alias(FORWARD_LOG_RETURN_COLUMN),
-    ).with_columns(
-        pl.col("_forward_log_ratio")
-        .reverse()
-        .cum_sum()
-        .reverse()
-        .shift(-1)
-        .fill_null(0.0)
-        .over("instrument_id")
-        .exp()
-        .alias("_forward_factor"),
-        pl.col("_forward_return_ratio")
-        .cum_prod()
-        .over("instrument_id")
-        .cast(pl.Float64)
-        .alias(FORWARD_RETURN_INDEX_COLUMN),
+        .with_columns(
+            pl.when(first)
+            .then(pl.col("close").log())
+            .otherwise(pl.col(FORWARD_LOG_RETURN_COLUMN))
+            .alias("_forward_log_index_contribution")
+        )
+        .with_columns(
+            pl.col("_forward_log_ratio")
+            .reverse()
+            .cum_sum()
+            .reverse()
+            .shift(-1)
+            .fill_null(0.0)
+            .over("instrument_id")
+            .exp()
+            .alias("_forward_factor"),
+            pl.when(first)
+            .then(pl.col("close"))
+            .otherwise(
+                pl.col("_forward_log_index_contribution")
+                .cum_sum()
+                .over("instrument_id")
+                .exp()
+            )
+            .alias(FORWARD_RETURN_INDEX_COLUMN),
+        )
     )
     factor = pl.col("_forward_factor")
     if _has_any(calculated, ~factor.is_finite() | (factor <= 0)):
@@ -270,7 +279,7 @@ def _forward_adjust(frame: pl.DataFrame, end: date) -> tuple[pl.DataFrame, list[
     filtered = calculated.filter(pl.col("trade_date") <= end)
     filtered_factors = cast(list[float], filtered["_forward_factor"].to_list())
     filtered = filtered.drop(
-        "_forward_log_ratio", "_forward_return_ratio", "_forward_factor"
+        "_forward_log_ratio", "_forward_log_index_contribution", "_forward_factor"
     )
     return filtered, filtered_factors
 
