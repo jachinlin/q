@@ -11,7 +11,7 @@ import tempfile
 import time
 import tracemalloc
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -19,22 +19,28 @@ import polars as pl
 from quant_core.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
 from quant_core.data.sources.baostock import BAOSTOCK_CAPABILITIES
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
-from quant_core.factors import FactorContext, FactorEngine, FactorRegistry, FeatureCache
+from quant_core.factors import (
+    FactorContext,
+    FactorEngine,
+    FactorRegistry,
+    FeatureCache,
+    PartitionedFactorEngine,
+)
 from quant_core.factors.builtin import register_etf_factors
 
 _FACTOR_IDS = (
-    "return_20d_v1",
-    "return_60d_v1",
-    "return_120d_v1",
-    "trend_120d_v1",
-    "volatility_60d_v1",
+    "return_20d_v1@2.1.0",
+    "return_60d_v1@2.1.0",
+    "return_120d_v1@2.1.0",
+    "trend_120d_v1@2.1.0",
+    "volatility_60d_v1@2.1.0",
 )
 
 
 class _SyntheticBars:
-    def __init__(self, frame: pl.DataFrame) -> None:
+    def __init__(self, frame: pl.DataFrame, statistics: dict[str, int]) -> None:
         self._frame = frame
-        self.calls = 0
+        self._statistics = statistics
 
     def bars(
         self,
@@ -47,7 +53,7 @@ class _SyntheticBars:
     ) -> pl.LazyFrame:
         del snapshot_id, as_of
         assert mode is AdjustmentMode.FORWARD
-        self.calls += 1
+        self._statistics["market_bar_reads"] += 1
         return self._frame.lazy().filter(
             pl.col("instrument_id").is_in(
                 [instrument.canonical() for instrument in instruments]
@@ -125,49 +131,77 @@ def run(
         raise ValueError("instruments/partition must be positive and sessions >= 121")
     started = time.perf_counter()
     tracemalloc.start()
-    output_rows = 0
-    read_calls = 0
-    partitions: list[dict[str, object]] = []
+    instruments = tuple(
+        InstrumentId.parse(f"SSE:{600000 + index:06d}")
+        for index in range(total_instruments)
+    )
+    statistics = {"market_bar_reads": 0, "max_partition_input_rows": 0}
     with tempfile.TemporaryDirectory(prefix="quant-i3-benchmark-") as raw_root:
         root = Path(raw_root)
-        for offset in range(0, total_instruments, partition_size):
-            count = min(partition_size, total_instruments - offset)
-            instruments = [
-                InstrumentId.parse(f"SSE:{600000 + index:06d}")
-                for index in range(offset, offset + count)
-            ]
-            frame = _bars(instruments, sessions)
-            service = _SyntheticBars(frame)
+
+        def engine_factory(
+            scope: tuple[InstrumentId, ...], cache: FeatureCache
+        ) -> FactorEngine:
+            frame = _bars(scope, sessions)
+            statistics["max_partition_input_rows"] = max(
+                statistics["max_partition_input_rows"], frame.height
+            )
+            service = _SyntheticBars(frame, statistics)
             registry = FactorRegistry()
-            register_etf_factors(registry, service, instruments)
-            engine = FactorEngine(
+            register_etf_factors(registry, service, scope)
+            return FactorEngine(
                 registry,
-                FeatureCache(root / f"partition-{offset // partition_size:04d}"),
+                cache,
                 capabilities=BAOSTOCK_CAPABILITIES,
             )
-            first_signal = frame.get_column("trade_date")[120]
-            last_signal = frame.get_column("trade_date")[-1]
-            partition_started = time.perf_counter()
-            ctx = FactorContext(
-                SnapshotId.parse(f"00000000-0000-0000-0000-{offset + 1:012d}"),
-                hashlib.sha256(f"{offset}:{count}".encode()).hexdigest(),
-                first_signal,
-                last_signal,
-            )
-            artifacts = engine.compute(_FACTOR_IDS, ctx)
-            rows = sum(artifact.row_count for artifact in artifacts.values())
-            output_rows += rows
-            read_calls += service.calls
-            partitions.append(
-                {
-                    "instruments": count,
-                    "input_rows": frame.height,
-                    "output_rows": rows,
-                    "wall_seconds": time.perf_counter() - partition_started,
-                }
-            )
-            del artifacts, engine, registry, service, frame
-            gc.collect()
+
+        universe_hash = hashlib.sha256(
+            "\n".join(item.canonical() for item in instruments).encode()
+        ).hexdigest()
+        first_signal = date(2000, 1, 1) + timedelta(days=120)
+        last_signal = date(2000, 1, 1) + timedelta(days=sessions - 1)
+        ctx = FactorContext(
+            SnapshotId.parse("00000000-0000-0000-0000-000000000001"),
+            universe_hash,
+            first_signal,
+            last_signal,
+        )
+        executor = PartitionedFactorEngine(
+            root, engine_factory, max_partition_size=partition_size
+        )
+        composite = executor.compute(
+            _FACTOR_IDS,
+            tuple(reversed(instruments)),
+            ctx,
+            partition_size=partition_size,
+        )
+        partitions = [
+            {
+                "index": partition.index,
+                "instruments": len(partition.instrument_ids),
+                "output_rows": partition.row_count,
+                "partition_id": partition.partition_id,
+                "universe_hash": partition.universe_hash,
+            }
+            for partition in composite.partitions
+        ]
+        output_rows = composite.row_count
+        composite_key = composite.composite_key
+        composite_hash = composite.content_hash
+        composite_hash_contract = composite.content_hash_contract
+        max_partition_output_rows = max(
+            (partition.row_count for partition in composite.partitions), default=0
+        )
+        max_factor_artifact_rows = max(
+            (
+                artifact.row_count
+                for partition in composite.partitions
+                for artifact in partition.artifacts
+            ),
+            default=0,
+        )
+        del composite, executor
+        gc.collect()
     _, python_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     return {
@@ -176,9 +210,15 @@ def run(
         "input_rows": total_instruments * sessions,
         "output_rows": output_rows,
         "partition_size": partition_size,
-        "max_partition_input_rows": partition_size * sessions,
+        "partition_count": len(partitions),
+        "max_partition_input_rows": statistics["max_partition_input_rows"],
+        "max_partition_output_rows": max_partition_output_rows,
+        "max_factor_artifact_rows": max_factor_artifact_rows,
         "publish_row_group_limit": 65_536,
-        "market_bar_reads": read_calls,
+        "market_bar_reads": statistics["market_bar_reads"],
+        "composite_key": composite_key,
+        "composite_content_hash": composite_hash,
+        "composite_content_hash_contract": composite_hash_contract,
         "wall_seconds": time.perf_counter() - started,
         "python_heap_peak_bytes": python_peak,
         "process_peak_rss_bytes": _peak_rss_bytes(),
