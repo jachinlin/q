@@ -12,12 +12,17 @@ from quant_core.strategies.base import (
     ValidationIssue,
 )
 from quant_core.strategies.etf_rotation import EtfRotationConfig, EtfRotationStrategy
-from quant_core.strategies.multifactor import MultifactorConfig, MultifactorStrategy
+from quant_core.strategies.multifactor import (
+    MultifactorConfig,
+    MultifactorDecision,
+    MultifactorStrategy,
+)
 
 __all__ = [
     "EtfRotationConfig",
     "EtfRotationStrategy",
     "MultifactorConfig",
+    "MultifactorDecision",
     "MultifactorStrategy",
     "PortfolioPosition",
     "PortfolioState",

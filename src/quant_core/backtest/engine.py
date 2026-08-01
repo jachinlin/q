@@ -21,7 +21,7 @@ from quant_core.backtest.execution import ExecutionModel
 from quant_core.backtest.models import AccountView, ExecutionConfig, MarketSlice
 from quant_core.backtest.rulebook import MarketRuleBook
 from quant_core.domain.identifiers import InstrumentId, SnapshotId
-from quant_core.portfolio.constructor import TargetPortfolio, TargetPosition
+from quant_core.portfolio.constructor import TargetPortfolio, validate_target_portfolio
 from quant_core.portfolio.rebalance import RebalancePlanner
 
 _EPSILON = 1e-10
@@ -274,7 +274,7 @@ class BacktestEngine:
                         final_snapshot,
                     )
                     if generated is not None:
-                        _validate_target(generated, trade_date, next_session)
+                        validate_target_portfolio(generated, trade_date, next_session)
                         if pending is not None:
                             raise ValueError("duplicate pending target")
                         writer.append_target(generated)
@@ -374,40 +374,6 @@ def _execution_prices(
         return {instrument: rows[instrument] for instrument in needed}
     except KeyError as error:
         raise ValueError("market slice is missing execution price") from error
-
-
-def _validate_target(target: object, signal_date: date, execute_date: date) -> None:
-    if not isinstance(target, TargetPortfolio):
-        raise TypeError("target generator must return TargetPortfolio or None")
-    if target.signal_date != signal_date or target.execute_date != execute_date:
-        raise ValueError("target dates do not match generated schedule")
-    if not isinstance(target.positions, tuple):
-        raise TypeError("target positions must be a tuple")
-    seen: set[InstrumentId] = set()
-    total = target.cash_weight
-    if not _weight(target.cash_weight):
-        raise ValueError("target cash_weight is invalid")
-    for position in target.positions:
-        if not isinstance(position, TargetPosition):
-            raise TypeError("target positions must contain TargetPosition")
-        if position.instrument_id in seen:
-            raise ValueError("target positions must be unique")
-        seen.add(position.instrument_id)
-        if not _weight(position.target_weight):
-            raise ValueError("target weight is invalid")
-        if position.score is not None and (
-            not isinstance(position.score, float) or not isfinite(position.score)
-        ):
-            raise ValueError("target score is invalid")
-        if not isinstance(position.reason_code, str) or not position.reason_code:
-            raise ValueError("target reason_code is invalid")
-        total += position.target_weight
-    if abs(total - 1.0) > _EPSILON:
-        raise ValueError("target weights plus cash_weight must equal one")
-
-
-def _weight(value: object) -> bool:
-    return isinstance(value, float) and isfinite(value) and value >= 0.0
 
 
 def _date(value: object, name: str) -> None:

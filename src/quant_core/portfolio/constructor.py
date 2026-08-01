@@ -35,6 +35,47 @@ class TargetPortfolio:
     cash_weight: float
 
 
+def validate_target_portfolio(
+    target: object, signal_date: date, execute_date: date
+) -> TargetPortfolio:
+    """Validate the shared target contract before it crosses an engine boundary."""
+    if not isinstance(target, TargetPortfolio):
+        raise TypeError("target generator must return TargetPortfolio or None")
+    if type(signal_date) is not date or type(execute_date) is not date:
+        raise TypeError("target schedule dates must be dates")
+    if target.signal_date != signal_date or target.execute_date != execute_date:
+        raise ValueError("target dates do not match generated schedule")
+    if not isinstance(target.positions, tuple):
+        raise TypeError("target positions must be a tuple")
+    if not _weight(target.cash_weight):
+        raise ValueError("target cash_weight is invalid")
+    seen: set[InstrumentId] = set()
+    total = target.cash_weight
+    for position in target.positions:
+        if not isinstance(position, TargetPosition):
+            raise TypeError("target positions must contain TargetPosition")
+        if not isinstance(position.instrument_id, InstrumentId):
+            raise TypeError("target position instrument_id must be an InstrumentId")
+        if position.instrument_id in seen:
+            raise ValueError("target positions must be unique")
+        seen.add(position.instrument_id)
+        if not _weight(position.target_weight):
+            raise ValueError("target weight is invalid")
+        if position.score is not None and (
+            not isinstance(position.score, float) or not isfinite(position.score)
+        ):
+            raise ValueError("target score is invalid")
+        if (
+            not isinstance(position.reason_code, str)
+            or not position.reason_code.strip()
+        ):
+            raise ValueError("target reason_code is invalid")
+        total += position.target_weight
+    if abs(total - 1.0) > _EPSILON:
+        raise ValueError("target weights plus cash_weight must equal one")
+    return target
+
+
 @dataclass(frozen=True, slots=True)
 class _Candidate:
     instrument_id: InstrumentId
@@ -218,3 +259,7 @@ def _require_turnover_within_limit(
 
 def _normalize_zero(value: float) -> float:
     return 0.0 if abs(value) <= _EPSILON else value
+
+
+def _weight(value: object) -> bool:
+    return isinstance(value, float) and isfinite(value) and value >= 0.0

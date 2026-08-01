@@ -171,6 +171,8 @@ class EtfRotationStrategy:
             raise ValueError("rebalance_date must equal signal_date")
         if not isinstance(current, PortfolioState):
             raise TypeError("current must be a PortfolioState")
+        if current.trade_date != rebalance_date:
+            raise ValueError("current portfolio state must match rebalance_date")
         factor_refs = (
             *_RETURN_REFS,
             self.config.trend_factor_ref,

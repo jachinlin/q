@@ -11,7 +11,11 @@ import yaml
 from quant_core.domain import InstrumentId
 from quant_core.portfolio import PortfolioConstraints, PortfolioConstructor
 from quant_core.strategies.base import PortfolioState, StrategyContext
-from quant_core.strategies.multifactor import MultifactorConfig, MultifactorStrategy
+from quant_core.strategies.multifactor import (
+    MultifactorConfig,
+    MultifactorDecision,
+    MultifactorStrategy,
+)
 
 _SNAPSHOT = UUID("00000000-0000-0000-0000-000000000602")
 _SIGNAL = date(2026, 7, 31)
@@ -90,7 +94,7 @@ def _frames() -> tuple[pl.DataFrame, pl.DataFrame]:
             "instrument_id": list(_IDS),
             "as_of": [_SIGNAL] * len(_IDS),
             "eligible": [True] * 7 + [False],
-            "reason_codes": [[] for _ in _IDS],
+            "reason_codes": [[] for _ in _IDS[:-1]] + [["NOT_ELIGIBLE"]],
             "industry": ["BANK"] * 4 + ["TECH"] * 4,
             "adv_amount": [1_000.0] * len(_IDS),
             "log_market_cap": [10.0, 11.0, 12.0, 13.0] * 2,
@@ -158,7 +162,7 @@ def test_multifactor_excludes_instruments_without_required_factor_coverage() -> 
     factors = factors.filter(
         ~(
             (pl.col("instrument_id") == _IDS[0])
-            & (pl.col("factor_ref") == _ALPHA_REFS[0])
+            & pl.col("factor_ref").is_in(_ALPHA_REFS[:3])
         )
     )
     data = _Data(factors, universe)
@@ -215,3 +219,30 @@ def test_example_multifactor_yaml_is_safe_loadable_and_rejects_unknown_keys() ->
     assert config.min_valid_factors == 6
     with pytest.raises(ValueError, match="unknown"):
         MultifactorConfig.from_mapping({**mapping, "unknown": True})
+
+
+def test_multifactor_audits_insufficient_factor_coverage_with_source_reason() -> None:
+    factors, universe = _frames()
+    factors = factors.with_columns(
+        pl.when(
+            (pl.col("instrument_id") == _IDS[0])
+            & pl.col("factor_ref").is_in(_ALPHA_REFS[:3])
+        )
+        .then(pl.lit(False))
+        .otherwise(pl.col("is_valid"))
+        .alias("is_valid"),
+        pl.lit("SOURCE_INVALID", dtype=pl.String).alias("invalid_reason"),
+    )
+    decisions: list[MultifactorDecision] = []
+
+    MultifactorStrategy(_config(), audit_sink=decisions.extend).generate_targets(
+        _context(_Data(factors, universe)),
+        _SIGNAL,
+        PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0),
+    )
+
+    decision = next(
+        item for item in decisions if item.instrument_id.canonical() == _IDS[0]
+    )
+    assert decision.reason_code == "INSUFFICIENT_FACTOR_COVERAGE"
+    assert decision.factor_reasons[_ALPHA_REFS[0]] == "SOURCE_INVALID"

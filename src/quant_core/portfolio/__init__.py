@@ -5,6 +5,7 @@ from quant_core.portfolio.constructor import (
     PortfolioConstructor,
     TargetPortfolio,
     TargetPosition,
+    validate_target_portfolio,
 )
 from quant_core.portfolio.rebalance import (
     OrderIntent,
@@ -23,4 +24,5 @@ __all__ = [
     "RebalancePlanner",
     "TargetPortfolio",
     "TargetPosition",
+    "validate_target_portfolio",
 ]

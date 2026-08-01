@@ -20,6 +20,7 @@ from quant_core.factors.base import canonical_factor_ref, is_available_on_signal
 from quant_core.portfolio.constructor import (
     PortfolioConstructor,
     TargetPortfolio,
+    validate_target_portfolio,
 )
 
 _FACTOR_SCHEMA = {
@@ -118,6 +119,14 @@ class StrategyContext:
             or self.execute_date not in self.sessions
         ):
             raise ValueError("sessions must include signal_date and execute_date")
+        signal_index = self.sessions.index(self.signal_date)
+        if (
+            signal_index + 1 >= len(self.sessions)
+            or self.sessions[signal_index + 1] != self.execute_date
+        ):
+            raise ValueError(
+                "execute_date must be the next actual session after signal_date"
+            )
         if self.data is None:
             raise TypeError("data must be supplied")
         if not isinstance(self.portfolio_constructor, PortfolioConstructor):
@@ -240,14 +249,6 @@ def is_rebalance_boundary(ctx: StrategyContext, frequency: RebalanceFrequency) -
     """Evaluate the close-to-next-session boundary without calendar assumptions."""
     if not isinstance(frequency, RebalanceFrequency):
         raise TypeError("frequency must be a RebalanceFrequency")
-    signal_index = ctx.sessions.index(ctx.signal_date)
-    if (
-        signal_index + 1 >= len(ctx.sessions)
-        or ctx.sessions[signal_index + 1] != ctx.execute_date
-    ):
-        raise ValueError(
-            "execute_date must be the next actual session after signal_date"
-        )
     if frequency is RebalanceFrequency.DAILY:
         return True
     if frequency is RebalanceFrequency.WEEKLY:
@@ -294,10 +295,16 @@ def validated_factor_values(
             raise ValueError("factor_values must have unique primary keys")
         seen.add(key)
         value, available_at, valid = row["value"], row["available_at"], row["is_valid"]
-        if valid:
+        if valid is not True and valid is not False:
+            raise ValueError("factor is_valid must be a nonnull boolean")
+        if available_at is not None and not is_available_on_signal_day(
+            available_at, signal_date
+        ):
+            raise ValueError("factor available_at is after signal date")
+        if valid is True:
             if not isinstance(value, float) or not isfinite(value):
                 raise ValueError("valid factor value must be finite")
-            if not is_available_on_signal_day(available_at, signal_date):
+            if available_at is None:
                 raise ValueError("valid factor value is not available on signal date")
     return frame
 
@@ -315,6 +322,34 @@ def validated_stock_universe(frame: pl.DataFrame, *, signal_date: date) -> pl.Da
         _canonical_instrument(row["instrument_id"])
         if row["as_of"] != signal_date:
             raise ValueError("stock_universe as_of must equal signal_date")
+        eligible = row["eligible"]
+        reasons = row["reason_codes"]
+        if eligible is not True and eligible is not False:
+            raise ValueError("stock_universe eligible must be a nonnull boolean")
+        if not isinstance(reasons, list) or any(
+            not isinstance(reason, str) or not reason.strip() for reason in reasons
+        ):
+            raise ValueError("stock_universe reason_codes must be nonempty strings")
+        if eligible is True:
+            if reasons:
+                raise ValueError("eligible universe rows must have no reason_codes")
+            industry, adv_amount, log_market_cap = (
+                row["industry"],
+                row["adv_amount"],
+                row["log_market_cap"],
+            )
+            if not isinstance(industry, str) or not industry.strip():
+                raise ValueError("eligible universe rows require industry")
+            if (
+                not isinstance(adv_amount, float)
+                or not isfinite(adv_amount)
+                or adv_amount < 0.0
+            ):
+                raise ValueError("eligible universe rows require finite adv_amount")
+            if not isinstance(log_market_cap, float) or not isfinite(log_market_cap):
+                raise ValueError("eligible universe rows require finite log_market_cap")
+        elif not reasons:
+            raise ValueError("ineligible universe rows require reason_codes")
     return frame
 
 
@@ -348,6 +383,10 @@ class StrategyTargetAdapter:
     ) -> TargetPortfolio | None:
         if not isinstance(strategy, StrategyRef):
             raise TypeError("strategy must be a StrategyRef")
+        if not isinstance(current, AccountSnapshot):
+            raise TypeError("current must be an AccountSnapshot")
+        if current.trade_date != signal_date:
+            raise ValueError("current account snapshot must match signal_date")
         try:
             resolved = self._registry[strategy]
         except KeyError as error:
@@ -377,11 +416,7 @@ class StrategyTargetAdapter:
         target = resolved.generate_targets(
             ctx, signal_date, PortfolioState.from_account_snapshot(current)
         )
-        if not isinstance(target, TargetPortfolio) or (
-            target.signal_date != signal_date or target.execute_date != execute_date
-        ):
-            raise ValueError("strategy target dates must match context")
-        return target
+        return validate_target_portfolio(target, signal_date, execute_date)
 
 
 def _require_date(value: object, name: str) -> None:

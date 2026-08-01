@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from math import isfinite
@@ -39,6 +39,38 @@ _FACTOR_DEFINITIONS = {
 }
 _CATEGORY_WEIGHTS = {"VALUE": 0.25, "QUALITY": 0.25, "MOMENTUM": 0.30, "RISK": 0.20}
 _EPSILON = 1e-10
+
+
+@dataclass(frozen=True, slots=True)
+class MultifactorDecision:
+    """Immutable per-instrument score or exclusion evidence."""
+
+    instrument_id: InstrumentId
+    score: float | None
+    reason_code: str
+    factor_reasons: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instrument_id, InstrumentId):
+            raise TypeError("instrument_id must be an InstrumentId")
+        if self.score is not None and (
+            not isinstance(self.score, float) or not isfinite(self.score)
+        ):
+            raise ValueError("score must be finite or None")
+        if not isinstance(self.reason_code, str) or not self.reason_code.strip():
+            raise ValueError("reason_code must be a nonempty string")
+        if not isinstance(self.factor_reasons, Mapping) or any(
+            not isinstance(reference, str)
+            or not isinstance(reason, str)
+            or not reason.strip()
+            for reference, reason in self.factor_reasons.items()
+        ):
+            raise ValueError("factor_reasons must map factor refs to nonempty reasons")
+        object.__setattr__(
+            self,
+            "factor_reasons",
+            MappingProxyType(dict(sorted(self.factor_reasons.items()))),
+        )
 
 
 def _default_factor_definitions() -> Mapping[str, tuple[str, int]]:
@@ -145,12 +177,20 @@ class MultifactorConfig:
             raise TypeError("factor_definitions must be a mapping")
         definitions: dict[str, tuple[str, int]] = {}
         for reference, value in raw_definitions.items():
+            if not isinstance(reference, str):
+                raise TypeError("factor definition reference must be a string")
             if not isinstance(value, Mapping):
                 raise TypeError("factor definition must be a mapping")
-            definitions[cast(str, reference)] = (
-                cast(str, value.get("category")),
-                cast(int, value.get("direction")),
-            )
+            if set(value) != {"category", "direction"}:
+                raise ValueError(
+                    "factor definition keys must be category and direction"
+                )
+            category, direction = value["category"], value["direction"]
+            if not isinstance(category, str):
+                raise TypeError("factor definition category must be a string")
+            if type(direction) is not int:
+                raise TypeError("factor definition direction must be an integer")
+            definitions[reference] = (category, direction)
         raw_weights = mapping.get("category_weights", _CATEGORY_WEIGHTS)
         if not isinstance(raw_weights, Mapping):
             raise TypeError("category_weights must be a mapping")
@@ -193,10 +233,18 @@ class MultifactorStrategy:
     strategy_id = "stock_multifactor"
     version = "1.0.0"
 
-    def __init__(self, config: MultifactorConfig) -> None:
+    def __init__(
+        self,
+        config: MultifactorConfig,
+        *,
+        audit_sink: Callable[[tuple[MultifactorDecision, ...]], None] | None = None,
+    ) -> None:
         if not isinstance(config, MultifactorConfig):
             raise TypeError("config must be a MultifactorConfig")
+        if audit_sink is not None and not callable(audit_sink):
+            raise TypeError("audit_sink must be callable or None")
         self.config = config
+        self._audit_sink = audit_sink
 
     @property
     def ref(self) -> StrategyRef:
@@ -219,6 +267,8 @@ class MultifactorStrategy:
             raise ValueError("rebalance_date must equal signal_date")
         if not isinstance(current, PortfolioState):
             raise TypeError("current must be a PortfolioState")
+        if current.trade_date != rebalance_date:
+            raise ValueError("current portfolio state must match rebalance_date")
         universe = validated_stock_universe(
             ctx.data.stock_universe(ctx.snapshot_id, ctx.signal_date),
             signal_date=ctx.signal_date,
@@ -237,7 +287,9 @@ class MultifactorStrategy:
             instruments=eligible_ids,
             factor_refs=tuple(_FACTOR_DEFINITIONS),
         )
-        scores = self._scores(universe, factors, ctx.signal_date)
+        scores, decisions = self._scores(universe, factors, ctx.signal_date)
+        if self._audit_sink is not None:
+            self._audit_sink(decisions)
         current_weights = {
             item.instrument_id.canonical(): item.current_weight
             for item in current.positions
@@ -281,9 +333,12 @@ class MultifactorStrategy:
 
     def _scores(
         self, universe: pl.DataFrame, factors: pl.DataFrame, signal_date: date
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float], tuple[MultifactorDecision, ...]]:
         base_rows = list(universe.iter_rows(named=True))
         transformed: dict[str, dict[str, float]] = {
+            cast(str, row["instrument_id"]): {} for row in base_rows
+        }
+        audit_reasons: dict[str, dict[str, str]] = {
             cast(str, row["instrument_id"]): {} for row in base_rows
         }
         source = {
@@ -295,13 +350,25 @@ class MultifactorStrategy:
             for item in base_rows:
                 identifier = cast(str, item["instrument_id"])
                 observed = source.get((identifier, factor_ref))
-                valid = (
-                    observed is not None
-                    and observed["is_valid"] is True
-                    and is_available_on_signal_day(
-                        observed["available_at"], signal_date
+                source_reason: str | None = None
+                if observed is None:
+                    source_reason = "MISSING_FACTOR_ROW"
+                elif observed["is_valid"] is not True:
+                    raw_reason = (
+                        observed.get("invalid_reason")
+                        if "invalid_reason" in factors.columns
+                        else None
                     )
-                )
+                    source_reason = (
+                        raw_reason
+                        if isinstance(raw_reason, str) and raw_reason.strip()
+                        else "INPUT_INVALID"
+                    )
+                elif not is_available_on_signal_day(
+                    observed["available_at"], signal_date
+                ):
+                    source_reason = "FUTURE_AVAILABLE_AT"
+                valid = observed is not None and source_reason is None
                 value = observed["value"] if observed is not None and valid else None
                 rows.append(
                     {
@@ -311,7 +378,7 @@ class MultifactorStrategy:
                         "log_market_cap": item["log_market_cap"],
                         "value": value,
                         "is_valid": valid,
-                        "invalid_reason": None,
+                        "invalid_reason": source_reason,
                     }
                 )
             frame = pl.DataFrame(
@@ -348,9 +415,24 @@ class MultifactorStrategy:
                     transformed[cast(str, row["instrument_id"])][factor_ref] = (
                         direction * value
                     )
+                else:
+                    reason = row["invalid_reason"]
+                    if isinstance(reason, str) and reason.strip():
+                        audit_reasons[cast(str, row["instrument_id"])][factor_ref] = (
+                            reason
+                        )
         result_scores: dict[str, float] = {}
+        decisions: list[MultifactorDecision] = []
         for identifier, values in transformed.items():
             if len(values) < self.config.min_valid_factors:
+                decisions.append(
+                    MultifactorDecision(
+                        InstrumentId.parse(identifier),
+                        None,
+                        "INSUFFICIENT_FACTOR_COVERAGE",
+                        audit_reasons[identifier],
+                    )
+                )
                 continue
             category_scores: dict[str, list[float]] = {
                 category: [] for category in _CATEGORY_WEIGHTS
@@ -360,9 +442,26 @@ class MultifactorStrategy:
                     value
                 )
             if any(not values for values in category_scores.values()):
+                decisions.append(
+                    MultifactorDecision(
+                        InstrumentId.parse(identifier),
+                        None,
+                        "INSUFFICIENT_FACTOR_COVERAGE",
+                        audit_reasons[identifier],
+                    )
+                )
                 continue
-            result_scores[identifier] = sum(
+            score = sum(
                 self.config.category_weights[category] * (sum(items) / len(items))
                 for category, items in category_scores.items()
             )
-        return result_scores
+            result_scores[identifier] = score
+            decisions.append(
+                MultifactorDecision(
+                    InstrumentId.parse(identifier),
+                    score,
+                    "MULTIFACTOR_SELECTED",
+                    audit_reasons[identifier],
+                )
+            )
+        return result_scores, tuple(decisions)
