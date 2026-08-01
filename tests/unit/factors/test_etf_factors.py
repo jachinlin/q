@@ -528,8 +528,20 @@ def test_unknown_window_availability_invalidates_signal() -> None:
     assert result["is_valid"].item() is False
 
 
-def test_signal_local_rebase_makes_early_trend_independent_of_later_jump() -> None:
-    """A global forward anchor changes older closes; each signal must rebase locally."""
+@pytest.mark.parametrize(
+    ("make_factor", "factor_id"),
+    [
+        (lambda service: ReturnFactor(service, [_SSE], 20), "return_20d_v1"),
+        (lambda service: ReturnFactor(service, [_SSE], 60), "return_60d_v1"),
+        (lambda service: ReturnFactor(service, [_SSE], 120), "return_120d_v1"),
+        (lambda service: Trend120dFactor(service, [_SSE]), "trend_120d_v1"),
+        (lambda service: Volatility60dFactor(service, [_SSE]), "volatility_60d_v1"),
+    ],
+)
+def test_signal_local_rebase_keeps_all_etf_market_factors_stable_after_future_jump(
+    make_factor: object, factor_id: str
+) -> None:
+    """Every market factor must rebase a global forward series at each signal."""
     closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
     bars = _bars(_SSE, closes)
     signal_day = bars["trade_date"][119]
@@ -539,20 +551,43 @@ def test_signal_local_rebase_makes_early_trend_independent_of_later_jump() -> No
         bars,
         [(bars["trade_date"][120], 0.5, datetime(2024, 4, 30, tzinfo=UTC))],
     )
-    short = (
-        Trend120dFactor(service, [_SSE])
-        .compute(_context(signal_day, signal_day))
-        .collect()
-    )
+    short = make_factor(service).compute(_context(signal_day, signal_day)).collect()  # type: ignore[operator]
     extended = (
+        make_factor(service).compute(_context(signal_day, extended_end)).collect()
+    )  # type: ignore[operator]
+    early = extended.filter(pl.col("trade_date") == signal_day)
+
+    assert short["factor_id"].item() == factor_id
+    assert early["value"].item() == pytest.approx(short["value"].item())
+    assert early["available_at"].item() == short["available_at"].item()
+
+
+def test_trend_signal_local_rebase_rejects_a_global_forward_scale() -> None:
+    """Removing `/ signal_factor` would publish the different global-scale trend."""
+    closes = np.exp(2.0 + 0.003 * np.arange(125)).tolist()
+    bars = _bars(_SSE, closes)
+    signal_day = bars["trade_date"][119]
+    extended_end = bars["trade_date"][124]
+    service = ActionAwarePriceService(
+        bars,
+        [(bars["trade_date"][120], 0.5, datetime(2024, 4, 30, tzinfo=UTC))],
+    )
+
+    actual = (
         Trend120dFactor(service, [_SSE])
         .compute(_context(signal_day, extended_end))
         .collect()
+        .filter(pl.col("trade_date") == signal_day)["value"]
+        .item()
     )
+    x = np.arange(120, dtype=np.float64)
+    global_log_closes = np.log(np.asarray(closes[:120]) * 0.5)
+    global_slope = np.linalg.lstsq(
+        np.column_stack((np.ones(120), x)), global_log_closes, rcond=None
+    )[0][1]
+    global_value = global_slope / np.mean(global_log_closes)
 
-    assert extended.filter(pl.col("trade_date") == signal_day)[
-        "value"
-    ].item() == pytest.approx(short["value"].item())
+    assert actual != pytest.approx(global_value)
 
 
 def test_volatility_uses_log_difference_for_positive_finite_extremes() -> None:
