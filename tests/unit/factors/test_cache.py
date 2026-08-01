@@ -466,6 +466,84 @@ def test_factor_content_hash_ignores_chunk_slice_offset_and_dictionary_encoding(
     )
 
 
+def test_factor_content_hash_matches_legacy_nested_dictionary_bytes() -> None:
+    """A dictionary child beneath a nullable struct remains generic Arrow content."""
+    category = pa.dictionary(pa.int8(), pa.string())
+    nested_type = pa.struct([("category", category), ("weight", pa.float64())])
+    table = pa.table(
+        {
+            "nested": pa.array(
+                [
+                    {"category": "alpha", "weight": 1.0},
+                    None,
+                    {"category": None, "weight": 2.0},
+                ],
+                type=nested_type,
+            )
+        }
+    )
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
+def test_factor_content_hash_ignores_dictionary_values_hidden_by_parent_nulls() -> None:
+    """A hidden child category must not enter the canonical dictionary encoding."""
+    category_type = pa.dictionary(pa.int8(), pa.string())
+    category = pa.array(["hidden", "alpha"], type=category_type)
+    nested = pa.StructArray.from_arrays(
+        [category, pa.array([0.0, 1.0])],
+        fields=[pa.field("category", category_type), pa.field("weight", pa.float64())],
+        mask=pa.array([True, False]),
+    )
+    table = pa.table({"nested": nested})
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
+def test_factor_content_hash_matches_legacy_fixed_list_and_map_bytes() -> None:
+    """Fixed-size lists and maps retain exact pre-optimization IPC semantics."""
+    fixed_type = pa.list_(pa.int32(), 2)
+    map_type = pa.map_(pa.string(), pa.int32())
+    table = pa.table(
+        {
+            "fixed": pa.array([[1, None], None, [2, 3]], type=fixed_type),
+            "mapping": pa.array(
+                [[("a", 1), ("b", None)], None, [("c", 3)]], type=map_type
+            ),
+        }
+    )
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
+def test_factor_content_hash_matches_legacy_recursive_nested_bytes() -> None:
+    """List/struct/dictionary/map combinations recurse without Python rows."""
+    category = pa.dictionary(pa.int8(), pa.string())
+    item = pa.struct(
+        [
+            ("category", category),
+            ("attributes", pa.map_(pa.string(), pa.int32())),
+        ]
+    )
+    table = pa.table(
+        {
+            "nested": pa.array(
+                [
+                    [
+                        {"category": "alpha", "attributes": [("x", 1)]},
+                        None,
+                    ],
+                    None,
+                    [{"category": None, "attributes": [("y", None)]}],
+                ],
+                type=pa.list_(item),
+            )
+        }
+    )
+
+    assert _factor_table_ipc_bytes(table) == _legacy_generic_factor_bytes(table)
+
+
 def _legacy_generic_factor_hash(table: pa.Table) -> str:
     """Reference the pre-performance generic logical Arrow canonicalization."""
     return hashlib.sha256(_legacy_generic_factor_bytes(table)).hexdigest()

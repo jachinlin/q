@@ -12,6 +12,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Protocol, cast
 
+import numpy as np
 import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
@@ -221,6 +222,41 @@ def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
             null_count=array.null_count,
             children=[values],
         )
+    if pa.types.is_fixed_size_list(data_type):
+        values = array.values.slice(
+            array.offset * data_type.list_size, len(array) * data_type.list_size
+        )
+        parent_validity = pa.array(
+            np.repeat(
+                array.is_valid().to_numpy(zero_copy_only=False),
+                data_type.list_size,
+            )
+        )
+        visible_values = pc.if_else(
+            parent_validity, values, pa.scalar(None, type=data_type.value_type)
+        )
+        values = _canonical_null_buffers(
+            visible_values, pa.field("item", data_type.value_type)
+        )
+        return pa.Array.from_buffers(
+            data_type,
+            len(array),
+            [array.buffers()[0]],
+            null_count=array.null_count,
+            children=[values],
+        )
+    if pa.types.is_map(data_type):
+        filled = _filled_nulls(array, data_type)
+        entries = _canonical_null_buffers(
+            filled.values, pa.field("entries", filled.values.type, nullable=False)
+        )
+        return pa.Array.from_buffers(
+            data_type,
+            len(array),
+            [array.buffers()[0], filled.buffers()[1]],
+            null_count=array.null_count,
+            children=[entries],
+        )
     if pa.types.is_struct(data_type):
         filled = _filled_nulls(array, data_type)
         children = [
@@ -247,10 +283,14 @@ def _canonical_null_buffers(array: pa.Array, field: pa.Field) -> pa.Array:
 
 def _filled_nulls(array: pa.Array, data_type: pa.DataType) -> pa.Array:
     """Use one schema-sized scalar to make invisible null payloads deterministic."""
-    return pc.fill_null(array, _null_fill_scalar(data_type))
+    return pc.fill_null(array, _null_fill_scalar(data_type, array))
 
 
-def _null_fill_scalar(data_type: pa.DataType) -> pa.Scalar:
+def _null_fill_scalar(
+    data_type: pa.DataType,
+    array: pa.Array | None = None,
+    parent_validity: pa.Array | None = None,
+) -> pa.Scalar:
     if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
         value: object = ""
     elif pa.types.is_binary(data_type) or pa.types.is_large_binary(data_type):
@@ -273,15 +313,49 @@ def _null_fill_scalar(data_type: pa.DataType) -> pa.Scalar:
         value = time()
     elif pa.types.is_duration(data_type):
         value = timedelta()
+    elif pa.types.is_dictionary(data_type):
+        value = _dictionary_fill_value(array, data_type.value_type, parent_validity)
     elif pa.types.is_list(data_type) or pa.types.is_large_list(data_type):
         value = []
+    elif pa.types.is_fixed_size_list(data_type):
+        value = [
+            _null_fill_scalar(data_type.value_type).as_py()
+            for _ in range(data_type.list_size)
+        ]
+    elif pa.types.is_map(data_type):
+        value = []
     elif pa.types.is_struct(data_type):
+        visible = array.is_valid() if isinstance(array, pa.StructArray) else None
+        if visible is not None and parent_validity is not None:
+            visible = pc.and_(visible, parent_validity)
         value = {
-            child.name: _null_fill_scalar(child.type).as_py() for child in data_type
+            child.name: _null_fill_scalar(
+                child.type,
+                array.field(index) if isinstance(array, pa.StructArray) else None,
+                visible,
+            ).as_py()
+            for index, child in enumerate(data_type)
         }
     else:
         raise TypeError(f"unsupported factor hash dtype: {data_type}")
     return pa.scalar(value, type=data_type)
+
+
+def _dictionary_fill_value(
+    array: pa.Array | None,
+    value_type: pa.DataType,
+    parent_validity: pa.Array | None,
+) -> object:
+    """Reuse an existing dictionary value so hidden struct rows add no category."""
+    if isinstance(array, pa.DictionaryArray):
+        decoded = pc.dictionary_decode(array)
+        if parent_validity is not None:
+            decoded = pc.filter(decoded, parent_validity)
+        visible = pc.drop_null(decoded)
+        if len(visible):
+            return visible[0].as_py()
+        return None
+    return _null_fill_scalar(value_type).as_py()
 
 
 def _owned_read_only_table(table: pa.Table) -> pa.Table:
