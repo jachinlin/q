@@ -643,6 +643,60 @@ def test_publish_allows_null_values_only_when_marked_invalid(tmp_path: Path) -> 
     assert artifact.row_count == 2
 
 
+@pytest.mark.parametrize("invalid_value", [42.0, math.nan])
+def test_publish_rejects_unknown_availability_with_non_null_invalid_value(
+    tmp_path: Path, invalid_value: float
+) -> None:
+    """Unknown availability is legal only for a null invalid observation."""
+    frame = (
+        make_frame(values=(invalid_value, 0.1), validity=(False, True))
+        .with_columns(
+            pl.when(pl.col("trade_date") == date(2025, 1, 3))
+            .then(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
+            .otherwise(pl.col("available_at"))
+            .alias("available_at")
+        )
+        .select(FACTOR_OUTPUT_SCHEMA.names())
+    )
+
+    with pytest.raises(ValueError, match="available_at|null"):
+        publish(FeatureCache(tmp_path), frame)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_invalid_null_with_unknown_availability_round_trips_through_manifest(
+    tmp_path: Path,
+) -> None:
+    """Capability-missing rows remain valid cache content across publish and load."""
+    frame = (
+        make_frame(values=(None, 0.1), validity=(False, True))
+        .with_columns(
+            pl.when(pl.col("trade_date") == date(2025, 1, 3))
+            .then(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
+            .otherwise(pl.col("available_at"))
+            .alias("available_at")
+        )
+        .select(FACTOR_OUTPUT_SCHEMA.names())
+    )
+    cache = FeatureCache(tmp_path)
+
+    artifact = publish(cache, frame)
+    loaded = cache.load(artifact.cache_key)
+
+    assert loaded is not None
+    assert loaded.content_hash == artifact.content_hash
+    assert loaded.lazy_frame().collect().filter(~pl.col("is_valid")).row(0) == (
+        date(2025, 1, 3),
+        "SSE:600001",
+        "momentum",
+        "1.0.0",
+        None,
+        None,
+        False,
+    )
+
+
 def test_load_revalidates_parquet_content_and_fails_closed(tmp_path: Path) -> None:
     """A manifest cannot make damaged Parquet appear to be a cache hit."""
     cache = FeatureCache(tmp_path)

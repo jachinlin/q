@@ -454,6 +454,14 @@ def _validated_frame(
         raise ValueError("valid factor output value must be finite")
     if frame.filter(pl.col("is_valid") & pl.col("available_at").is_null()).height:
         raise ValueError("valid factor output available_at must not be null")
+    if frame.filter(
+        ~pl.col("is_valid")
+        & pl.col("value").is_not_null()
+        & pl.col("available_at").is_null()
+    ).height:
+        raise ValueError(
+            "null available_at is allowed only for a null invalid factor value"
+        )
     return frame.sort(_PRIMARY_KEY, maintain_order=True)
 
 

@@ -166,12 +166,41 @@ def test_single_factor_diagnostics_reject_duplicate_signal_keys(operation: str) 
 
 
 def test_correlation_rejects_duplicate_factor_keys() -> None:
-    factors = _factors([(0, "A", 1.0, True), (0, "A", 2.0, True)]).with_columns(
+    factors = _factors([(0, "A", 1.0, True), (0, "A", 2.0, False)]).with_columns(
         pl.lit("f1").alias("factor_id")
     )
 
     with pytest.raises(ValueError, match="duplicate factor correlation key"):
         factor_correlation_matrix(factors)
+
+
+@pytest.mark.parametrize("operation", ["rank_ic", "quantile_returns"])
+def test_future_return_duplicates_are_rejected_before_null_boundary_filtering(
+    operation: str,
+) -> None:
+    factors = _factors([(0, "A", 1.0, True)])
+    future = pl.DataFrame(
+        {
+            "signal_date": [_day(0), _day(0)],
+            "instrument_id": ["A", "A"],
+            "return_start": [_day(1), None],
+            "return_end": [_day(2), _day(2)],
+            "future_return": [0.1, 0.2],
+        },
+        schema={
+            "signal_date": pl.Date,
+            "instrument_id": pl.String,
+            "return_start": pl.Date,
+            "return_end": pl.Date,
+            "future_return": pl.Float64,
+        },
+    )
+
+    with pytest.raises(ValueError, match="duplicate future returns key"):
+        if operation == "rank_ic":
+            spearman_rank_ic(factors, future)
+        else:
+            quantile_future_returns(factors, future, 2)
 
 
 def test_correlation_diagonal_is_invalid_for_only_single_or_constant_daily_sections() -> (

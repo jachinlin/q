@@ -176,11 +176,11 @@ def factor_correlation_matrix(factors: pl.DataFrame) -> pl.DataFrame:
         {"signal_date", "instrument_id", "factor_id", "value", "is_valid"},
         "factors",
     )
-    valid = _valid_factors(factors)
-    if valid.select(
+    if factors.select(
         pl.struct("signal_date", "instrument_id", "factor_id").is_duplicated().any()
     ).item():
         raise ValueError("duplicate factor correlation key")
+    valid = _valid_factors(factors)
     ids = sorted(set(valid["factor_id"].to_list()))
     rows = []
     for left in ids:
@@ -246,8 +246,8 @@ def _validate_future(frame: pl.DataFrame) -> None:
         {"signal_date", "instrument_id", "return_start", "return_end", "future_return"},
         "future returns",
     )
+    _unique(frame, "future returns")
     bounded = _return_rows_with_boundaries(frame)
-    _unique(bounded, "future returns")
     if bounded.filter(
         (pl.col("return_start") <= pl.col("signal_date"))
         | (pl.col("return_end") < pl.col("return_start"))
