@@ -684,6 +684,8 @@ def test_coordinated_payload_and_manifest_tamper_at_final_rename_fails_closed(
                 encoding="utf-8",
             )
             manifest_path = source_path / "manifest.json"
+            if not manifest_path.exists():
+                manifest_path = next(source_path.parent.glob(".success-marker-*"))
             manifest = _manifest(manifest_path)
             entry = manifest["experiment"]["artifacts"]["report.html"]
             entry["size_bytes"] = report.stat().st_size
@@ -696,6 +698,63 @@ def test_coordinated_payload_and_manifest_tamper_at_final_rename_fails_closed(
     with pytest.raises(ValueError, match="changed|manifest|candidate"):
         _publish(tmp_path, staging)
 
+    assert not (final / "manifest.json").exists()
+
+
+def test_failed_marker_quarantine_cannot_leave_a_public_success_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail-closed publication cannot depend on post-marker cleanup succeeding."""
+    staging = _prepared_bundle(tmp_path)
+    final = tmp_path / "published" / f"experiment_id={_EXPERIMENT}"
+    real_rename = os.rename
+    real_replace = os.replace
+
+    def tamper_at_payload_commit(source: str | Path, target: str | Path) -> None:
+        source_path = Path(source)
+        if Path(target) == final:
+            report = source_path / "report.html"
+            report.write_text(
+                "<!doctype html><html><body>quarantine failure</body></html>",
+                encoding="utf-8",
+            )
+        real_rename(source, target)
+
+    def fail_final_marker_quarantine(source: str | Path, target: str | Path) -> None:
+        if Path(source) == final / "manifest.json":
+            raise OSError("injected marker quarantine failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(artifacts_module.os, "rename", tamper_at_payload_commit)
+    monkeypatch.setattr(artifacts_module.os, "replace", fail_final_marker_quarantine)
+
+    with pytest.raises(ValueError, match="changed|hash|size|candidate"):
+        _publish(tmp_path, staging)
+
+    assert not (final / "manifest.json").exists()
+
+
+def test_final_marker_commit_failure_leaves_only_unmarked_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The success marker is the final no-replace commit and may fail safely."""
+    staging = _prepared_bundle(tmp_path)
+    final = tmp_path / "published" / f"experiment_id={_EXPERIMENT}"
+    real_publish = artifacts_module._atomic_directory_publish_no_replace
+
+    def fail_marker_commit(source: Path, target: Path) -> None:
+        if target == final / "manifest.json":
+            raise OSError("injected final marker commit failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(
+        artifacts_module, "_atomic_directory_publish_no_replace", fail_marker_commit
+    )
+
+    with pytest.raises(OSError, match="injected final marker commit failure"):
+        _publish(tmp_path, staging)
+
+    assert final.is_dir()
     assert not (final / "manifest.json").exists()
 
 
@@ -750,6 +809,43 @@ def test_failed_recovery_never_overwrites_a_recreated_staging_identity(
         for path in candidates
         for manifest in path.rglob("manifest.json")
     )
+
+
+def test_recovery_never_moves_a_replaced_consumed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollback must prove the opaque source is the originally captured staging inode."""
+    staging = _prepared_bundle(tmp_path)
+    final = tmp_path / "published" / f"experiment_id={_EXPERIMENT}"
+    real_publish = artifacts_module._atomic_directory_publish_no_replace
+    replacement: Path | None = None
+
+    def replace_consumed_source(source: Path, target: Path) -> None:
+        nonlocal replacement
+        if target == final:
+            consumed = next(source.parent.glob(".source-*"))
+            displaced = source.parent / ".displaced-original-source"
+            real_publish(consumed, displaced)
+            consumed.mkdir()
+            (consumed / "attacker.txt").write_text("replacement", encoding="utf-8")
+            replacement = consumed
+            raise OSError("injected consumed-source replacement")
+        real_publish(source, target)
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_atomic_directory_publish_no_replace",
+        replace_consumed_source,
+    )
+
+    with pytest.raises(OSError, match="injected consumed-source replacement"):
+        _publish(tmp_path, staging)
+
+    assert replacement is not None
+    assert replacement.joinpath("attacker.txt").read_text(encoding="utf-8") == (
+        "replacement"
+    )
+    assert not staging.exists()
 
 
 def test_concurrent_double_publish_has_exactly_one_winner(tmp_path: Path) -> None:
@@ -927,7 +1023,15 @@ def test_source_file_swap_between_lstat_and_open_is_rejected(
         _publish(tmp_path, staging)
 
 
-@pytest.mark.parametrize(("phase", "exit_code"), [("before", 73), ("after", 74)])
+@pytest.mark.parametrize(
+    ("phase", "exit_code"),
+    [
+        ("before-payload", 73),
+        ("after-payload", 74),
+        ("tamper-after-payload", 75),
+        ("after-marker", 76),
+    ],
+)
 def test_process_crash_at_final_commit_boundary_is_fail_closed(
     tmp_path: Path, phase: str, exit_code: int
 ) -> None:
@@ -952,11 +1056,39 @@ final = artifact_root / f"experiment_id={experiment_id}"
 real_publish = artifacts._atomic_directory_publish_no_replace
 
 def crash(source: Path, target: Path) -> None:
-    if target == final and phase == "before":
+    if target == final and phase == "before-payload":
         os._exit(73)
+    if target == final and phase == "tamper-after-payload":
+        report = source / "report.html"
+        report.write_text(
+            "<!doctype html><html><body>tamper then crash</body></html>",
+            encoding="utf-8",
+        )
+        manifest_path = source / "manifest.json"
+        if not manifest_path.exists():
+            manifest_path = next(source.parent.glob(".success-marker-*"))
+        manifest = json.loads(manifest_path.read_bytes())
+        entry = manifest["experiment"]["artifacts"]["report.html"]
+        payload = report.read_bytes()
+        import hashlib
+        entry["size_bytes"] = len(payload)
+        entry["sha256"] = hashlib.sha256(payload).hexdigest()
+        manifest_path.write_bytes(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
     real_publish(source, target)
-    if target == final and phase == "after":
+    if target == final and phase == "after-payload":
         os._exit(74)
+    if target == final and phase == "tamper-after-payload":
+        os._exit(75)
+    if target == final / "manifest.json" and phase == "after-marker":
+        os._exit(76)
 
 artifacts._atomic_directory_publish_no_replace = crash
 artifacts.publish_experiment_artifacts(
@@ -990,12 +1122,15 @@ artifacts.publish_experiment_artifacts(
     assert candidates
     assert all(str(_EXPERIMENT) not in part.name for part in candidates)
 
-    if phase == "before":
+    if phase == "before-payload":
         assert not final.exists()
         for manifest in artifact_root.rglob("manifest.json"):
             with pytest.raises(ValueError, match="identity|published"):
                 validate_experiment_artifacts(
                     manifest.parent, resolved_config=_CONFIG
                 )
+    elif phase in {"after-payload", "tamper-after-payload"}:
+        assert final.is_dir()
+        assert not (final / "manifest.json").exists()
     else:
         validate_experiment_artifacts(final, resolved_config=_CONFIG)

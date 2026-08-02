@@ -684,10 +684,11 @@ def publish_experiment_artifacts(
     )
     candidate_dir = candidate_parent / f".bundle-{uuid4().hex}"
     consumed_staging = candidate_parent / f".source-{uuid4().hex}"
+    success_marker = candidate_parent / f".success-marker-{uuid4().hex}"
     candidate_dir.mkdir()
     candidate_identity = _require_plain_directory(candidate_dir, "candidate_dir")
     staging_consumed = False
-    final_committed = False
+    payload_committed = False
     try:
         _copy_bundle_no_follow(staging_dir, candidate_dir)
         _write_atomic_bytes(candidate_dir / "manifest.json", final_manifest_bytes)
@@ -717,29 +718,52 @@ def publish_experiment_artifacts(
             _validate_experiment_file_set(staging_dir, marker_present=True)
             _atomic_directory_publish_no_replace(staging_dir, consumed_staging)
             staging_consumed = True
+            _atomic_directory_publish_no_replace(
+                candidate_dir / "manifest.json", success_marker
+            )
+            marker_identity = _require_plain_file(success_marker, "success marker")
+            marker_manifest = _read_expected_manifest(
+                success_marker, final_manifest_bytes
+            )
+            _validate_private_payload(
+                candidate_dir,
+                marker_manifest,
+                experiment_id,
+                resolved_config,
+                expected_entries=entries,
+            )
             _atomic_directory_publish_no_replace(candidate_dir, final_dir)
-            final_committed = True
-            try:
-                _validate_private_candidate(
-                    final_dir,
-                    experiment_id,
-                    resolved_config,
-                    final_manifest_bytes,
-                    expected_entries=entries,
-                )
-            except BaseException:
-                _quarantine_manifest(final_dir)
-                raise
+            payload_committed = True
+            _require_same_file(success_marker, marker_identity, "success marker")
+            marker_manifest = _read_expected_manifest(
+                success_marker, final_manifest_bytes
+            )
+            _validate_private_payload(
+                final_dir,
+                marker_manifest,
+                experiment_id,
+                resolved_config,
+                expected_entries=entries,
+            )
+            _require_same_file(success_marker, marker_identity, "success marker")
+            if success_marker.read_bytes() != final_manifest_bytes:
+                raise ValueError("success marker changed before publication")
+            _atomic_directory_publish_no_replace(
+                success_marker, final_dir / "manifest.json"
+            )
     except BaseException as error:
-        if not final_committed and staging_consumed:
+        if not payload_committed and staging_consumed:
             try:
+                _require_same_directory(
+                    consumed_staging, staging_identity, "consumed staging"
+                )
                 if _path_lexists(staging_dir):
                     raise FileExistsError("staging path was recreated during recovery")
                 _atomic_directory_publish_no_replace(consumed_staging, staging_dir)
                 staging_consumed = False
             except BaseException as restore_error:  # noqa: BLE001
                 error.add_note(f"failed to restore experiment staging: {restore_error}")
-        if final_committed or staging_consumed:
+        if payload_committed or staging_consumed:
             _quarantine_manifest(candidate_dir, error)
             _quarantine_manifest(consumed_staging, error)
             _write_quarantine_diagnostic(candidate_parent, error)
@@ -782,6 +806,39 @@ def _validate_private_candidate(
     if expected_entries is not None and entries != expected_entries:
         raise ValueError("candidate artifacts changed before publication")
     return entries
+
+
+def _read_expected_manifest(
+    marker_path: Path, expected_manifest_bytes: bytes
+) -> dict[str, Any]:
+    raw, manifest = _read_experiment_manifest(marker_path)
+    if raw != expected_manifest_bytes:
+        raise ValueError("success marker changed before publication")
+    if raw != canonical_json_bytes(cast(JsonValue, manifest)):
+        raise ValueError("success marker must be canonical UTF-8 JSON")
+    return manifest
+
+
+def _validate_private_payload(
+    payload_dir: Path,
+    manifest: dict[str, Any],
+    experiment_id: UUID,
+    resolved_config: Mapping[str, JsonValue],
+    *,
+    expected_entries: dict[str, ExperimentArtifactEntry],
+) -> None:
+    """Validate payload bytes while no public success marker exists."""
+    _require_plain_directory(payload_dir, "payload_dir")
+    entries = _validate_experiment_bundle(
+        payload_dir,
+        manifest,
+        resolved_config,
+        marker_present=False,
+        require_experiment_index=True,
+        expected_experiment_id=experiment_id,
+    )
+    if entries != expected_entries:
+        raise ValueError("candidate artifacts changed before marker publication")
 
 
 def _copy_bundle_no_follow(source: Path, target: Path) -> None:
@@ -882,12 +939,17 @@ def _require_same_directory(
         raise ValueError(f"{label} directory identity changed")
 
 
+def _require_same_file(path: Path, expected: _PathIdentity, label: str) -> None:
+    if _require_plain_file(path, label) != expected:
+        raise ValueError(f"{label} identity changed")
+
+
 def _path_lexists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
 def _atomic_directory_publish_no_replace(source: Path, target: Path) -> None:
-    """Atomically rename a directory while refusing every existing target."""
+    """Atomically rename one filesystem object while refusing an existing target."""
     if _path_lexists(target):
         raise FileExistsError(f"publish target already exists: {target}")
     if os.name == "nt":

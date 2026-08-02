@@ -113,15 +113,7 @@ class SourceTreeSpec:
         for value in self.include:
             if not isinstance(value, str):
                 raise TypeError("source tree include entries must be strings")
-            path = PurePosixPath(value)
-            if (
-                not value
-                or path.is_absolute()
-                or ".." in path.parts
-                or not path.parts
-                or path.as_posix() != value
-            ):
-                raise ValueError("source tree include contains an unsafe path")
+            _portable_source_path(value, "source tree include")
             normalized.append(value)
         if tuple(sorted(set(normalized))) != self.include:
             raise ValueError("source tree include must be sorted and unique")
@@ -273,8 +265,10 @@ def _run_git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
             check=False,
             capture_output=True,
         )
-    except OSError as error:
+    except FileNotFoundError as error:
         raise _GitUnavailable("Git executable is unavailable") from error
+    except OSError as error:
+        raise ValueError("Git command could not start") from error
 
 
 def _git_output(root: Path, *arguments: str) -> bytes:
@@ -288,13 +282,12 @@ def _hash_tree(root: Path, raw_paths: Sequence[bytes]) -> str:
     digest = hashlib.sha256(_TREE_HASH_DOMAIN)
     for raw_path in sorted(raw_paths):
         try:
-            posix = PurePosixPath(raw_path.decode("utf-8"))
+            decoded = raw_path.decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValueError("source tree paths must be UTF-8") from error
-        if posix.is_absolute() or ".." in posix.parts or not posix.parts:
-            raise ValueError("source tree contains an unsafe path")
+        posix = _portable_source_path(decoded, "source tree")
         relative = Path(*posix.parts)
-        path = root / relative
+        path = _join_source_path(root, relative)
         _hash_piece(digest, b"path", posix.as_posix().encode("utf-8"))
         status = _safe_source_lstat(root, relative)
         if status is None:
@@ -304,6 +297,34 @@ def _hash_tree(root: Path, raw_paths: Sequence[bytes]) -> str:
         else:
             raise ValueError("source tree contains an unsupported tracked path")
     return digest.hexdigest()
+
+
+def _portable_source_path(value: str, label: str) -> PurePosixPath:
+    """Parse one portable, slash-only, relative source path without normalization."""
+    segments = value.split("/")
+    if (
+        not value
+        or "\\" in value
+        or ":" in value
+        or value.startswith("/")
+        or any(segment in {"", ".", ".."} for segment in segments)
+    ):
+        raise ValueError(f"{label} contains an unsafe path")
+    path = PurePosixPath(*segments)
+    if path.is_absolute() or path.as_posix() != value:
+        raise ValueError(f"{label} contains an unsafe path")
+    return path
+
+
+def _join_source_path(root: Path, relative: Path) -> Path:
+    candidate = root.joinpath(*relative.parts)
+    try:
+        common = Path(os.path.commonpath((root, candidate)))
+    except ValueError as error:
+        raise ValueError("source tree path is outside source root") from error
+    if common != root:
+        raise ValueError("source tree path is outside source root")
+    return candidate
 
 
 def _source_identity_hash(

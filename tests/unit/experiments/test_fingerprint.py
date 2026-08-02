@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -300,6 +301,41 @@ def test_missing_git_executable_falls_back_to_explicit_source_root(
     assert _SHA256.fullmatch(identity.source_hash)
 
 
+@pytest.mark.parametrize(
+    "spawn_error",
+    [
+        PermissionError("Git executable permission denied"),
+        OSError(errno.EIO, "Git spawn I/O failure"),
+    ],
+    ids=("permission", "io-failure"),
+)
+def test_non_missing_git_spawn_failures_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spawn_error: OSError,
+) -> None:
+    """Only a definitely missing executable may enter source-tree fallback."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "strategy.py").write_bytes(b"SIGNAL = 1\n")
+
+    def failed_spawn(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        del args, kwargs
+        raise spawn_error
+
+    monkeypatch.setattr(fingerprint_module.subprocess, "run", failed_spawn)
+
+    with pytest.raises(ValueError, match="Git.*start|Git.*execute"):
+        resolve_source_identity(
+            root,
+            source_tree_spec=SourceTreeSpec(
+                schema_version=1, include=("strategy.py",)
+            ),
+        )
+
+
 def test_unborn_git_repository_falls_back_to_explicit_source_tree(
     tmp_path: Path,
 ) -> None:
@@ -361,6 +397,44 @@ def test_no_git_source_identity_requires_a_versioned_explicit_include_spec(
 
     with pytest.raises(ValueError, match="schema_version"):
         SourceTreeSpec(schema_version=2, include=("strategy.py",))
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        r"..\secret.py",
+        r"C:\source.py",
+        "C:/source.py",
+        r"\\server\share\source.py",
+        r"package\..\secret.py",
+        r"package\nested/source.py",
+    ],
+    ids=(
+        "backslash-traversal",
+        "windows-drive-backslash",
+        "windows-drive-forward",
+        "unc",
+        "mixed-traversal",
+        "mixed-separators",
+    ),
+)
+def test_source_tree_spec_rejects_cross_platform_unsafe_paths(
+    unsafe_path: str,
+) -> None:
+    """One portable include grammar must reject Windows escape spellings."""
+    with pytest.raises(ValueError, match="unsafe path"):
+        SourceTreeSpec(schema_version=1, include=(unsafe_path,))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native path semantics test")
+def test_tree_hash_join_rejects_backslash_escape_after_parsing(tmp_path: Path) -> None:
+    """Hashing must recheck native containment even if an unsafe path bypasses config."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (tmp_path / "secret.py").write_bytes(b"SECRET = True\n")
+
+    with pytest.raises(ValueError, match="unsafe path|outside source root"):
+        fingerprint_module._hash_tree(root, (b"..\\secret.py",))
 
 
 def test_explicit_source_spec_excludes_runtime_artifacts_and_binds_source_changes(
