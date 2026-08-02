@@ -23,12 +23,12 @@ from quant_core.strategies.base import (
 )
 
 _RETURN_REFS = (
-    "return_20d_v1@1.0.0",
-    "return_60d_v1@1.0.0",
-    "return_120d_v1@1.0.0",
+    "return_20d_v1@2.1.0",
+    "return_60d_v1@2.1.0",
+    "return_120d_v1@2.1.0",
 )
-_DEFAULT_TREND = "trend_120d_v1@1.0.0"
-_DEFAULT_VOLATILITY = "volatility_60d_v1@1.0.0"
+_DEFAULT_TREND = "trend_120d_v1@2.1.0"
+_DEFAULT_VOLATILITY = "volatility_60d_v1@2.1.0"
 _EPSILON = 1e-10
 
 

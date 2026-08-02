@@ -277,13 +277,8 @@ def require_provider_capabilities(
 def _load_yaml_mapping(path: Path, config_root: Path) -> dict[str, object]:
     if not isinstance(path, Path) or not isinstance(config_root, Path):
         raise TypeError("path and config_root must be Paths")
-    source = _plain_config_file(path, config_root)
-    try:
-        raw = source.read_bytes()
-    except OSError as error:
-        raise ExperimentConfigError("experiment YAML cannot be read") from error
-    if len(raw) > _MAX_YAML_BYTES:
-        raise ExperimentConfigError("experiment YAML exceeds the size limit")
+    source, identities = _plain_config_file(path, config_root)
+    raw = _read_config_handle(source, identities)
     try:
         text = raw.decode("utf-8")
         loaded = yaml.safe_load(text)
@@ -296,7 +291,12 @@ def _load_yaml_mapping(path: Path, config_root: Path) -> dict[str, object]:
     return cast(dict[str, object], loaded)
 
 
-def _plain_config_file(path: Path, config_root: Path) -> Path:
+type _PathIdentity = tuple[int, int, int, int, int, int]
+
+
+def _plain_config_file(
+    path: Path, config_root: Path
+) -> tuple[Path, tuple[tuple[Path, _PathIdentity], ...]]:
     root = config_root.absolute()
     candidate = path.absolute()
     try:
@@ -305,7 +305,15 @@ def _plain_config_file(path: Path, config_root: Path) -> Path:
         raise ExperimentConfigError("experiment YAML must be inside config_root") from error
     if not relative.parts:
         raise ExperimentConfigError("experiment YAML must name a file")
-    for component in (root, *(root / Path(*relative.parts[:index]) for index in range(1, len(relative.parts) + 1))):
+    components = (
+        root,
+        *(
+            root / Path(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ),
+    )
+    identities: list[tuple[Path, _PathIdentity]] = []
+    for component in components:
         try:
             observed = component.stat(follow_symlinks=False)
         except OSError as error:
@@ -314,12 +322,74 @@ def _plain_config_file(path: Path, config_root: Path) -> Path:
             raise ExperimentConfigError(
                 "experiment YAML path contains a link or reparse point"
             )
+        identities.append((component, _path_identity(observed)))
     if not stat.S_ISDIR(root.stat(follow_symlinks=False).st_mode):
         raise ExperimentConfigError("config_root must be a directory")
     final_status = candidate.stat(follow_symlinks=False)
     if not stat.S_ISREG(final_status.st_mode):
         raise ExperimentConfigError("experiment YAML must be a regular file")
-    return candidate
+    return candidate, tuple(identities)
+
+
+def _read_config_handle(
+    source: Path, identities: tuple[tuple[Path, _PathIdentity], ...]
+) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        raise ExperimentConfigError("experiment YAML cannot be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ExperimentConfigError("experiment YAML must be a regular file")
+        if _path_identity(opened) != identities[-1][1]:
+            raise ExperimentConfigError("experiment YAML changed before safe open")
+        if opened.st_size > _MAX_YAML_BYTES:
+            raise ExperimentConfigError("experiment YAML exceeds the size limit")
+        payload = bytearray()
+        while len(payload) <= _MAX_YAML_BYTES:
+            remaining = _MAX_YAML_BYTES + 1 - len(payload)
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ExperimentConfigError("experiment YAML cannot be read") from error
+    finally:
+        os.close(descriptor)
+    if _path_identity(after) != _path_identity(opened):
+        raise ExperimentConfigError("experiment YAML changed while being read")
+    if len(payload) > _MAX_YAML_BYTES:
+        raise ExperimentConfigError("experiment YAML exceeds the size limit")
+    _verify_config_identities(identities)
+    return bytes(payload)
+
+
+def _verify_config_identities(
+    identities: tuple[tuple[Path, _PathIdentity], ...]
+) -> None:
+    for component, expected in identities:
+        try:
+            observed = component.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ExperimentConfigError("experiment YAML path changed while reading") from error
+        if component.is_symlink() or _is_reparse(observed):
+            raise ExperimentConfigError("experiment YAML path changed while reading")
+        if _path_identity(observed) != expected:
+            raise ExperimentConfigError("experiment YAML path changed while reading")
+
+
+def _path_identity(value: os.stat_result) -> _PathIdentity:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        int(getattr(value, "st_file_attributes", 0)),
+    )
 
 
 def _resolve_snapshot(

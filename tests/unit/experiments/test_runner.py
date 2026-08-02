@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import threading
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
+import quant_core.experiments.config as experiment_config_module
 from quant_core.backtest.accounting import AccountSnapshot
 from quant_core.backtest.artifacts import (
     FACTOR_METRICS_SCHEMA,
@@ -297,6 +300,129 @@ def test_rejects_symlink_or_reparse_config_path(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction capability test")
+def test_rejects_windows_junction_in_config_path(tmp_path: Path) -> None:
+    config_root = tmp_path / "configs"
+    config_root.mkdir()
+    target = tmp_path / "junction-target"
+    path = _write_config(target, _minimal_yaml())
+    junction = config_root / "linked"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(
+            "directory junctions are unavailable: "
+            + (completed.stderr or completed.stdout).strip()
+        )
+
+    with pytest.raises(ExperimentConfigError, match="link or reparse"):
+        resolve_experiment_yaml(
+            junction / path.name,
+            config_root=config_root,
+            catalog=_catalog(tmp_path),
+            strategies={_STOCK_REF: object()},
+            rulebook=_rulebook(),
+        )
+
+
+def test_oversized_yaml_is_rejected_before_path_read_materializes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_root = tmp_path / "configs"
+    path = config_root / "oversized.yaml"
+    config_root.mkdir()
+    with path.open("wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    original = Path.read_bytes
+    materialized: list[int] = []
+
+    def observed_read(candidate: Path) -> bytes:
+        payload = original(candidate)
+        materialized.append(len(payload))
+        return payload
+
+    monkeypatch.setattr(Path, "read_bytes", observed_read)
+
+    with pytest.raises(ExperimentConfigError, match="size limit"):
+        resolve_experiment_yaml(
+            path,
+            config_root=config_root,
+            catalog=_catalog(tmp_path),
+            strategies={_STOCK_REF: object()},
+            rulebook=_rulebook(),
+        )
+
+    assert materialized == []
+
+
+def test_yaml_replacement_between_validation_and_handle_read_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_root = tmp_path / "configs"
+    path = _write_config(config_root, _minimal_yaml())
+    replacement = config_root / "replacement.yaml"
+    replacement.write_text(
+        _minimal_yaml().replace("100000000", "200000000") + "\n",
+        encoding="utf-8",
+    )
+    barrier = threading.Barrier(2)
+    replacement_done = threading.Event()
+    replacement_errors: list[OSError] = []
+    original_path_read = Path.read_bytes
+    original_open = os.open
+
+    def replace_at_barrier() -> None:
+        barrier.wait(timeout=5)
+        try:
+            os.replace(replacement, path)
+        except OSError as error:
+            replacement_errors.append(error)
+        finally:
+            replacement_done.set()
+
+    replacing = threading.Thread(target=replace_at_barrier)
+    replacing.start()
+
+    def raced_path_read(candidate: Path) -> bytes:
+        if candidate == path:
+            barrier.wait(timeout=5)
+            assert replacement_done.wait(timeout=5)
+        return original_path_read(candidate)
+
+    def raced_open(candidate: object, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = original_open(candidate, flags, *args, **kwargs)
+        if Path(candidate) == path:
+            barrier.wait(timeout=5)
+            assert replacement_done.wait(timeout=5)
+        return descriptor
+
+    monkeypatch.setattr(Path, "read_bytes", raced_path_read)
+    monkeypatch.setattr(experiment_config_module.os, "open", raced_open)
+    try:
+        try:
+            resolved = resolve_experiment_yaml(
+                path,
+                config_root=config_root,
+                catalog=_catalog(tmp_path),
+                strategies={_STOCK_REF: object()},
+                rulebook=_rulebook(),
+            )
+        except ExperimentConfigError as error:
+            assert "changed" in str(error) or "safely" in str(error)
+        else:
+            assert resolved.mapping["initial_cash_fen"] == 100000000
+    finally:
+        replacing.join(timeout=5)
+    assert not replacing.is_alive()
+    assert not replacement_errors or all(
+        isinstance(error, PermissionError) for error in replacement_errors
+    )
+
+
 @pytest.mark.parametrize(
     ("body", "match"),
     [
@@ -548,9 +674,11 @@ class _Finalizer:
         events: list[str],
         *,
         fail: bool = False,
+        after_finalize: Any = None,
     ) -> None:
         self.events = events
         self.fail = fail
+        self.after_finalize = after_finalize
 
     def finalize(
         self,
@@ -562,6 +690,8 @@ class _Finalizer:
         self.events.append(ExperimentStage.ARTIFACT_VERIFY.value)
         if self.fail:
             raise ValueError("artifact validation failed")
+        if self.after_finalize is not None:
+            self.after_finalize()
         return ExperimentArtifactPublication(
             backtest.artifact_dir,
             backtest.manifest_path,
@@ -740,6 +870,96 @@ def test_cancellation_at_artifact_boundary_prevents_publish_and_register(
     ]
     assert registry.metrics is None
     assert query.record.status is ExperimentStatus.RUNNING
+
+
+def test_cancellation_after_publication_begins_cannot_preempt_registration(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    query = _Query(_record())
+    registry = _Registry(query, events)
+    runtime = _Runtime(events, tmp_path / ".raw" / f"experiment_id={_RUN_ID}")
+    cancelled = [False]
+
+    def analytics(path: Path) -> None:
+        events.append(ExperimentStage.ANALYTICS.value)
+        path.joinpath("metrics.json").write_text('{"alpha":1.5}', encoding="utf-8")
+
+    runner = ExperimentRunner(
+        query=query,
+        registry=registry,
+        runtime_factory=lambda experiment: runtime,
+        analytics_materializer=analytics,
+        artifact_finalizer=_Finalizer(
+            events,
+            after_finalize=lambda: cancelled.__setitem__(0, True),
+        ),
+    )
+
+    result = runner.run(
+        _RUN_ID,
+        _Progress(),
+        type("Cancellation", (), {"is_cancelled": lambda self: cancelled[0]})(),
+    )
+
+    assert result.publication.artifact_dir.name == f"experiment_id={_RUN_ID}"
+    assert query.record.status is ExperimentStatus.SUCCEEDED
+    assert events[-1] == ExperimentStage.REGISTER.value
+
+
+class _RecoveringFinalizer:
+    def __init__(self, publication: ExperimentArtifactPublication) -> None:
+        self.publication = publication
+        self.recover_calls = 0
+        self.finalize_calls = 0
+
+    def recover(self, experiment: ExperimentRecord) -> ExperimentArtifactPublication:
+        assert experiment.id == _RUN_ID
+        self.recover_calls += 1
+        return self.publication
+
+    def finalize(self, *args: object) -> ExperimentArtifactPublication:
+        del args
+        self.finalize_calls += 1
+        raise AssertionError("recovery must not recompute or finalize")
+
+
+def test_restart_recovers_published_running_experiment_before_cancellation(
+    tmp_path: Path,
+) -> None:
+    published = tmp_path / "published" / f"experiment_id={_RUN_ID}"
+    published.mkdir(parents=True)
+    (published / "metrics.json").write_text('{"alpha":1.5}', encoding="utf-8")
+    publication = ExperimentArtifactPublication(
+        published,
+        published / "manifest.json",
+        {},
+        {"experiment_id": _RUN_ID},
+    )
+    finalizer = _RecoveringFinalizer(publication)
+    events: list[str] = []
+    query = _Query(_record())
+    registry = _Registry(query, events)
+    runner = ExperimentRunner(
+        query=query,
+        registry=registry,
+        runtime_factory=lambda experiment: (_ for _ in ()).throw(
+            AssertionError("recovery must not rebuild runtime")
+        ),
+        analytics_materializer=lambda path: None,
+        artifact_finalizer=finalizer,
+    )
+
+    result = runner.run(
+        _RUN_ID,
+        _Progress(),
+        type("Cancellation", (), {"is_cancelled": lambda self: True})(),
+    )
+
+    assert result.publication == publication
+    assert finalizer.recover_calls == 1
+    assert finalizer.finalize_calls == 0
+    assert query.record.status is ExperimentStatus.SUCCEEDED
 
 
 def _task() -> ClaimedTask:

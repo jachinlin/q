@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
 import math
@@ -34,6 +33,7 @@ from quant_core.domain.enums import Severity
 from quant_core.errors import ErrorDetail, QuantError
 from quant_core.experiments.models import ExperimentRecord, ExperimentStatus
 from quant_core.experiments.query import ExperimentDetail
+from quant_core.experiments.verification import validate_registered_publication
 from quant_core.factors.base import (
     FactorArtifact,
     canonical_factor_ref,
@@ -261,6 +261,21 @@ class ExperimentArtifactFinalizer:
         self._environment_bytes = environment_bytes
         self._publisher = publisher
 
+    def recover(
+        self, experiment: ExperimentRecord
+    ) -> ExperimentArtifactPublication | None:
+        """Return a fully validated publication left after a pre-register crash."""
+        if not isinstance(experiment, ExperimentRecord):
+            raise TypeError("experiment must be an ExperimentRecord")
+        final_dir = self._artifact_root / f"experiment_id={experiment.id}"
+        if not os.path.lexists(final_dir):
+            return None
+        _validate_environment_identity(experiment, self._environment)
+        return validate_experiment_artifacts(
+            final_dir,
+            resolved_config=experiment.config,
+        )
+
     def finalize(
         self,
         experiment: ExperimentRecord,
@@ -381,6 +396,18 @@ class ExperimentRunner:
         if experiment.status is not ExperimentStatus.RUNNING:
             raise ValueError("experiment runner requires RUNNING status")
 
+        recovered = self._recover_publication(experiment)
+        if recovered is not None:
+            self._execute(
+                ExperimentStage.REGISTER,
+                6,
+                progress,
+                cancellation,
+                lambda: self._register_publication(experiment, recovered),
+                check_cancellation=False,
+            )
+            return ExperimentRunResult(recovered)
+
         runtime = cast(
             PreparedExperimentRuntime,
             self._execute(
@@ -444,62 +471,19 @@ class ExperimentRunner:
             ),
         )
 
-        def register() -> None:
-            self._registry.register_success(
-                experiment.id,
-                publication,
-                _finite_metrics(publication.artifact_dir / "metrics.json"),
-            )
-            if (
-                self._query.get(experiment.id).record.status
-                is not ExperimentStatus.SUCCEEDED
-            ):
-                raise _register_incomplete()
-
         self._execute(
             ExperimentStage.REGISTER,
             6,
             progress,
             cancellation,
-            register,
+            lambda: self._register_publication(experiment, publication),
+            check_cancellation=False,
         )
         return ExperimentRunResult(publication)
 
     def verify_success(self, experiment_id: str) -> ExperimentArtifactPublication:
         detail = self._query.get(experiment_id)
-        if detail.record.status is not ExperimentStatus.SUCCEEDED:
-            raise ValueError("only SUCCEEDED experiments can use recovery verification")
-        registered = {artifact.name: artifact for artifact in detail.artifacts}
-        manifest = registered.get("manifest.json")
-        if manifest is None:
-            raise ValueError("SUCCEEDED experiment has no registered manifest")
-        manifest_path = Path(manifest.path)
-        publication = validate_experiment_artifacts(
-            manifest_path.parent,
-            resolved_config=detail.record.config,
-        )
-        expected_names = {*publication.entries, "manifest.json"}
-        if set(registered) != expected_names:
-            raise ValueError("registered artifact names do not match publication")
-        for name, entry in publication.entries.items():
-            persisted = registered[name]
-            expected_path = (publication.artifact_dir / entry.path).resolve()
-            if (
-                Path(persisted.path).resolve() != expected_path
-                or persisted.content_hash != entry.sha256
-            ):
-                raise ValueError(
-                    "registered artifact path or hash does not match publication"
-                )
-        manifest_bytes = publication.manifest_path.read_bytes()
-        if (
-            Path(manifest.path).resolve() != publication.manifest_path.resolve()
-            or manifest.content_hash != hashlib.sha256(manifest_bytes).hexdigest()
-        ):
-            raise ValueError(
-                "registered manifest path or hash does not match publication"
-            )
-        return publication
+        return validate_registered_publication(detail)
 
     def _validated_runtime(
         self, experiment: ExperimentRecord
@@ -511,6 +495,41 @@ class ExperimentRunner:
         runtime.validate()
         return runtime
 
+    def _recover_publication(
+        self, experiment: ExperimentRecord
+    ) -> ExperimentArtifactPublication | None:
+        recover = getattr(self._finalizer, "recover", None)
+        if not callable(recover):
+            return None
+        try:
+            recovered = recover(experiment)
+        except Exception as error:
+            raise ExperimentStageFailure(ExperimentStage.ARTIFACT_VERIFY, error) from error
+        if recovered is not None and not isinstance(
+            recovered, ExperimentArtifactPublication
+        ):
+            raise ExperimentStageFailure(
+                ExperimentStage.ARTIFACT_VERIFY,
+                TypeError("artifact recovery returned an invalid publication"),
+            )
+        return recovered
+
+    def _register_publication(
+        self,
+        experiment: ExperimentRecord,
+        publication: ExperimentArtifactPublication,
+    ) -> None:
+        self._registry.register_success(
+            experiment.id,
+            publication,
+            _finite_metrics(publication.artifact_dir / "metrics.json"),
+        )
+        if (
+            self._query.get(experiment.id).record.status
+            is not ExperimentStatus.SUCCEEDED
+        ):
+            raise _register_incomplete()
+
     @staticmethod
     def _execute(
         stage: ExperimentStage,
@@ -518,8 +537,10 @@ class ExperimentRunner:
         progress: TaskProgressSink,
         cancellation: CancellationToken,
         operation: Callable[[], object],
+        *,
+        check_cancellation: bool = True,
     ) -> object:
-        if cancellation.is_cancelled():
+        if check_cancellation and cancellation.is_cancelled():
             raise ExperimentRunCancelled(stage)
         progress.update(
             TaskProgress(

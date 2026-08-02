@@ -18,10 +18,6 @@ from typing import Protocol, cast
 import polars as pl
 from sqlalchemy import Engine
 
-from quant_core.backtest.artifacts import (
-    ExperimentArtifactPublication,
-    validate_experiment_artifacts,
-)
 from quant_core.backtest.engine import StrategyRef
 from quant_core.backtest.rulebook import AShareRuleBook, MarketRuleBook
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
@@ -43,6 +39,7 @@ from quant_core.experiments.models import (
 )
 from quant_core.experiments.query import ExperimentDetail, ExperimentQuery
 from quant_core.experiments.registry import ExperimentRegistry
+from quant_core.experiments.verification import validate_registered_publication
 from quant_core.persistence.database import create_sqlite_engine, upgrade_database
 from quant_core.persistence.repositories import MetadataRepository
 from quant_core.settings import Settings
@@ -93,8 +90,8 @@ class _TaskQueue(Protocol):
 class ExperimentResult:
     """A deeply verified successful experiment publication."""
 
-    _detail: ExperimentDetail
-    _publication: ExperimentArtifactPublication
+    _query: _ExperimentQuery
+    _experiment_id: str
 
     def metrics(self) -> dict[str, JsonValue]:
         """Read the registered metrics payload for this experiment only."""
@@ -117,8 +114,11 @@ class ExperimentResult:
             raise ValueError("registered nav.parquet cannot be read") from error
 
     def _registered_bytes(self, name: str) -> bytes:
-        publication = validate_registered_publication(self._detail)
-        registered = {artifact.name: artifact for artifact in self._detail.artifacts}
+        detail = self._query.get(self._experiment_id)
+        if detail.record.status is not ExperimentStatus.SUCCEEDED:
+            raise ValueError("experiment result requires SUCCEEDED status")
+        publication = validate_registered_publication(detail)
+        registered = {artifact.name: artifact for artifact in detail.artifacts}
         artifact = registered.get(name)
         entry = publication.entries.get(name)
         if artifact is None or entry is None:
@@ -172,6 +172,8 @@ class ExperimentClient:
     @classmethod
     def from_default_settings(cls) -> ExperimentClient:
         """Build local SDK services without constructing a worker or provider."""
+        from quant_core.experiments.runtime import strategy_factories
+
         source_root = Path(__file__).resolve().parents[3]
         data_root_text = os.environ.get("QUANT_DATA_ROOT")
         if not data_root_text:
@@ -204,10 +206,7 @@ class ExperimentClient:
             queue=TaskQueue(engine),
             config_root=config_root,
             catalog=repository,
-            strategies={
-                StrategyRef("stock_multifactor", "1.0.0"): object(),
-                StrategyRef("etf_rotation", "1.0.0"): object(),
-            },
+            strategies=strategy_factories(),
             rulebook=rulebook,
             environment_factory=lambda: capture_environment(
                 source_root, source_root / "uv.lock"
@@ -333,44 +332,8 @@ class ExperimentClient:
         detail = self._query.get(experiment_id)
         if detail.record.status is not ExperimentStatus.SUCCEEDED:
             raise ValueError("experiment result requires SUCCEEDED status")
-        publication = validate_registered_publication(detail)
-        return ExperimentResult(detail, publication)
-
-
-def validate_registered_publication(
-    detail: ExperimentDetail,
-) -> ExperimentArtifactPublication:
-    """Deeply validate a publication and its complete durable registration."""
-    if not isinstance(detail, ExperimentDetail):
-        raise TypeError("detail must be an ExperimentDetail")
-    registered = {artifact.name: artifact for artifact in detail.artifacts}
-    manifest = registered.get("manifest.json")
-    if manifest is None:
-        raise ValueError("SUCCEEDED experiment has no registered manifest")
-    publication = validate_experiment_artifacts(
-        Path(manifest.path).parent,
-        resolved_config=detail.record.config,
-    )
-    expected_names = {*publication.entries, "manifest.json"}
-    if set(registered) != expected_names:
-        raise ValueError("registered artifact names do not match publication")
-    for name, entry in publication.entries.items():
-        persisted = registered[name]
-        expected_path = (publication.artifact_dir / entry.path).resolve()
-        if (
-            Path(persisted.path).resolve() != expected_path
-            or persisted.content_hash != entry.sha256
-        ):
-            raise ValueError(
-                "registered artifact path or hash does not match publication"
-            )
-    manifest_bytes = publication.manifest_path.read_bytes()
-    if (
-        Path(manifest.path).resolve() != publication.manifest_path.resolve()
-        or manifest.content_hash != hashlib.sha256(manifest_bytes).hexdigest()
-    ):
-        raise ValueError("registered manifest path or hash does not match publication")
-    return publication
+        validate_registered_publication(detail)
+        return ExperimentResult(self._query, experiment_id)
 
 
 def _positive_seconds(value: float, label: str) -> float:

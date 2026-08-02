@@ -839,6 +839,40 @@ def test_running_cancel_request_preserves_owner_until_cancel_finish(
     ]
 
 
+def test_registered_backtest_success_wins_cancel_request_before_task_finish(
+    engine: Engine,
+) -> None:
+    _insert_experiment(engine)
+    queue = _queue(engine)
+    task_id = queue.enqueue(
+        "BACKTEST",
+        {},
+        0,
+        experiment_id="experiment-1",
+    )
+    claimed = queue.claim("worker-1", NOW)
+    assert claimed is not None
+    queue.request_cancel(task_id, "user-1")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE experiment SET status = 'SUCCEEDED', completed_at = :now "
+                "WHERE id = 'experiment-1'"
+            ),
+            {"now": NOW_TEXT},
+        )
+
+    queue.finish(
+        claimed.attempt_id,
+        "worker-1",
+        TaskOutcome(status=TaskStatus.SUCCEEDED),
+    )
+
+    task = _task_row(engine, task_id)
+    attempt = _attempt_rows(engine, task_id)[0]
+    assert task["status"] == attempt["status"] == "SUCCEEDED"
+
+
 def test_finish_is_owner_fenced_idempotent_and_persists_canonical_error(
     engine: Engine,
 ) -> None:

@@ -38,10 +38,10 @@ _ALPHA_REFS = (
     "book_to_price_mrq_v1@1.0.0",
     "roe_avg_pit_v1@1.0.0",
     "cfo_to_np_pit_v1@1.0.0",
-    "momentum_120_20_v1@1.0.0",
-    "volatility_60d_v1@1.0.0",
-    "downside_volatility_60d_v1@1.0.0",
-    "max_drawdown_120d_v1@1.0.0",
+    "momentum_120_20_v1@2.1.0",
+    "volatility_60d_v1@2.1.0",
+    "downside_volatility_60d_v1@2.1.0",
+    "max_drawdown_120d_v1@2.1.0",
 )
 _IDS = tuple(f"SSE:{600001 + index:06d}" for index in range(8))
 _RAW_BY_FACTOR = {
@@ -49,9 +49,9 @@ _RAW_BY_FACTOR = {
     "book_to_price_mrq_v1@1.0.0": (131.0, 137.0, 131.0, 138.0, 1000.0, 138.0),
     "roe_avg_pit_v1@1.0.0": (137.0, 131.0, 131.0, 1000.0, 138.0, 138.0),
     "cfo_to_np_pit_v1@1.0.0": (131.0, 137.0, 131.0, 1000.0, 138.0, 138.0),
-    "momentum_120_20_v1@1.0.0": (137.0, 131.0, 131.0, 138.0, 1000.0, 138.0),
-    "volatility_60d_v1@1.0.0": (-137.0, -131.0, -131.0, -138.0, -1000.0, -138.0),
-    "downside_volatility_60d_v1@1.0.0": (
+    "momentum_120_20_v1@2.1.0": (137.0, 131.0, 131.0, 138.0, 1000.0, 138.0),
+    "volatility_60d_v1@2.1.0": (-137.0, -131.0, -131.0, -138.0, -1000.0, -138.0),
+    "downside_volatility_60d_v1@2.1.0": (
         -131.0,
         -131.0,
         -137.0,
@@ -59,7 +59,7 @@ _RAW_BY_FACTOR = {
         -138.0,
         -1000.0,
     ),
-    "max_drawdown_120d_v1@1.0.0": (-137.0, -131.0, -131.0, -1000.0, -138.0, -138.0),
+    "max_drawdown_120d_v1@2.1.0": (-137.0, -131.0, -131.0, -1000.0, -138.0, -138.0),
 }
 _EXPECTED_FACTOR_Z = {
     "earnings_yield_ttm_v1@1.0.0": (
@@ -94,7 +94,7 @@ _EXPECTED_FACTOR_Z = {
         -0.6916621767473222,
         0.0822140244244251,
     ),
-    "momentum_120_20_v1@1.0.0": (
+    "momentum_120_20_v1@2.1.0": (
         0.42565458364508985,
         -0.4484675152379841,
         0.248118407336624,
@@ -102,7 +102,7 @@ _EXPECTED_FACTOR_Z = {
         1.6701293097050858,
         -0.2511314701497959,
     ),
-    "volatility_60d_v1@1.0.0": (
+    "volatility_60d_v1@2.1.0": (
         -0.42565458364508985,
         0.4484675152379841,
         -0.248118407336624,
@@ -110,7 +110,7 @@ _EXPECTED_FACTOR_Z = {
         -1.6701293097050858,
         0.2511314701497959,
     ),
-    "downside_volatility_60d_v1@1.0.0": (
+    "downside_volatility_60d_v1@2.1.0": (
         -1.6212439465260766,
         0.5428499119637041,
         0.26933216074961036,
@@ -118,7 +118,7 @@ _EXPECTED_FACTOR_Z = {
         1.623915963328636,
         -0.2746761943547232,
     ),
-    "max_drawdown_120d_v1@1.0.0": (
+    "max_drawdown_120d_v1@2.1.0": (
         -0.3472186562479454,
         1.027667633232938,
         -0.07713404910014317,
@@ -396,7 +396,7 @@ def _replace_alpha_ref(mapping: dict[str, object], replacement: str) -> None:
 
 def _reverse_risk_direction(mapping: dict[str, object]) -> None:
     definition = _mapping_section(mapping, "factor_definitions")[
-        "volatility_60d_v1@1.0.0"
+        "volatility_60d_v1@2.1.0"
     ]
     assert isinstance(definition, dict)
     definition["direction"] = 1

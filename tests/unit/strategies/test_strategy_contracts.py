@@ -77,7 +77,7 @@ def _factor_frame(**overrides: object) -> pl.DataFrame:
     row = {
         "trade_date": _DAY,
         "instrument_id": _ID.canonical(),
-        "factor_ref": "return_20d_v1@1.0.0",
+        "factor_ref": "return_20d_v1@2.1.0",
         "value": 1.0,
         "available_at": datetime(2026, 7, 31, 7, tzinfo=UTC),
         "is_valid": True,
@@ -167,7 +167,7 @@ def test_factor_data_fails_closed_for_pit_and_audit_contracts(
             frame,
             signal_date=_DAY,
             instruments=(_ID,),
-            factor_refs=("return_20d_v1@1.0.0",),
+            factor_refs=("return_20d_v1@2.1.0",),
         )
 
 

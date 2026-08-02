@@ -52,11 +52,11 @@ _EXECUTE = date(2024, 2, 2)
 _POST_END = date(2024, 2, 5)
 _UNIVERSE_HASH = hashlib.sha256(b"offline-synthetic-etf-pool").hexdigest()
 _FACTOR_VALUES = {
-    "return_20d_v1@1.0.0": 0.03,
-    "return_60d_v1@1.0.0": 0.08,
-    "return_120d_v1@1.0.0": 0.12,
-    "trend_120d_v1@1.0.0": 1.0,
-    "volatility_60d_v1@1.0.0": 0.2,
+    "return_20d_v1@2.1.0": 0.03,
+    "return_60d_v1@2.1.0": 0.08,
+    "return_120d_v1@2.1.0": 0.12,
+    "trend_120d_v1@2.1.0": 1.0,
+    "volatility_60d_v1@2.1.0": 0.2,
 }
 
 
@@ -281,9 +281,9 @@ def test_offline_synthetic_complete_snapshot_runs_strategy_through_real_engine(
             {
                 "etf_pool": [_ETF.canonical()],
                 "return_factor_weights": {
-                    "return_20d_v1@1.0.0": 0.2,
-                    "return_60d_v1@1.0.0": 0.3,
-                    "return_120d_v1@1.0.0": 0.5,
+                    "return_20d_v1@2.1.0": 0.2,
+                    "return_60d_v1@2.1.0": 0.3,
+                    "return_120d_v1@2.1.0": 0.5,
                 },
                 "volatility_penalty": 0.1,
                 "top_n": 1,

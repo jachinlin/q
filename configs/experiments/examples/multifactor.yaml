@@ -13,10 +13,10 @@ strategy_config:
     book_to_price_mrq_v1@1.0.0: {category: VALUE, direction: 1}
     roe_avg_pit_v1@1.0.0: {category: QUALITY, direction: 1}
     cfo_to_np_pit_v1@1.0.0: {category: QUALITY, direction: 1}
-    momentum_120_20_v1@1.0.0: {category: MOMENTUM, direction: 1}
-    volatility_60d_v1@1.0.0: {category: RISK, direction: -1}
-    downside_volatility_60d_v1@1.0.0: {category: RISK, direction: -1}
-    max_drawdown_120d_v1@1.0.0: {category: RISK, direction: -1}
+    momentum_120_20_v1@2.1.0: {category: MOMENTUM, direction: 1}
+    volatility_60d_v1@2.1.0: {category: RISK, direction: -1}
+    downside_volatility_60d_v1@2.1.0: {category: RISK, direction: -1}
+    max_drawdown_120d_v1@2.1.0: {category: RISK, direction: -1}
   category_weights: {VALUE: 0.25, QUALITY: 0.25, MOMENTUM: 0.30, RISK: 0.20}
   min_valid_factors: 6
   mad_multiplier: 3.0

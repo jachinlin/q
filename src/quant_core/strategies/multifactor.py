@@ -32,10 +32,10 @@ _FACTOR_DEFINITIONS = {
     "book_to_price_mrq_v1@1.0.0": ("VALUE", 1),
     "roe_avg_pit_v1@1.0.0": ("QUALITY", 1),
     "cfo_to_np_pit_v1@1.0.0": ("QUALITY", 1),
-    "momentum_120_20_v1@1.0.0": ("MOMENTUM", 1),
-    "volatility_60d_v1@1.0.0": ("RISK", -1),
-    "downside_volatility_60d_v1@1.0.0": ("RISK", -1),
-    "max_drawdown_120d_v1@1.0.0": ("RISK", -1),
+    "momentum_120_20_v1@2.1.0": ("MOMENTUM", 1),
+    "volatility_60d_v1@2.1.0": ("RISK", -1),
+    "downside_volatility_60d_v1@2.1.0": ("RISK", -1),
+    "max_drawdown_120d_v1@2.1.0": ("RISK", -1),
 }
 _CATEGORY_WEIGHTS = {"VALUE": 0.25, "QUALITY": 0.25, "MOMENTUM": 0.30, "RISK": 0.20}
 _EPSILON = 1e-10

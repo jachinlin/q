@@ -28,12 +28,12 @@ _ETF_A = "SSE:510001"
 _ETF_B = "SSE:510002"
 _ETF_C = "SSE:510003"
 _RETURN_REFS = (
-    "return_20d_v1@1.0.0",
-    "return_60d_v1@1.0.0",
-    "return_120d_v1@1.0.0",
+    "return_20d_v1@2.1.0",
+    "return_60d_v1@2.1.0",
+    "return_120d_v1@2.1.0",
 )
-_TREND_REF = "trend_120d_v1@1.0.0"
-_VOL_REF = "volatility_60d_v1@1.0.0"
+_TREND_REF = "trend_120d_v1@2.1.0"
+_VOL_REF = "volatility_60d_v1@2.1.0"
 
 
 class _Data:

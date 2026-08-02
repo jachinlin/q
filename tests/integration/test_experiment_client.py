@@ -9,28 +9,27 @@ import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from datetime import UTC, date, datetime
-from math import isfinite
 from pathlib import Path
 from typing import Any
-from uuid import UUID
 
 import polars as pl
-import pyarrow as pa
 import pytest
 import yaml
 from sqlalchemy import Engine, func, insert, select, text, update
 
-from quant_core.analytics.materialize import materialize_analytics
 from quant_core.backtest.artifacts import (
-    FACTOR_METRICS_SCHEMA,
     ExperimentArtifactPublication,
     publish_experiment_artifacts,
 )
-from quant_core.backtest.engine import BacktestEngine, StrategyRef
+from quant_core.backtest.engine import StrategyRef
 from quant_core.backtest.rulebook import AShareRuleBook
-from quant_core.data.contracts import JsonValue, canonical_json_bytes
+from quant_core.data.contracts import (
+    JsonValue,
+    ProviderCapabilities,
+    canonical_json_bytes,
+)
+from quant_core.data.repository import SnapshotResearchRepository
 from quant_core.data.sources.baostock import BaoStockSdkGateway
 from quant_core.domain.enums import DatasetKind, SnapshotStatus
 from quant_core.domain.identifiers import (
@@ -39,7 +38,6 @@ from quant_core.domain.identifiers import (
     SnapshotId,
 )
 from quant_core.experiments import ExperimentClient
-from quant_core.experiments.client import validate_registered_publication
 from quant_core.experiments.fingerprint import (
     ExperimentFingerprintInput,
     SourceTreeSpec,
@@ -50,11 +48,11 @@ from quant_core.experiments.models import ExperimentSpec, ExperimentStatus
 from quant_core.experiments.query import ExperimentQuery
 from quant_core.experiments.registry import ExperimentRegistry
 from quant_core.experiments.runner import (
-    ExperimentArtifactFinalizer,
-    ExperimentBacktestHandler,
-    ExperimentFactorResult,
     ExperimentRunner,
-    ExperimentRunResult,
+)
+from quant_core.experiments.runtime import (
+    ExperimentRuntimeFactory,
+    build_experiment_worker,
 )
 from quant_core.persistence.database import create_sqlite_engine, upgrade_database
 from quant_core.persistence.orm import (
@@ -68,28 +66,12 @@ from quant_core.persistence.orm import (
 from quant_core.persistence.repositories import (
     DatasetPartitionRecord,
     DatasetVersionRecord,
+    MetadataRepository,
     SnapshotRecord,
 )
-from quant_core.portfolio import RebalancePlanner
 from quant_core.tasks.models import TaskRecord, TaskStatus
 from quant_core.tasks.queue import TaskQueue
 from quant_core.tasks.worker import Worker
-from tests.integration.test_backtest_timeline import (
-    _SNAPSHOT as TIMELINE_SNAPSHOT,
-)
-from tests.integration.test_backtest_timeline import (
-    _Data as TimelineData,
-)
-from tests.integration.test_backtest_timeline import (
-    _Progress as TimelineProgress,
-)
-from tests.integration.test_backtest_timeline import _request as timeline_request
-from tests.integration.test_backtest_timeline import (
-    _RuleBook as TimelineRuleBook,
-)
-from tests.integration.test_backtest_timeline import (
-    _Targets as TimelineTargets,
-)
 from tests.integration.test_experiment_artifact_contract import (
     _CONFIG as ARTIFACT_CONFIG,
 )
@@ -97,6 +79,10 @@ from tests.integration.test_experiment_artifact_contract import (
     _EXPERIMENT as ARTIFACT_EXPERIMENT,
 )
 from tests.integration.test_experiment_artifact_contract import _prepared_bundle
+from tests.integration.test_experiment_runtime import (
+    _published_offline_snapshot,
+    _resolved_etf_config,
+)
 
 _NOW = datetime(2026, 8, 3, 7, tzinfo=UTC)
 _STRATEGY = StrategyRef("stock_multifactor", "1.0.0")
@@ -133,58 +119,6 @@ class _Catalog:
         return self._daily_version
 
 
-class _RegisteringRunner:
-    def __init__(
-        self,
-        registry: ExperimentRegistry,
-        query: ExperimentQuery,
-        artifact_root: Path,
-        environment: dict[str, JsonValue],
-    ) -> None:
-        self._registry = registry
-        self._query = query
-        self._artifact_root = artifact_root
-        self._environment = environment
-
-    def run(
-        self,
-        experiment_id: str,
-        _progress: object,
-        cancellation: Any,
-    ) -> ExperimentRunResult:
-        record = self._query.get(experiment_id).record
-        request = replace(
-            timeline_request(),
-            experiment_id=UUID(experiment_id),
-        )
-        backtest = BacktestEngine(
-            TimelineData(),
-            TimelineTargets(),
-            TimelineRuleBook(),
-            RebalancePlanner(),
-            artifact_root=self._artifact_root / ".experiment-staging",
-        ).run(request, TimelineProgress(), cancellation)
-        materialize_analytics(backtest.artifact_dir)
-        factors = ExperimentFactorResult(
-            {},
-            pa.Table.from_pylist([], schema=FACTOR_METRICS_SCHEMA),
-        )
-        publication = ExperimentArtifactFinalizer(
-            artifact_root=self._artifact_root,
-            environment=self._environment,
-        ).finalize(record, factors, backtest)
-        self._registry.register_success(
-            experiment_id,
-            publication,
-            _numeric_metrics(publication),
-            actor="spawned-worker",
-        )
-        return ExperimentRunResult(publication)
-
-    def verify_success(self, experiment_id: str) -> ExperimentArtifactPublication:
-        return validate_registered_publication(self._query.get(experiment_id))
-
-
 class _UnusedFinalizer:
     def finalize(self, *_: object) -> ExperimentArtifactPublication:
         raise AssertionError("recovery verification must not finalize artifacts")
@@ -197,45 +131,29 @@ def _run_independent_worker(
 ) -> None:
     engine = create_sqlite_engine(Path(database))
     try:
-        registry = ExperimentRegistry(engine, clock=lambda: _NOW)
-        query = ExperimentQuery(engine)
-        runner = _RegisteringRunner(
-            registry,
-            query,
-            Path(artifact_root),
-            environment,
+        root = Path(artifact_root)
+        catalog = MetadataRepository(engine)
+        runtime_factory = ExperimentRuntimeFactory(
+            catalog=catalog,
+            repository=SnapshotResearchRepository(catalog),
+            capabilities=ProviderCapabilities.complete(),
+            provider="offline-complete-fixture",
+            feature_root=root.parent / "features",
+            artifact_root=root,
+            rulebook=_rulebook(),
+            enrichment=None,
         )
-        processed = Worker(
-            TaskQueue(engine),
+        processed = build_experiment_worker(
+            engine=engine,
             worker_id="spawned-worker",
-            handlers=(
-                ExperimentBacktestHandler(
-                    registry=registry,
-                    query=query,
-                    runner=runner,
-                ),
-            ),
-            clock=lambda: _NOW,
-            heartbeat_interval=60.0,
+            runtime_factory=runtime_factory,
+            artifact_root=root,
+            environment=environment,
         ).run_once()
         if not processed:
             raise RuntimeError("spawned worker did not claim the submitted task")
     finally:
         engine.dispose()
-
-
-def _numeric_metrics(
-    publication: ExperimentArtifactPublication,
-) -> dict[str, float]:
-    payload = json.loads((publication.artifact_dir / "metrics.json").read_bytes())
-    return {
-        name: float(value)
-        for name, value in payload.items()
-        if isinstance(name, str)
-        and not isinstance(value, bool)
-        and isinstance(value, (int, float))
-        and isfinite(value)
-    }
 
 
 @pytest.fixture
@@ -358,57 +276,31 @@ def _cross_process_experiment(
     tmp_path: Path,
     environment: dict[str, JsonValue],
 ) -> str:
-    snapshot_hash = "d" * 64
-    manifest_path = tmp_path / "timeline-snapshot-manifest.json"
-    manifest_path.write_text("{}", encoding="utf-8")
-    with engine.begin() as connection:
-        connection.execute(
-            insert(QualityRunORM).values(
-                id=str(_QUALITY_RUN_ID),
-                status="COMPLETED",
-                started_at=_NOW.isoformat(),
-                completed_at=_NOW.isoformat(),
-                created_at=_NOW.isoformat(),
-            )
-        )
-        connection.execute(
-            insert(SnapshotORM).values(
-                id=str(TIMELINE_SNAPSHOT),
-                publication_fingerprint="e" * 64,
-                as_of=_NOW.isoformat(),
-                status=SnapshotStatus.PUBLISHED.value,
-                manifest_path=str(manifest_path),
-                manifest_hash=snapshot_hash,
-                quality_run_id=str(_QUALITY_RUN_ID),
-                created_at=_NOW.isoformat(),
-                published_at=_NOW.isoformat(),
-            )
-        )
-    config_hash = hashlib.sha256(
-        canonical_json_bytes(ARTIFACT_CONFIG)
-    ).hexdigest()
+    snapshot = _published_offline_snapshot(MetadataRepository(engine), tmp_path)
+    config = _resolved_etf_config(snapshot.id)
+    config_hash = hashlib.sha256(canonical_json_bytes(config)).hexdigest()
     fingerprint = compute_fingerprint(
         ExperimentFingerprintInput(
-            strategy_id="timeline",
-            strategy_version="1",
-            resolved_config=ARTIFACT_CONFIG,
-            snapshot_manifest_hash=snapshot_hash,
+            strategy_id="etf_rotation",
+            strategy_version="1.0.0",
+            resolved_config=config,
+            snapshot_manifest_hash=snapshot.manifest_hash,
             source_hash=str(environment["source_hash"]),
             lockfile_hash=str(environment["lockfile_hash"]),
-            rulebook_version="test-v1",
+            rulebook_version="a-share-v1",
         )
     )
     spec = ExperimentSpec(
-        strategy_id="timeline",
-        strategy_version="1",
-        config=ARTIFACT_CONFIG,
+        strategy_id="etf_rotation",
+        strategy_version="1.0.0",
+        config=config,
         config_hash=config_hash,
-        snapshot_id=str(TIMELINE_SNAPSHOT),
-        snapshot_manifest_hash=snapshot_hash,
+        snapshot_id=str(snapshot.id),
+        snapshot_manifest_hash=snapshot.manifest_hash,
         source_tree_hash=str(environment["source_tree_hash"]),
         git_commit_hash=None,
         lockfile_hash=str(environment["lockfile_hash"]),
-        rulebook_version="test-v1",
+        rulebook_version="a-share-v1",
         fingerprint=fingerprint,
         created_at=_NOW,
     )
@@ -617,7 +509,10 @@ def _register_success_fixture(engine: Engine, tmp_path: Path) -> str:
                 path=str(publication.manifest_path.resolve()),
                 content_hash=hashlib.sha256(manifest_bytes).hexdigest(),
                 metadata_json=canonical_json_bytes(
-                    {"size_bytes": len(manifest_bytes)}
+                    {
+                        "schema": "quant.experiment.manifest.v1",
+                        "size_bytes": len(manifest_bytes),
+                    }
                 ).decode(),
                 created_at=_NOW.isoformat(),
             )
@@ -650,6 +545,55 @@ def test_result_access_revalidates_after_artifact_changes_post_handoff(
     Path(metrics.path).write_bytes(b"{}")
 
     with pytest.raises(ValueError):
+        result.metrics()
+
+
+@pytest.mark.parametrize("field", ["content_hash", "metadata_json"])
+def test_result_rejects_db_registration_tamper_before_handoff(
+    engine: Engine, tmp_path: Path, field: str
+) -> None:
+    experiment_id = _register_success_fixture(engine, tmp_path)
+    changed = (
+        "0" * 64
+        if field == "content_hash"
+        else canonical_json_bytes({"size_bytes": 1}).decode()
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            update(ExperimentArtifactORM)
+            .where(
+                ExperimentArtifactORM.experiment_id == experiment_id,
+                ExperimentArtifactORM.name == "metrics.json",
+            )
+            .values({field: changed})
+        )
+
+    with pytest.raises(ValueError, match="registered|metadata|publication"):
+        _client(engine, tmp_path).result(experiment_id)
+
+
+@pytest.mark.parametrize("field", ["content_hash", "metadata_json"])
+def test_result_requeries_and_rejects_db_tamper_after_handoff(
+    engine: Engine, tmp_path: Path, field: str
+) -> None:
+    experiment_id = _register_success_fixture(engine, tmp_path)
+    result = _client(engine, tmp_path).result(experiment_id)
+    changed = (
+        "0" * 64
+        if field == "content_hash"
+        else canonical_json_bytes({"size_bytes": 1}).decode()
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            update(ExperimentArtifactORM)
+            .where(
+                ExperimentArtifactORM.experiment_id == experiment_id,
+                ExperimentArtifactORM.name == "metrics.json",
+            )
+            .values({field: changed})
+        )
+
+    with pytest.raises(ValueError, match="registered|metadata|publication"):
         result.metrics()
 
 
@@ -900,6 +844,12 @@ def test_submitted_task_survives_client_close_and_is_finished_by_spawned_worker(
     experiment_id = _cross_process_experiment(engine, tmp_path, environment)
     client = _client(engine, tmp_path)
     task = client.submit(experiment_id)
+    with engine.begin() as connection:
+        connection.execute(
+            update(TaskORM)
+            .where(TaskORM.id == task.id)
+            .values(available_at=datetime(2020, 1, 1, tzinfo=UTC).isoformat())
+        )
     client.close()
     engine.dispose()
 
@@ -928,4 +878,4 @@ def test_submitted_task_survives_client_close_and_is_finished_by_spawned_worker(
     assert experiment.status is ExperimentStatus.SUCCEEDED
     assert metrics["metrics_version"] == "1.0.0"
     assert isinstance(nav, pl.DataFrame)
-    assert nav.height == 3
+    assert nav.height == 2

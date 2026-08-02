@@ -675,9 +675,25 @@ class TaskQueue:
                     cast(str, task["id"]), "finish", task_status
                 )
             _require_active_pair(attempt, task, "finish")
+            registered_backtest_success = False
+            if (
+                task_status == TaskStatus.CANCEL_REQUESTED.value
+                and outcome.status is TaskStatus.SUCCEEDED
+                and task["task_type"] == "BACKTEST"
+                and task["experiment_id"] is not None
+            ):
+                experiment_status = connection.scalar(
+                    select(ExperimentORM.status).where(
+                        ExperimentORM.id == cast(str, task["experiment_id"])
+                    )
+                )
+                registered_backtest_success = (
+                    experiment_status == "SUCCEEDED"
+                )
             if (
                 task_status == TaskStatus.CANCEL_REQUESTED.value
                 and outcome.status is not TaskStatus.CANCELLED
+                and not registered_backtest_success
             ):
                 _raise_state_conflict(
                     cast(str, task["id"]), "finish", task_status
