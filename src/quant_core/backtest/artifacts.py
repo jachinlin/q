@@ -6,20 +6,25 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from html.parser import HTMLParser
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import yaml
 
 from quant_core.backtest.accounting import AccountSnapshot
 from quant_core.backtest.models import ExecutionBatch, ExecutionConfig, FillResult
+from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.domain.identifiers import InstrumentId
+from quant_core.experiments.fingerprint import SourceIdentity
 from quant_core.portfolio.constructor import TargetPortfolio
 
 _COMPRESSION = "zstd"
@@ -87,6 +92,54 @@ _SCHEMAS = {
     "fills.parquet": _FILLS_SCHEMA,
     "costs.parquet": _COSTS_SCHEMA,
 }
+FACTOR_METRICS_SCHEMA_VERSION = 1
+_EXPERIMENT_MANIFEST_SCHEMA_VERSION = 1
+FACTOR_METRICS_SCHEMA = pa.schema(
+    [
+        pa.field("factor_ref", pa.string(), nullable=False),
+        pa.field("signal_date", pa.date32(), nullable=False),
+        pa.field("metric_type", pa.string(), nullable=False),
+        pa.field("metric_value", pa.float64(), nullable=True),
+        pa.field("sample_count", pa.int64(), nullable=False),
+        pa.field("is_valid", pa.bool_(), nullable=False),
+        pa.field("quality_reason", pa.string(), nullable=True),
+    ]
+)
+_ANALYTICS_ARTIFACT_NAMES = (
+    "metrics.json",
+    "drawdown.parquet",
+    "monthly_returns.parquet",
+    "exposure_summary.parquet",
+    "factor_summary.parquet",
+    "attribution.parquet",
+    "quality_disclosure.json",
+)
+_EXPERIMENT_LAYER_NAMES = (
+    "resolved_config.yaml",
+    "environment.json",
+    "factor_metrics.parquet",
+    "report.html",
+    "run.log",
+)
+_EXPERIMENT_PAYLOAD_NAMES = (
+    *_SCHEMAS,
+    *_ANALYTICS_ARTIFACT_NAMES,
+    *_EXPERIMENT_LAYER_NAMES,
+)
+_EXPERIMENT_PARQUET_NAMES = {
+    name for name in _EXPERIMENT_PAYLOAD_NAMES if name.endswith(".parquet")
+}
+_ENVIRONMENT_FIELDS = {
+    "schema_version",
+    "source_identity_mode",
+    "source_hash",
+    "git_commit",
+    "source_tree_hash",
+    "working_tree_dirty",
+    "lockfile_path",
+    "lockfile_hash",
+    "python_version",
+}
 
 
 class WriterState(StrEnum):
@@ -128,6 +181,56 @@ class ArtifactEntry:
             or any(character not in "0123456789abcdef" for character in self.sha256)
         ):
             raise ValueError("sha256 must be a lowercase SHA-256 hex digest")
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentArtifactEntry:
+    """Integrity index entry for one file in the experiment success superset."""
+
+    path: str
+    size_bytes: int
+    sha256: str
+    schema: str | None = None
+    row_count: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_safe_file_path(self.path)
+        if type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise ValueError("size_bytes must be a nonnegative integer")
+        if not _is_sha256(self.sha256):
+            raise ValueError("sha256 must be a lowercase SHA-256 hex digest")
+        parquet = self.path.endswith(".parquet")
+        if parquet and (
+            not isinstance(self.schema, str)
+            or not self.schema
+            or type(self.row_count) is not int
+            or self.row_count < 0
+        ):
+            raise ValueError("Parquet entries require schema and row count")
+        if not parquet and (self.schema is not None or self.row_count is not None):
+            raise ValueError("non-Parquet entries cannot declare schema or row count")
+
+    def manifest_value(self) -> dict[str, JsonValue]:
+        """Return the exact versioned experiment-index representation."""
+        value: dict[str, JsonValue] = {
+            "path": self.path,
+            "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
+        }
+        if self.schema is not None and self.row_count is not None:
+            value["schema"] = self.schema
+            value["row_count"] = self.row_count
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentArtifactPublication:
+    """A fully validated immutable bundle ready for scalar registration."""
+
+    artifact_dir: Path
+    manifest_path: Path
+    entries: dict[str, ExperimentArtifactEntry]
+    manifest: dict[str, JsonValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +583,467 @@ class BacktestArtifactWriter:
             _write_json(self._staging_dir / "diagnostic.json", diagnostic)
         except BaseException as diagnostic_error:  # noqa: BLE001
             error.add_note(f"failed to write diagnostic: {diagnostic_error}")
+
+
+def validate_experiment_artifacts(
+    artifact_dir: Path,
+    *,
+    resolved_config: Mapping[str, JsonValue],
+) -> ExperimentArtifactPublication:
+    """Deeply validate a visible experiment bundle and its success index."""
+    if not isinstance(artifact_dir, Path):
+        raise TypeError("artifact_dir must be a Path")
+    if not artifact_dir.is_dir():
+        raise ValueError("artifact_dir must be an experiment artifact directory")
+    manifest_path = artifact_dir / "manifest.json"
+    raw, manifest = _read_experiment_manifest(manifest_path)
+    if raw != canonical_json_bytes(cast(JsonValue, manifest)):
+        raise ValueError("experiment manifest must be canonical UTF-8 JSON")
+    entries = _validate_experiment_bundle(
+        artifact_dir,
+        manifest,
+        resolved_config,
+        marker_present=True,
+        require_experiment_index=True,
+    )
+    return ExperimentArtifactPublication(
+        artifact_dir=artifact_dir,
+        manifest_path=manifest_path,
+        entries=entries,
+        manifest=cast(dict[str, JsonValue], manifest),
+    )
+
+
+def publish_experiment_artifacts(
+    staging_dir: Path,
+    artifact_root: Path,
+    experiment_id: UUID,
+    *,
+    resolved_config: Mapping[str, JsonValue],
+) -> ExperimentArtifactPublication:
+    """Build and validate a private candidate, then reveal it with one rename."""
+    if not isinstance(staging_dir, Path) or not isinstance(artifact_root, Path):
+        raise TypeError("staging_dir and artifact_root must be Paths")
+    if not isinstance(experiment_id, UUID):
+        raise TypeError("experiment_id must be a UUID")
+    if not staging_dir.is_dir():
+        raise ValueError("staging_dir must be an experiment artifact directory")
+    final_dir = artifact_root / f"experiment_id={experiment_id}"
+    if staging_dir.name != final_dir.name:
+        raise ValueError("staging directory identity does not match experiment_id")
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    if final_dir.exists():
+        raise FileExistsError("experiment artifact directory already exists")
+    if staging_dir.resolve() == final_dir.resolve():
+        raise ValueError("staging and final directories must be distinct")
+    if staging_dir.stat().st_dev != artifact_root.stat().st_dev:
+        raise ValueError("staging and final directories must share one filesystem")
+
+    manifest_path = staging_dir / "manifest.json"
+    original_manifest_bytes, manifest = _read_experiment_manifest(manifest_path)
+    if "experiment" in manifest:
+        raise ValueError("staging manifest already contains an experiment index")
+    entries = _validate_experiment_bundle(
+        staging_dir,
+        manifest,
+        resolved_config,
+        marker_present=True,
+        require_experiment_index=False,
+    )
+    extended_manifest = dict(manifest)
+    extended_manifest["experiment"] = {
+        "schema_version": _EXPERIMENT_MANIFEST_SCHEMA_VERSION,
+        "artifacts": {
+            name: entries[name].manifest_value()
+            for name in _EXPERIMENT_PAYLOAD_NAMES
+        },
+    }
+    final_manifest_bytes = canonical_json_bytes(cast(JsonValue, extended_manifest))
+    publication = ExperimentArtifactPublication(
+        artifact_dir=final_dir,
+        manifest_path=final_dir / "manifest.json",
+        entries=dict(entries),
+        manifest=cast(dict[str, JsonValue], extended_manifest),
+    )
+    candidate_parent = Path(
+        tempfile.mkdtemp(
+            prefix=f".experiment-candidate-{experiment_id}-", dir=artifact_root
+        )
+    )
+    candidate_dir = candidate_parent / final_dir.name
+    candidate_owned = False
+    final_committed = False
+    try:
+        os.replace(staging_dir, candidate_dir)
+        candidate_owned = True
+        _write_atomic_bytes(candidate_dir / "manifest.json", final_manifest_bytes)
+        candidate = validate_experiment_artifacts(
+            candidate_dir, resolved_config=resolved_config
+        )
+        if candidate.entries != entries:
+            raise ValueError("experiment artifacts changed while building candidate")
+        if final_dir.exists():
+            raise FileExistsError("experiment artifact directory already exists")
+        os.replace(candidate_dir, final_dir)
+        candidate_owned = False
+        final_committed = True
+    except BaseException as error:
+        try:
+            if final_committed and final_dir.exists():
+                os.replace(final_dir, candidate_dir)
+                candidate_owned = True
+            if candidate_owned and candidate_dir.is_dir():
+                _write_atomic_bytes(
+                    candidate_dir / "manifest.json", original_manifest_bytes
+                )
+                os.replace(candidate_dir, staging_dir)
+        except BaseException as restore_error:  # noqa: BLE001
+            error.add_note(f"failed to restore experiment staging: {restore_error}")
+        _remove_empty_directory(candidate_parent, error)
+        raise
+    _remove_empty_directory(candidate_parent)
+    return publication
+
+
+def _validate_experiment_bundle(
+    artifact_dir: Path,
+    manifest: dict[str, Any],
+    resolved_config: Mapping[str, JsonValue],
+    *,
+    marker_present: bool,
+    require_experiment_index: bool,
+) -> dict[str, ExperimentArtifactEntry]:
+    _validate_experiment_file_set(artifact_dir, marker_present=marker_present)
+    raw_entries = _collect_entries(artifact_dir)
+    nav_dates = tuple(
+        pq.read_table(artifact_dir / "nav.parquet", columns=["trade_date"])
+        .column("trade_date")
+        .to_pylist()
+    )
+    if not nav_dates or any(not isinstance(value, date) for value in nav_dates):
+        raise ValueError("nav trade dates must be a nonempty sequence of dates")
+    _validate_content(artifact_dir, cast(tuple[date, ...], nav_dates))
+    raw_manifest = {
+        name: manifest[name]
+        for name in (
+            "schema_version",
+            "experiment_id",
+            "snapshot_id",
+            "strategy",
+            "start_date",
+            "end_date",
+            "benchmark",
+            "initial_cash_fen",
+            "rulebook_version",
+            "execution_config",
+            "completed_sessions",
+            "artifacts",
+        )
+        if name in manifest
+    }
+    _validate_manifest(raw_manifest, raw_entries)
+
+    from quant_core.analytics.materialize import validate_published_analytics
+
+    validate_published_analytics(artifact_dir, manifest)
+    _validate_resolved_config(artifact_dir / "resolved_config.yaml", resolved_config)
+    _validate_environment(artifact_dir / "environment.json")
+    _validate_factor_metrics(artifact_dir / "factor_metrics.parquet")
+    _validate_report(artifact_dir / "report.html")
+    _validate_utf8_text(artifact_dir / "run.log", "run.log")
+    entries = _collect_experiment_entries(artifact_dir)
+    experiment_index = manifest.get("experiment")
+    if require_experiment_index or experiment_index is not None:
+        _validate_experiment_index(experiment_index, entries)
+    return entries
+
+
+def _validate_experiment_file_set(artifact_dir: Path, *, marker_present: bool) -> None:
+    expected = set(_EXPERIMENT_PAYLOAD_NAMES)
+    if marker_present:
+        expected.add("manifest.json")
+    actual: set[str] = set()
+    for path in artifact_dir.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"unexpected experiment artifact {path.name}")
+        actual.add(path.name)
+    missing = sorted(expected - actual)
+    if missing:
+        raise ValueError(f"missing experiment artifact {missing[0]}")
+    unexpected = sorted(actual - expected)
+    if unexpected:
+        raise ValueError(f"unexpected experiment artifact {unexpected[0]}")
+
+
+def _collect_experiment_entries(
+    artifact_dir: Path,
+) -> dict[str, ExperimentArtifactEntry]:
+    entries: dict[str, ExperimentArtifactEntry] = {}
+    for name in _EXPERIMENT_PAYLOAD_NAMES:
+        path = artifact_dir / name
+        if name in _EXPERIMENT_PARQUET_NAMES:
+            try:
+                schema = pq.read_schema(path)
+                row_count = pq.read_metadata(path).num_rows
+            except Exception as error:
+                raise ValueError(f"experiment artifact {name} is not valid Parquet") from error
+            entries[name] = ExperimentArtifactEntry(
+                name,
+                path.stat().st_size,
+                _sha256(path),
+                schema.to_string(show_field_metadata=False),
+                row_count,
+            )
+        else:
+            entries[name] = ExperimentArtifactEntry(
+                name, path.stat().st_size, _sha256(path)
+            )
+    return entries
+
+
+def _validate_experiment_index(
+    value: object, entries: dict[str, ExperimentArtifactEntry]
+) -> None:
+    if not isinstance(value, dict) or set(value) != {"schema_version", "artifacts"}:
+        raise ValueError("experiment manifest index is invalid")
+    if value.get("schema_version") != _EXPERIMENT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("experiment manifest schema version is invalid")
+    indexed = value.get("artifacts")
+    if not isinstance(indexed, dict) or set(indexed) != set(entries):
+        raise ValueError("experiment manifest artifacts are incomplete")
+    for name, expected in entries.items():
+        _validate_experiment_index_entry(name, indexed[name], expected)
+
+
+def _validate_experiment_index_entry(
+    name: str, value: object, expected: ExperimentArtifactEntry
+) -> None:
+    if not isinstance(value, dict):
+        raise TypeError(f"experiment artifact entry {name} is invalid")
+    expected_fields = {"path", "size_bytes", "sha256"}
+    if name.endswith(".parquet"):
+        expected_fields |= {"schema", "row_count"}
+    if set(value) != expected_fields:
+        raise ValueError(f"experiment artifact entry {name} fields are invalid")
+    path = value.get("path")
+    if not isinstance(path, str):
+        raise TypeError("experiment artifact path must be a safe relative file path")
+    _validate_safe_file_path(path)
+    if path != name:
+        raise ValueError("experiment artifact path must match its registered name")
+    if value.get("size_bytes") != expected.size_bytes:
+        raise ValueError(f"experiment artifact {name} size mismatch")
+    if value.get("sha256") != expected.sha256:
+        raise ValueError(f"experiment artifact {name} hash mismatch")
+    if name.endswith(".parquet"):
+        if value.get("schema") != expected.schema:
+            raise ValueError(f"experiment artifact {name} schema mismatch")
+        if value.get("row_count") != expected.row_count:
+            raise ValueError(f"experiment artifact {name} row count mismatch")
+
+
+def _validate_resolved_config(
+    path: Path, resolved_config: Mapping[str, JsonValue]
+) -> None:
+    if not isinstance(resolved_config, Mapping):
+        raise TypeError("resolved_config must be a mapping")
+    try:
+        text = path.read_bytes().decode("utf-8")
+        loaded = yaml.safe_load(text)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError("resolved_config.yaml must be safe UTF-8 YAML") from error
+    if not isinstance(loaded, dict):
+        raise TypeError("resolved_config.yaml YAML root must be a mapping")
+    try:
+        actual = canonical_json_bytes(cast(JsonValue, loaded))
+        expected = canonical_json_bytes(resolved_config)
+    except ValueError as error:
+        raise ValueError("resolved_config.yaml YAML must contain finite JSON values") from error
+    if actual != expected:
+        raise ValueError("resolved_config.yaml YAML does not match resolved_config")
+
+
+def _validate_environment(path: Path) -> None:
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("environment.json must be valid UTF-8 JSON") from error
+    if not isinstance(payload, dict) or set(payload) != _ENVIRONMENT_FIELDS:
+        raise ValueError("environment.json environment fields are invalid")
+    try:
+        canonical = canonical_json_bytes(cast(JsonValue, payload))
+    except ValueError as error:
+        raise ValueError("environment.json environment values must be finite") from error
+    if raw != canonical:
+        raise ValueError("environment.json must be canonical UTF-8 JSON")
+    if payload.get("schema_version") != 1:
+        raise ValueError("environment.json schema version is invalid")
+    lockfile_path = payload.get("lockfile_path")
+    if not isinstance(lockfile_path, str):
+        raise TypeError("environment.json lockfile path is invalid")
+    relative = Path(lockfile_path)
+    if (
+        not lockfile_path
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or not _is_sha256(payload.get("lockfile_hash"))
+    ):
+        raise ValueError("environment.json lockfile identity is invalid")
+    python_version = payload.get("python_version")
+    if not isinstance(python_version, str) or not python_version:
+        raise ValueError("environment.json Python version is invalid")
+    try:
+        SourceIdentity(
+            cast(str, payload["source_identity_mode"]),
+            cast(str, payload["source_hash"]),
+            cast(str | None, payload["git_commit"]),
+            cast(str | None, payload["source_tree_hash"]),
+            cast(bool, payload["working_tree_dirty"]),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("environment.json source identity is invalid") from error
+
+
+def _validate_factor_metrics(path: Path) -> None:
+    try:
+        parquet = pq.ParquetFile(path)
+        table = parquet.read()
+    except Exception as error:
+        raise ValueError("factor_metrics.parquet is not valid Parquet") from error
+    if parquet.schema_arrow != FACTOR_METRICS_SCHEMA:
+        raise ValueError("factor_metrics.parquet schema mismatch")
+    for row in table.to_pylist():
+        factor_ref = row["factor_ref"]
+        metric_type = row["metric_type"]
+        metric_value = row["metric_value"]
+        sample_count = row["sample_count"]
+        valid = row["is_valid"]
+        reason = row["quality_reason"]
+        if (
+            not isinstance(factor_ref, str)
+            or not factor_ref
+            or not isinstance(metric_type, str)
+            or not metric_type
+            or type(sample_count) is not int
+            or sample_count < 0
+            or type(valid) is not bool
+            or (
+                metric_value is not None
+                and (
+                    not isinstance(metric_value, float) or not isfinite(metric_value)
+                )
+            )
+        ):
+            raise ValueError("factor_metrics.parquet content is invalid")
+        if (valid and (metric_value is None or reason is not None)) or (
+            not valid
+            and (
+                metric_value is not None
+                or not isinstance(reason, str)
+                or not reason
+            )
+        ):
+            raise ValueError("factor_metrics.parquet validity fields are inconsistent")
+
+
+class _HtmlDocumentParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_html_root = False
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        del attrs
+        if tag.casefold() == "html":
+            self.has_html_root = True
+
+
+def _validate_report(path: Path) -> None:
+    text = _validate_utf8_text(path, "report.html")
+    parser = _HtmlDocumentParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception as error:
+        raise ValueError("report.html must be valid UTF-8 HTML") from error
+    if not text.strip() or not parser.has_html_root:
+        raise ValueError("report.html must be nonempty UTF-8 HTML")
+
+
+def _validate_utf8_text(path: Path, label: str) -> str:
+    try:
+        return path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"{label} must be UTF-8 text") from error
+
+
+def _read_experiment_manifest(path: Path) -> tuple[bytes, dict[str, Any]]:
+    if not path.is_file():
+        raise ValueError("missing experiment artifact manifest.json")
+    try:
+        raw = path.read_bytes()
+        parsed = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("experiment manifest must be valid UTF-8 JSON") from error
+    if not isinstance(parsed, dict):
+        raise TypeError("experiment manifest must be a JSON object")
+    try:
+        canonical_json_bytes(cast(JsonValue, parsed))
+    except ValueError as error:
+        raise ValueError("experiment manifest must contain finite JSON values") from error
+    return raw, cast(dict[str, Any], parsed)
+
+
+def _write_temporary_bytes(directory: Path, *, prefix: str, payload: bytes) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="wb", prefix=prefix, suffix=".tmp", dir=directory, delete=False
+    ) as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        return Path(handle.name)
+
+
+def _write_atomic_bytes(path: Path, payload: bytes) -> None:
+    temporary = _write_temporary_bytes(
+        path.parent, prefix=f".{path.name}.restore-", payload=payload
+    )
+    try:
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _remove_empty_directory(
+    path: Path, error: BaseException | None = None
+) -> None:
+    try:
+        path.rmdir()
+    except OSError as cleanup_error:
+        if error is not None:
+            error.add_note(f"failed to remove private candidate directory: {cleanup_error}")
+
+
+def _validate_safe_file_path(value: str) -> None:
+    relative = Path(value)
+    if (
+        not value
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or len(relative.parts) != 1
+    ):
+        raise ValueError("experiment artifact path must be a safe relative file path")
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _sha256(path: Path) -> str:

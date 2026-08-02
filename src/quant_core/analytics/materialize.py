@@ -237,30 +237,42 @@ def materialize_analytics(artifact_dir: Path) -> AnalyticsResult:
         return _materialize_analytics_locked(artifact_dir)
 
 
+def validate_published_analytics(
+    artifact_dir: Path, manifest: dict[str, Any] | None = None
+) -> None:
+    """Recompute and validate registered analytics without mutating the bundle."""
+    if not isinstance(artifact_dir, Path):
+        raise TypeError("artifact_dir must be a Path")
+    if not artifact_dir.is_dir():
+        raise ValueError("artifact_dir must be a published artifact directory")
+    parsed = (
+        _parse_manifest(_read_manifest_bytes(artifact_dir / "manifest.json"))
+        if manifest is None
+        else manifest
+    )
+    if not isinstance(parsed, dict):
+        raise TypeError("manifest must be a JSON object")
+    _require_json_finite(parsed, "manifest")
+    raw_entries = _validate_raw_manifest(artifact_dir, parsed)
+    performance, attribution = _calculate_expected_analytics(artifact_dir)
+    if "analytics" not in parsed:
+        raise ValueError("published artifact has no registered analytics index")
+    _validate_registered_analytics(
+        artifact_dir,
+        parsed["analytics"],
+        raw_entries,
+        performance,
+        attribution,
+    )
+
+
 def _materialize_analytics_locked(artifact_dir: Path) -> AnalyticsResult:
     """Materialize while one artifact identity is exclusively owned."""
     manifest_path = artifact_dir / "manifest.json"
     original_manifest_bytes = _read_manifest_bytes(manifest_path)
     manifest = _parse_manifest(original_manifest_bytes)
     raw_entries = _validate_raw_manifest(artifact_dir, manifest)
-    frames = {
-        name: pl.read_parquet(artifact_dir / name)
-        for name in (
-            "nav.parquet",
-            "holdings.parquet",
-            "fills.parquet",
-            "costs.parquet",
-        )
-    }
-    performance = calculate_performance(
-        frames["nav.parquet"], frames["fills.parquet"], frames["costs.parquet"]
-    )
-    attribution = calculate_attribution(
-        frames["nav.parquet"],
-        frames["holdings.parquet"],
-        frames["fills.parquet"],
-        frames["costs.parquet"],
-    )
+    performance, attribution = _calculate_expected_analytics(artifact_dir)
     if "analytics" in manifest:
         _validate_registered_analytics(
             artifact_dir,
@@ -312,6 +324,30 @@ def _materialize_analytics_locked(artifact_dir: Path) -> AnalyticsResult:
     )
 
 
+def _calculate_expected_analytics(
+    artifact_dir: Path,
+) -> tuple[PerformanceResult, AttributionResult]:
+    frames = {
+        name: pl.read_parquet(artifact_dir / name)
+        for name in (
+            "nav.parquet",
+            "holdings.parquet",
+            "fills.parquet",
+            "costs.parquet",
+        )
+    }
+    performance = calculate_performance(
+        frames["nav.parquet"], frames["fills.parquet"], frames["costs.parquet"]
+    )
+    attribution = calculate_attribution(
+        frames["nav.parquet"],
+        frames["holdings.parquet"],
+        frames["fills.parquet"],
+        frames["costs.parquet"],
+    )
+    return performance, attribution
+
+
 def _read_manifest_bytes(path: Path) -> bytes:
     if not path.is_file():
         raise ValueError("artifact directory must contain manifest.json")
@@ -333,9 +369,12 @@ def _validate_raw_manifest(
     artifact_dir: Path, manifest: dict[str, Any]
 ) -> dict[str, dict[str, object]]:
     fields = set(manifest)
-    if fields != _RAW_MANIFEST_FIELDS and fields != _RAW_MANIFEST_FIELDS | {
-        "analytics"
-    }:
+    allowed_fields = (
+        _RAW_MANIFEST_FIELDS,
+        _RAW_MANIFEST_FIELDS | {"analytics"},
+        _RAW_MANIFEST_FIELDS | {"analytics", "experiment"},
+    )
+    if fields not in allowed_fields:
         raise ValueError("manifest has invalid fields")
     if manifest.get("schema_version") != 1:
         raise ValueError("manifest schema_version must be 1")
