@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ from html.parser import HTMLParser
 from math import isfinite
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
@@ -23,6 +25,7 @@ import yaml
 from quant_core.backtest.accounting import AccountSnapshot
 from quant_core.backtest.models import ExecutionBatch, ExecutionConfig, FillResult
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
+from quant_core.data.partitions import _PartitionLock
 from quant_core.domain.identifiers import InstrumentId
 from quant_core.experiments.fingerprint import SourceIdentity
 from quant_core.portfolio.constructor import TargetPortfolio
@@ -231,6 +234,16 @@ class ExperimentArtifactPublication:
     manifest_path: Path
     entries: dict[str, ExperimentArtifactEntry]
     manifest: dict[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class _PathIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+    file_attributes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -593,19 +606,25 @@ def validate_experiment_artifacts(
     """Deeply validate a visible experiment bundle and its success index."""
     if not isinstance(artifact_dir, Path):
         raise TypeError("artifact_dir must be a Path")
-    if not artifact_dir.is_dir():
-        raise ValueError("artifact_dir must be an experiment artifact directory")
-    manifest_path = artifact_dir / "manifest.json"
-    raw, manifest = _read_experiment_manifest(manifest_path)
-    if raw != canonical_json_bytes(cast(JsonValue, manifest)):
-        raise ValueError("experiment manifest must be canonical UTF-8 JSON")
-    entries = _validate_experiment_bundle(
-        artifact_dir,
-        manifest,
-        resolved_config,
-        marker_present=True,
-        require_experiment_index=True,
-    )
+    if not artifact_dir.name.startswith("experiment_id="):
+        raise ValueError("artifact_dir must have a published experiment identity")
+    _require_plain_directory(artifact_dir.parent, "artifact_root")
+    _require_plain_directory(artifact_dir, "artifact_dir")
+    lock_path = artifact_dir.parent / ".experiment-publish.lock"
+    with _PartitionLock(
+        lock_path, timeout_seconds=60.0, stale_after_seconds=0.0
+    ):
+        manifest_path = artifact_dir / "manifest.json"
+        raw, manifest = _read_experiment_manifest(manifest_path)
+        if raw != canonical_json_bytes(cast(JsonValue, manifest)):
+            raise ValueError("experiment manifest must be canonical UTF-8 JSON")
+        entries = _validate_experiment_bundle(
+            artifact_dir,
+            manifest,
+            resolved_config,
+            marker_present=True,
+            require_experiment_index=True,
+        )
     return ExperimentArtifactPublication(
         artifact_dir=artifact_dir,
         manifest_path=manifest_path,
@@ -621,26 +640,26 @@ def publish_experiment_artifacts(
     *,
     resolved_config: Mapping[str, JsonValue],
 ) -> ExperimentArtifactPublication:
-    """Build and validate a private candidate, then reveal it with one rename."""
+    """Copy into an opaque candidate and publish it with one no-replace rename."""
     if not isinstance(staging_dir, Path) or not isinstance(artifact_root, Path):
         raise TypeError("staging_dir and artifact_root must be Paths")
     if not isinstance(experiment_id, UUID):
         raise TypeError("experiment_id must be a UUID")
-    if not staging_dir.is_dir():
-        raise ValueError("staging_dir must be an experiment artifact directory")
     final_dir = artifact_root / f"experiment_id={experiment_id}"
     if staging_dir.name != final_dir.name:
         raise ValueError("staging directory identity does not match experiment_id")
     artifact_root.mkdir(parents=True, exist_ok=True)
-    if final_dir.exists():
+    _require_plain_directory(artifact_root, "artifact_root")
+    staging_identity = _require_plain_directory(staging_dir, "staging_dir")
+    if _path_lexists(final_dir):
         raise FileExistsError("experiment artifact directory already exists")
     if staging_dir.resolve() == final_dir.resolve():
         raise ValueError("staging and final directories must be distinct")
-    if staging_dir.stat().st_dev != artifact_root.stat().st_dev:
+    if staging_identity.device != artifact_root.stat().st_dev:
         raise ValueError("staging and final directories must share one filesystem")
 
     manifest_path = staging_dir / "manifest.json"
-    original_manifest_bytes, manifest = _read_experiment_manifest(manifest_path)
+    _, manifest = _read_experiment_manifest(manifest_path)
     if "experiment" in manifest:
         raise ValueError("staging manifest already contains an experiment index")
     entries = _validate_experiment_bundle(
@@ -649,6 +668,7 @@ def publish_experiment_artifacts(
         resolved_config,
         marker_present=True,
         require_experiment_index=False,
+        expected_experiment_id=experiment_id,
     )
     extended_manifest = dict(manifest)
     extended_manifest["experiment"] = {
@@ -659,50 +679,288 @@ def publish_experiment_artifacts(
         },
     }
     final_manifest_bytes = canonical_json_bytes(cast(JsonValue, extended_manifest))
-    publication = ExperimentArtifactPublication(
+    candidate_parent = Path(
+        tempfile.mkdtemp(prefix=".experiment-candidate-", dir=artifact_root)
+    )
+    candidate_dir = candidate_parent / f".bundle-{uuid4().hex}"
+    consumed_staging = candidate_parent / f".source-{uuid4().hex}"
+    candidate_dir.mkdir()
+    candidate_identity = _require_plain_directory(candidate_dir, "candidate_dir")
+    staging_consumed = False
+    final_committed = False
+    try:
+        _copy_bundle_no_follow(staging_dir, candidate_dir)
+        _write_atomic_bytes(candidate_dir / "manifest.json", final_manifest_bytes)
+        candidate_entries = _validate_private_candidate(
+            candidate_dir,
+            experiment_id,
+            resolved_config,
+            final_manifest_bytes,
+        )
+        if candidate_entries != entries:
+            raise ValueError("experiment artifacts changed while building candidate")
+        lock_path = artifact_root / ".experiment-publish.lock"
+        with _PartitionLock(
+            lock_path, timeout_seconds=60.0, stale_after_seconds=0.0
+        ):
+            _require_same_directory(candidate_dir, candidate_identity, "candidate")
+            if _path_lexists(final_dir):
+                raise FileExistsError("experiment artifact directory already exists")
+            _validate_private_candidate(
+                candidate_dir,
+                experiment_id,
+                resolved_config,
+                final_manifest_bytes,
+                expected_entries=entries,
+            )
+            _require_same_directory(staging_dir, staging_identity, "staging")
+            _validate_experiment_file_set(staging_dir, marker_present=True)
+            _atomic_directory_publish_no_replace(staging_dir, consumed_staging)
+            staging_consumed = True
+            _atomic_directory_publish_no_replace(candidate_dir, final_dir)
+            final_committed = True
+            try:
+                _validate_private_candidate(
+                    final_dir,
+                    experiment_id,
+                    resolved_config,
+                    final_manifest_bytes,
+                    expected_entries=entries,
+                )
+            except BaseException:
+                _quarantine_manifest(final_dir)
+                raise
+    except BaseException as error:
+        if not final_committed and staging_consumed:
+            try:
+                if _path_lexists(staging_dir):
+                    raise FileExistsError("staging path was recreated during recovery")
+                _atomic_directory_publish_no_replace(consumed_staging, staging_dir)
+                staging_consumed = False
+            except BaseException as restore_error:  # noqa: BLE001
+                error.add_note(f"failed to restore experiment staging: {restore_error}")
+        if final_committed or staging_consumed:
+            _quarantine_manifest(candidate_dir, error)
+            _quarantine_manifest(consumed_staging, error)
+            _write_quarantine_diagnostic(candidate_parent, error)
+        else:
+            _remove_private_tree(candidate_parent, error)
+        raise
+    _remove_private_tree(consumed_staging)
+    _remove_empty_directory(candidate_parent)
+    return ExperimentArtifactPublication(
         artifact_dir=final_dir,
         manifest_path=final_dir / "manifest.json",
         entries=dict(entries),
         manifest=cast(dict[str, JsonValue], extended_manifest),
     )
-    candidate_parent = Path(
-        tempfile.mkdtemp(
-            prefix=f".experiment-candidate-{experiment_id}-", dir=artifact_root
-        )
+
+
+def _validate_private_candidate(
+    candidate_dir: Path,
+    experiment_id: UUID,
+    resolved_config: Mapping[str, JsonValue],
+    expected_manifest_bytes: bytes,
+    *,
+    expected_entries: dict[str, ExperimentArtifactEntry] | None = None,
+) -> dict[str, ExperimentArtifactEntry]:
+    """Validate opaque candidate bytes without granting public identity."""
+    _require_plain_directory(candidate_dir, "candidate_dir")
+    raw, manifest = _read_experiment_manifest(candidate_dir / "manifest.json")
+    if raw != expected_manifest_bytes:
+        raise ValueError("candidate manifest changed before publication")
+    if raw != canonical_json_bytes(cast(JsonValue, manifest)):
+        raise ValueError("candidate manifest must be canonical UTF-8 JSON")
+    entries = _validate_experiment_bundle(
+        candidate_dir,
+        manifest,
+        resolved_config,
+        marker_present=True,
+        require_experiment_index=True,
+        expected_experiment_id=experiment_id,
     )
-    candidate_dir = candidate_parent / final_dir.name
-    candidate_owned = False
-    final_committed = False
+    if expected_entries is not None and entries != expected_entries:
+        raise ValueError("candidate artifacts changed before publication")
+    return entries
+
+
+def _copy_bundle_no_follow(source: Path, target: Path) -> None:
+    """Copy one exact bundle into publisher-owned files without following aliases."""
+    _validate_experiment_file_set(source, marker_present=True)
+    expected = ("manifest.json", *_EXPERIMENT_PAYLOAD_NAMES)
+    for name in expected:
+        _copy_file_no_follow(source / name, target / name)
+    _validate_experiment_file_set(target, marker_present=True)
+
+
+def _copy_file_no_follow(source: Path, target: Path) -> None:
+    before = _require_plain_file(source, source.name)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    binary = getattr(os, "O_BINARY", 0)
+    source_fd = os.open(source, os.O_RDONLY | nofollow | binary)
+    target_fd: int | None = None
     try:
-        os.replace(staging_dir, candidate_dir)
-        candidate_owned = True
-        _write_atomic_bytes(candidate_dir / "manifest.json", final_manifest_bytes)
-        candidate = validate_experiment_artifacts(
-            candidate_dir, resolved_config=resolved_config
+        opened = _identity_from_stat(os.fstat(source_fd))
+        if opened != before:
+            raise ValueError(f"experiment artifact {source.name} changed before copy")
+        target_fd = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary,
+            0o600,
         )
-        if candidate.entries != entries:
-            raise ValueError("experiment artifacts changed while building candidate")
-        if final_dir.exists():
-            raise FileExistsError("experiment artifact directory already exists")
-        os.replace(candidate_dir, final_dir)
-        candidate_owned = False
-        final_committed = True
-    except BaseException as error:
-        try:
-            if final_committed and final_dir.exists():
-                os.replace(final_dir, candidate_dir)
-                candidate_owned = True
-            if candidate_owned and candidate_dir.is_dir():
-                _write_atomic_bytes(
-                    candidate_dir / "manifest.json", original_manifest_bytes
-                )
-                os.replace(candidate_dir, staging_dir)
-        except BaseException as restore_error:  # noqa: BLE001
-            error.add_note(f"failed to restore experiment staging: {restore_error}")
-        _remove_empty_directory(candidate_parent, error)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_fd, view)
+                view = view[written:]
+        os.fsync(target_fd)
+        after = _identity_from_stat(os.fstat(source_fd))
+        if after != before or _require_plain_file(source, source.name) != before:
+            raise ValueError(f"experiment artifact {source.name} changed during copy")
+    except BaseException:
+        if target_fd is not None:
+            os.close(target_fd)
+            target_fd = None
+        target.unlink(missing_ok=True)
         raise
-    _remove_empty_directory(candidate_parent)
-    return publication
+    finally:
+        os.close(source_fd)
+        if target_fd is not None:
+            os.close(target_fd)
+    copied = _require_plain_file(target, target.name)
+    if copied.inode == before.inode and copied.device == before.device:
+        target.unlink(missing_ok=True)
+        raise ValueError("publisher copy retained a source file alias")
+
+
+def _require_plain_directory(path: Path, label: str) -> _PathIdentity:
+    try:
+        status = path.lstat()
+    except OSError as error:
+        raise ValueError(f"{label} must be an existing directory") from error
+    if _is_reparse(status) or not stat.S_ISDIR(status.st_mode):
+        raise ValueError(f"{label} must be a plain non-reparse directory")
+    return _identity_from_stat(status)
+
+
+def _require_plain_file(path: Path, label: str) -> _PathIdentity:
+    try:
+        status = path.lstat()
+    except OSError as error:
+        raise ValueError(f"experiment artifact {label} is missing") from error
+    if _is_reparse(status) or not stat.S_ISREG(status.st_mode):
+        raise ValueError(f"experiment artifact {label} must be a plain regular file")
+    return _identity_from_stat(status)
+
+
+def _identity_from_stat(status: os.stat_result) -> _PathIdentity:
+    return _PathIdentity(
+        device=status.st_dev,
+        inode=status.st_ino,
+        mode=status.st_mode,
+        size=status.st_size,
+        modified_ns=status.st_mtime_ns,
+        file_attributes=getattr(status, "st_file_attributes", 0),
+    )
+
+
+def _is_reparse(status: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(status.st_mode) or bool(
+        getattr(status, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _require_same_directory(
+    path: Path, expected: _PathIdentity, label: str
+) -> None:
+    actual = _require_plain_directory(path, label)
+    if (actual.device, actual.inode) != (expected.device, expected.inode):
+        raise ValueError(f"{label} directory identity changed")
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _atomic_directory_publish_no_replace(source: Path, target: Path) -> None:
+    """Atomically rename a directory while refusing every existing target."""
+    if _path_lexists(target):
+        raise FileExistsError(f"publish target already exists: {target}")
+    if os.name == "nt":
+        os.rename(source, target)
+        return
+
+    import ctypes
+    import errno
+
+    if not hasattr(os, "uname") or os.uname().sysname != "Linux":
+        raise RuntimeError("atomic no-replace directory publication is unsupported")
+    library = cast(Any, ctypes.CDLL(None, use_errno=True))
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace directory publication is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(target),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), target)
+    raise OSError(error_number, os.strerror(error_number), target)
+
+
+def _quarantine_manifest(
+    directory: Path, error: BaseException | None = None
+) -> None:
+    manifest = directory / "manifest.json"
+    if not _path_lexists(manifest):
+        return
+    quarantine = directory / f".manifest.quarantine-{uuid4().hex}.json"
+    try:
+        os.replace(manifest, quarantine)
+    except BaseException as quarantine_error:  # noqa: BLE001
+        if error is not None:
+            error.add_note(f"failed to quarantine manifest marker: {quarantine_error}")
+
+
+def _write_quarantine_diagnostic(directory: Path, error: BaseException) -> None:
+    try:
+        _write_json(
+            directory / "diagnostic.json",
+            {"error_type": type(error).__name__, "message": str(error)},
+        )
+    except BaseException as diagnostic_error:  # noqa: BLE001
+        error.add_note(f"failed to write quarantine diagnostic: {diagnostic_error}")
+
+
+def _remove_private_tree(
+    path: Path, error: BaseException | None = None
+) -> None:
+    if not _path_lexists(path):
+        return
+    try:
+        _require_plain_directory(path, "private directory")
+        shutil.rmtree(path)
+    except BaseException as cleanup_error:  # noqa: BLE001
+        if error is not None:
+            error.add_note(f"failed to remove private directory: {cleanup_error}")
 
 
 def _validate_experiment_bundle(
@@ -712,6 +970,7 @@ def _validate_experiment_bundle(
     *,
     marker_present: bool,
     require_experiment_index: bool,
+    expected_experiment_id: UUID | None = None,
 ) -> dict[str, ExperimentArtifactEntry]:
     _validate_experiment_file_set(artifact_dir, marker_present=marker_present)
     raw_entries = _collect_entries(artifact_dir)
@@ -722,6 +981,9 @@ def _validate_experiment_bundle(
     )
     if not nav_dates or any(not isinstance(value, date) for value in nav_dates):
         raise ValueError("nav trade dates must be a nonempty sequence of dates")
+    _validate_nav_timeline_against_manifest(
+        cast(tuple[date, ...], nav_dates), manifest
+    )
     _validate_content(artifact_dir, cast(tuple[date, ...], nav_dates))
     raw_manifest = {
         name: manifest[name]
@@ -745,7 +1007,9 @@ def _validate_experiment_bundle(
 
     from quant_core.analytics.materialize import validate_published_analytics
 
-    validate_published_analytics(artifact_dir, manifest)
+    validate_published_analytics(
+        artifact_dir, manifest, expected_experiment_id=expected_experiment_id
+    )
     _validate_resolved_config(artifact_dir / "resolved_config.yaml", resolved_config)
     _validate_environment(artifact_dir / "environment.json")
     _validate_factor_metrics(artifact_dir / "factor_metrics.parquet")
@@ -758,14 +1022,31 @@ def _validate_experiment_bundle(
     return entries
 
 
+def _validate_nav_timeline_against_manifest(
+    nav_dates: tuple[date, ...], manifest: dict[str, Any]
+) -> None:
+    if nav_dates != tuple(sorted(nav_dates)) or len(set(nav_dates)) != len(nav_dates):
+        raise ValueError("nav trade dates must be strictly ascending and unique")
+    completed = manifest.get("completed_sessions")
+    if type(completed) is not int or completed != len(nav_dates):
+        raise ValueError("nav timeline does not match completed_sessions")
+    try:
+        start = date.fromisoformat(cast(str, manifest.get("start_date")))
+        end = date.fromisoformat(cast(str, manifest.get("end_date")))
+    except (TypeError, ValueError) as error:
+        raise ValueError("manifest date range is invalid") from error
+    if start > end or nav_dates[0] < start or nav_dates[-1] > end:
+        raise ValueError("nav timeline is outside manifest date range")
+
+
 def _validate_experiment_file_set(artifact_dir: Path, *, marker_present: bool) -> None:
+    _require_plain_directory(artifact_dir, "artifact_dir")
     expected = set(_EXPERIMENT_PAYLOAD_NAMES)
     if marker_present:
         expected.add("manifest.json")
     actual: set[str] = set()
     for path in artifact_dir.iterdir():
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"unexpected experiment artifact {path.name}")
+        _require_plain_file(path, path.name)
         actual.add(path.name)
     missing = sorted(expected - actual)
     if missing:
@@ -781,6 +1062,7 @@ def _collect_experiment_entries(
     entries: dict[str, ExperimentArtifactEntry] = {}
     for name in _EXPERIMENT_PAYLOAD_NAMES:
         path = artifact_dir / name
+        _require_plain_file(path, name)
         if name in _EXPERIMENT_PARQUET_NAMES:
             try:
                 schema = pq.read_schema(path)

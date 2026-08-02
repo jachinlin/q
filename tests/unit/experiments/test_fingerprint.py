@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import replace
@@ -16,6 +17,7 @@ import quant_core.experiments.fingerprint as fingerprint_module
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.experiments.fingerprint import (
     ExperimentFingerprintInput,
+    SourceTreeSpec,
     capture_environment,
     compute_fingerprint,
     hash_lockfile,
@@ -262,8 +264,9 @@ def test_no_git_tree_hash_is_explicit_order_stable_and_ignores_dot_git(
     (unrelated / "noise.py").write_bytes(b"NOISE = True\n")
     monkeypatch.chdir(unrelated)
 
-    first = resolve_source_identity(first_root)
-    second = resolve_source_identity(second_root)
+    spec = SourceTreeSpec(schema_version=1, include=("a.py", "b.py"))
+    first = resolve_source_identity(first_root, source_tree_spec=spec)
+    second = resolve_source_identity(second_root, source_tree_spec=spec)
 
     assert first.mode == second.mode == "source_tree"
     assert first.git_commit is second.git_commit is None
@@ -286,7 +289,10 @@ def test_missing_git_executable_falls_back_to_explicit_source_root(
 
     monkeypatch.setattr(fingerprint_module.subprocess, "run", missing_git)
 
-    identity = resolve_source_identity(root)
+    identity = resolve_source_identity(
+        root,
+        source_tree_spec=SourceTreeSpec(schema_version=1, include=("strategy.py",)),
+    )
 
     assert identity.mode == "source_tree"
     assert identity.git_commit is None
@@ -303,7 +309,10 @@ def test_unborn_git_repository_falls_back_to_explicit_source_tree(
     _git(root, "init", "--quiet")
     (root / "strategy.py").write_bytes(b"SIGNAL = 1\n")
 
-    identity = resolve_source_identity(root)
+    identity = resolve_source_identity(
+        root,
+        source_tree_spec=SourceTreeSpec(schema_version=1, include=("strategy.py",)),
+    )
 
     assert identity.mode == "source_tree"
     assert identity.git_commit is None
@@ -337,3 +346,143 @@ def test_environment_requires_lockfile_inside_explicit_source_root(
 
     with pytest.raises(ValueError, match="source root"):
         capture_environment(root, outside)
+
+
+def test_no_git_source_identity_requires_a_versioned_explicit_include_spec(
+    tmp_path: Path,
+) -> None:
+    """No fallback may guess that runtime, artifact, or secret files are source."""
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "strategy.py").write_bytes(b"SIGNAL = 1\n")
+
+    with pytest.raises(ValueError, match="explicit.*source|source.*spec"):
+        resolve_source_identity(root)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        SourceTreeSpec(schema_version=2, include=("strategy.py",))
+
+
+def test_explicit_source_spec_excludes_runtime_artifacts_and_binds_source_changes(
+    tmp_path: Path,
+) -> None:
+    """Only declared source files contribute to no-Git identity."""
+    root = tmp_path / "source"
+    root.mkdir()
+    source = root / "strategy.py"
+    source.write_bytes(b"SIGNAL = 1\n")
+    (root / "secret.env").write_bytes(b"TOKEN=first\n")
+    (root / "runtime.log").write_bytes(b"first\n")
+    artifacts = root / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "result.bin").write_bytes(b"first")
+    spec = SourceTreeSpec(schema_version=1, include=("strategy.py",))
+
+    first = resolve_source_identity(root, source_tree_spec=spec)
+    (root / "secret.env").write_bytes(b"TOKEN=second\n")
+    (root / "runtime.log").write_bytes(b"second\n")
+    (artifacts / "result.bin").write_bytes(b"second")
+    second = resolve_source_identity(root, source_tree_spec=spec)
+    source.write_bytes(b"SIGNAL = 2\n")
+    third = resolve_source_identity(root, source_tree_spec=spec)
+
+    assert first.source_hash == second.source_hash
+    assert third.source_hash != first.source_hash
+
+
+@pytest.mark.parametrize(
+    ("failing_command", "stderr"),
+    [
+        ("rev-parse --show-toplevel", b"fatal: detected dubious ownership"),
+        ("rev-parse --verify HEAD", b"fatal: corrupt loose object"),
+        ("status --porcelain=v1 -z --untracked-files=no", b"permission denied"),
+        ("ls-files -z --cached", b"fatal: index file smaller than expected"),
+    ],
+)
+def test_git_operational_failures_never_fall_back_to_source_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_command: str,
+    stderr: bytes,
+) -> None:
+    """Only proven non-repo/unborn states may use the explicit fallback."""
+    root = tmp_path / "repo"
+    _committed_repo(root)
+    (root / "strategy.py").write_bytes(b"SIGNAL = 2\n")
+    real_run = fingerprint_module.subprocess.run
+
+    def fail_one(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        command = " ".join(arguments[3:])
+        if command == failing_command:
+            return subprocess.CompletedProcess(arguments, 128, b"", stderr)
+        return real_run(arguments, **kwargs)
+
+    monkeypatch.setattr(fingerprint_module.subprocess, "run", fail_one)
+
+    with pytest.raises(ValueError, match="Git"):
+        resolve_source_identity(
+            root,
+            source_tree_spec=SourceTreeSpec(
+                schema_version=1, include=("strategy.py",)
+            ),
+        )
+
+
+def test_git_output_decode_failure_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undecodable Git identity output is corruption, not a no-Git fallback."""
+    root = tmp_path / "repo"
+    _committed_repo(root)
+
+    def undecodable(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        del kwargs
+        return subprocess.CompletedProcess(arguments, 0, b"\xff", b"")
+
+    monkeypatch.setattr(fingerprint_module.subprocess, "run", undecodable)
+
+    with pytest.raises(ValueError, match="UTF-8|decode"):
+        resolve_source_identity(
+            root,
+            source_tree_spec=SourceTreeSpec(
+                schema_version=1, include=("strategy.py",)
+            ),
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction capability test")
+def test_explicit_source_spec_rejects_windows_junction_components(
+    tmp_path: Path,
+) -> None:
+    """An included source path cannot traverse an NTFS reparse-point directory."""
+    root = tmp_path / "source"
+    root.mkdir()
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    (target / "strategy.py").write_bytes(b"SIGNAL = 1\n")
+    junction = root / "linked"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        pytest.skip(
+            "Windows junction creation is unavailable: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+
+    with pytest.raises(ValueError, match="reparse"):
+        resolve_source_identity(
+            root,
+            source_tree_spec=SourceTreeSpec(
+                schema_version=1, include=("linked/strategy.py",)
+            ),
+        )

@@ -238,7 +238,10 @@ def materialize_analytics(artifact_dir: Path) -> AnalyticsResult:
 
 
 def validate_published_analytics(
-    artifact_dir: Path, manifest: dict[str, Any] | None = None
+    artifact_dir: Path,
+    manifest: dict[str, Any] | None = None,
+    *,
+    expected_experiment_id: UUID | None = None,
 ) -> None:
     """Recompute and validate registered analytics without mutating the bundle."""
     if not isinstance(artifact_dir, Path):
@@ -253,7 +256,9 @@ def validate_published_analytics(
     if not isinstance(parsed, dict):
         raise TypeError("manifest must be a JSON object")
     _require_json_finite(parsed, "manifest")
-    raw_entries = _validate_raw_manifest(artifact_dir, parsed)
+    raw_entries = _validate_raw_manifest(
+        artifact_dir, parsed, expected_experiment_id=expected_experiment_id
+    )
     performance, attribution = _calculate_expected_analytics(artifact_dir)
     if "analytics" not in parsed:
         raise ValueError("published artifact has no registered analytics index")
@@ -366,7 +371,10 @@ def _parse_manifest(raw: bytes) -> dict[str, Any]:
 
 
 def _validate_raw_manifest(
-    artifact_dir: Path, manifest: dict[str, Any]
+    artifact_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    expected_experiment_id: UUID | None = None,
 ) -> dict[str, dict[str, object]]:
     fields = set(manifest)
     allowed_fields = (
@@ -403,10 +411,13 @@ def _validate_raw_manifest(
         raise ValueError("manifest identity is invalid") from error
     if start > end:
         raise ValueError("manifest date range is invalid")
-    if artifact_dir.name != f"experiment_id={manifest['experiment_id']}":
-        raise ValueError(
-            "manifest experiment identity does not match artifact directory"
-        )
+    if expected_experiment_id is None:
+        if artifact_dir.name != f"experiment_id={manifest['experiment_id']}":
+            raise ValueError(
+                "manifest experiment identity does not match artifact directory"
+            )
+    elif manifest["experiment_id"] != str(expected_experiment_id):
+        raise ValueError("manifest experiment identity does not match expected identity")
     if (
         type(manifest.get("initial_cash_fen")) is not int
         or manifest["initial_cash_fen"] < 0
