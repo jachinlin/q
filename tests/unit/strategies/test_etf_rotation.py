@@ -1,5 +1,6 @@
 """Behavioral tests for snapshot-bound ETF rotation targets."""
 
+from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -151,6 +152,14 @@ def _empty_state() -> PortfolioState:
 
 def _empty_account_snapshot() -> AccountSnapshot:
     return AccountSnapshot(_SIGNAL, 1_000_000, (), 0, 1_000_000)
+
+
+def _etf_mapping() -> dict[str, object]:
+    return yaml.safe_load(
+        Path("configs/experiments/examples/etf_rotation.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
 
 
 def test_etf_rotation_scores_selected_etfs_and_normalizes_equal_weights() -> None:
@@ -517,27 +526,24 @@ def test_etf_config_fails_closed_for_invalid_inputs(
 
 
 def test_example_etf_yaml_is_safe_loadable_and_has_one_validated_entry_point() -> None:
-    mapping = yaml.safe_load(
-        (Path("configs/experiments/examples/etf_rotation.yaml")).read_text(
-            encoding="utf-8"
-        )
-    )
+    mapping = _etf_mapping()
 
     config = EtfRotationConfig.from_mapping(mapping)
 
     assert config.frequency is RebalanceFrequency.MONTHLY
+    invalid = deepcopy(mapping)
+    invalid["unknown"] = True
     with pytest.raises(ValueError, match="unknown"):
-        EtfRotationConfig.from_mapping({**mapping, "unknown": True})
+        EtfRotationConfig.from_mapping(invalid)
 
 
 @pytest.mark.parametrize("identifier", ["BAD", "SSE:51001", "UNKNOWN:510001"])
 def test_etf_mapping_rejects_noncanonical_pool_identifier(identifier: str) -> None:
-    mapping = yaml.safe_load(
-        Path("configs/experiments/examples/etf_rotation.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    mapping["etf_pool"] = [identifier, *mapping["etf_pool"][1:]]
+    mapping = deepcopy(_etf_mapping())
+    etf_pool = mapping["etf_pool"]
+    assert isinstance(etf_pool, list)
+    etf_pool[0] = identifier
+
     with pytest.raises((TypeError, ValueError)):
         EtfRotationConfig.from_mapping(mapping)
 
