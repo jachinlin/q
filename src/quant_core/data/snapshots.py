@@ -30,6 +30,15 @@ from quant_core.persistence.repositories import (
 _TEMP_MANIFEST = re.compile(r"\.[0-9a-f]{32}\.manifest\.tmp\Z")
 SNAPSHOT_MANIFEST_FORMAT_VERSION = 1
 SNAPSHOT_MANIFEST_VERSION = "snapshot-manifest-v1"
+_SNAPSHOT_MANIFEST_FIELDS = {
+    "as_of",
+    "created_at",
+    "datasets",
+    "format_version",
+    "quality_run_id",
+    "snapshot_id",
+    "status",
+}
 
 
 class SnapshotPublisher:
@@ -277,7 +286,10 @@ class SnapshotPublisher:
             if hashlib.sha256(manifest_bytes).hexdigest() != snapshot.manifest_hash:
                 return False
             manifest = json.loads(manifest_bytes.decode("utf-8"))
-            if not isinstance(manifest, dict):
+            if (
+                not isinstance(manifest, dict)
+                or set(manifest) != _SNAPSHOT_MANIFEST_FIELDS
+            ):
                 return False
             datasets = manifest["datasets"]
             canonical = canonical_json_bytes(manifest)

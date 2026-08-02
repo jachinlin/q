@@ -140,6 +140,7 @@ def _run_independent_worker(
             provider="offline-complete-fixture",
             feature_root=root.parent / "features",
             artifact_root=root,
+            snapshot_root=root.parent / "snapshots",
             rulebook=_rulebook(),
             enrichment=None,
         )

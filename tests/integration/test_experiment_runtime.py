@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -12,6 +13,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from sqlalchemy import text
 
 from quant_core.backtest.rulebook import AShareRuleBook
 from quant_core.data.contracts import (
@@ -26,6 +28,7 @@ from quant_core.data.snapshots import SnapshotPublisher
 from quant_core.data.sources.baostock import BAOSTOCK_CAPABILITIES
 from quant_core.domain.enums import DatasetKind, SnapshotStatus
 from quant_core.domain.identifiers import InstrumentId, QualityRunId, SnapshotId
+from quant_core.errors import QuantError
 from quant_core.experiments import build_default_experiment_worker
 from quant_core.experiments.config import ExperimentCapabilityUnavailable
 from quant_core.experiments.fingerprint import (
@@ -89,6 +92,8 @@ def _register_dataset(
     root: Path,
     dataset: DatasetKind,
     rows: list[dict[str, object]],
+    *,
+    coverage: tuple[date, date] | None = None,
 ) -> object:
     definition = CANONICAL_SCHEMAS[dataset]
     path = root / "curated" / f"{dataset.value}.parquet"
@@ -111,25 +116,32 @@ def _register_dataset(
         DatasetKind.DAILY_BAR,
         DatasetKind.SECURITY_STATUS,
     }
+    start_date, end_date = coverage or (date(2023, 12, 25), date(2024, 7, 1))
     return catalog.register_dataset_version(
         DatasetVersionSpec(
             dataset=dataset,
             source="offline-complete-fixture",
             partitions=(partition,),
-            start_date=date(2023, 12, 25) if dated else None,
-            end_date=date(2024, 7, 1) if dated else None,
+            start_date=start_date if dated else None,
+            end_date=end_date if dated else None,
             created_run_id="offline-complete-fixture",
         )
     )
 
 
 def _published_offline_snapshot(
-    catalog: MetadataRepository, root: Path
+    catalog: MetadataRepository,
+    root: Path,
+    *,
+    excluded: frozenset[DatasetKind] = frozenset(),
+    data_end: date = date(2024, 7, 1),
+    bars_end: date | None = None,
+    coverage: dict[DatasetKind, tuple[date, date]] | None = None,
 ) -> SnapshotRecord:
     instrument = "SSE:510300"
     sessions: list[date] = []
     day = date(2023, 12, 25)
-    while day <= date(2024, 7, 1):
+    while day <= data_end:
         if day.weekday() < 5:
             sessions.append(day)
         day += timedelta(days=1)
@@ -155,27 +167,28 @@ def _published_offline_snapshot(
     previous = 3.0
     for ordinal, session in enumerate(sessions):
         close = 3.0 + ordinal * 0.01
-        bars.append(
-            {
-                "instrument_id": instrument,
-                "trade_date": session,
-                "open": close,
-                "high": close + 0.01,
-                "low": close - 0.01,
-                "close": close,
-                "preclose": previous,
-                "volume": 1_000_000,
-                "amount": close * 1_000_000,
-                "adjustment_flag": "none",
-                "turnover": 1.0,
-                "pct_change": (close / previous - 1.0) * 100.0,
-                "pe_ttm": 10.0,
-                "pb_mrq": 1.0,
-                "ps_ttm": 2.0,
-                "pcf_ncf_ttm": 3.0,
-                **_audit(session),
-            }
-        )
+        if bars_end is None or session <= bars_end:
+            bars.append(
+                {
+                    "instrument_id": instrument,
+                    "trade_date": session,
+                    "open": close,
+                    "high": close + 0.01,
+                    "low": close - 0.01,
+                    "close": close,
+                    "preclose": previous,
+                    "volume": 1_000_000,
+                    "amount": close * 1_000_000,
+                    "adjustment_flag": "none",
+                    "turnover": 1.0,
+                    "pct_change": (close / previous - 1.0) * 100.0,
+                    "pe_ttm": 10.0,
+                    "pb_mrq": 1.0,
+                    "ps_ttm": 2.0,
+                    "pcf_ncf_ttm": 3.0,
+                    **_audit(session),
+                }
+            )
         statuses.append(
             {
                 "instrument_id": instrument,
@@ -190,12 +203,24 @@ def _published_offline_snapshot(
             }
         )
         previous = close
+    rows_by_dataset = {
+        DatasetKind.INSTRUMENT: instruments,
+        DatasetKind.TRADE_CALENDAR: calendar,
+        DatasetKind.DAILY_BAR: bars,
+        DatasetKind.SECURITY_STATUS: statuses,
+        DatasetKind.CORPORATE_ACTION: [],
+    }
+    coverage_by_dataset = coverage or {}
     records = [
-        _register_dataset(catalog, root, DatasetKind.INSTRUMENT, instruments),
-        _register_dataset(catalog, root, DatasetKind.TRADE_CALENDAR, calendar),
-        _register_dataset(catalog, root, DatasetKind.DAILY_BAR, bars),
-        _register_dataset(catalog, root, DatasetKind.SECURITY_STATUS, statuses),
-        _register_dataset(catalog, root, DatasetKind.CORPORATE_ACTION, []),
+        _register_dataset(
+            catalog,
+            root,
+            dataset,
+            rows,
+            coverage=coverage_by_dataset.get(dataset),
+        )
+        for dataset, rows in rows_by_dataset.items()
+        if dataset not in excluded
     ]
     versions = {record.dataset.value: record.id for record in records}  # type: ignore[attr-defined]
     quality = catalog.register_quality_run(
@@ -212,6 +237,369 @@ def _published_offline_snapshot(
         clock=lambda: datetime(2024, 7, 1, tzinfo=UTC),
     ).publish(versions, quality.id)
     return catalog.get_snapshot(snapshot_id)
+
+
+def _runtime_for_snapshot(
+    catalog: MetadataRepository,
+    root: Path,
+    snapshot: SnapshotRecord,
+    *,
+    start: date = date(2024, 6, 27),
+    end: date = date(2024, 6, 28),
+) -> tuple[object, Path, Path]:
+    config = _resolved_etf_config(snapshot.id)
+    config["start_date"] = start.isoformat()
+    config["end_date"] = end.isoformat()
+    now = datetime(2024, 7, 1, tzinfo=UTC)
+    experiment = ExperimentRecord(
+        id="00000000-0000-0000-0000-000000000771",
+        strategy_id="etf_rotation",
+        strategy_version="1.0.0",
+        config=config,
+        config_hash=hashlib.sha256(canonical_json_bytes(config)).hexdigest(),
+        snapshot_id=str(snapshot.id),
+        snapshot_manifest_hash=snapshot.manifest_hash,
+        source_tree_hash="3" * 64,
+        git_commit_hash=None,
+        lockfile_hash="4" * 64,
+        rulebook_version="a-share-v1",
+        fingerprint="5" * 64,
+        status=ExperimentStatus.RUNNING,
+        research_mark=ResearchMark.UNREVIEWED,
+        created_at=now,
+        queued_at=now,
+        started_at=now,
+        completed_at=None,
+    )
+    feature_root = root / "features"
+    artifact_root = root / "artifacts"
+    module = importlib.import_module("quant_core.experiments.runtime")
+    runtime = module.ExperimentRuntimeFactory(
+        catalog=catalog,
+        repository=SnapshotResearchRepository(catalog),
+        capabilities=ProviderCapabilities.complete(),
+        provider="offline-complete-fixture",
+        feature_root=feature_root,
+        artifact_root=artifact_root,
+        snapshot_root=root / "snapshots",
+        rulebook=AShareRuleBook.load(Path("configs/rules/a_share_v1.yaml")),
+        enrichment=None,
+    )(experiment)
+    return runtime, feature_root, artifact_root
+
+
+def _assert_validate_rejects_without_writes(
+    runtime: object,
+    feature_root: Path,
+    artifact_root: Path,
+    *,
+    cause_code: str,
+    dataset: DatasetKind | None = None,
+) -> None:
+    with pytest.raises(QuantError) as caught:
+        runtime.validate()  # type: ignore[attr-defined]
+
+    assert caught.value.detail.code == "EXPERIMENT_SNAPSHOT_INVALID"
+    assert caught.value.detail.context["stage"] == "VALIDATE"
+    assert caught.value.detail.context["cause_code"] == cause_code
+    if dataset is not None:
+        assert caught.value.detail.context["dataset"] == dataset.value
+    assert not feature_root.exists()
+    assert not artifact_root.exists()
+
+
+def test_validate_rejects_tampered_snapshot_manifest_bytes_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(catalog, tmp_path)
+    snapshot.manifest_path.write_bytes(b'{"tampered":true}')
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAP_MANIFEST_MISMATCH",
+    )
+
+
+def test_validate_rejects_nonexact_snapshot_manifest_schema_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(catalog, tmp_path)
+    manifest = json.loads(snapshot.manifest_path.read_bytes())
+    manifest["unexpected"] = "field"
+    payload = canonical_json_bytes(manifest)
+    manifest_hash = hashlib.sha256(payload).hexdigest()
+    snapshot.manifest_path.write_bytes(payload)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER snapshot_published_no_update"))
+        connection.execute(
+            text("UPDATE snapshot SET manifest_hash = :manifest_hash WHERE id = :id"),
+            {"manifest_hash": manifest_hash, "id": str(snapshot.id)},
+        )
+    rebound = catalog.get_snapshot(snapshot.id)
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, rebound
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAP_MANIFEST_MISMATCH",
+    )
+
+
+def test_validate_rejects_manifest_catalog_dataset_mapping_mismatch_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(catalog, tmp_path)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER snapshot_dataset_published_no_update"))
+        connection.execute(text("DROP TRIGGER quality_run_dataset_completed_no_update"))
+        connection.execute(
+            text(
+                "UPDATE snapshot_dataset SET dataset_version_id = :replacement "
+                "WHERE snapshot_id = :snapshot_id AND dataset = :dataset"
+            ),
+            {
+                "replacement": str(
+                    snapshot.dataset_versions[DatasetKind.CORPORATE_ACTION.value]
+                ),
+                "snapshot_id": str(snapshot.id),
+                "dataset": DatasetKind.SECURITY_STATUS.value,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE quality_run_dataset SET dataset_version_id = :replacement "
+                "WHERE quality_run_id = :quality_run_id AND dataset = :dataset"
+            ),
+            {
+                "replacement": str(
+                    snapshot.dataset_versions[DatasetKind.CORPORATE_ACTION.value]
+                ),
+                "quality_run_id": str(snapshot.quality_run_id),
+                "dataset": DatasetKind.SECURITY_STATUS.value,
+            },
+        )
+    rebound = catalog.get_snapshot(snapshot.id)
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, rebound
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAP_MANIFEST_MISMATCH",
+    )
+
+
+def test_validate_rejects_snapshot_quality_scope_mismatch_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(catalog, tmp_path)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER quality_run_dataset_completed_no_delete"))
+        connection.execute(
+            text(
+                "DELETE FROM quality_run_dataset "
+                "WHERE quality_run_id = :quality_run_id AND dataset = :dataset"
+            ),
+            {
+                "quality_run_id": str(snapshot.quality_run_id),
+                "dataset": DatasetKind.CORPORATE_ACTION.value,
+            },
+        )
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAP_QUALITY_SCOPE_MISMATCH",
+    )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        DatasetKind.DAILY_BAR,
+        DatasetKind.TRADE_CALENDAR,
+        DatasetKind.INSTRUMENT,
+    ],
+)
+def test_validate_rejects_each_foundation_dataset_without_writes(
+    tmp_path: Path, missing: DatasetKind
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, excluded=frozenset({missing})
+    )
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAPSHOT_DATASET_MISSING",
+        dataset=missing,
+    )
+
+
+def test_validate_rejects_capability_derived_corporate_action_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(
+        catalog,
+        tmp_path,
+        excluded=frozenset({DatasetKind.CORPORATE_ACTION}),
+    )
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAPSHOT_DATASET_MISSING",
+        dataset=DatasetKind.CORPORATE_ACTION,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dataset", "coverage"),
+    [
+        (DatasetKind.DAILY_BAR, (date(2024, 6, 28), date(2024, 7, 1))),
+        (DatasetKind.TRADE_CALENDAR, (date(2023, 12, 25), date(2024, 6, 27))),
+    ],
+)
+def test_validate_rejects_experiment_range_outside_dataset_coverage_without_writes(
+    tmp_path: Path,
+    dataset: DatasetKind,
+    coverage: tuple[date, date],
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, coverage={dataset: coverage}
+    )
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAPSHOT_DATE_COVERAGE_INVALID",
+        dataset=dataset,
+    )
+
+
+def test_validate_rejects_missing_actual_benchmark_bars_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, bars_end=date(2024, 6, 27)
+    )
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAPSHOT_DATE_COVERAGE_INVALID",
+        dataset=DatasetKind.DAILY_BAR,
+    )
+
+
+def test_validate_rejects_missing_next_trading_session_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, data_end=date(2024, 6, 28)
+    )
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAPSHOT_NEXT_SESSION_MISSING",
+        dataset=DatasetKind.TRADE_CALENDAR,
+    )
+
+
+def test_validate_rejects_tampered_required_dataset_partition_without_writes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    catalog = MetadataRepository(engine)
+    snapshot = _published_offline_snapshot(catalog, tmp_path)
+    daily = catalog.get_dataset_version(
+        snapshot.dataset_versions[DatasetKind.DAILY_BAR.value]
+    )
+    daily.partitions[0].path.write_bytes(b"tampered parquet bytes")
+    runtime, feature_root, artifact_root = _runtime_for_snapshot(
+        catalog, tmp_path, snapshot
+    )
+
+    _assert_validate_rejects_without_writes(
+        runtime,
+        feature_root,
+        artifact_root,
+        cause_code="SNAPSHOT_DATASET_INVALID",
+        dataset=DatasetKind.DAILY_BAR,
+    )
 
 
 def test_default_worker_is_shipped_as_a_local_concrete_composition_root(
@@ -349,6 +737,7 @@ def test_complete_offline_snapshot_runs_public_worker_chain_to_registration(
         provider="offline-complete-fixture",
         feature_root=tmp_path / "features",
         artifact_root=tmp_path / "artifacts",
+        snapshot_root=tmp_path / "snapshots",
         rulebook=AShareRuleBook.load(Path("configs/rules/a_share_v1.yaml")),
         enrichment=None,
     )
@@ -373,7 +762,11 @@ def test_complete_offline_snapshot_runs_public_worker_chain_to_registration(
     assert worker.run_once()
     detail = ExperimentQuery(engine).get(experiment_id)
     task = queue.get(task_id)
-    assert task.status is TaskStatus.SUCCEEDED, (task.progress, task.error, detail.audit)
+    assert task.status is TaskStatus.SUCCEEDED, (
+        task.progress,
+        task.error,
+        detail.audit,
+    )
     assert detail.record.status is ExperimentStatus.SUCCEEDED
     assert {artifact.name for artifact in detail.artifacts} >= {
         "manifest.json",
@@ -431,6 +824,7 @@ def test_baostock_runtime_fails_validate_before_cache_or_artifact_creation(
         provider="baostock",
         feature_root=feature_root,
         artifact_root=artifact_root,
+        snapshot_root=tmp_path,
         rulebook=AShareRuleBook.load(Path("configs/rules/a_share_v1.yaml")),
         enrichment=None,
     )(experiment)

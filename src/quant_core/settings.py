@@ -39,6 +39,10 @@ class Settings(BaseSettings):
         return self.data_root / "data" / "features"
 
     @property
+    def snapshot_root(self) -> Path:
+        return self.data_root / "data" / "snapshots"
+
+    @property
     def artifact_root(self) -> Path:
         return self.data_root / "artifacts"
 

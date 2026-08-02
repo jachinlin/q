@@ -98,6 +98,19 @@ class SnapshotDatasetMissing(QuantError):
         )
 
 
+def verify_published_dataset(
+    catalog: SnapshotCatalog,
+    snapshot_id: SnapshotId,
+    dataset: DatasetKind,
+) -> DatasetVersionRecord:
+    """Read-verify every physical partition bound to one published dataset."""
+    record = _published_dataset_record(catalog, snapshot_id, dataset)
+    for partition in record.partitions:
+        source = _validated_regular_partition_path(partition.path)
+        _verify_owned_partition(source, partition)
+    return record
+
+
 class SnapshotResearchRepository:
     """Resolve every Parquet input through one explicit immutable snapshot."""
 
@@ -288,25 +301,25 @@ class SnapshotResearchRepository:
     def _dataset_record(
         self, snapshot_id: SnapshotId, dataset: DatasetKind
     ) -> DatasetVersionRecord:
-        snapshot = self._catalog.get_snapshot(snapshot_id)
-        if (
-            snapshot.status is not SnapshotStatus.PUBLISHED
-            or snapshot.published_at is None
-        ):
-            _raise_snapshot_not_published(snapshot_id)
-        version_id = snapshot.dataset_versions.get(dataset.value)
-        if version_id is None:
-            raise SnapshotDatasetMissing(snapshot_id, dataset)
-        record = self._catalog.get_dataset_version(version_id)
-        if (
-            record.dataset is not dataset
-            or record.status != SnapshotStatus.PUBLISHED.value
-        ):
-            _raise_catalog_error(
-                snapshot_id, dataset, "dataset version is not published"
-            )
-        _validate_catalog_partition_identities(snapshot_id, dataset, record)
-        return record
+        return _published_dataset_record(self._catalog, snapshot_id, dataset)
+
+
+def _published_dataset_record(
+    catalog: SnapshotCatalog,
+    snapshot_id: SnapshotId,
+    dataset: DatasetKind,
+) -> DatasetVersionRecord:
+    snapshot = catalog.get_snapshot(snapshot_id)
+    if snapshot.status is not SnapshotStatus.PUBLISHED or snapshot.published_at is None:
+        _raise_snapshot_not_published(snapshot_id)
+    version_id = snapshot.dataset_versions.get(dataset.value)
+    if version_id is None:
+        raise SnapshotDatasetMissing(snapshot_id, dataset)
+    record = catalog.get_dataset_version(version_id)
+    if record.dataset is not dataset or record.status != SnapshotStatus.PUBLISHED.value:
+        _raise_catalog_error(snapshot_id, dataset, "dataset version is not published")
+    _validate_catalog_partition_identities(snapshot_id, dataset, record)
+    return record
 
 
 def _instrument_predicate(
