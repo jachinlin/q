@@ -9,7 +9,9 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -261,13 +263,12 @@ class TaskORM(Base):
             "'CANCEL_REQUESTED', 'CANCELLED', 'ORPHANED')",
             name="ck_task_status",
         ),
-        Index("ix_task_queue", "status", "available_at", "priority", "created_at"),
         Index("ix_task_experiment", "experiment_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    experiment_id: Mapped[str] = mapped_column(
-        ForeignKey("experiment.id", ondelete="CASCADE"), nullable=False
+    experiment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("experiment.id", ondelete="CASCADE")
     )
     task_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_json: Mapped[str] = mapped_column(String, nullable=False)
@@ -279,6 +280,31 @@ class TaskORM(Base):
     updated_at: Mapped[str] = mapped_column(String(32), nullable=False)
     heartbeat_at: Mapped[str | None] = mapped_column(String(32))
     completed_at: Mapped[str | None] = mapped_column(String(32))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    locked_at: Mapped[str | None] = mapped_column(String(32))
+    error_json: Mapped[str | None] = mapped_column(Text)
+
+
+Index(
+    "ix_task_queue",
+    TaskORM.status,
+    TaskORM.available_at,
+    TaskORM.priority.desc(),
+    TaskORM.created_at,
+    TaskORM.id,
+)
+Index(
+    "uq_task_active_idempotency",
+    TaskORM.task_type,
+    text("COALESCE(experiment_id, '')"),
+    TaskORM.idempotency_key,
+    unique=True,
+    sqlite_where=text(
+        "idempotency_key IS NOT NULL "
+        "AND status IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')"
+    ),
+)
 
 
 class TaskAttemptORM(Base):
