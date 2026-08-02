@@ -51,12 +51,9 @@ from quant_core.persistence.orm import (
     QualityRunORM,
     SnapshotDatasetORM,
     SnapshotORM,
-    TaskAttemptORM,
     TaskORM,
 )
 from quant_core.tasks.models import (
-    TaskAttemptRecord,
-    TaskAttemptSpec,
     TaskRecord,
     TaskSpec,
     TaskStatus,
@@ -237,13 +234,16 @@ class MetadataRepository:
 
     def register_experiment(self, spec: ExperimentSpec) -> ExperimentRecord:
         """Persist a new experiment even when its fingerprint has been seen before."""
+        config_bytes = canonical_json_bytes(spec.config)
+        if hashlib.sha256(config_bytes).hexdigest() != spec.config_hash:
+            raise ValueError("config_hash must match canonical config")
         identifier = str(uuid4())
         with Session(self._engine) as session, session.begin():
             row = ExperimentORM(
                 id=identifier,
                 strategy_id=spec.strategy_id,
                 strategy_version=spec.strategy_version,
-                config_json=_json_text(spec.config),
+                config_json=config_bytes.decode("utf-8"),
                 config_hash=spec.config_hash,
                 snapshot_id=spec.snapshot_id,
                 snapshot_manifest_hash=spec.snapshot_manifest_hash,
@@ -299,29 +299,6 @@ class MetadataRepository:
             session.add(row)
             session.flush()
             return self._task_record(row)
-
-    def create_task_attempt(self, spec: TaskAttemptSpec) -> TaskAttemptRecord:
-        """Persist an explicitly requested attempt without retry policy."""
-        identifier = str(uuid4())
-        with Session(self._engine) as session, session.begin():
-            if session.get(TaskORM, spec.task_id) is None:
-                raise KeyError(f"task does not exist: {spec.task_id}")
-            row = TaskAttemptORM(
-                id=identifier,
-                task_id=spec.task_id,
-                attempt_no=spec.attempt_no,
-                status=TaskStatus.RUNNING.value,
-                worker_id=spec.worker_id,
-                started_at=_timestamp(spec.started_at),
-                heartbeat_at=spec.started_at.astimezone(UTC).isoformat(),
-                completed_at=None,
-                log_path=spec.log_path,
-                progress_json="{}",
-                error_json=None,
-            )
-            session.add(row)
-            session.flush()
-            return self._task_attempt_record(row)
 
     def register_pipeline_run(self, spec: PipelineRunSpec) -> PipelineRunRecord:
         """Create or return the stable run identified by its canonical request."""
@@ -1076,30 +1053,6 @@ class MetadataRepository:
                 if row.completed_at is not None
                 else None
             ),
-        )
-
-    @staticmethod
-    def _task_attempt_record(row: TaskAttemptORM) -> TaskAttemptRecord:
-        return TaskAttemptRecord(
-            id=row.id,
-            task_id=row.task_id,
-            attempt_no=row.attempt_no,
-            status=TaskStatus(row.status),
-            worker_id=row.worker_id,
-            started_at=_parse_timestamp(row.started_at),
-            heartbeat_at=(
-                _parse_timestamp(row.heartbeat_at)
-                if row.heartbeat_at is not None
-                else None
-            ),
-            completed_at=(
-                _parse_timestamp(row.completed_at)
-                if row.completed_at is not None
-                else None
-            ),
-            log_path=row.log_path,
-            progress=json.loads(row.progress_json),
-            error=(json.loads(row.error_json) if row.error_json is not None else None),
         )
 
     def _dataset_record(

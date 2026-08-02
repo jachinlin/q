@@ -65,27 +65,6 @@ class TaskRecord(_TaskModel):
     completed_at: datetime | None
 
 
-class TaskAttemptSpec(_TaskModel):
-    task_id: str
-    attempt_no: int
-    worker_id: str
-    started_at: datetime
-    log_path: str
-
-    @field_validator("started_at")
-    @classmethod
-    def normalize_started_at(cls, value: datetime) -> datetime:
-        return _utc(value, "started_at")
-
-    @model_validator(mode="after")
-    def validate_attempt(self) -> TaskAttemptSpec:
-        if not self.task_id or not self.worker_id or not self.log_path:
-            raise ValueError("task attempt identity fields must not be empty")
-        if self.attempt_no <= 0:
-            raise ValueError("attempt_no must be positive")
-        return self
-
-
 class TaskAttemptRecord(_TaskModel):
     id: str
     task_id: str

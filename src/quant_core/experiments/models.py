@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 class ExperimentStatus(StrEnum):
@@ -52,7 +53,6 @@ class ExperimentSpec(_ExperimentModel):
         "config_hash",
         "snapshot_manifest_hash",
         "source_tree_hash",
-        "git_commit_hash",
         "lockfile_hash",
         "fingerprint",
     )
@@ -61,6 +61,13 @@ class ExperimentSpec(_ExperimentModel):
         if value is not None and not _SHA256.fullmatch(value):
             field_name = getattr(info, "field_name", "hash")
             raise ValueError(f"{field_name} must be a lowercase SHA-256 hex digest")
+        return value
+
+    @field_validator("git_commit_hash")
+    @classmethod
+    def validate_git_oid(cls, value: str | None) -> str | None:
+        if value is not None and not _GIT_OID.fullmatch(value):
+            raise ValueError("git_commit_hash must be a 40- or 64-character Git OID")
         return value
 
     @field_validator("created_at")
@@ -123,6 +130,11 @@ class ExperimentMetric(_ExperimentModel):
     value: float
     unit: str | None = None
     created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        return _utc(value, "created_at")
 
 
 class ExperimentArtifact(_ExperimentModel):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -292,6 +292,20 @@ def test_domain_models_validate_fingerprint_metadata_and_exact_statuses() -> Non
             fingerprint="e" * 64,
             created_at=datetime(2026, 7, 30, tzinfo=UTC),
         )
+    for git_oid in ("1" * 40, "2" * 64):
+        experiment = ExperimentSpec(
+            strategy_id="momentum",
+            strategy_version="1",
+            config={},
+            config_hash=hashlib.sha256(b"{}").hexdigest(),
+            snapshot_manifest_hash="b" * 64,
+            git_commit_hash=git_oid,
+            lockfile_hash="d" * 64,
+            rulebook_version="cn-a-v1",
+            fingerprint="e" * 64,
+            created_at=datetime(2026, 7, 30, tzinfo=UTC),
+        )
+        assert experiment.git_commit_hash == git_oid
 
 
 def test_repository_persists_duplicate_experiments_and_utc_task_records(
@@ -300,7 +314,7 @@ def test_repository_persists_duplicate_experiments_and_utc_task_records(
     """A uniqueness shortcut must not reuse research, and timestamps must round-trip UTC."""
     from quant_core.experiments.models import ExperimentSpec
     from quant_core.persistence.repositories import MetadataRepository
-    from quant_core.tasks.models import TaskAttemptSpec, TaskSpec, TaskStatus
+    from quant_core.tasks.models import TaskSpec, TaskStatus
 
     database = tmp_path / "repository.db"
     upgrade_database(database)
@@ -333,24 +347,12 @@ def test_repository_persists_duplicate_experiments_and_utc_task_records(
             available_at=created_at + timedelta(seconds=2),
         )
     )
-    attempt = repository.create_task_attempt(
-        TaskAttemptSpec(
-            task_id=task.id,
-            attempt_no=1,
-            worker_id="worker-1",
-            started_at=created_at + timedelta(seconds=3),
-            log_path="logs/task-1.ndjson",
-        )
-    )
-
     assert first.id != repeated.id
     assert repository.count_experiments_by_fingerprint("e" * 64) == 2
     assert first.config == {"universe": ["SSE:600000"], "window": 20}
     assert first.created_at == created_at
     assert task.status is TaskStatus.QUEUED
     assert task.available_at == created_at + timedelta(seconds=2)
-    assert attempt.status is TaskStatus.RUNNING
-    assert attempt.started_at == created_at + timedelta(seconds=3)
     with engine.connect() as connection:
         persisted_config = connection.execute(
             text("SELECT config_json FROM experiment WHERE id = :id"),
@@ -362,6 +364,40 @@ def test_repository_persists_duplicate_experiments_and_utc_task_records(
         ).scalar_one()
     assert persisted_config == '{"universe":["SSE:600000"],"window":20}'
     assert persisted_time == "2026-07-30T16:00:00+00:00"
+    engine.dispose()
+
+
+def test_repository_rejects_config_mutated_after_dto_validation(
+    tmp_path: Path,
+) -> None:
+    """Mutating nested config after validation must not persist JSON with a stale hash."""
+    from quant_core.experiments.models import ExperimentSpec
+    from quant_core.persistence.repositories import MetadataRepository
+
+    database = tmp_path / "mutated-config.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    repository = MetadataRepository(engine)
+    experiment = ExperimentSpec(
+        strategy_id="momentum",
+        strategy_version="1.0.0",
+        config={"windows": [20]},
+        config_hash=hashlib.sha256(b'{"windows":[20]}').hexdigest(),
+        snapshot_manifest_hash="b" * 64,
+        source_tree_hash="c" * 64,
+        lockfile_hash="d" * 64,
+        rulebook_version="cn-a-v1",
+        fingerprint="e" * 64,
+        created_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+    windows = experiment.config["windows"]
+    assert isinstance(windows, list)
+    windows.append(60)
+
+    with pytest.raises(ValueError, match="config_hash must match canonical config"):
+        repository.register_experiment(experiment)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM experiment")).scalar_one() == 0
     engine.dispose()
 
 
@@ -388,3 +424,32 @@ def test_auxiliary_dtos_reject_noncanonical_persistent_values() -> None:
             details={},
             created_at=naive_timestamp,
         )
+
+
+def test_experiment_metric_requires_and_normalizes_utc_timestamp() -> None:
+    """Metric timestamps must reject naive input and persist one UTC convention."""
+    from quant_core.experiments.models import ExperimentMetric
+
+    naive_timestamp = datetime(2026, 7, 30, tzinfo=UTC).replace(tzinfo=None)
+    with pytest.raises(ValueError, match="created_at must be timezone-aware"):
+        ExperimentMetric(
+            experiment_id="experiment-1",
+            name="sharpe",
+            value=1.25,
+            created_at=naive_timestamp,
+        )
+
+    metric = ExperimentMetric(
+        experiment_id="experiment-1",
+        name="sharpe",
+        value=1.25,
+        created_at=datetime(
+            2026,
+            7,
+            30,
+            16,
+            tzinfo=timezone(timedelta(hours=8)),
+        ),
+    )
+    assert metric.created_at == datetime(2026, 7, 30, 8, tzinfo=UTC)
+    assert metric.created_at.tzinfo is UTC
