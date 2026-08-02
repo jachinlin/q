@@ -662,6 +662,22 @@ def test_backtest_request_rejects_invalid_direct_construction(
         invalid_request()
 
 
+@pytest.mark.parametrize("initial_cash_fen", [0, -1])
+def test_backtest_request_rejects_nonpositive_initial_cash(
+    initial_cash_fen: int,
+) -> None:
+    """Allowing a nonpositive opening NAV violates strategy and analytics input."""
+    with pytest.raises(ValueError, match="positive integer"):
+        replace(_request(), initial_cash_fen=initial_cash_fen)
+
+
+def test_backtest_request_accepts_one_fen_initial_cash() -> None:
+    """The smallest positive integer remains a valid public request boundary."""
+    request = replace(_request(), initial_cash_fen=1)
+
+    assert request.initial_cash_fen == 1
+
+
 @pytest.mark.parametrize(
     "invalid_result",
     [

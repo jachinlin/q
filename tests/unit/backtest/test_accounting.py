@@ -315,7 +315,7 @@ def test_fifo_partial_sale_rounds_half_up_and_final_sale_consumes_residual_cost(
     assert sum(event.cost_basis_delta_fen for event in account.ledger) == 0
 
 
-def test_record_date_entitlements_are_idempotent_and_require_evidence() -> None:
+def test_record_date_entitlements_are_idempotent() -> None:
     account = PortfolioAccount(1_000_000, _calendar())
     account.begin_session(_D2, ())
     account.apply(_batch(_fill(OrderSide.BUY, 100, 100_000), ending_cash=900_000))
@@ -352,9 +352,47 @@ def test_record_date_entitlements_are_idempotent_and_require_evidence() -> None:
         account.ledger,
     ) == (901_000, 110, before)
 
-    missing = PortfolioAccount(1, _calendar())
+
+def test_pre_lifecycle_record_date_has_zero_entitlement() -> None:
+    """A cash-only account cannot own shares before its first active session."""
+    account = PortfolioAccount(1_000, _calendar())
+    dividend = CorporateAction(
+        "pre-start",
+        CorporateActionType.CASH_DIVIDEND,
+        _A,
+        _D2,
+        _D4,
+        Decimal(1),
+    )
+
+    account.begin_session(_D4, (dividend,))
+    snapshot = account.mark_to_market(_D4, {})
+
+    assert snapshot.cash_fen == 1_000
+    assert (account.ledger[-1].event_type, account.ledger[-1].cash_delta_fen) == (
+        LedgerEventType.CASH_DIVIDEND,
+        0,
+    )
+
+
+def test_in_lifecycle_missing_record_date_snapshot_fails_closed() -> None:
+    """Skipping an active-lifecycle record date must not imply zero holdings."""
+    account = PortfolioAccount(1_000, _calendar())
+    account.begin_session(_D2, ())
+    account.mark_to_market(_D2, {})
+    dividend = CorporateAction(
+        "missing-active-date",
+        CorporateActionType.CASH_DIVIDEND,
+        _A,
+        _D3,
+        _D4,
+        Decimal(1),
+    )
+
     with pytest.raises(ValueError, match="record-date"):
-        missing.begin_session(_D4, (dividend,))
+        account.begin_session(_D4, (dividend,))
+
+    assert account.last_snapshot == AccountSnapshot(_D2, 1_000, (), 0, 1_000)
 
 
 def test_corporate_action_batch_rolls_back_when_later_action_lacks_record_evidence() -> (

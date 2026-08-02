@@ -31,6 +31,7 @@ _STOCK = InstrumentId.parse("SSE:600001")
 _FRIDAY = date(2024, 1, 5)
 _MONDAY = date(2024, 1, 8)
 _TUESDAY = date(2024, 1, 9)
+_NEXT_SESSION = date(2024, 1, 12)
 
 
 class _RuleBook:
@@ -49,7 +50,10 @@ class _RuleBook:
 class _Data:
     def __init__(self) -> None:
         self.calendar_value = TradingCalendar(
-            SnapshotId(_SNAPSHOT), _FRIDAY, _TUESDAY, (_FRIDAY, _MONDAY, _TUESDAY)
+            SnapshotId(_SNAPSHOT),
+            _FRIDAY,
+            _NEXT_SESSION,
+            (_FRIDAY, _MONDAY, _TUESDAY, _NEXT_SESSION),
         )
         self.slices = {
             _FRIDAY: _slice(_FRIDAY, stock_close=10.0),
@@ -57,8 +61,20 @@ class _Data:
             _TUESDAY: _slice(_TUESDAY, stock_close=11.0),
         }
 
-    def calendar(self, snapshot_id: UUID, start: date, end: date) -> TradingCalendar:
-        assert (snapshot_id, start, end) == (_SNAPSHOT, _FRIDAY, _TUESDAY)
+    def calendar(
+        self,
+        snapshot_id: UUID,
+        start: date,
+        end: date,
+        *,
+        include_next_session: bool,
+    ) -> TradingCalendar:
+        assert (snapshot_id, start, end, include_next_session) == (
+            _SNAPSHOT,
+            _FRIDAY,
+            _TUESDAY,
+            True,
+        )
         return self.calendar_value
 
     def market_slice(self, snapshot_id: UUID, trade_date: date) -> SnapshotMarketSlice:
@@ -183,6 +199,128 @@ def test_engine_generates_after_close_and_executes_on_next_session(
     assert result.sessions_completed == 3
 
 
+def test_end_date_buy_uses_requested_next_session_coverage_and_publishes(
+    tmp_path: Path,
+) -> None:
+    """Omitting the post-end session makes a final-session BUY abort at T+1."""
+
+    class CoverageData(_Data):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calendar_calls: list[tuple[UUID, date, date, bool]] = []
+
+        def calendar(
+            self,
+            snapshot_id: UUID,
+            start: date,
+            end: date,
+            *,
+            include_next_session: bool = False,
+        ) -> TradingCalendar:
+            self.calendar_calls.append((snapshot_id, start, end, include_next_session))
+            if include_next_session:
+                return TradingCalendar(
+                    SnapshotId(_SNAPSHOT),
+                    start,
+                    _NEXT_SESSION,
+                    (_MONDAY, _TUESDAY, _NEXT_SESSION),
+                )
+            return TradingCalendar(
+                SnapshotId(_SNAPSHOT), start, end, (_MONDAY, _TUESDAY)
+            )
+
+    class FinalSessionBuyTargets:
+        def generate_target(
+            self,
+            strategy: StrategyRef,
+            snapshot_id: UUID,
+            signal_date: date,
+            execute_date: date,
+            current: object,
+        ) -> TargetPortfolio:
+            del strategy, snapshot_id, current
+            return TargetPortfolio(
+                signal_date,
+                execute_date,
+                (TargetPosition(_STOCK, 1.0, 2.0, "TEST"),),
+                0.0,
+            )
+
+    data = CoverageData()
+    request = replace(
+        _request(),
+        experiment_id=UUID("00000000-0000-0000-0000-000000000011"),
+        start_date=_MONDAY,
+    )
+
+    result = BacktestEngine(
+        data,
+        FinalSessionBuyTargets(),
+        _RuleBook(),
+        RebalancePlanner(),
+        artifact_root=tmp_path,
+    ).run(request, _Progress(), _NeverCancelled())
+
+    assert data.calendar_calls == [
+        (_SNAPSHOT, _MONDAY, _TUESDAY, True),
+    ]
+    assert result.manifest_path.is_file()
+    assert result.final_snapshot.trade_date == _TUESDAY
+    assert result.final_snapshot.positions[0].sellable_quantity == 0
+
+
+def test_engine_rejects_missing_post_end_session_before_market_loop(
+    tmp_path: Path,
+) -> None:
+    """A provider ignoring next-session coverage must fail before simulating data."""
+
+    class InsufficientCalendarData(_Data):
+        def __init__(self) -> None:
+            super().__init__()
+            self.market_slice_calls = 0
+
+        def calendar(
+            self,
+            snapshot_id: UUID,
+            start: date,
+            end: date,
+            *,
+            include_next_session: bool = False,
+        ) -> TradingCalendar:
+            del include_next_session
+            return TradingCalendar(
+                SnapshotId(snapshot_id), start, end, (_MONDAY, _TUESDAY)
+            )
+
+        def market_slice(
+            self, snapshot_id: UUID, trade_date: date
+        ) -> SnapshotMarketSlice:
+            self.market_slice_calls += 1
+            return super().market_slice(snapshot_id, trade_date)
+
+    class NoneTargets:
+        def generate_target(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    data = InsufficientCalendarData()
+    request = replace(
+        _request(),
+        experiment_id=UUID("00000000-0000-0000-0000-000000000012"),
+        start_date=_MONDAY,
+    )
+
+    with pytest.raises(ValueError, match="next trading session"):
+        BacktestEngine(
+            data,
+            NoneTargets(),
+            _RuleBook(),
+            RebalancePlanner(),
+            artifact_root=tmp_path,
+        ).run(request, _Progress(), _NeverCancelled())
+
+    assert data.market_slice_calls == 0
+
+
 def test_engine_rejects_same_date_slice_from_another_snapshot(tmp_path: Path) -> None:
     class WrongSnapshotData(_Data):
         def market_slice(
@@ -284,9 +422,19 @@ def test_manifest_retains_non_session_request_boundary(tmp_path: Path) -> None:
 
     class WeekendData(_Data):
         def calendar(
-            self, snapshot_id: UUID, start: date, end: date
+            self,
+            snapshot_id: UUID,
+            start: date,
+            end: date,
+            *,
+            include_next_session: bool,
         ) -> TradingCalendar:
-            assert (snapshot_id, start, end) == (_SNAPSHOT, date(2024, 1, 6), _TUESDAY)
+            assert (snapshot_id, start, end, include_next_session) == (
+                _SNAPSHOT,
+                date(2024, 1, 6),
+                _TUESDAY,
+                True,
+            )
             return self.calendar_value
 
     result = BacktestEngine(

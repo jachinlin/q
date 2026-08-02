@@ -216,6 +216,7 @@ class PortfolioAccount:
         self._ledger_source_ids = {opening.source_id}
         self._processed_action_ids: set[str] = set()
         self._record_quantities: dict[date, dict[InstrumentId, int]] = {}
+        self._lifecycle_start: date | None = None
         self._last_session: date | None = None
         self._phase = "idle"
         self._last_snapshot: AccountSnapshot | None = None
@@ -250,19 +251,20 @@ class PortfolioAccount:
         event_ids = set(self._ledger_event_ids)
         source_ids = set(self._ledger_source_ids)
         processed = set(self._processed_action_ids)
+        lifecycle_start = self._lifecycle_start or trade_date
         for action in action_items:
             if action.event_id in processed:
                 continue
             if action.effective_date != trade_date:
                 raise ValueError("corporate action effective_date must match session")
-            try:
-                entitled = self._record_quantities[action.record_date].get(
-                    action.instrument_id, 0
-                )
-            except KeyError as error:
-                raise ValueError(
-                    "corporate action requires record-date evidence"
-                ) from error
+            evidence = self._record_quantities.get(action.record_date)
+            if evidence is None:
+                if action.record_date < lifecycle_start:
+                    entitled = 0
+                else:
+                    raise ValueError("corporate action requires record-date evidence")
+            else:
+                entitled = evidence.get(action.instrument_id, 0)
             if action.action_type is CorporateActionType.CASH_DIVIDEND:
                 amount = _rounded_fen(Decimal(entitled) * action.cash_per_share_yuan)
                 cash += amount
@@ -314,6 +316,7 @@ class PortfolioAccount:
         self._ledger_event_ids = event_ids
         self._ledger_source_ids = source_ids
         self._processed_action_ids = processed
+        self._lifecycle_start = lifecycle_start
         self._last_session = trade_date
         self._phase = "open"
         self._last_snapshot = None

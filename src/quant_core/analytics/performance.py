@@ -460,8 +460,11 @@ def _period_returns(
     for key, indexes in grouped.items():
         first = indexes[0]
         last = indexes[-1]
-        portfolio_return = float(nav_values[last] / nav_values[first] - 1.0)
-        benchmark_return = float(benchmark_values[last] / benchmark_values[first] - 1.0)
+        baseline = first if first == 0 else first - 1
+        portfolio_return = float(nav_values[last] / nav_values[baseline] - 1.0)
+        benchmark_return = float(
+            benchmark_values[last] / benchmark_values[baseline] - 1.0
+        )
         row: dict[str, object] = {
             "year": key[0],
             "period_start": dates[first],

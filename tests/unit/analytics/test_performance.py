@@ -101,6 +101,21 @@ def _empty_costs() -> pl.DataFrame:
     return pl.DataFrame(schema=COSTS_SCHEMA)
 
 
+def _period_nav(
+    dates: list[date], nav_values: list[int], benchmark_values: list[float]
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "trade_date": dates,
+            "cash_fen": nav_values,
+            "market_value_fen": [0] * len(dates),
+            "nav_fen": nav_values,
+            "benchmark_close": benchmark_values,
+        },
+        schema=NAV_SCHEMA,
+    )
+
+
 def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> None:
     """A wrong metric formula, sample convention, or period boundary breaks this."""
     result = calculate_performance(_nav(), _fills(), _costs(), sessions_per_year=3)
@@ -158,9 +173,9 @@ def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> Non
             "month": 2,
             "period_start": date(2024, 2, 1),
             "period_end": date(2024, 2, 2),
-            "portfolio_return": pytest.approx(0.11111111111111116),
-            "benchmark_return": pytest.approx(0.02),
-            "relative_return": pytest.approx(0.09111111111111116),
+            "portfolio_return": pytest.approx(0.0),
+            "benchmark_return": pytest.approx(-0.02857142857142858),
+            "relative_return": pytest.approx(0.02857142857142858),
         },
     ]
     assert result.annual_returns.to_dicts() == [
@@ -174,6 +189,64 @@ def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> Non
         }
     ]
     assert result.undefined_metrics == {}
+
+
+def test_annual_returns_include_the_first_session_move_across_years() -> None:
+    """Using the new year's first NAV as baseline drops its cross-year move."""
+    nav = _period_nav(
+        [
+            date(2023, 12, 28),
+            date(2023, 12, 29),
+            date(2024, 1, 2),
+            date(2024, 1, 3),
+        ],
+        [10_000, 11_000, 9_900, 12_100],
+        [100.0, 105.0, 100.0, 110.0],
+    )
+
+    result = calculate_performance(nav, _empty_fills(), _empty_costs())
+
+    assert result.annual_returns.to_dicts() == [
+        {
+            "year": 2023,
+            "period_start": date(2023, 12, 28),
+            "period_end": date(2023, 12, 29),
+            "portfolio_return": pytest.approx(0.1),
+            "benchmark_return": pytest.approx(0.05),
+            "relative_return": pytest.approx(0.05),
+        },
+        {
+            "year": 2024,
+            "period_start": date(2024, 1, 2),
+            "period_end": date(2024, 1, 3),
+            "portfolio_return": pytest.approx(0.1),
+            "benchmark_return": pytest.approx(0.04761904761904767),
+            "relative_return": pytest.approx(0.052380952380952334),
+        },
+    ]
+
+
+def test_period_returns_compound_to_full_cumulative_return() -> None:
+    """Dropping any boundary-session return breaks period-to-total compounding."""
+    nav = _period_nav(
+        [
+            date(2023, 12, 28),
+            date(2023, 12, 29),
+            date(2024, 1, 2),
+            date(2024, 1, 3),
+        ],
+        [10_000, 11_000, 9_900, 12_100],
+        [100.0, 105.0, 100.0, 110.0],
+    )
+
+    result = calculate_performance(nav, _empty_fills(), _empty_costs())
+
+    assert result.metrics["cumulative_return"] == pytest.approx(0.21)
+    for periods in (result.monthly_returns, result.annual_returns):
+        compounded = 1.0
+        for period_return in periods["portfolio_return"].to_list():
+            compounded *= 1.0 + period_return
+        assert compounded - 1.0 == pytest.approx(0.21)
 
 
 def test_zero_volatility_discloses_undefined_ratios_without_nonfinite_values() -> None:

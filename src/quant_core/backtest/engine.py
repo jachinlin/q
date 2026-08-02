@@ -66,8 +66,8 @@ class BacktestRequest:
             raise ValueError("start_date must not follow end_date")
         if not isinstance(self.benchmark, InstrumentId):
             raise TypeError("benchmark must be an InstrumentId")
-        if type(self.initial_cash_fen) is not int or self.initial_cash_fen < 0:
-            raise ValueError("initial_cash_fen must be a nonnegative integer")
+        if type(self.initial_cash_fen) is not int or self.initial_cash_fen <= 0:
+            raise ValueError("initial_cash_fen must be a positive integer")
         if (
             not isinstance(self.rulebook_version, str)
             or not self.rulebook_version.strip()
@@ -116,8 +116,15 @@ class SnapshotMarketSlice:
 
 class BacktestMarketData(Protocol):
     def calendar(
-        self, snapshot_id: UUID, start: date, end: date
-    ) -> TradingCalendar: ...
+        self,
+        snapshot_id: UUID,
+        start: date,
+        end: date,
+        *,
+        include_next_session: bool,
+    ) -> TradingCalendar:
+        """Return the range and, when requested, its first later session."""
+        ...
 
     def market_slice(
         self, snapshot_id: UUID, trade_date: date
@@ -207,7 +214,10 @@ class BacktestEngine:
         completed = 0
         try:
             calendar = self._market_data.calendar(
-                request.snapshot_id, request.start_date, request.end_date
+                request.snapshot_id,
+                request.start_date,
+                request.end_date,
+                include_next_session=True,
             )
             sessions = _validate_calendar(calendar, request)
             account = PortfolioAccount(request.initial_cash_fen, calendar)
@@ -317,6 +327,12 @@ def _validate_calendar(calendar: object, request: BacktestRequest) -> tuple[date
         raise ValueError("calendar snapshot does not match request")
     if calendar.start > request.start_date or calendar.end < request.end_date:
         raise ValueError("calendar does not cover request range")
+    try:
+        calendar.next_session(request.end_date)
+    except ValueError as error:
+        raise ValueError(
+            "calendar does not cover next trading session after request end"
+        ) from error
     sessions = calendar.sessions(request.start_date, request.end_date)
     if not sessions:
         raise ValueError("backtest request contains no trading sessions")
