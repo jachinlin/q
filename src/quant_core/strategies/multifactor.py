@@ -145,9 +145,7 @@ class MultifactorConfig:
         object.__setattr__(
             self,
             "factor_definitions",
-            MappingProxyType(
-                {reference: definitions[reference] for reference in _FACTOR_DEFINITIONS}
-            ),
+            MappingProxyType(dict(sorted(definitions.items()))),
         )
         object.__setattr__(
             self, "category_weights", MappingProxyType(dict(sorted(weights.items())))
@@ -347,7 +345,8 @@ class MultifactorStrategy:
             (cast(str, row["instrument_id"]), cast(str, row["factor_ref"])): row
             for row in factors.iter_rows(named=True)
         }
-        for factor_ref, (_, direction) in self.config.factor_definitions.items():
+        for factor_ref in _FACTOR_DEFINITIONS:
+            _, direction = self.config.factor_definitions[factor_ref]
             rows: list[dict[str, object]] = []
             for item in base_rows:
                 identifier = cast(str, item["instrument_id"])
@@ -439,7 +438,8 @@ class MultifactorStrategy:
             category_scores: dict[str, list[float]] = {
                 category: [] for category in _CATEGORY_WEIGHTS
             }
-            for factor_ref, value in values.items():
+            for factor_ref in sorted(values):
+                value = values[factor_ref]
                 category_scores[self.config.factor_definitions[factor_ref][0]].append(
                     value
                 )

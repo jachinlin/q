@@ -33,33 +33,137 @@ _ALPHA_REFS = (
     "max_drawdown_120d_v1@1.0.0",
 )
 _IDS = tuple(f"SSE:{600001 + index:06d}" for index in range(8))
-_VALUE_RAW = [131.0, 131.0, 137.0, 138.0, 138.0, 1000.0]
-_QUALITY_RAW = [137.0, 131.0, 131.0, 1000.0, 138.0, 138.0]
-_MOMENTUM_RAW = [131.0, 137.0, 131.0, 138.0, 1000.0, 138.0]
-_RISK_RAW = [-137.0, -131.0, -131.0, -138.0, -1000.0, -138.0]
+_RAW_BY_FACTOR = {
+    "earnings_yield_ttm_v1@1.0.0": (131.0, 131.0, 137.0, 138.0, 138.0, 1000.0),
+    "book_to_price_mrq_v1@1.0.0": (131.0, 137.0, 131.0, 138.0, 1000.0, 138.0),
+    "roe_avg_pit_v1@1.0.0": (137.0, 131.0, 131.0, 1000.0, 138.0, 138.0),
+    "cfo_to_np_pit_v1@1.0.0": (131.0, 137.0, 131.0, 1000.0, 138.0, 138.0),
+    "momentum_120_20_v1@1.0.0": (137.0, 131.0, 131.0, 138.0, 1000.0, 138.0),
+    "volatility_60d_v1@1.0.0": (-137.0, -131.0, -131.0, -138.0, -1000.0, -138.0),
+    "downside_volatility_60d_v1@1.0.0": (
+        -131.0,
+        -131.0,
+        -137.0,
+        -138.0,
+        -138.0,
+        -1000.0,
+    ),
+    "max_drawdown_120d_v1@1.0.0": (-137.0, -131.0, -131.0, -1000.0, -138.0, -138.0),
+}
+_EXPECTED_FACTOR_Z = {
+    "earnings_yield_ttm_v1@1.0.0": (
+        1.6212439465260766,
+        -0.5428499119637041,
+        -0.26933216074961036,
+        0.5401778951611508,
+        -1.623915963328636,
+        0.2746761943547232,
+    ),
+    "book_to_price_mrq_v1@1.0.0": (
+        -1.084622120900817,
+        0.8583152809660731,
+        0.10694234157347496,
+        -1.3044136043554668,
+        1.5366272445979174,
+        -0.11284914188118134,
+    ),
+    "roe_avg_pit_v1@1.0.0": (
+        0.3472186562479454,
+        -1.027667633232938,
+        0.07713404910014317,
+        1.85151215119962,
+        -1.1764994528239259,
+        -0.07169777049084472,
+    ),
+    "cfo_to_np_pit_v1@1.0.0": (
+        -1.6304437390445652,
+        0.8851908910748366,
+        -0.08269133670107048,
+        1.4373923369936963,
+        -0.6916621767473222,
+        0.0822140244244251,
+    ),
+    "momentum_120_20_v1@1.0.0": (
+        0.42565458364508985,
+        -0.4484675152379841,
+        0.248118407336624,
+        -1.6443033152990194,
+        1.6701293097050858,
+        -0.2511314701497959,
+    ),
+    "volatility_60d_v1@1.0.0": (
+        -0.42565458364508985,
+        0.4484675152379841,
+        -0.248118407336624,
+        1.6443033152990194,
+        -1.6701293097050858,
+        0.2511314701497959,
+    ),
+    "downside_volatility_60d_v1@1.0.0": (
+        -1.6212439465260766,
+        0.5428499119637041,
+        0.26933216074961036,
+        -0.5401778951611508,
+        1.623915963328636,
+        -0.2746761943547232,
+    ),
+    "max_drawdown_120d_v1@1.0.0": (
+        -0.3472186562479454,
+        1.027667633232938,
+        -0.07713404910014317,
+        -1.85151215119962,
+        1.1764994528239259,
+        0.07169777049084472,
+    ),
+}
+_EXPECTED_CATEGORY_MEANS = {
+    "VALUE": (
+        0.26831091281262975,
+        0.1577326845011845,
+        -0.0811949095880677,
+        -0.382117854597158,
+        -0.043644359365359264,
+        0.08091352623677092,
+    ),
+    "QUALITY": (
+        -0.6416125413983099,
+        -0.07123837107905068,
+        -0.002778643800463658,
+        1.6444522440966582,
+        -0.9340808147856241,
+        0.005258126966790191,
+    ),
+    "MOMENTUM": (
+        0.42565458364508985,
+        -0.4484675152379841,
+        0.248118407336624,
+        -1.6443033152990194,
+        1.6701293097050858,
+        -0.2511314701497959,
+    ),
+    "RISK": (
+        0.7980390621397039,
+        -0.6729950201448753,
+        0.0186400985623856,
+        0.24912891035391713,
+        -0.37676203548249204,
+        -0.016051015428639154,
+    ),
+}
+_EXPECTED_CATEGORY_WEIGHTS = {
+    "VALUE": 0.25,
+    "QUALITY": 0.25,
+    "MOMENTUM": 0.30,
+    "RISK": 0.20,
+}
 _EXPECTED_FINAL = {
-    "SSE:600001": 0.25185993115227834,
-    "SSE:600002": -0.22482830505693546,
-    "SSE:600003": 0.033656856027000484,
-    "SSE:600004": -0.1222622327762512,
-    "SSE:600005": 0.09491018128225193,
-    "SSE:600006": -0.03333643062834397,
+    "SSE:600001": 0.19397878037504768,
+    "SSE:600002": -0.24751568024483683,
+    "SSE:600003": 0.05717015356633147,
+    "SSE:600004": -0.12788161514404733,
+    "SSE:600005": 0.18125509227728148,
+    "SSE:600006": -0.057006730829776316,
 }
-_EXPECTED_COMPONENTS_600001 = {
-    "VALUE": 1.6212439465260766,
-    "QUALITY": 0.3472186562479454,
-    "MOMENTUM": -1.084622120900817,
-    "RISK_RAW_Z": -0.42565458364508985,
-    "RISK_DIRECTED": 0.42565458364508985,
-}
-_EXPECTED_RISK_RAW_Z = [
-    -0.42565458364508985,
-    0.4484675152379841,
-    -0.248118407336624,
-    1.6443033152990194,
-    -1.6701293097050858,
-    0.2511314701497959,
-]
 
 
 class _Data:
@@ -154,16 +258,6 @@ def _frames() -> tuple[pl.DataFrame, pl.DataFrame]:
 
 def _literal_oracle_frames() -> tuple[pl.DataFrame, pl.DataFrame]:
     visible = datetime(2026, 7, 31, 7, tzinfo=UTC)
-    raw_by_factor = (
-        _VALUE_RAW,
-        _VALUE_RAW,
-        _QUALITY_RAW,
-        _QUALITY_RAW,
-        _MOMENTUM_RAW,
-        _RISK_RAW,
-        _RISK_RAW,
-        _RISK_RAW,
-    )
     factor_rows = [
         {
             "trade_date": _SIGNAL,
@@ -173,7 +267,7 @@ def _literal_oracle_frames() -> tuple[pl.DataFrame, pl.DataFrame]:
             "available_at": visible,
             "is_valid": True,
         }
-        for factor_ref, values in zip(_ALPHA_REFS, raw_by_factor, strict=True)
+        for factor_ref, values in _RAW_BY_FACTOR.items()
         for index, instrument in enumerate(_IDS[:6])
     ]
     factors = pl.DataFrame(
@@ -245,13 +339,44 @@ def test_multifactor_literal_score_oracle_covers_full_transform_chain() -> None:
     assert actual == pytest.approx(_EXPECTED_FINAL, abs=1e-12)
 
 
-def test_risk_direction_and_category_weights_have_literal_oracle(
+def test_factor_definition_mapping_order_is_publicly_canonical_and_score_neutral() -> (
+    None
+):
+    factors, universe = _literal_oracle_frames()
+    constraints = PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)
+    default_config = _config(constraints=constraints)
+    reversed_config = _config(
+        constraints=constraints,
+        factor_definitions=dict(reversed(default_config.factor_definitions.items())),
+    )
+
+    def scores(config: MultifactorConfig) -> dict[str, float | None]:
+        decisions: list[MultifactorDecision] = []
+        MultifactorStrategy(config, audit_sink=decisions.extend).generate_targets(
+            _context(_Data(factors, universe)),
+            _SIGNAL,
+            _empty_multifactor_state(),
+        )
+        return {
+            decision.instrument_id.canonical(): decision.score for decision in decisions
+        }
+
+    assert tuple(default_config.factor_definitions) == tuple(sorted(_ALPHA_REFS))
+    assert tuple(reversed_config.factor_definitions) == tuple(sorted(_ALPHA_REFS))
+    assert scores(default_config) == pytest.approx(_EXPECTED_FINAL, abs=1e-12)
+    assert scores(reversed_config) == pytest.approx(_EXPECTED_FINAL, abs=1e-12)
+
+
+def test_transform_order_and_factor_components_have_keyed_literal_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factors, universe = _literal_oracle_frames()
-    decisions: list[MultifactorDecision] = []
-    calls: list[str] = []
-    zscore_outputs: list[list[float | None]] = []
+    raw_signatures = {
+        values: factor_ref for factor_ref, values in _RAW_BY_FACTOR.items()
+    }
+    frame_refs: dict[int, str] = {}
+    calls: list[tuple[str, str]] = []
+    zscore_outputs: dict[str, tuple[float | None, ...]] = {}
     original_winsorize = multifactor_module.winsorize_mad
     original_neutralize = multifactor_module.neutralize_wls
     original_zscore = multifactor_module.zscore
@@ -262,8 +387,11 @@ def test_risk_direction_and_category_weights_have_literal_oracle(
         group_cols: tuple[str, ...],
         n_mad: float,
     ) -> pl.DataFrame:
-        calls.append("winsorize_mad")
-        return original_winsorize(frame, value_col, group_cols, n_mad)
+        factor_ref = raw_signatures[tuple(frame[value_col].to_list())]
+        calls.append((factor_ref, "winsorize_mad"))
+        result = original_winsorize(frame, value_col, group_cols, n_mad)
+        frame_refs[id(result)] = factor_ref
+        return result
 
     def recording_neutralize(
         frame: pl.DataFrame,
@@ -271,70 +399,95 @@ def test_risk_direction_and_category_weights_have_literal_oracle(
         industry_col: str,
         size_col: str,
     ) -> pl.DataFrame:
-        calls.append("neutralize_wls")
-        return original_neutralize(frame, value_col, industry_col, size_col)
+        factor_ref = frame_refs[id(frame)]
+        calls.append((factor_ref, "neutralize_wls"))
+        result = original_neutralize(frame, value_col, industry_col, size_col)
+        frame_refs[id(result)] = factor_ref
+        return result
 
     def recording_zscore(
         frame: pl.DataFrame,
         value_col: str,
         group_cols: tuple[str, ...],
     ) -> pl.DataFrame:
-        calls.append("zscore")
+        factor_ref = frame_refs[id(frame)]
+        calls.append((factor_ref, "zscore"))
         result = original_zscore(frame, value_col, group_cols)
-        zscore_outputs.append(result[value_col].to_list())
+        zscore_outputs[factor_ref] = tuple(result[value_col].to_list())
         return result
 
     monkeypatch.setattr(multifactor_module, "winsorize_mad", recording_winsorize)
     monkeypatch.setattr(multifactor_module, "neutralize_wls", recording_neutralize)
     monkeypatch.setattr(multifactor_module, "zscore", recording_zscore)
     strategy = MultifactorStrategy(
-        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)),
-        audit_sink=decisions.extend,
+        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0))
     )
 
     strategy.generate_targets(
         _context(_Data(factors, universe)), _SIGNAL, _empty_multifactor_state()
     )
 
-    assert calls == ["winsorize_mad", "neutralize_wls", "zscore"] * 8
-    assert zscore_outputs[0][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["VALUE"], abs=1e-12
-    )
-    assert zscore_outputs[1][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["VALUE"], abs=1e-12
-    )
-    assert zscore_outputs[2][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["QUALITY"], abs=1e-12
-    )
-    assert zscore_outputs[3][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["QUALITY"], abs=1e-12
-    )
-    assert zscore_outputs[4][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["MOMENTUM"], abs=1e-12
-    )
-    for risk_output in zscore_outputs[5:8]:
-        assert risk_output == pytest.approx(_EXPECTED_RISK_RAW_Z, abs=1e-12)
-    assert zscore_outputs[5][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["RISK_RAW_Z"], abs=1e-12
-    )
-    assert -zscore_outputs[5][0] == pytest.approx(
-        _EXPECTED_COMPONENTS_600001["RISK_DIRECTED"], abs=1e-12
-    )
+    assert calls == [
+        (factor_ref, transform)
+        for factor_ref in _ALPHA_REFS
+        for transform in ("winsorize_mad", "neutralize_wls", "zscore")
+    ]
+    assert set(zscore_outputs) == set(_ALPHA_REFS)
+    for factor_ref, expected in _EXPECTED_FACTOR_Z.items():
+        assert zscore_outputs[factor_ref] == pytest.approx(expected, abs=1e-12)
     assert all(
         strategy.config.factor_definitions[ref][1] == -1 for ref in _ALPHA_REFS[5:]
     )
 
-    expected = (
-        0.25 * _EXPECTED_COMPONENTS_600001["VALUE"]
-        + 0.25 * _EXPECTED_COMPONENTS_600001["QUALITY"]
-        + 0.30 * _EXPECTED_COMPONENTS_600001["MOMENTUM"]
-        + 0.20 * _EXPECTED_COMPONENTS_600001["RISK_DIRECTED"]
+
+def test_category_means_and_weights_have_literal_final_oracle() -> None:
+    factors, universe = _literal_oracle_frames()
+    decisions: list[MultifactorDecision] = []
+    MultifactorStrategy(
+        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)),
+        audit_sink=decisions.extend,
+    ).generate_targets(
+        _context(_Data(factors, universe)), _SIGNAL, _empty_multifactor_state()
     )
-    assert expected == pytest.approx(0.25185993115227834, abs=1e-12)
-    decision = next(
-        item for item in decisions if item.instrument_id.canonical() == "SSE:600001"
-    )
-    assert decision.score == pytest.approx(expected, abs=1e-12)
+    decision_by_id = {
+        decision.instrument_id.canonical(): decision for decision in decisions
+    }
+
+    for index, instrument_id in enumerate(_IDS[:6]):
+        component_means = {
+            "VALUE": (
+                _EXPECTED_FACTOR_Z[_ALPHA_REFS[0]][index]
+                + _EXPECTED_FACTOR_Z[_ALPHA_REFS[1]][index]
+            )
+            / 2.0,
+            "QUALITY": (
+                _EXPECTED_FACTOR_Z[_ALPHA_REFS[2]][index]
+                + _EXPECTED_FACTOR_Z[_ALPHA_REFS[3]][index]
+            )
+            / 2.0,
+            "MOMENTUM": _EXPECTED_FACTOR_Z[_ALPHA_REFS[4]][index],
+            "RISK": -(
+                _EXPECTED_FACTOR_Z[_ALPHA_REFS[5]][index]
+                + _EXPECTED_FACTOR_Z[_ALPHA_REFS[6]][index]
+                + _EXPECTED_FACTOR_Z[_ALPHA_REFS[7]][index]
+            )
+            / 3.0,
+        }
+        expected_means = {
+            category: values[index]
+            for category, values in _EXPECTED_CATEGORY_MEANS.items()
+        }
+        assert component_means == pytest.approx(expected_means, abs=1e-12)
+        weighted_score = sum(
+            _EXPECTED_CATEGORY_WEIGHTS[category] * expected_means[category]
+            for category in ("VALUE", "QUALITY", "MOMENTUM", "RISK")
+        )
+        assert weighted_score == pytest.approx(
+            _EXPECTED_FINAL[instrument_id], abs=1e-12
+        )
+        assert decision_by_id[instrument_id].score == pytest.approx(
+            _EXPECTED_FINAL[instrument_id], abs=1e-12
+        )
 
 
 def test_auxiliary_fields_do_not_change_literal_scores() -> None:
@@ -432,10 +585,11 @@ def test_multifactor_score_tie_selects_smaller_canonical_id() -> None:
         _empty_multifactor_state(),
     )
 
-    tied_scores = {item.instrument_id.canonical(): item.score for item in decisions[:2]}
-    assert tied_scores["SSE:600001"] == pytest.approx(
-        tied_scores["SSE:600002"], abs=1e-12
-    )
+    decision_by_id = {item.instrument_id.canonical(): item for item in decisions}
+    assert decision_by_id["SSE:600001"].reason_code == "MULTIFACTOR_SELECTED"
+    assert decision_by_id["SSE:600002"].reason_code == "MULTIFACTOR_SELECTED"
+    assert decision_by_id["SSE:600001"].score is not None
+    assert decision_by_id["SSE:600001"].score == decision_by_id["SSE:600002"].score
     assert tuple(
         position.instrument_id.canonical() for position in target.positions
     ) == ("SSE:600001",)
