@@ -235,7 +235,9 @@ def _repository(tmp_path: Path) -> SnapshotResearchRepository:
         created_at=datetime(2024, 2, 6, tzinfo=UTC),
         published_at=datetime(2024, 2, 6, tzinfo=UTC),
     )
-    return SnapshotResearchRepository(_Catalog(snapshot, versions))
+    return SnapshotResearchRepository(
+        _Catalog(snapshot, versions), trusted_curated_root=tmp_path
+    )
 
 
 def _factor_artifacts() -> dict[str, FactorArtifact]:

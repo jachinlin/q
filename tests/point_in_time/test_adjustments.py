@@ -39,6 +39,7 @@ class AdjustmentFixture:
 
     repository: FixtureSnapshotRepository
     snapshot_id: SnapshotId
+    trusted_curated_root: Path
 
 
 def test_backward_adjustment_uses_only_actions_known_at_as_of(
@@ -64,7 +65,9 @@ def test_backward_adjustment_uses_only_actions_known_at_as_of(
             ),
         ],
     )
-    service = PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+    service = PriceAdjustmentService(
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
+    )
 
     before_announcement = service.bars(
         fixture.snapshot_id,
@@ -127,7 +130,11 @@ def test_raw_mode_preserves_raw_ohlcv_values(tmp_path: Path) -> None:
     )
 
     result = (
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        )
         .bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
@@ -157,7 +164,9 @@ def test_raw_and_backward_modes_do_not_expose_forward_log_returns(
 ) -> None:
     """The row-local return contract belongs only to FORWARD research reads."""
     fixture = _adjustment_fixture(tmp_path, [])
-    service = PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+    service = PriceAdjustmentService(
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
+    )
 
     for mode in (AdjustmentMode.RAW, AdjustmentMode.BACKWARD):
         result = service.bars(
@@ -197,7 +206,9 @@ def test_forward_adjustment_uses_baostock_preclose_without_action_dataset(
     )
 
     result = (
-        PriceAdjustmentService(SnapshotResearchRepository(base.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(base.repository, trusted_curated_root=tmp_path)
+        )
         .bars(
             snapshot_id,
             [_INSTRUMENT],
@@ -448,7 +459,11 @@ def test_forward_adjustment_rejects_adjusted_price_overflow(tmp_path: Path) -> N
     fixture = _adjustment_fixture(tmp_path, [], bar_values=overflowing)
 
     with pytest.raises(ValueError, match="adjusted open must be finite and positive"):
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        ).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
             _DAYS[0],
@@ -473,7 +488,11 @@ def test_forward_adjustment_rejects_adjusted_price_underflow_to_zero(
     fixture = _adjustment_fixture(tmp_path, [], bar_values=underflowing)
 
     with pytest.raises(ValueError, match="adjusted open must be finite and positive"):
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        ).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
             _DAYS[0],
@@ -546,7 +565,11 @@ def test_forward_service_preserves_representable_subnormal_return_index(
     fixture = _adjustment_fixture(tmp_path, [], bar_values=bars)
 
     result = (
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        )
         .bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
@@ -622,7 +645,11 @@ def test_forward_service_accepts_finite_extreme_log_difference(
     fixture = _adjustment_fixture(tmp_path, [], bar_values=bars)
 
     result = (
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        )
         .bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
@@ -1002,7 +1029,11 @@ def test_backward_adjustment_composes_multiple_events_in_ex_date_order(
     )
 
     result = (
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        )
         .bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
@@ -1299,7 +1330,11 @@ def test_backward_adjustment_empty_bars_preserves_schema_and_metadata(
     fixture = _adjustment_fixture(tmp_path, [])
 
     result = (
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        )
         .bars(
             fixture.snapshot_id,
             [InstrumentId.parse("SZSE:000001")],
@@ -1332,7 +1367,11 @@ def test_backward_adjustment_rejects_nonpositive_event_factor(tmp_path: Path) ->
     )
 
     with pytest.raises(ValueError, match="corporate action adjustment factor"):
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        ).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
             _DAYS[0],
@@ -1359,7 +1398,11 @@ def test_backward_adjustment_rejects_rights_price_without_independent_ratio(
     )
 
     with pytest.raises(ValueError, match="rights_price is unsupported"):
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        ).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
             _DAYS[0],
@@ -1403,7 +1446,11 @@ def test_backward_adjustment_rejects_duplicate_action_primary_key(
     fixture = _adjustment_fixture(tmp_path, [duplicate, duplicate])
 
     with pytest.raises(ValueError, match="duplicate corporate action primary key"):
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        ).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
             _DAYS[0],
@@ -1427,7 +1474,11 @@ def test_adjustment_request_rejects_invalid_time_bounds(
     fixture = _adjustment_fixture(tmp_path, [])
 
     with pytest.raises(ValueError, match=message):
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository)).bars(
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository, trusted_curated_root=tmp_path
+            )
+        ).bars(
             fixture.snapshot_id,
             [_INSTRUMENT],
             start,
@@ -1466,12 +1517,17 @@ def _adjustment_fixture(
     snapshot_id = base.repository.bind_dataset(
         with_bars, DatasetKind.CORPORATE_ACTION, corporate_actions
     )
-    return AdjustmentFixture(base.repository, snapshot_id)
+    return AdjustmentFixture(base.repository, snapshot_id, tmp_path)
 
 
 def _backward_bars(fixture: AdjustmentFixture, start: date, end: date, as_of: date):
     return (
-        PriceAdjustmentService(SnapshotResearchRepository(fixture.repository))
+        PriceAdjustmentService(
+            SnapshotResearchRepository(
+                fixture.repository,
+                trusted_curated_root=fixture.trusted_curated_root,
+            )
+        )
         .bars(
             fixture.snapshot_id,
             [_INSTRUMENT],

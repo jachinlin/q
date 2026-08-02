@@ -200,7 +200,9 @@ def test_real_twenty_year_snapshot_acceptance(
     engine = create_sqlite_engine(state_db)
     try:
         catalog = MetadataRepository(engine)
-        repository = SnapshotResearchRepository(catalog)
+        repository = SnapshotResearchRepository(
+            catalog, trusted_curated_root=data_root / "data" / "curated"
+        )
         snapshot_id = SnapshotId(parsed_snapshot_id)
         today = __import__("datetime").datetime.now(_SHANGHAI).date()
         expected_end = _latest_complete_trading_day(repository, snapshot_id, today)

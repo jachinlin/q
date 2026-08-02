@@ -180,6 +180,7 @@ class ExperimentRuntimeFactory:
         feature_root: Path,
         artifact_root: Path,
         snapshot_root: Path,
+        trusted_curated_root: Path,
         rulebook: MarketRuleBook,
         enrichment: PitUniverseEnrichmentProvider | None,
         shares_provider: PitValueProvider | None = None,
@@ -190,10 +191,16 @@ class ExperimentRuntimeFactory:
             raise TypeError("capabilities must be ProviderCapabilities")
         if not all(
             isinstance(path, Path)
-            for path in (feature_root, artifact_root, snapshot_root)
+            for path in (
+                feature_root,
+                artifact_root,
+                snapshot_root,
+                trusted_curated_root,
+            )
         ):
             raise TypeError(
-                "feature_root, artifact_root, and snapshot_root must be Paths"
+                "feature_root, artifact_root, snapshot_root, and "
+                "trusted_curated_root must be Paths"
             )
         self._catalog = catalog
         self._repository = repository
@@ -207,6 +214,7 @@ class ExperimentRuntimeFactory:
         self._industry = industry_provider
         self._factories = dict(factories or strategy_factories())
         self._snapshot_root = snapshot_root.resolve()
+        self._trusted_curated_root = trusted_curated_root.absolute()
 
     def __call__(self, experiment: ExperimentRecord) -> PreparedExperimentRuntime:
         if not isinstance(experiment, ExperimentRecord):
@@ -232,6 +240,7 @@ class ExperimentRuntimeFactory:
             snapshot=snapshot,
             catalog=self._catalog,
             snapshot_root=self._snapshot_root,
+            trusted_curated_root=self._trusted_curated_root,
             repository=self._repository,
             capabilities=self._capabilities,
             provider=self._provider,
@@ -255,6 +264,7 @@ class _ConcreteExperimentRuntime:
         snapshot: SnapshotRecord,
         catalog: RuntimeSnapshotCatalog,
         snapshot_root: Path,
+        trusted_curated_root: Path,
         repository: ResearchDataRepository,
         capabilities: ProviderCapabilities,
         provider: str,
@@ -272,6 +282,7 @@ class _ConcreteExperimentRuntime:
         self._snapshot = snapshot
         self._catalog = catalog
         self._snapshot_root = snapshot_root
+        self._trusted_curated_root = trusted_curated_root
         self._repository = repository
         self._capabilities = capabilities
         self._provider = provider
@@ -467,7 +478,10 @@ class _ConcreteExperimentRuntime:
         for dataset in sorted(required, key=lambda item: item.value):
             try:
                 versions[dataset] = verify_published_dataset(
-                    self._catalog, self._snapshot_id, dataset
+                    self._catalog,
+                    self._snapshot_id,
+                    dataset,
+                    trusted_curated_root=self._trusted_curated_root,
                 )
             except QuantError as error:
                 raise ExperimentSnapshotInvalid(
@@ -708,7 +722,9 @@ def build_default_experiment_worker(*, worker_id: str) -> Worker:
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
     catalog = MetadataRepository(engine)
-    repository = SnapshotResearchRepository(catalog)
+    repository = SnapshotResearchRepository(
+        catalog, trusted_curated_root=settings.curated_root
+    )
     rulebook = AShareRuleBook.load(
         source_root / "configs" / "rules" / "a_share_v1.yaml"
     )
@@ -722,6 +738,7 @@ def build_default_experiment_worker(*, worker_id: str) -> Worker:
         rulebook=rulebook,
         enrichment=None,
         snapshot_root=settings.snapshot_root,
+        trusted_curated_root=settings.curated_root,
     )
     return build_experiment_worker(
         engine=engine,

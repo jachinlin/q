@@ -216,7 +216,13 @@ def _publish_fixture_snapshot(
         clock=lambda: datetime(2024, 1, 6, tzinfo=UTC),
     )
     result = pipeline.bootstrap()
-    return SnapshotResearchRepository(metadata), result, source
+    return (
+        SnapshotResearchRepository(
+            metadata, trusted_curated_root=tmp_path / "data" / "curated"
+        ),
+        result,
+        source,
+    )
 
 
 def test_baostock_raw_to_snapshot_forward_adjustment_needs_no_corporate_actions(

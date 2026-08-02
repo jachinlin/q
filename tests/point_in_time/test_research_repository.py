@@ -41,7 +41,9 @@ from tests.fixtures.point_in_time import _write_dataset, point_in_time_fixture
 def test_financials_do_not_cross_snapshot_membership(tmp_path: Path) -> None:
     """Changing the late financial version must not change an earlier snapshot read."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
 
     result = repository.financials_as_of(
         fixture.early_snapshot_id,
@@ -58,7 +60,9 @@ def test_financials_choose_latest_available_revision_before_shanghai_close(
 ) -> None:
     """Dropping the availability cutoff would incorrectly expose revision 2 early."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
 
     result = repository.financials_as_of(
         fixture.late_snapshot_id,
@@ -76,7 +80,7 @@ def test_financials_exclude_an_unusable_metric_group(tmp_path: Path) -> None:
     fixture = point_in_time_fixture(tmp_path)
 
     result = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .financials_as_of(
             fixture.late_snapshot_id,
             ["unusable_metric"],
@@ -95,7 +99,7 @@ def test_financials_exclude_a_metric_group_with_unknown_availability(
     fixture = point_in_time_fixture(tmp_path)
 
     result = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .financials_as_of(
             fixture.late_snapshot_id,
             ["unknown_availability_metric"],
@@ -126,7 +130,9 @@ def test_financials_fail_closed_when_published_partition_is_replaced(
     replacement.replace(path)
 
     with pytest.raises(ValueError, match="catalog integrity"):
-        SnapshotResearchRepository(catalog).financials_as_of(
+        SnapshotResearchRepository(
+            catalog, trusted_curated_root=tmp_path
+        ).financials_as_of(
             fixture.early_snapshot_id,
             ["revenue"],
             date(2024, 4, 29),
@@ -147,7 +153,9 @@ def test_security_status_fail_closed_when_published_partition_is_deleted(
     record.partitions[0].path.unlink()
 
     with pytest.raises(ValueError, match="published partition is unavailable"):
-        SnapshotResearchRepository(catalog).security_status(
+        SnapshotResearchRepository(
+            catalog, trusted_curated_root=tmp_path
+        ).security_status(
             fixture.early_snapshot_id,
             date(2024, 4, 29),
         )
@@ -170,7 +178,9 @@ def test_instruments_fail_closed_when_published_partition_is_corrupt(
     instruments.partitions[0].path.write_bytes(b"not parquet")
 
     with pytest.raises(ValueError, match="catalog integrity"):
-        SnapshotResearchRepository(fixture.repository).instruments(snapshot_id)
+        SnapshotResearchRepository(
+            fixture.repository, trusted_curated_root=tmp_path
+        ).instruments(snapshot_id)
 
 
 def test_dataset_verification_does_not_use_whole_table_parquet_read(
@@ -184,7 +194,10 @@ def test_dataset_verification_does_not_use_whole_table_parquet_read(
     monkeypatch.setattr(repository_module.pq, "read_table", reject_whole_table_read)
 
     record = verify_published_dataset(
-        fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+        fixture.repository,
+        fixture.early_snapshot_id,
+        DatasetKind.DAILY_BAR,
+        trusted_curated_root=tmp_path,
     )
 
     assert record.dataset is DatasetKind.DAILY_BAR
@@ -203,7 +216,10 @@ def test_dataset_verification_streams_hash_without_arrow_output_buffer(
     )
 
     record = verify_published_dataset(
-        fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+        fixture.repository,
+        fixture.early_snapshot_id,
+        DatasetKind.DAILY_BAR,
+        trusted_curated_root=tmp_path,
     )
 
     assert record.dataset is DatasetKind.DAILY_BAR
@@ -225,7 +241,10 @@ def test_dataset_verification_binds_parquet_reader_to_open_descriptor(
     monkeypatch.setattr(repository_module.pq, "ParquetFile", observed_parquet_file)
 
     verify_published_dataset(
-        fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+        fixture.repository,
+        fixture.early_snapshot_id,
+        DatasetKind.DAILY_BAR,
+        trusted_curated_root=tmp_path,
     )
 
     assert sources
@@ -243,7 +262,10 @@ def test_dataset_verification_checks_partition_size_before_parquet_reads(
 
     with pytest.raises(ValueError, match="size limit"):
         verify_published_dataset(
-            fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+            fixture.repository,
+            fixture.early_snapshot_id,
+            DatasetKind.DAILY_BAR,
+            trusted_curated_root=tmp_path,
         )
 
 
@@ -280,9 +302,92 @@ def test_multi_row_group_verification_preserves_legacy_content_hash(
         fixture.early_snapshot_id, DatasetKind.DAILY_BAR, version
     )
 
-    verified = verify_published_dataset(catalog, snapshot_id, DatasetKind.DAILY_BAR)
+    verified = verify_published_dataset(
+        catalog,
+        snapshot_id,
+        DatasetKind.DAILY_BAR,
+        trusted_curated_root=tmp_path,
+    )
 
     assert verified.partitions[0].content_hash == partition.content_hash
+
+
+def test_dataset_verification_rejects_catalog_partition_outside_curated_root(
+    tmp_path: Path,
+) -> None:
+    catalog_storage = tmp_path / "catalog-storage"
+    catalog_storage.mkdir()
+    fixture = point_in_time_fixture(catalog_storage)
+    curated_root = tmp_path / "configured-curated"
+    curated_root.mkdir()
+
+    with pytest.raises(ValueError, match="outside the trusted root"):
+        verify_published_dataset(
+            fixture.repository,
+            fixture.early_snapshot_id,
+            DatasetKind.DAILY_BAR,
+            trusted_curated_root=curated_root,
+        )
+
+
+def test_dataset_verification_accepts_nested_partition_in_curated_root(
+    tmp_path: Path,
+) -> None:
+    curated_root = tmp_path / "configured-curated"
+    nested = curated_root / "year=2024" / "month=04"
+    nested.mkdir(parents=True)
+    fixture = point_in_time_fixture(nested)
+
+    verified = verify_published_dataset(
+        fixture.repository,
+        fixture.early_snapshot_id,
+        DatasetKind.DAILY_BAR,
+        trusted_curated_root=curated_root,
+    )
+
+    assert verified.dataset is DatasetKind.DAILY_BAR
+
+
+def test_snapshot_scan_rejects_catalog_partition_outside_curated_root(
+    tmp_path: Path,
+) -> None:
+    catalog_storage = tmp_path / "catalog-storage"
+    catalog_storage.mkdir()
+    fixture = point_in_time_fixture(catalog_storage)
+    curated_root = tmp_path / "configured-curated"
+    curated_root.mkdir()
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=curated_root
+    )
+
+    with pytest.raises(ValueError, match="outside the trusted root"):
+        repository.bars(
+            fixture.early_snapshot_id,
+            [InstrumentId.parse("SSE:600000")],
+            date(2024, 4, 28),
+            date(2024, 4, 29),
+        )
+
+
+def test_snapshot_scan_accepts_nested_partition_in_curated_root(
+    tmp_path: Path,
+) -> None:
+    curated_root = tmp_path / "configured-curated"
+    nested = curated_root / "year=2024" / "month=04"
+    nested.mkdir(parents=True)
+    fixture = point_in_time_fixture(nested)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=curated_root
+    )
+
+    result = repository.bars(
+        fixture.early_snapshot_id,
+        [InstrumentId.parse("SSE:600000")],
+        date(2024, 4, 28),
+        date(2024, 4, 29),
+    ).collect()
+
+    assert result["close"].to_list() == [10.0, 11.0]
 
 
 def test_trade_calendar_fail_closed_when_published_partition_is_replaced(
@@ -307,7 +412,9 @@ def test_trade_calendar_fail_closed_when_published_partition_is_replaced(
     replacement.replace(path)
 
     with pytest.raises(ValueError, match="catalog integrity"):
-        SnapshotResearchRepository(fixture.repository).trade_calendar(
+        SnapshotResearchRepository(
+            fixture.repository, trusted_curated_root=tmp_path
+        ).trade_calendar(
             snapshot_id,
             date(2024, 4, 29),
             date(2024, 4, 29),
@@ -346,7 +453,9 @@ def test_read_query_rejects_a_partition_beneath_a_directory_link(
     )
 
     with pytest.raises(ValueError, match="link|reparse"):
-        SnapshotResearchRepository(fixture.repository).trade_calendar(
+        SnapshotResearchRepository(
+            fixture.repository, trusted_curated_root=tmp_path
+        ).trade_calendar(
             snapshot_id,
             date(2024, 4, 29),
             date(2024, 4, 29),
@@ -358,7 +467,9 @@ def test_bars_are_snapshot_bound_range_reads_with_canonical_sort(
 ) -> None:
     """Removing the ordered range filter would reorder or leak bar observations."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
 
     result = repository.bars(
         fixture.early_snapshot_id,
@@ -383,7 +494,7 @@ def test_bars_remain_a_lazy_parquet_scan_until_the_consumer_collects(
     monkeypatch.setattr(repository_module.duckdb, "connect", eager_duckdb_is_forbidden)
 
     result = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .bars(
             fixture.early_snapshot_id,
             [InstrumentId.parse("SSE:600000")],
@@ -406,7 +517,7 @@ def test_bars_never_follows_a_partition_replaced_between_lazy_plan_and_collect(
         catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions["daily_bar"]
     )
     path = record.partitions[0].path
-    planned = SnapshotResearchRepository(catalog).bars(
+    planned = SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
         fixture.early_snapshot_id,
         [InstrumentId.parse("SSE:600000")],
         date(2024, 4, 28),
@@ -426,7 +537,7 @@ def test_bars_plan_keeps_predicates_pushed_to_the_parquet_scan(tmp_path: Path) -
     fixture = point_in_time_fixture(tmp_path)
 
     plan = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .bars(
             fixture.early_snapshot_id,
             [InstrumentId.parse("SSE:600000")],
@@ -456,7 +567,7 @@ def test_bars_remains_bound_when_the_source_partition_is_deleted(
         .partitions[0]
         .path
     )
-    planned = SnapshotResearchRepository(catalog).bars(
+    planned = SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
         fixture.early_snapshot_id,
         [InstrumentId.parse("SSE:600000")],
         date(2024, 4, 28),
@@ -482,7 +593,7 @@ def test_bars_ignores_a_source_hard_link_after_owning_scan_bytes(
         .partitions[0]
         .path
     )
-    planned = SnapshotResearchRepository(catalog).bars(
+    planned = SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
         fixture.early_snapshot_id,
         [InstrumentId.parse("SSE:600000")],
         date(2024, 4, 28),
@@ -521,7 +632,7 @@ def test_bars_rejects_source_content_that_differs_from_the_catalog(
     replacement.replace(path)
 
     with pytest.raises(ValueError, match="catalog integrity"):
-        SnapshotResearchRepository(catalog).bars(
+        SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
             fixture.early_snapshot_id,
             [InstrumentId.parse("SSE:600000")],
             date(2024, 4, 28),
@@ -532,7 +643,9 @@ def test_bars_rejects_source_content_that_differs_from_the_catalog(
 def test_bars_repeated_collect_reuses_the_same_owned_bytes(tmp_path: Path) -> None:
     """Re-executing one lazy plan stays bound to its verified materialization."""
     fixture = point_in_time_fixture(tmp_path)
-    planned = SnapshotResearchRepository(fixture.repository).bars(
+    planned = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    ).bars(
         fixture.early_snapshot_id,
         [InstrumentId.parse("SSE:600000")],
         date(2024, 4, 28),
@@ -546,7 +659,9 @@ def test_bars_repeated_collect_reuses_the_same_owned_bytes(tmp_path: Path) -> No
 def test_bars_supports_two_live_plans_for_the_same_partition(tmp_path: Path) -> None:
     """One live lazy plan must not make the same published partition unavailable."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
 
     first = repository.bars(
         fixture.early_snapshot_id,
@@ -580,7 +695,7 @@ def test_bars_owns_bytes_across_same_length_in_place_source_write(
         .partitions[0]
         .path
     )
-    planned = SnapshotResearchRepository(catalog).bars(
+    planned = SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
         fixture.early_snapshot_id,
         [InstrumentId.parse("SSE:600000")],
         date(2024, 4, 28),
@@ -603,7 +718,9 @@ def test_bars_concurrent_plans_share_one_verified_owned_copy(
 ) -> None:
     """Concurrent same-content plans perform one bounded copy and both collect."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
     copyfileobj = shutil.copyfileobj
     copies = 0
 
@@ -645,7 +762,9 @@ def test_bars_owned_copy_lifetime_follows_the_last_lazy_plan(tmp_path: Path) -> 
         .partitions[0]
         .path
     )
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
     planned = repository.bars(
         fixture.early_snapshot_id,
         [InstrumentId.parse("SSE:600000")],
@@ -683,7 +802,7 @@ def test_corporate_actions_as_of_excludes_actions_available_after_shanghai_close
     )
 
     result = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .corporate_actions_as_of(
             snapshot_id, [InstrumentId.parse("SSE:600000")], date(2024, 4, 29)
         )
@@ -714,7 +833,7 @@ def test_corporate_actions_as_of_excludes_future_ex_date(tmp_path: Path) -> None
     )
 
     result = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .corporate_actions_as_of(
             snapshot_id, [InstrumentId.parse("SSE:600000")], date(2024, 4, 29)
         )
@@ -744,7 +863,7 @@ def test_corporate_actions_as_of_excludes_null_ex_date(tmp_path: Path) -> None:
     )
 
     result = (
-        SnapshotResearchRepository(fixture.repository)
+        SnapshotResearchRepository(fixture.repository, trusted_curated_root=tmp_path)
         .corporate_actions_as_of(
             snapshot_id, [InstrumentId.parse("SSE:600000")], date(2024, 4, 29)
         )
@@ -757,7 +876,9 @@ def test_corporate_actions_as_of_excludes_null_ex_date(tmp_path: Path) -> None:
 def test_security_status_filters_the_requested_as_of_date(tmp_path: Path) -> None:
     """Treating status as unbounded history would return observations from other dates."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
 
     result = repository.security_status(
         fixture.early_snapshot_id,
@@ -774,7 +895,9 @@ def test_missing_snapshot_dataset_has_a_stable_structured_contract(
 ) -> None:
     """A missing dataset must not be mistaken for an empty, mutable latest dataset."""
     fixture = point_in_time_fixture(tmp_path)
-    repository = SnapshotResearchRepository(fixture.repository)
+    repository = SnapshotResearchRepository(
+        fixture.repository, trusted_curated_root=tmp_path
+    )
     missing_snapshot_id = fixture.repository.snapshot_without_dataset(
         fixture.early_snapshot_id, "daily_bar"
     )
@@ -867,7 +990,7 @@ def test_research_rejects_draft_snapshot_from_real_metadata_catalog(
         )
 
     with pytest.raises(QuantError) as captured:
-        SnapshotResearchRepository(catalog).bars(
+        SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
             snapshot_id,
             [InstrumentId.parse("SSE:600000")],
             date(2024, 4, 29),
@@ -985,7 +1108,7 @@ def test_research_sorts_distinct_catalog_partitions_and_rejects_duplicates(
     )
 
     result = (
-        SnapshotResearchRepository(catalog)
+        SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path)
         .bars(
             multiple_snapshot_id,
             [InstrumentId.parse("SSE:600000")],
@@ -1006,7 +1129,7 @@ def test_research_sorts_distinct_catalog_partitions_and_rejects_duplicates(
     )
 
     with pytest.raises(QuantError) as captured:
-        SnapshotResearchRepository(catalog).bars(
+        SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
             duplicate_snapshot_id,
             [InstrumentId.parse("SSE:600000")],
             date(2024, 4, 28),
@@ -1032,7 +1155,7 @@ def test_research_rejects_nonpublished_dataset_version(tmp_path: Path) -> None:
     )
 
     with pytest.raises(QuantError) as captured:
-        SnapshotResearchRepository(catalog).bars(
+        SnapshotResearchRepository(catalog, trusted_curated_root=tmp_path).bars(
             snapshot_id,
             [InstrumentId.parse("SSE:600000")],
             date(2024, 4, 28),
@@ -1052,7 +1175,9 @@ def test_research_rejects_published_snapshot_without_published_at(
     )
 
     with pytest.raises(QuantError) as captured:
-        SnapshotResearchRepository(fixture.repository).bars(
+        SnapshotResearchRepository(
+            fixture.repository, trusted_curated_root=tmp_path
+        ).bars(
             snapshot_id,
             [InstrumentId.parse("SSE:600000")],
             date(2024, 4, 28),

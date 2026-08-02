@@ -53,7 +53,9 @@ def test_build_returns_one_auditable_row_per_instrument_with_reason_priority(
     """Dropping a rule, changing priority, or reading future data changes this table."""
     repository, snapshot_id = _universe_fixture(tmp_path)
 
-    result = UniverseBuilder(SnapshotResearchRepository(repository)).build(
+    result = UniverseBuilder(
+        SnapshotResearchRepository(repository, trusted_curated_root=tmp_path)
+    ).build(
         snapshot_id,
         _AS_OF,
         UniverseRules(min_listing_days=3, min_avg_amount_20d=100.0),
@@ -98,7 +100,9 @@ def test_build_fail_closes_each_row_when_as_of_is_not_a_trading_day(
     """Treating a natural-calendar date as open would fabricate a historical pool."""
     repository, snapshot_id = _universe_fixture(tmp_path)
 
-    result = UniverseBuilder(SnapshotResearchRepository(repository)).build(
+    result = UniverseBuilder(
+        SnapshotResearchRepository(repository, trusted_curated_root=tmp_path)
+    ).build(
         snapshot_id,
         date(2024, 4, 6),
         UniverseRules(min_listing_days=3),
@@ -156,7 +160,9 @@ def test_baostock_mapped_historical_daily_rows_are_visible_at_market_close(
     )
     snapshot_id = base.repository.bind_dataset(with_status, DatasetKind.DAILY_BAR, bars)
 
-    result = UniverseBuilder(SnapshotResearchRepository(base.repository)).build(
+    result = UniverseBuilder(
+        SnapshotResearchRepository(base.repository, trusted_curated_root=tmp_path)
+    ).build(
         snapshot_id,
         as_of,
         UniverseRules(min_listing_days=0, min_avg_amount_20d=100.0),
@@ -181,7 +187,7 @@ def test_baostock_mapped_historical_daily_rows_are_visible_at_market_close(
     )
 
     invisible = (
-        SnapshotResearchRepository(base.repository)
+        SnapshotResearchRepository(base.repository, trusted_curated_root=tmp_path)
         .security_status(pre_close_snapshot, as_of)
         .collect()
     )
@@ -209,7 +215,7 @@ def test_snapshot_repository_reads_instruments_and_calendar_from_the_snapshot(
 ) -> None:
     """Substituting any unbound dataset version would change this selected evidence."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    research = SnapshotResearchRepository(repository)
+    research = SnapshotResearchRepository(repository, trusted_curated_root=tmp_path)
 
     instruments = research.instruments(snapshot_id).collect()
     calendar = research.trade_calendar(snapshot_id, _TRADING_DAYS[0], _AS_OF).collect()
@@ -223,7 +229,7 @@ def test_liquidity_distinguishes_short_calendar_from_missing_window_bars(
 ) -> None:
     """A missing bar must not be hidden behind the distinct short-calendar code."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     short_calendar = frames.calendar.tail(19)
     alternate = _AlternateRepository(
         frames.instruments,
@@ -247,7 +253,7 @@ def test_liquidity_distinguishes_short_calendar_from_missing_window_bars(
 def test_liquidity_uses_only_the_most_recent_twenty_open_days(tmp_path: Path) -> None:
     """Including older low-amount days would falsely exclude this otherwise liquid stock."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     earlier_days = [date(2024, 3, day) for day in range(4, 9)]
     older_calendar = pl.DataFrame([_calendar_row(day) for day in earlier_days])
     older_bars = pl.DataFrame(
@@ -275,7 +281,7 @@ def test_liquidity_uses_only_the_most_recent_twenty_open_days(tmp_path: Path) ->
 def test_non_stock_instruments_remain_auditable_but_ineligible(tmp_path: Path) -> None:
     """Allowing any non-STOCK type would contaminate the equity factor universe."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     identifiers = list(_IDS.values())[:5]
     types = ["STOCK", "ETF", "INDEX", "CONVERTIBLE_BOND", "UNKNOWN"]
     instruments = frames.instruments.filter(pl.col("instrument_id").is_in(identifiers))
@@ -349,7 +355,7 @@ def test_builder_fail_closes_invalid_alternate_repository_inputs(
 ) -> None:
     """Last-write-wins or ignored foreign evidence would make an audit non-reproducible."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     alternate = _corrupt_alternate(frames, kind)
 
     with pytest.raises(ValueError, match="UNIVERSE_INPUT_INVALID: " + message):
@@ -363,7 +369,7 @@ def test_builder_fail_closes_invalid_alternate_repository_inputs(
 def test_non_trading_and_empty_universes_are_stably_sorted(tmp_path: Path) -> None:
     """Input order must not affect fail-closed output, including an empty snapshot."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     reversed_instruments = frames.instruments.sort("instrument_id", descending=True)
     non_trading = UniverseBuilder(
         _AlternateRepository(
@@ -393,7 +399,7 @@ def test_reversed_calendar_produces_the_same_historical_universe(
 ) -> None:
     """Repository row order must not change the selected 20-day evidence window."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     earlier_days = [date(2024, 3, day) for day in range(4, 9)]
     calendar = pl.concat(
         [pl.DataFrame([_calendar_row(day) for day in earlier_days]), frames.calendar]
@@ -435,7 +441,7 @@ def test_builder_fail_closes_invalid_alternate_calendar_rows(
 ) -> None:
     """Out-of-request or malformed calendar dates cannot silently redefine history."""
     repository, snapshot_id = _universe_fixture(tmp_path)
-    frames = _frames(repository, snapshot_id)
+    frames = _frames(repository, snapshot_id, tmp_path)
     calendar = frames.calendar
     if kind == "future":
         calendar = pl.concat(
@@ -530,8 +536,14 @@ class _AlternateRepository:
         return frame.lazy()
 
 
-def _frames(repository: FixtureSnapshotRepository, snapshot_id: SnapshotId) -> _Frames:
-    research = SnapshotResearchRepository(repository)
+def _frames(
+    repository: FixtureSnapshotRepository,
+    snapshot_id: SnapshotId,
+    trusted_curated_root: Path,
+) -> _Frames:
+    research = SnapshotResearchRepository(
+        repository, trusted_curated_root=trusted_curated_root
+    )
     instruments = research.instruments(snapshot_id).collect()
     identifiers = [InstrumentId.parse(value) for value in instruments["instrument_id"]]
     return _Frames(

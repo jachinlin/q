@@ -360,12 +360,15 @@ def _runtime_for_snapshot(
     module = importlib.import_module("quant_core.experiments.runtime")
     runtime = module.ExperimentRuntimeFactory(
         catalog=catalog,
-        repository=SnapshotResearchRepository(catalog),
+        repository=SnapshotResearchRepository(
+            catalog, trusted_curated_root=root / "curated"
+        ),
         capabilities=ProviderCapabilities.complete(),
         provider="offline-complete-fixture",
         feature_root=feature_root,
         artifact_root=artifact_root,
         snapshot_root=root / "snapshots",
+        trusted_curated_root=root / "curated",
         rulebook=AShareRuleBook.load(Path("configs/rules/a_share_v1.yaml")),
         enrichment=None,
     )(experiment)
@@ -393,10 +396,12 @@ def _assert_validate_rejects_without_writes(
 
 
 def _market_data(
-    catalog: MetadataRepository, snapshot: SnapshotRecord
+    catalog: MetadataRepository, snapshot: SnapshotRecord, root: Path
 ) -> SnapshotBacktestMarketData:
     return SnapshotBacktestMarketData(
-        repository=SnapshotResearchRepository(catalog),
+        repository=SnapshotResearchRepository(
+            catalog, trusted_curated_root=root / "curated"
+        ),
         snapshot_id=snapshot.id,
         benchmark=InstrumentId.parse("SSE:510300"),
         capabilities=ProviderCapabilities.complete(),
@@ -668,7 +673,7 @@ def test_validate_accepts_newly_listed_instrument_without_prelisting_rows(
 
     runtime.validate()  # type: ignore[attr-defined]
 
-    market = _market_data(catalog, snapshot).market_slice(
+    market = _market_data(catalog, snapshot, tmp_path).market_slice(
         snapshot.id.value, date(2024, 6, 27)
     )
     assert market.market.bars["instrument_id"].to_list() == [
@@ -695,7 +700,7 @@ def test_validate_accepts_suspended_session_without_a_bar(
 
     runtime.validate()  # type: ignore[attr-defined]
 
-    market = _market_data(catalog, snapshot).market_slice(
+    market = _market_data(catalog, snapshot, tmp_path).market_slice(
         snapshot.id.value, date(2024, 6, 28)
     )
     assert market.market.bars["instrument_id"].to_list() == ["SSE:510300"]
@@ -717,7 +722,7 @@ def test_validate_accepts_post_delist_sessions_without_bar_or_status(
 
     runtime.validate()  # type: ignore[attr-defined]
 
-    market = _market_data(catalog, snapshot).market_slice(
+    market = _market_data(catalog, snapshot, tmp_path).market_slice(
         snapshot.id.value, date(2024, 7, 1)
     )
     assert market.market.bars["instrument_id"].to_list() == ["SSE:510300"]
@@ -742,7 +747,7 @@ def test_validate_defers_missing_status_rows_to_market_slice_contract(
     runtime.validate()  # type: ignore[attr-defined]
 
     with pytest.raises(ValueError, match="status join is incomplete"):
-        _market_data(catalog, snapshot).market_slice(
+        _market_data(catalog, snapshot, tmp_path).market_slice(
             snapshot.id.value, date(2024, 6, 28)
         )
 
@@ -805,6 +810,29 @@ def test_default_worker_is_shipped_as_a_local_concrete_composition_root(
 
     assert isinstance(worker, Worker)
     assert callable(module.ExperimentRuntimeFactory)
+
+
+def test_default_worker_anchors_repository_to_settings_curated_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = importlib.import_module("quant_core.experiments.runtime")
+    data_root = tmp_path / "runtime-data"
+    observed: list[Path] = []
+    repository_type = SnapshotResearchRepository
+
+    def anchored_repository(
+        catalog: MetadataRepository, *, trusted_curated_root: Path
+    ) -> SnapshotResearchRepository:
+        observed.append(trusted_curated_root)
+        return repository_type(catalog, trusted_curated_root=trusted_curated_root)
+
+    monkeypatch.setenv("QUANT_DATA_ROOT", str(data_root))
+    monkeypatch.setattr(module, "SnapshotResearchRepository", anchored_repository)
+
+    worker = build_default_experiment_worker(worker_id="curated-root-test")
+
+    assert isinstance(worker, Worker)
+    assert observed == [(data_root / "data" / "curated").absolute()]
 
 
 def test_shipped_strategy_market_refs_exactly_resolve_real_factor_registry() -> None:
@@ -925,12 +953,15 @@ def test_complete_offline_snapshot_runs_public_worker_chain_to_registration(
     module = importlib.import_module("quant_core.experiments.runtime")
     runtime_factory = module.ExperimentRuntimeFactory(
         catalog=catalog,
-        repository=SnapshotResearchRepository(catalog),
+        repository=SnapshotResearchRepository(
+            catalog, trusted_curated_root=tmp_path / "curated"
+        ),
         capabilities=ProviderCapabilities.complete(),
         provider="offline-complete-fixture",
         feature_root=tmp_path / "features",
         artifact_root=tmp_path / "artifacts",
         snapshot_root=tmp_path / "snapshots",
+        trusted_curated_root=tmp_path / "curated",
         rulebook=AShareRuleBook.load(Path("configs/rules/a_share_v1.yaml")),
         enrichment=None,
     )
@@ -1018,6 +1049,7 @@ def test_baostock_runtime_fails_validate_before_cache_or_artifact_creation(
         feature_root=feature_root,
         artifact_root=artifact_root,
         snapshot_root=tmp_path,
+        trusted_curated_root=tmp_path,
         rulebook=AShareRuleBook.load(Path("configs/rules/a_share_v1.yaml")),
         enrichment=None,
     )(experiment)

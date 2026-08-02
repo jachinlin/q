@@ -135,12 +135,15 @@ def _run_independent_worker(
         catalog = MetadataRepository(engine)
         runtime_factory = ExperimentRuntimeFactory(
             catalog=catalog,
-            repository=SnapshotResearchRepository(catalog),
+            repository=SnapshotResearchRepository(
+                catalog, trusted_curated_root=root.parent / "curated"
+            ),
             capabilities=ProviderCapabilities.complete(),
             provider="offline-complete-fixture",
             feature_root=root.parent / "features",
             artifact_root=root,
             snapshot_root=root.parent / "snapshots",
+            trusted_curated_root=root.parent / "curated",
             rulebook=_rulebook(),
             enrichment=None,
         )

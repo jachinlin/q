@@ -37,14 +37,19 @@ def open_verified_file(
         raise ValueError("file path is outside the trusted root") from error
     if not relative.parts:
         raise ValueError("trusted file path must name a child of the trusted root")
-    components = (
-        root,
-        *(
-            root / Path(*relative.parts[:index])
-            for index in range(1, len(relative.parts) + 1)
-        ),
+    root_components = (*reversed(root.parents), root)
+    target_components = tuple(
+        root / Path(*relative.parts[:index])
+        for index in range(1, len(relative.parts) + 1)
     )
-    identities = tuple(_component_identity(component) for component in components)
+    components = (
+        *root_components,
+        *(component for component in target_components if component != root),
+    )
+    identities = tuple(
+        _component_identity(component, directory=index < len(components) - 1)
+        for index, component in enumerate(components)
+    )
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(absolute, flags)
@@ -66,7 +71,8 @@ def open_verified_file(
         if _stat_signature(after_descriptor) != _stat_signature(opened):
             raise ValueError("verified file descriptor identity changed while reading")
         after_identities = tuple(
-            _component_identity(component) for component in components
+            _component_identity(component, directory=index < len(components) - 1)
+            for index, component in enumerate(components)
         )
         if after_identities != identities:
             raise ValueError("verified file path identity changed while reading")
@@ -77,7 +83,7 @@ def open_verified_file(
             os.close(descriptor)
 
 
-def _component_identity(path: Path) -> tuple[int, int, int]:
+def _component_identity(path: Path, *, directory: bool) -> tuple[int, int, int]:
     try:
         observed = path.stat(follow_symlinks=False)
     except OSError as error:
@@ -85,6 +91,8 @@ def _component_identity(path: Path) -> tuple[int, int, int]:
     reparse_point = getattr(observed, "st_file_attributes", 0) & 0x400
     if stat.S_ISLNK(observed.st_mode) or reparse_point:
         raise ValueError("verified file path contains a link or reparse point")
+    if directory and not stat.S_ISDIR(observed.st_mode):
+        raise ValueError("verified file root components must be directories")
     return _stat_identity(observed)
 
 

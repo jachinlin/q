@@ -108,8 +108,11 @@ def verify_published_dataset(
     catalog: SnapshotCatalog,
     snapshot_id: SnapshotId,
     dataset: DatasetKind,
+    *,
+    trusted_curated_root: Path,
 ) -> DatasetVersionRecord:
     """Read-verify every physical partition bound to one published dataset."""
+    root = _trusted_curated_root(trusted_curated_root)
     record = _published_dataset_record(catalog, snapshot_id, dataset)
     verified_bytes = 0
     for partition in record.partitions:
@@ -119,7 +122,7 @@ def verify_published_dataset(
         verified_bytes += _verify_owned_partition(
             partition.path,
             partition,
-            trusted_root=partition.path.absolute().parent,
+            trusted_root=root,
             max_bytes=min(_MAX_PARTITION_FILE_BYTES, remaining),
         )
     return record
@@ -128,9 +131,10 @@ def verify_published_dataset(
 class SnapshotResearchRepository:
     """Resolve every Parquet input through one explicit immutable snapshot."""
 
-    def __init__(self, catalog: SnapshotCatalog) -> None:
+    def __init__(self, catalog: SnapshotCatalog, *, trusted_curated_root: Path) -> None:
         self._catalog = catalog
-        self._partition_leases = _SnapshotPartitionLeasePool()
+        self._trusted_curated_root = _trusted_curated_root(trusted_curated_root)
+        self._partition_leases = _SnapshotPartitionLeasePool(self._trusted_curated_root)
 
     def instruments(self, snapshot_id: SnapshotId) -> pl.LazyFrame:
         """Return every canonical instrument bound to ``snapshot_id``."""
@@ -408,43 +412,58 @@ def _validate_catalog_partition_identities(
 class _SnapshotPartitionLease:
     """Own one immutable scan input for the lifetime of a lazy daily-bar plan."""
 
-    def __init__(self, partition: DatasetPartitionRecord) -> None:
-        self._directory = tempfile.TemporaryDirectory(
-            prefix=".snapshot-scan-", dir=str(partition.path.absolute().parent)
-        )
-        self.path = Path(self._directory.name) / f"{partition.content_hash}.parquet"
+    def __init__(
+        self, partition: DatasetPartitionRecord, trusted_curated_root: Path
+    ) -> None:
+        directory: tempfile.TemporaryDirectory[str] | None = None
         try:
             try:
-                with (
-                    open_verified_file(
-                        partition.path,
-                        trusted_root=partition.path.absolute().parent,
-                        max_bytes=_MAX_PARTITION_FILE_BYTES,
-                    ) as source,
-                    self.path.open("xb") as target,
-                ):
-                    shutil.copyfileobj(source.file, target, length=_COPY_CHUNK_BYTES)
+                with open_verified_file(
+                    partition.path,
+                    trusted_root=trusted_curated_root,
+                    max_bytes=_MAX_PARTITION_FILE_BYTES,
+                ) as source:
+                    directory = tempfile.TemporaryDirectory(
+                        prefix=".snapshot-scan-", dir=str(trusted_curated_root)
+                    )
+                    self.path = (
+                        Path(directory.name) / f"{partition.content_hash}.parquet"
+                    )
+                    target = self.path.open("xb")
+                    try:
+                        shutil.copyfileobj(
+                            source.file, target, length=_COPY_CHUNK_BYTES
+                        )
+                    finally:
+                        target.close()
             except ValueError as error:
-                if "link or reparse point" in str(error):
+                if "link or reparse point" in str(
+                    error
+                ) or "outside the trusted root" in str(error):
                     raise
                 raise ValueError("published partition is unavailable") from error
+            if directory is None:
+                raise RuntimeError("snapshot partition lease directory was not created")
+            self._directory = directory
             _verify_owned_partition(
                 self.path,
                 partition,
-                trusted_root=self.path.parent,
+                trusted_root=Path(directory.name),
                 max_bytes=_MAX_PARTITION_FILE_BYTES,
             )
             self.path.chmod(stat.S_IREAD)
         except BaseException:
-            self._directory.cleanup()
+            if directory is not None:
+                directory.cleanup()
             raise
 
 
 class _SnapshotPartitionLeasePool:
     """Single-flight weak pool of verified content-addressed scan copies."""
 
-    def __init__(self) -> None:
+    def __init__(self, trusted_curated_root: Path) -> None:
         self._lock = threading.Lock()
+        self._trusted_curated_root = trusted_curated_root
         self._leases: weakref.WeakValueDictionary[
             tuple[str, str, int], _SnapshotPartitionLease
         ] = weakref.WeakValueDictionary()
@@ -458,7 +477,7 @@ class _SnapshotPartitionLeasePool:
         with self._lock:
             lease = self._leases.get(key)
             if lease is None:
-                lease = _SnapshotPartitionLease(partition)
+                lease = _SnapshotPartitionLease(partition, self._trusted_curated_root)
                 self._leases[key] = lease
             return lease
 
@@ -474,6 +493,12 @@ def _retain_partition_leases(
         return frame
 
     return retain
+
+
+def _trusted_curated_root(value: Path) -> Path:
+    if not isinstance(value, Path):
+        raise TypeError("trusted_curated_root must be a Path")
+    return value.absolute()
 
 
 def _verify_owned_partition(
@@ -503,7 +528,7 @@ def _verify_owned_partition(
             file_size = opened.size
         schema_fingerprint = hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
     except ValueError as error:
-        if "size limit" in str(error):
+        if "size limit" in str(error) or "outside the trusted root" in str(error):
             raise
         raise ValueError(message) from error
     except Exception as error:
