@@ -1,5 +1,6 @@
 """Behavioral tests for the constrained stock multifactor strategy."""
 
+from dataclasses import FrozenInstanceError
 from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import UUID
@@ -8,6 +9,7 @@ import polars as pl
 import pytest
 import yaml
 
+import quant_core.strategies.multifactor as multifactor_module
 from quant_core.domain import InstrumentId
 from quant_core.portfolio import PortfolioConstraints, PortfolioConstructor
 from quant_core.strategies.base import PortfolioState, StrategyContext
@@ -31,6 +33,33 @@ _ALPHA_REFS = (
     "max_drawdown_120d_v1@1.0.0",
 )
 _IDS = tuple(f"SSE:{600001 + index:06d}" for index in range(8))
+_VALUE_RAW = [131.0, 131.0, 137.0, 138.0, 138.0, 1000.0]
+_QUALITY_RAW = [137.0, 131.0, 131.0, 1000.0, 138.0, 138.0]
+_MOMENTUM_RAW = [131.0, 137.0, 131.0, 138.0, 1000.0, 138.0]
+_RISK_RAW = [-137.0, -131.0, -131.0, -138.0, -1000.0, -138.0]
+_EXPECTED_FINAL = {
+    "SSE:600001": 0.25185993115227834,
+    "SSE:600002": -0.22482830505693546,
+    "SSE:600003": 0.033656856027000484,
+    "SSE:600004": -0.1222622327762512,
+    "SSE:600005": 0.09491018128225193,
+    "SSE:600006": -0.03333643062834397,
+}
+_EXPECTED_COMPONENTS_600001 = {
+    "VALUE": 1.6212439465260766,
+    "QUALITY": 0.3472186562479454,
+    "MOMENTUM": -1.084622120900817,
+    "RISK_RAW_Z": -0.42565458364508985,
+    "RISK_DIRECTED": 0.42565458364508985,
+}
+_EXPECTED_RISK_RAW_Z = [
+    -0.42565458364508985,
+    0.4484675152379841,
+    -0.248118407336624,
+    1.6443033152990194,
+    -1.6701293097050858,
+    0.2511314701497959,
+]
 
 
 class _Data:
@@ -123,6 +152,68 @@ def _frames() -> tuple[pl.DataFrame, pl.DataFrame]:
     return factors, universe
 
 
+def _literal_oracle_frames() -> tuple[pl.DataFrame, pl.DataFrame]:
+    visible = datetime(2026, 7, 31, 7, tzinfo=UTC)
+    raw_by_factor = (
+        _VALUE_RAW,
+        _VALUE_RAW,
+        _QUALITY_RAW,
+        _QUALITY_RAW,
+        _MOMENTUM_RAW,
+        _RISK_RAW,
+        _RISK_RAW,
+        _RISK_RAW,
+    )
+    factor_rows = [
+        {
+            "trade_date": _SIGNAL,
+            "instrument_id": instrument,
+            "factor_ref": factor_ref,
+            "value": values[index],
+            "available_at": visible,
+            "is_valid": True,
+        }
+        for factor_ref, values in zip(_ALPHA_REFS, raw_by_factor, strict=True)
+        for index, instrument in enumerate(_IDS[:6])
+    ]
+    factors = pl.DataFrame(
+        factor_rows,
+        schema={
+            "trade_date": pl.Date,
+            "instrument_id": pl.String,
+            "factor_ref": pl.String,
+            "value": pl.Float64,
+            "available_at": pl.Datetime("us", "UTC"),
+            "is_valid": pl.Boolean,
+        },
+    )
+    universe = pl.DataFrame(
+        {
+            "instrument_id": list(_IDS[:6]),
+            "as_of": [_SIGNAL] * 6,
+            "eligible": [True] * 6,
+            "reason_codes": [[] for _ in range(6)],
+            "industry": ["AAA", "AAA", "AAA", "BBB", "BBB", "BBB"],
+            "adv_amount": [1_000.0] * 6,
+            "log_market_cap": [10.0, 11.0, 12.0, 10.0, 11.0, 12.0],
+        },
+        schema={
+            "instrument_id": pl.String,
+            "as_of": pl.Date,
+            "eligible": pl.Boolean,
+            "reason_codes": pl.List(pl.String),
+            "industry": pl.String,
+            "adv_amount": pl.Float64,
+            "log_market_cap": pl.Float64,
+        },
+    )
+    return factors, universe
+
+
+def _empty_multifactor_state() -> PortfolioState:
+    return PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0)
+
+
 def _context(data: _Data) -> StrategyContext:
     return StrategyContext(
         _SNAPSHOT,
@@ -132,6 +223,222 @@ def _context(data: _Data) -> StrategyContext:
         data,
         PortfolioConstructor(),
     )
+
+
+def test_multifactor_literal_score_oracle_covers_full_transform_chain() -> None:
+    factors, universe = _literal_oracle_frames()
+    decisions: list[MultifactorDecision] = []
+    strategy = MultifactorStrategy(
+        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)),
+        audit_sink=decisions.extend,
+    )
+
+    strategy.generate_targets(
+        _context(_Data(factors, universe)), _SIGNAL, _empty_multifactor_state()
+    )
+
+    actual = {
+        item.instrument_id.canonical(): item.score
+        for item in decisions
+        if item.reason_code == "MULTIFACTOR_SELECTED"
+    }
+    assert actual == pytest.approx(_EXPECTED_FINAL, abs=1e-12)
+
+
+def test_risk_direction_and_category_weights_have_literal_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factors, universe = _literal_oracle_frames()
+    decisions: list[MultifactorDecision] = []
+    calls: list[str] = []
+    zscore_outputs: list[list[float | None]] = []
+    original_winsorize = multifactor_module.winsorize_mad
+    original_neutralize = multifactor_module.neutralize_wls
+    original_zscore = multifactor_module.zscore
+
+    def recording_winsorize(
+        frame: pl.DataFrame,
+        value_col: str,
+        group_cols: tuple[str, ...],
+        n_mad: float,
+    ) -> pl.DataFrame:
+        calls.append("winsorize_mad")
+        return original_winsorize(frame, value_col, group_cols, n_mad)
+
+    def recording_neutralize(
+        frame: pl.DataFrame,
+        value_col: str,
+        industry_col: str,
+        size_col: str,
+    ) -> pl.DataFrame:
+        calls.append("neutralize_wls")
+        return original_neutralize(frame, value_col, industry_col, size_col)
+
+    def recording_zscore(
+        frame: pl.DataFrame,
+        value_col: str,
+        group_cols: tuple[str, ...],
+    ) -> pl.DataFrame:
+        calls.append("zscore")
+        result = original_zscore(frame, value_col, group_cols)
+        zscore_outputs.append(result[value_col].to_list())
+        return result
+
+    monkeypatch.setattr(multifactor_module, "winsorize_mad", recording_winsorize)
+    monkeypatch.setattr(multifactor_module, "neutralize_wls", recording_neutralize)
+    monkeypatch.setattr(multifactor_module, "zscore", recording_zscore)
+    strategy = MultifactorStrategy(
+        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)),
+        audit_sink=decisions.extend,
+    )
+
+    strategy.generate_targets(
+        _context(_Data(factors, universe)), _SIGNAL, _empty_multifactor_state()
+    )
+
+    assert calls == ["winsorize_mad", "neutralize_wls", "zscore"] * 8
+    assert zscore_outputs[0][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["VALUE"], abs=1e-12
+    )
+    assert zscore_outputs[1][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["VALUE"], abs=1e-12
+    )
+    assert zscore_outputs[2][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["QUALITY"], abs=1e-12
+    )
+    assert zscore_outputs[3][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["QUALITY"], abs=1e-12
+    )
+    assert zscore_outputs[4][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["MOMENTUM"], abs=1e-12
+    )
+    for risk_output in zscore_outputs[5:8]:
+        assert risk_output == pytest.approx(_EXPECTED_RISK_RAW_Z, abs=1e-12)
+    assert zscore_outputs[5][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["RISK_RAW_Z"], abs=1e-12
+    )
+    assert -zscore_outputs[5][0] == pytest.approx(
+        _EXPECTED_COMPONENTS_600001["RISK_DIRECTED"], abs=1e-12
+    )
+    assert all(
+        strategy.config.factor_definitions[ref][1] == -1 for ref in _ALPHA_REFS[5:]
+    )
+
+    expected = (
+        0.25 * _EXPECTED_COMPONENTS_600001["VALUE"]
+        + 0.25 * _EXPECTED_COMPONENTS_600001["QUALITY"]
+        + 0.30 * _EXPECTED_COMPONENTS_600001["MOMENTUM"]
+        + 0.20 * _EXPECTED_COMPONENTS_600001["RISK_DIRECTED"]
+    )
+    assert expected == pytest.approx(0.25185993115227834, abs=1e-12)
+    decision = next(
+        item for item in decisions if item.instrument_id.canonical() == "SSE:600001"
+    )
+    assert decision.score == pytest.approx(expected, abs=1e-12)
+
+
+def test_auxiliary_fields_do_not_change_literal_scores() -> None:
+    factors, universe = _literal_oracle_frames()
+
+    def selected_scores(candidate_universe: pl.DataFrame) -> dict[str, float | None]:
+        decisions: list[MultifactorDecision] = []
+        MultifactorStrategy(
+            _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)),
+            audit_sink=decisions.extend,
+        ).generate_targets(
+            _context(_Data(factors, candidate_universe)),
+            _SIGNAL,
+            _empty_multifactor_state(),
+        )
+        return {
+            item.instrument_id.canonical(): item.score
+            for item in decisions
+            if item.reason_code == "MULTIFACTOR_SELECTED"
+        }
+
+    baseline = selected_scores(universe)
+    higher_adv = selected_scores(
+        universe.with_columns((pl.col("adv_amount") + 1_000.0).alias("adv_amount"))
+    )
+    shifted_size = selected_scores(
+        universe.with_columns((pl.col("log_market_cap") + 7.0).alias("log_market_cap"))
+    )
+    renamed_industries = selected_scores(
+        universe.with_columns(
+            pl.col("industry").replace({"AAA": "X", "BBB": "Y"}).alias("industry")
+        )
+    )
+
+    assert baseline == pytest.approx(_EXPECTED_FINAL, abs=1e-12)
+    assert higher_adv == pytest.approx(baseline, abs=1e-12)
+    assert shifted_size == pytest.approx(baseline, abs=1e-12)
+    assert renamed_industries == pytest.approx(baseline, abs=1e-12)
+
+
+def test_transform_zero_variance_reason_and_decision_audit_are_immutable() -> None:
+    factors, universe = _literal_oracle_frames()
+    factors = factors.with_columns(
+        pl.when(pl.col("factor_ref") == _ALPHA_REFS[0])
+        .then(pl.lit(0.0))
+        .otherwise(pl.col("value"))
+        .alias("value")
+    )
+    decisions: list[MultifactorDecision] = []
+
+    MultifactorStrategy(
+        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 6, 0.0, 1.0)),
+        audit_sink=decisions.extend,
+    ).generate_targets(
+        _context(_Data(factors, universe)), _SIGNAL, _empty_multifactor_state()
+    )
+
+    assert len(decisions) == 6
+    assert all(decision.reason_code == "MULTIFACTOR_SELECTED" for decision in decisions)
+    assert all(
+        decision.factor_reasons[_ALPHA_REFS[0]] == "ZERO_VARIANCE"
+        for decision in decisions
+    )
+    with pytest.raises(FrozenInstanceError):
+        decisions[0].score = 0.0  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        decisions[0].factor_reasons["x"] = "mutated"  # type: ignore[index]
+
+
+def test_multifactor_score_tie_selects_smaller_canonical_id() -> None:
+    factors, universe = _literal_oracle_frames()
+    duplicate_rows = factors.filter(
+        pl.col("instrument_id") == "SSE:600001"
+    ).with_columns(pl.lit("SSE:600002").alias("instrument_id"))
+    tied_factors = pl.concat(
+        [
+            factors.filter(pl.col("instrument_id") != "SSE:600002"),
+            duplicate_rows,
+        ]
+    )
+    tied_universe = universe.with_columns(
+        pl.when(pl.col("instrument_id") == "SSE:600002")
+        .then(pl.lit(10.0))
+        .otherwise(pl.col("log_market_cap"))
+        .alias("log_market_cap")
+    )
+    decisions: list[MultifactorDecision] = []
+
+    target = MultifactorStrategy(
+        _config(constraints=PortfolioConstraints(1.0, 1.0, 1, 1, 0.0, 1.0)),
+        audit_sink=decisions.extend,
+    ).generate_targets(
+        _context(_Data(tied_factors, tied_universe)),
+        _SIGNAL,
+        _empty_multifactor_state(),
+    )
+
+    tied_scores = {item.instrument_id.canonical(): item.score for item in decisions[:2]}
+    assert tied_scores["SSE:600001"] == pytest.approx(
+        tied_scores["SSE:600002"], abs=1e-12
+    )
+    assert tuple(
+        position.instrument_id.canonical() for position in target.positions
+    ) == ("SSE:600001",)
 
 
 def test_multifactor_uses_eligible_current_snapshot_and_constructor_constraints() -> (

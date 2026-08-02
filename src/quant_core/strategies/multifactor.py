@@ -145,7 +145,9 @@ class MultifactorConfig:
         object.__setattr__(
             self,
             "factor_definitions",
-            MappingProxyType(dict(sorted(definitions.items()))),
+            MappingProxyType(
+                {reference: definitions[reference] for reference in _FACTOR_DEFINITIONS}
+            ),
         )
         object.__setattr__(
             self, "category_weights", MappingProxyType(dict(sorted(weights.items())))
