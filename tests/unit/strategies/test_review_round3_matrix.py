@@ -24,6 +24,7 @@ _DAY = date(2026, 7, 31)
 _NEXT = date(2026, 8, 3)
 _SNAPSHOT = UUID("00000000-0000-0000-0000-000000000612")
 _ID = InstrumentId.parse("SSE:600001")
+_ID_2 = InstrumentId.parse("SSE:600002")
 
 
 class _Data:
@@ -72,6 +73,31 @@ def _account() -> AccountSnapshot:
     return AccountSnapshot(_DAY, 100, (), 0, 100)
 
 
+def _position(
+    instrument: InstrumentId = _ID,
+    *,
+    market_value_fen: int = 40,
+    current_weight: float = 0.4,
+) -> PortfolioPosition:
+    return PortfolioPosition(instrument, 100, market_value_fen, current_weight)
+
+
+def _valid_state(**change: object) -> PortfolioState:
+    values: dict[str, object] = {
+        "trade_date": _DAY,
+        "cash_fen": 20,
+        "nav_fen": 100,
+        "total_market_value_fen": 80,
+        "positions": (
+            _position(),
+            _position(_ID_2, market_value_fen=40, current_weight=0.4),
+        ),
+        "cash_weight": 0.2,
+    }
+    values.update(change)
+    return PortfolioState(**values)  # type: ignore[arg-type]
+
+
 def _factor(**change: object) -> pl.DataFrame:
     row = {
         "trade_date": _DAY,
@@ -108,6 +134,43 @@ def _universe(**change: object) -> pl.DataFrame:
     row.update(change)
     return pl.DataFrame(
         [row],
+        schema={
+            "instrument_id": pl.String,
+            "as_of": pl.Date,
+            "eligible": pl.Boolean,
+            "reason_codes": pl.List(pl.String),
+            "industry": pl.String,
+            "adv_amount": pl.Float64,
+            "log_market_cap": pl.Float64,
+        },
+    )
+
+
+def _universe_pair(**change: object) -> pl.DataFrame:
+    rows = [
+        {
+            "instrument_id": _ID.canonical(),
+            "as_of": _DAY,
+            "eligible": True,
+            "reason_codes": [],
+            "industry": "BANK",
+            "adv_amount": 1.0,
+            "log_market_cap": 1.0,
+        },
+        {
+            "instrument_id": _ID_2.canonical(),
+            "as_of": _DAY,
+            "eligible": True,
+            "reason_codes": [],
+            "industry": "TECH",
+            "adv_amount": 2.0,
+            "log_market_cap": 2.0,
+        },
+    ]
+    for row in rows:
+        row.update(change)
+    return pl.DataFrame(
+        rows,
         schema={
             "instrument_id": pl.String,
             "as_of": pl.Date,
@@ -318,3 +381,117 @@ def test_state_rejects_each_direct_numeric_and_position_invariant(
 ) -> None:
     with pytest.raises((TypeError, ValueError)):
         PortfolioState(*state)  # type: ignore[arg-type]
+
+
+def test_state_rejects_noninteger_total_market_value_and_negative_nav() -> None:
+    with pytest.raises(ValueError, match="total_market_value_fen"):
+        _valid_state(total_market_value_fen=80.0)
+    with pytest.raises(ValueError, match="nav_fen"):
+        _valid_state(nav_fen=-100)
+
+
+def test_state_rejects_duplicate_and_unsorted_positions() -> None:
+    first = _position()
+    duplicate = _position()
+    with pytest.raises(ValueError, match="unique"):
+        _valid_state(positions=(first, duplicate))
+    with pytest.raises(ValueError, match="sorted"):
+        _valid_state(positions=(_position(_ID_2), first))
+
+
+def test_state_rejects_each_weight_and_market_sum_invariant() -> None:
+    with pytest.raises(ValueError, match="must equal positions"):
+        _valid_state(
+            positions=(
+                _position(market_value_fen=30, current_weight=0.3),
+                _position(_ID_2, market_value_fen=30, current_weight=0.3),
+            )
+        )
+    with pytest.raises(ValueError, match="weights must sum"):
+        _valid_state(
+            positions=(
+                _position(current_weight=0.3),
+                _position(_ID_2, current_weight=0.3),
+            )
+        )
+    with pytest.raises(ValueError, match="position weight"):
+        _valid_state(
+            cash_weight=0.2,
+            positions=(
+                _position(current_weight=0.3),
+                _position(_ID_2, current_weight=0.5),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        _factor().drop("value"),
+        _factor().with_columns(pl.lit("x").alias("extra")),
+        _factor().with_columns(pl.col("value").cast(pl.Float32)),
+        _factor().with_columns(pl.col("trade_date").cast(pl.Datetime)),
+    ],
+)
+def test_factor_matrix_rejects_exact_schema_or_dtype_mutation(
+    frame: pl.DataFrame,
+) -> None:
+    with pytest.raises(ValueError, match="schema"):
+        validated_factor_values(
+            frame, signal_date=_DAY, instruments=(_ID,), factor_refs=("x@1",)
+        )
+
+
+def test_factor_matrix_rejects_null_availability_and_duplicate_request_refs() -> None:
+    with pytest.raises(ValueError, match="not available"):
+        validated_factor_values(
+            _factor(available_at=None),
+            signal_date=_DAY,
+            instruments=(_ID,),
+            factor_refs=("x@1",),
+        )
+    with pytest.raises(ValueError, match="unique"):
+        validated_factor_values(
+            _factor(),
+            signal_date=_DAY,
+            instruments=(_ID,),
+            factor_refs=("x@1", "x@1"),
+        )
+
+
+@pytest.mark.parametrize(
+    "frame, message",
+    [
+        (_universe_pair().reverse(), "sorted"),
+        (
+            _universe_pair().with_columns(
+                pl.lit(_ID.canonical()).alias("instrument_id")
+            ),
+            "unique",
+        ),
+        (
+            _universe_pair().with_columns(pl.lit("BAD").alias("instrument_id")),
+            "canonical",
+        ),
+    ],
+)
+def test_universe_rejects_identity_order_and_canonicality_mutations(
+    frame: pl.DataFrame, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validated_stock_universe(frame, signal_date=_DAY)
+
+
+@pytest.mark.parametrize(
+    "frame, message",
+    [
+        (_universe(reason_codes=[None]), "reason_codes"),
+        (_universe(adv_amount=None), "adv_amount"),
+        (_universe(industry=""), "industry"),
+    ],
+)
+def test_universe_rejects_null_or_empty_eligible_evidence(
+    frame: pl.DataFrame, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validated_stock_universe(frame, signal_date=_DAY)

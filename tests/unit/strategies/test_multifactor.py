@@ -292,17 +292,40 @@ def test_multifactor_audits_insufficient_factor_coverage_with_source_reason() ->
     )
     decisions: list[MultifactorDecision] = []
 
-    MultifactorStrategy(_config(), audit_sink=decisions.extend).generate_targets(
+    target = MultifactorStrategy(
+        _config(), audit_sink=decisions.extend
+    ).generate_targets(
         _context(_Data(factors, universe)),
         _SIGNAL,
         PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0),
     )
 
+    selected = {position.instrument_id.canonical() for position in target.positions}
+    assert _IDS[0] not in selected
     decision = next(
         item for item in decisions if item.instrument_id.canonical() == _IDS[0]
     )
     assert decision.reason_code == "INSUFFICIENT_FACTOR_COVERAGE"
     assert decision.factor_reasons[_ALPHA_REFS[0]] == "SOURCE_INVALID"
+
+
+def test_multifactor_rejects_future_factor_availability_before_targeting() -> None:
+    factors, universe = _frames()
+    factors = factors.with_columns(
+        pl.when(
+            (pl.col("instrument_id") == _IDS[0])
+            & (pl.col("factor_ref") == _ALPHA_REFS[0])
+        )
+        .then(pl.lit(datetime(2026, 8, 3, tzinfo=UTC)))
+        .otherwise(pl.col("available_at"))
+        .alias("available_at")
+    )
+    with pytest.raises(ValueError, match="available_at"):
+        MultifactorStrategy(_config()).generate_targets(
+            _context(_Data(factors, universe)),
+            _SIGNAL,
+            PortfolioState(_SIGNAL, 1_000_000, 1_000_000, 0, (), 1.0),
+        )
 
 
 def test_multifactor_accepts_exactly_six_valid_factors_with_category_coverage() -> None:

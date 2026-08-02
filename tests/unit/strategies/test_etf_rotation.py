@@ -106,6 +106,32 @@ def _factor_frame(values: dict[str, dict[str, float | None]]) -> pl.DataFrame:
     )
 
 
+def _fully_valid_etf_values() -> dict[str, dict[str, float]]:
+    return {
+        _ETF_A: {
+            _RETURN_REFS[0]: 0.1,
+            _RETURN_REFS[1]: 0.1,
+            _RETURN_REFS[2]: 0.1,
+            _TREND_REF: 1.0,
+            _VOL_REF: 0.1,
+        },
+        _ETF_B: {
+            _RETURN_REFS[0]: 0.3,
+            _RETURN_REFS[1]: 0.3,
+            _RETURN_REFS[2]: 0.3,
+            _TREND_REF: 1.0,
+            _VOL_REF: 0.1,
+        },
+        _ETF_C: {
+            _RETURN_REFS[0]: 0.2,
+            _RETURN_REFS[1]: 0.2,
+            _RETURN_REFS[2]: 0.2,
+            _TREND_REF: 1.0,
+            _VOL_REF: 0.1,
+        },
+    }
+
+
 def _context(
     data: _Data, *, sessions: tuple[date, ...] | None = None
 ) -> StrategyContext:
@@ -215,6 +241,64 @@ def test_etf_rotation_excludes_missing_or_nonpositive_trend_signals_and_moves_to
 
     assert target.positions == ()
     assert target.cash_weight == 1.0
+
+
+@pytest.mark.parametrize("mode", ["missing", "invalid"])
+def test_etf_excludes_one_instrument_for_each_unusable_signal(mode: str) -> None:
+    frame = _factor_frame(_fully_valid_etf_values())
+    mask = (pl.col("instrument_id") == _ETF_A) & (
+        pl.col("factor_ref") == _RETURN_REFS[0]
+    )
+    if mode == "missing":
+        frame = frame.filter(~mask)
+    elif mode == "invalid":
+        frame = frame.with_columns(
+            pl.when(mask).then(False).otherwise(pl.col("is_valid")).alias("is_valid"),
+            pl.when(mask).then(0.2).otherwise(pl.col("value")).alias("value"),
+            pl.when(mask)
+            .then(pl.lit("SOURCE_INVALID"))
+            .otherwise(pl.col("invalid_reason"))
+            .alias("invalid_reason"),
+        )
+    target = EtfRotationStrategy(_config(top_n=1)).generate_targets(
+        _context(_Data(frame)), _SIGNAL, _empty_state()
+    )
+    assert [position.instrument_id.canonical() for position in target.positions] == [
+        _ETF_B
+    ]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_etf_rejects_nonfinite_factor_values_before_targeting(value: float) -> None:
+    frame = _factor_frame(_fully_valid_etf_values()).with_columns(
+        pl.when(
+            (pl.col("instrument_id") == _ETF_A)
+            & (pl.col("factor_ref") == _RETURN_REFS[0])
+        )
+        .then(value)
+        .otherwise(pl.col("value"))
+        .alias("value")
+    )
+    with pytest.raises(ValueError, match="finite"):
+        EtfRotationStrategy(_config(top_n=1)).generate_targets(
+            _context(_Data(frame)), _SIGNAL, _empty_state()
+        )
+
+
+def test_etf_rejects_future_factor_availability_before_targeting() -> None:
+    frame = _factor_frame(_fully_valid_etf_values()).with_columns(
+        pl.when(
+            (pl.col("instrument_id") == _ETF_A)
+            & (pl.col("factor_ref") == _RETURN_REFS[0])
+        )
+        .then(pl.lit(datetime(2026, 8, 3, tzinfo=UTC)))
+        .otherwise(pl.col("available_at"))
+        .alias("available_at")
+    )
+    with pytest.raises(ValueError, match="available_at"):
+        EtfRotationStrategy(_config(top_n=1)).generate_targets(
+            _context(_Data(frame)), _SIGNAL, _empty_state()
+        )
 
 
 def test_etf_rotation_breaks_score_ties_by_canonical_identifier() -> None:
@@ -442,6 +526,18 @@ def test_example_etf_yaml_is_safe_loadable_and_has_one_validated_entry_point() -
     assert config.frequency is RebalanceFrequency.MONTHLY
     with pytest.raises(ValueError, match="unknown"):
         EtfRotationConfig.from_mapping({**mapping, "unknown": True})
+
+
+@pytest.mark.parametrize("identifier", ["BAD", "SSE:51001", "UNKNOWN:510001"])
+def test_etf_mapping_rejects_noncanonical_pool_identifier(identifier: str) -> None:
+    mapping = yaml.safe_load(
+        Path("configs/experiments/examples/etf_rotation.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    mapping["etf_pool"] = [identifier, *mapping["etf_pool"][1:]]
+    with pytest.raises((TypeError, ValueError)):
+        EtfRotationConfig.from_mapping(mapping)
 
 
 def test_adapter_rejects_validation_issues_before_generating_a_target() -> None:
