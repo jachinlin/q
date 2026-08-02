@@ -12,7 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Never
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy import Engine, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -33,10 +33,17 @@ from quant_core.domain.identifiers import (
     SnapshotId,
 )
 from quant_core.errors import ErrorDetail, QuantError
+from quant_core.experiments.models import (
+    ExperimentRecord,
+    ExperimentSpec,
+    ExperimentStatus,
+    ResearchMark,
+)
 from quant_core.persistence.orm import (
     AuditLogORM,
     DatasetPartitionORM,
     DatasetVersionORM,
+    ExperimentORM,
     PipelineRunORM,
     PipelineStageORM,
     QualityIssueORM,
@@ -44,6 +51,15 @@ from quant_core.persistence.orm import (
     QualityRunORM,
     SnapshotDatasetORM,
     SnapshotORM,
+    TaskAttemptORM,
+    TaskORM,
+)
+from quant_core.tasks.models import (
+    TaskAttemptRecord,
+    TaskAttemptSpec,
+    TaskRecord,
+    TaskSpec,
+    TaskStatus,
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -218,6 +234,94 @@ class MetadataRepository:
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    def register_experiment(self, spec: ExperimentSpec) -> ExperimentRecord:
+        """Persist a new experiment even when its fingerprint has been seen before."""
+        identifier = str(uuid4())
+        with Session(self._engine) as session, session.begin():
+            row = ExperimentORM(
+                id=identifier,
+                strategy_id=spec.strategy_id,
+                strategy_version=spec.strategy_version,
+                config_json=_json_text(spec.config),
+                config_hash=spec.config_hash,
+                snapshot_id=spec.snapshot_id,
+                snapshot_manifest_hash=spec.snapshot_manifest_hash,
+                source_tree_hash=spec.source_tree_hash,
+                git_commit_hash=spec.git_commit_hash,
+                lockfile_hash=spec.lockfile_hash,
+                rulebook_version=spec.rulebook_version,
+                fingerprint=spec.fingerprint,
+                status=ExperimentStatus.CREATED.value,
+                research_mark=ResearchMark.UNREVIEWED.value,
+                created_at=_timestamp(spec.created_at),
+                queued_at=None,
+                started_at=None,
+                completed_at=None,
+            )
+            session.add(row)
+            session.flush()
+            return self._experiment_record(row)
+
+    def count_experiments_by_fingerprint(self, fingerprint: str) -> int:
+        """Return duplicate-research evidence without reusing experiment identity."""
+        _validate_hash(fingerprint, "fingerprint")
+        with Session(self._engine) as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(ExperimentORM)
+                    .where(ExperimentORM.fingerprint == fingerprint)
+                )
+                or 0
+            )
+
+    def create_task(self, spec: TaskSpec) -> TaskRecord:
+        """Persist one queued task without claiming or executing it."""
+        identifier = str(uuid4())
+        with Session(self._engine) as session, session.begin():
+            if session.get(ExperimentORM, spec.experiment_id) is None:
+                raise KeyError(f"experiment does not exist: {spec.experiment_id}")
+            row = TaskORM(
+                id=identifier,
+                experiment_id=spec.experiment_id,
+                task_type=spec.task_type,
+                payload_json=_json_text(spec.payload),
+                status=TaskStatus.QUEUED.value,
+                priority=spec.priority,
+                progress_json="{}",
+                created_at=_timestamp(spec.created_at),
+                available_at=_timestamp(spec.available_at),
+                updated_at=_timestamp(spec.created_at),
+                heartbeat_at=None,
+                completed_at=None,
+            )
+            session.add(row)
+            session.flush()
+            return self._task_record(row)
+
+    def create_task_attempt(self, spec: TaskAttemptSpec) -> TaskAttemptRecord:
+        """Persist an explicitly requested attempt without retry policy."""
+        identifier = str(uuid4())
+        with Session(self._engine) as session, session.begin():
+            if session.get(TaskORM, spec.task_id) is None:
+                raise KeyError(f"task does not exist: {spec.task_id}")
+            row = TaskAttemptORM(
+                id=identifier,
+                task_id=spec.task_id,
+                attempt_no=spec.attempt_no,
+                status=TaskStatus.RUNNING.value,
+                worker_id=spec.worker_id,
+                started_at=_timestamp(spec.started_at),
+                heartbeat_at=spec.started_at.astimezone(UTC).isoformat(),
+                completed_at=None,
+                log_path=spec.log_path,
+                progress_json="{}",
+                error_json=None,
+            )
+            session.add(row)
+            session.flush()
+            return self._task_attempt_record(row)
 
     def register_pipeline_run(self, spec: PipelineRunSpec) -> PipelineRunRecord:
         """Create or return the stable run identified by its canonical request."""
@@ -915,6 +1019,88 @@ class MetadataRepository:
                 )
             normalized[kind.value] = identifier
         return normalized
+
+    @staticmethod
+    def _experiment_record(row: ExperimentORM) -> ExperimentRecord:
+        return ExperimentRecord(
+            id=row.id,
+            strategy_id=row.strategy_id,
+            strategy_version=row.strategy_version,
+            config=json.loads(row.config_json),
+            config_hash=row.config_hash,
+            snapshot_id=row.snapshot_id,
+            snapshot_manifest_hash=row.snapshot_manifest_hash,
+            source_tree_hash=row.source_tree_hash,
+            git_commit_hash=row.git_commit_hash,
+            lockfile_hash=row.lockfile_hash,
+            rulebook_version=row.rulebook_version,
+            fingerprint=row.fingerprint,
+            status=ExperimentStatus(row.status),
+            research_mark=ResearchMark(row.research_mark),
+            created_at=_parse_timestamp(row.created_at),
+            queued_at=(
+                _parse_timestamp(row.queued_at) if row.queued_at is not None else None
+            ),
+            started_at=(
+                _parse_timestamp(row.started_at)
+                if row.started_at is not None
+                else None
+            ),
+            completed_at=(
+                _parse_timestamp(row.completed_at)
+                if row.completed_at is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _task_record(row: TaskORM) -> TaskRecord:
+        return TaskRecord(
+            id=row.id,
+            experiment_id=row.experiment_id,
+            task_type=row.task_type,
+            payload=json.loads(row.payload_json),
+            status=TaskStatus(row.status),
+            priority=row.priority,
+            progress=json.loads(row.progress_json),
+            created_at=_parse_timestamp(row.created_at),
+            available_at=_parse_timestamp(row.available_at),
+            updated_at=_parse_timestamp(row.updated_at),
+            heartbeat_at=(
+                _parse_timestamp(row.heartbeat_at)
+                if row.heartbeat_at is not None
+                else None
+            ),
+            completed_at=(
+                _parse_timestamp(row.completed_at)
+                if row.completed_at is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _task_attempt_record(row: TaskAttemptORM) -> TaskAttemptRecord:
+        return TaskAttemptRecord(
+            id=row.id,
+            task_id=row.task_id,
+            attempt_no=row.attempt_no,
+            status=TaskStatus(row.status),
+            worker_id=row.worker_id,
+            started_at=_parse_timestamp(row.started_at),
+            heartbeat_at=(
+                _parse_timestamp(row.heartbeat_at)
+                if row.heartbeat_at is not None
+                else None
+            ),
+            completed_at=(
+                _parse_timestamp(row.completed_at)
+                if row.completed_at is not None
+                else None
+            ),
+            log_path=row.log_path,
+            progress=json.loads(row.progress_json),
+            error=(json.loads(row.error_json) if row.error_json is not None else None),
+        )
 
     def _dataset_record(
         self, session: Session, identifier: str
