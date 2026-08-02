@@ -355,6 +355,17 @@ class TaskQueue:
 
         self._immediate(write)
 
+    def is_cancel_requested(self, attempt_id: str, worker_id: str) -> bool:
+        """Read cooperative-cancellation state under the current owner fence."""
+        attempt_identifier = _bounded_identity(attempt_id, "attempt_id", 36)
+        worker = _bounded_identity(worker_id, "worker_id", 128)
+        with self._engine.connect() as connection:
+            attempt, task = _attempt_and_task(connection, attempt_identifier)
+            _require_owner(attempt, task, worker, attempt_identifier)
+            _require_active_pair(attempt, task, "is_cancel_requested")
+            status = cast(str, task["status"])
+            return status == TaskStatus.CANCEL_REQUESTED.value
+
     def request_cancel(self, task_id: str, actor: str) -> None:
         """Cancel queued work or request cooperative cancellation from its owner."""
         identifier = _bounded_identity(task_id, "task_id", 36)

@@ -15,6 +15,7 @@ from quant_core.tasks.queue import (
     TaskQueueError,
     TaskQueueNotFound,
 )
+from quant_core.tasks.worker import Worker
 
 __all__ = [
     "ClaimedTask",
@@ -28,4 +29,5 @@ __all__ = [
     "TaskQueueError",
     "TaskQueueNotFound",
     "TaskStatus",
+    "Worker",
 ]
