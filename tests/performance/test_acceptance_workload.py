@@ -24,6 +24,7 @@ from quant_core.data.repository import SnapshotResearchRepository
 from quant_core.domain.identifiers import SnapshotId
 from quant_core.persistence.database import create_sqlite_engine
 from quant_core.persistence.repositories import MetadataRepository
+from tests.performance._process_memory import process_peak_rss_bytes
 
 pytestmark = pytest.mark.acceptance
 
@@ -136,7 +137,8 @@ def _environment_payload(
     artifacts: dict[str, tuple[Path, dict[str, Any]]],
     security_count: int,
     timings: dict[str, float],
-    peak_memory_bytes: int,
+    process_peak_bytes: int,
+    python_peak_tracemalloc_bytes: int,
 ) -> dict[str, object]:
     starts = [date.fromisoformat(item[1]["start_date"]) for item in artifacts.values()]
     return {
@@ -164,7 +166,9 @@ def _environment_payload(
             for strategy_id, (_, manifest) in artifacts.items()
         },
         "stage_seconds": timings,
-        "peak_memory_bytes": peak_memory_bytes,
+        "peak_memory_bytes": process_peak_bytes,
+        "process_peak_rss_bytes": process_peak_bytes,
+        "python_peak_tracemalloc_bytes": python_peak_tracemalloc_bytes,
     }
 
 
@@ -216,8 +220,9 @@ def test_real_twenty_year_snapshot_acceptance(
         analytics_started = time.perf_counter()
         materialize_analytics(cloned)
         timings[f"{strategy_id}_analytics"] = time.perf_counter() - analytics_started
-    _, peak_memory_bytes = tracemalloc.get_traced_memory()
+    _, python_peak_tracemalloc_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    process_peak_bytes = process_peak_rss_bytes()
 
     multifactor_seconds = sum(
         value for name, value in timings.items() if name.startswith("stock_multifactor")
@@ -229,12 +234,14 @@ def test_real_twenty_year_snapshot_acceptance(
     assert multifactor_seconds <= _MULTIFACTOR_LIMIT_SECONDS, (
         f"multifactor acceptance exceeded {_MULTIFACTOR_LIMIT_SECONDS}s; "
         f"slowest_stage={slowest_stage}; stages={timings}; "
-        f"peak_memory_bytes={peak_memory_bytes}"
+        f"process_peak_rss_bytes={process_peak_bytes}; "
+        f"python_peak_tracemalloc_bytes={python_peak_tracemalloc_bytes}"
     )
     assert etf_seconds <= _ETF_LIMIT_SECONDS, (
         f"ETF acceptance exceeded {_ETF_LIMIT_SECONDS}s; "
         f"slowest_stage={slowest_stage}; stages={timings}; "
-        f"peak_memory_bytes={peak_memory_bytes}"
+        f"process_peak_rss_bytes={process_peak_bytes}; "
+        f"python_peak_tracemalloc_bytes={python_peak_tracemalloc_bytes}"
     )
     evidence = _environment_payload(
         data_root=data_root,
@@ -243,7 +250,8 @@ def test_real_twenty_year_snapshot_acceptance(
         artifacts=artifacts,
         security_count=security_count,
         timings=timings,
-        peak_memory_bytes=peak_memory_bytes,
+        process_peak_bytes=process_peak_bytes,
+        python_peak_tracemalloc_bytes=python_peak_tracemalloc_bytes,
     )
     evidence_path = tmp_path / "acceptance_environment.json"
     evidence_path.write_text(

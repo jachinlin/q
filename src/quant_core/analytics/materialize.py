@@ -23,6 +23,7 @@ from quant_core.analytics.performance import (
     PerformanceResult,
     calculate_performance,
 )
+from quant_core.data.partitions import _PartitionLock
 from quant_core.domain.identifiers import InstrumentId
 
 _SCHEMA_VERSION = 1
@@ -231,16 +232,17 @@ def materialize_analytics(artifact_dir: Path) -> AnalyticsResult:
         raise TypeError("artifact_dir must be a Path")
     if not artifact_dir.is_dir():
         raise ValueError("artifact_dir must be a published artifact directory")
+    lock_path = artifact_dir.parent / f".{artifact_dir.name}.analytics.lock"
+    with _PartitionLock(lock_path, timeout_seconds=60 * 60):
+        return _materialize_analytics_locked(artifact_dir)
+
+
+def _materialize_analytics_locked(artifact_dir: Path) -> AnalyticsResult:
+    """Materialize while one artifact identity is exclusively owned."""
     manifest_path = artifact_dir / "manifest.json"
     original_manifest_bytes = _read_manifest_bytes(manifest_path)
     manifest = _parse_manifest(original_manifest_bytes)
     raw_entries = _validate_raw_manifest(artifact_dir, manifest)
-    if "analytics" in manifest:
-        _validate_registered_analytics(artifact_dir, manifest["analytics"], raw_entries)
-        return AnalyticsResult(
-            artifact_dir, manifest_path, artifact_dir / "metrics.json", METRICS_VERSION
-        )
-
     frames = {
         name: pl.read_parquet(artifact_dir / name)
         for name in (
@@ -259,6 +261,18 @@ def materialize_analytics(artifact_dir: Path) -> AnalyticsResult:
         frames["fills.parquet"],
         frames["costs.parquet"],
     )
+    if "analytics" in manifest:
+        _validate_registered_analytics(
+            artifact_dir,
+            manifest["analytics"],
+            raw_entries,
+            performance,
+            attribution,
+        )
+        return AnalyticsResult(
+            artifact_dir, manifest_path, artifact_dir / "metrics.json", METRICS_VERSION
+        )
+
     staging = Path(
         tempfile.mkdtemp(
             prefix=f".analytics-{artifact_dir.name}-", dir=artifact_dir.parent
@@ -266,19 +280,29 @@ def materialize_analytics(artifact_dir: Path) -> AnalyticsResult:
     )
     _write_staging(staging, performance, attribution)
     new_entries = _validate_staged_analytics(staging)
-    analytics_entries = {"nav.parquet": raw_entries["nav.parquet"], **new_entries}
+    _publish_staged_files(staging, artifact_dir, new_entries)
+    if _read_manifest_bytes(manifest_path) != original_manifest_bytes:
+        raise ValueError("manifest changed during analytics calculation")
+    final_raw_entries = _validate_raw_manifest(artifact_dir, manifest)
+    analytics_entries = {
+        "nav.parquet": final_raw_entries["nav.parquet"],
+        **new_entries,
+    }
     analytics_index: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
         "metrics_version": METRICS_VERSION,
         "artifacts": analytics_entries,
     }
-    _publish_staged_files(staging, artifact_dir, new_entries)
-    if _read_manifest_bytes(manifest_path) != original_manifest_bytes:
-        raise ValueError("manifest changed during analytics calculation")
     published_manifest = dict(manifest)
     published_manifest["analytics"] = analytics_index
     _publish_manifest(manifest_path, published_manifest)
-    _validate_registered_analytics(artifact_dir, analytics_index, raw_entries)
+    _validate_registered_analytics(
+        artifact_dir,
+        analytics_index,
+        final_raw_entries,
+        performance,
+        attribution,
+    )
     try:
         staging.rmdir()
     except OSError:
@@ -432,38 +456,54 @@ def _write_staging(
     performance: PerformanceResult,
     attribution: AttributionResult,
 ) -> None:
-    metrics_payload: dict[str, object] = {
-        "metrics_version": performance.metrics_version,
-        **dict(performance.metrics),
-        "annual_returns": _json_rows(performance.annual_returns),
-    }
-    quality_payload: dict[str, object] = {
-        "schema_version": _SCHEMA_VERSION,
-        "metrics_version": performance.metrics_version,
-        "calculation_mode": "CASH_EXACT",
-        "undefined_metrics": dict(performance.undefined_metrics),
-        "unavailable_dimensions": {
-            "factor": "UNAVAILABLE",
-            "industry": "UNKNOWN",
-            "style": "UNAVAILABLE",
+    payloads = _expected_json_payloads(performance, attribution)
+    for name, payload in payloads.items():
+        _write_json(staging / name, payload)
+    frames = _expected_parquet_frames(performance, attribution)
+    for name, schema in _ANALYTICS_SCHEMAS.items():
+        _write_parquet(staging / name, frames[name], schema)
+
+
+def _expected_json_payloads(
+    performance: PerformanceResult,
+    attribution: AttributionResult,
+) -> dict[str, dict[str, object]]:
+    return {
+        "metrics.json": {
+            "metrics_version": performance.metrics_version,
+            **dict(performance.metrics),
+            "annual_returns": _json_rows(performance.annual_returns),
         },
-        "attribution_method": (
-            "market_value_t-minus-market_value_t-1-plus-sell-gross-minus-buy-gross;"
-            " residual-is-UNEXPLAINED"
-        ),
-        "warnings": list(attribution.disclosures),
+        "quality_disclosure.json": {
+            "schema_version": _SCHEMA_VERSION,
+            "metrics_version": performance.metrics_version,
+            "calculation_mode": "CASH_EXACT",
+            "undefined_metrics": dict(performance.undefined_metrics),
+            "unavailable_dimensions": {
+                "factor": "UNAVAILABLE",
+                "industry": "UNKNOWN",
+                "style": "UNAVAILABLE",
+            },
+            "attribution_method": (
+                "market_value_t-minus-market_value_t-1-plus-sell-gross-minus-buy-gross;"
+                " residual-is-UNEXPLAINED"
+            ),
+            "warnings": list(attribution.disclosures),
+        },
     }
-    _write_json(staging / "metrics.json", metrics_payload)
-    _write_json(staging / "quality_disclosure.json", quality_payload)
-    frames = {
+
+
+def _expected_parquet_frames(
+    performance: PerformanceResult,
+    attribution: AttributionResult,
+) -> dict[str, pl.DataFrame]:
+    return {
         "drawdown.parquet": performance.drawdown,
         "monthly_returns.parquet": performance.monthly_returns,
         "exposure_summary.parquet": attribution.exposure_summary,
         "factor_summary.parquet": attribution.factor_summary,
         "attribution.parquet": attribution.attribution,
     }
-    for name, schema in _ANALYTICS_SCHEMAS.items():
-        _write_parquet(staging / name, frames[name], schema)
 
 
 def _json_rows(frame: pl.DataFrame) -> list[dict[str, object]]:
@@ -573,6 +613,8 @@ def _validate_registered_analytics(
     artifact_dir: Path,
     analytics: object,
     raw_entries: dict[str, dict[str, object]],
+    performance: PerformanceResult,
+    attribution: AttributionResult,
 ) -> None:
     if not isinstance(analytics, dict) or set(analytics) != {
         "schema_version",
@@ -598,6 +640,11 @@ def _validate_registered_analytics(
             schema,
             error_label="analytics artifact",
         )
+    expected_frames = _expected_parquet_frames(performance, attribution)
+    for name, expected in expected_frames.items():
+        actual = pl.read_parquet(artifact_dir / name)
+        if not actual.equals(expected):
+            raise ValueError(f"analytics artifact {name} does not match raw artifacts")
     payloads: dict[str, dict[str, Any]] = {}
     for name, logical_schema in _JSON_SCHEMAS.items():
         payloads[name] = _validate_json_entry(
@@ -608,6 +655,10 @@ def _validate_registered_analytics(
         )
     _validate_metrics_payload(payloads["metrics.json"])
     _validate_quality_payload(payloads["quality_disclosure.json"])
+    expected_payloads = _expected_json_payloads(performance, attribution)
+    for name, expected_payload in expected_payloads.items():
+        if payloads[name] != expected_payload:
+            raise ValueError(f"analytics artifact {name} does not match raw artifacts")
     null_metrics = {
         name
         for name in _METRIC_NUMBER_FIELDS | {"max_drawdown_recovery_date"}

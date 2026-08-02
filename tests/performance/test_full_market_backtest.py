@@ -16,6 +16,7 @@ from quant_core.backtest.accounting import AccountSnapshot, PositionSnapshot
 from quant_core.backtest.artifacts import BacktestArtifactWriter, ManifestContext
 from quant_core.backtest.models import ExecutionConfig, ExecutionPrice
 from quant_core.domain.identifiers import InstrumentId
+from tests.performance._process_memory import process_peak_rss_bytes
 
 pytestmark = pytest.mark.performance
 
@@ -100,8 +101,9 @@ def test_synthetic_twenty_year_full_market_analytics_completes_within_budget(
     materialize_analytics(artifact_dir)
     analytics_seconds = time.perf_counter() - analytics_started
     total_seconds = time.perf_counter() - started
-    _, peak_bytes = tracemalloc.get_traced_memory()
+    _, python_peak_tracemalloc_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    process_peak_bytes = process_peak_rss_bytes()
     stages = {
         "raw_publication_seconds": raw_seconds,
         "analytics_materialization_seconds": analytics_seconds,
@@ -113,7 +115,9 @@ def test_synthetic_twenty_year_full_market_analytics_completes_within_budget(
         "universe_size": _UNIVERSE_SIZE,
         "positions_per_session": _POSITION_COUNT,
         "total_seconds": total_seconds,
-        "peak_memory_bytes": peak_bytes,
+        "peak_memory_bytes": process_peak_bytes,
+        "process_peak_rss_bytes": process_peak_bytes,
+        "python_peak_tracemalloc_bytes": python_peak_tracemalloc_bytes,
         "stages": stages,
         "slowest_stage": slowest_stage,
     }

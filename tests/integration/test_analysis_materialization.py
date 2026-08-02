@@ -217,6 +217,20 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _rebind_analytics_entry(artifact_dir: Path, name: str) -> bytes:
+    manifest_path = artifact_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    path = artifact_dir / name
+    entry = manifest["analytics"]["artifacts"][name]
+    entry["size_bytes"] = path.stat().st_size
+    entry["sha256"] = _sha256(path)
+    rebound = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    manifest_path.write_bytes(rebound)
+    return rebound
+
+
 def test_materialize_publishes_exact_analytics_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -416,6 +430,82 @@ def test_registered_json_rebound_hash_still_rejects_logical_schema_tampering(
 
     with pytest.raises(ValueError, match="quality disclosure logical schema"):
         materialize_analytics(artifact_dir)
+
+
+def test_raw_tamper_immediately_before_manifest_publish_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw rewrite after computation must not publish a success marker."""
+    artifact_dir = _published_backtest(tmp_path)
+    manifest_path = artifact_dir / "manifest.json"
+    raw_path = artifact_dir / "holdings.parquet"
+    tampered_suffix = b"concurrent-raw-tamper"
+    real_publish = materialize_module._publish_staged_files
+
+    def publish_then_tamper(*args: object, **kwargs: object) -> None:
+        real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        raw_path.write_bytes(raw_path.read_bytes() + tampered_suffix)
+
+    monkeypatch.setattr(
+        materialize_module, "_publish_staged_files", publish_then_tamper
+    )
+
+    with pytest.raises(ValueError, match="raw artifact"):
+        materialize_analytics(artifact_dir)
+
+    assert raw_path.read_bytes().endswith(tampered_suffix)
+    assert "analytics" not in json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def test_registered_finite_metric_rebound_hash_is_recomputed_from_raw(
+    tmp_path: Path,
+) -> None:
+    """A coordinated finite metric rewrite must not pass idempotent validation."""
+    artifact_dir = _published_backtest(tmp_path)
+    materialize_analytics(artifact_dir)
+    metrics_path = artifact_dir / "metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["cumulative_return"] = 0.25
+    metrics_path.write_text(
+        json.dumps(metrics, sort_keys=True, separators=(",", ":"), allow_nan=False),
+        encoding="utf-8",
+    )
+    rebound_manifest = _rebind_analytics_entry(artifact_dir, "metrics.json")
+    tampered_metrics = metrics_path.read_bytes()
+
+    with pytest.raises(ValueError, match="does not match raw artifacts"):
+        materialize_analytics(artifact_dir)
+
+    assert metrics_path.read_bytes() == tampered_metrics
+    assert (artifact_dir / "manifest.json").read_bytes() == rebound_manifest
+
+
+def test_registered_exact_schema_parquet_rebound_hash_is_recomputed_from_raw(
+    tmp_path: Path,
+) -> None:
+    """A coordinated exact-schema Parquet rewrite must fail without overwrite."""
+    artifact_dir = _published_backtest(tmp_path)
+    materialize_analytics(artifact_dir)
+    drawdown_path = artifact_dir / "drawdown.parquet"
+    table = pq.read_table(drawdown_path)
+    values = table["drawdown"].to_pylist()
+    values[0] = -0.125
+    index = table.schema.get_field_index("drawdown")
+    tampered = table.set_column(
+        index,
+        table.schema.field(index),
+        pa.array(values, type=pa.float64()),
+    )
+    pq.write_table(tampered, drawdown_path, compression="zstd")
+    assert pq.read_schema(drawdown_path) == table.schema
+    rebound_manifest = _rebind_analytics_entry(artifact_dir, "drawdown.parquet")
+    tampered_hash = _sha256(drawdown_path)
+
+    with pytest.raises(ValueError, match="does not match raw artifacts"):
+        materialize_analytics(artifact_dir)
+
+    assert _sha256(drawdown_path) == tampered_hash
+    assert (artifact_dir / "manifest.json").read_bytes() == rebound_manifest
 
 
 def test_raw_manifest_identity_value_tampering_fails_closed(tmp_path: Path) -> None:
