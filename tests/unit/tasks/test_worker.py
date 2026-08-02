@@ -6,13 +6,13 @@ import importlib
 import json
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, event, text
 
 from quant_core.domain.enums import Severity
 from quant_core.errors import ErrorDetail, QuantError
@@ -218,7 +218,7 @@ class _UnsafeFailureHandler:
                 "retryable": True,
                 "message": "returned-message-secret",
                 "context": {
-                    "stage": "publish",
+                    "stage": "returned-stage-secret",
                     "api_key": "returned-api-key-secret",
                     "opaque": "returned-opaque-secret",
                 },
@@ -256,6 +256,99 @@ class _HeartbeatFailureQueue:
         self._delegate.finish(attempt_id, worker_id, outcome)
 
 
+class _ProgressRaceQueue:
+    def __init__(self, delegate: TaskQueue) -> None:
+        self._delegate = delegate
+        self.periodic_captured = threading.Event()
+        self.release_periodic = threading.Event()
+        self.immediate_persisted = threading.Event()
+
+    def claim(self, worker_id: str, now: datetime) -> Any:
+        return self._delegate.claim(worker_id, now)
+
+    def heartbeat(
+        self,
+        attempt_id: str,
+        worker_id: str,
+        progress: TaskProgress,
+        now: datetime,
+    ) -> None:
+        if threading.current_thread().name.startswith("quant-worker-heartbeat-"):
+            self.periodic_captured.set()
+            if not self.release_periodic.wait(timeout=2):
+                raise TimeoutError("periodic heartbeat test barrier was not released")
+            self._delegate.heartbeat(attempt_id, worker_id, progress, now)
+            return
+        self._delegate.heartbeat(attempt_id, worker_id, progress, now)
+        self.immediate_persisted.set()
+
+    def is_cancel_requested(self, attempt_id: str, worker_id: str) -> bool:
+        return self._delegate.is_cancel_requested(attempt_id, worker_id)
+
+    def finish(
+        self, attempt_id: str, worker_id: str, outcome: TaskOutcome
+    ) -> None:
+        self._delegate.finish(attempt_id, worker_id, outcome)
+
+
+class _ProgressRaceHandler:
+    task_type = "BACKTEST"
+
+    def __init__(self) -> None:
+        self.update_started = threading.Event()
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, cancellation
+        self.update_started.set()
+        progress.update(LATEST_PROGRESS)
+        return TaskOutcome(status=TaskStatus.SUCCEEDED)
+
+
+class _FinishCancellationRaceQueue:
+    def __init__(self, delegate: TaskQueue) -> None:
+        self._delegate = delegate
+        self.success_finish_entered = threading.Event()
+        self.release_success_finish = threading.Event()
+        self.finish_statuses: list[TaskStatus] = []
+
+    def claim(self, worker_id: str, now: datetime) -> Any:
+        return self._delegate.claim(worker_id, now)
+
+    def heartbeat(
+        self,
+        attempt_id: str,
+        worker_id: str,
+        progress: TaskProgress,
+        now: datetime,
+    ) -> None:
+        self._delegate.heartbeat(attempt_id, worker_id, progress, now)
+
+    def is_cancel_requested(self, attempt_id: str, worker_id: str) -> bool:
+        return self._delegate.is_cancel_requested(attempt_id, worker_id)
+
+    def finish(
+        self, attempt_id: str, worker_id: str, outcome: TaskOutcome
+    ) -> None:
+        self.finish_statuses.append(outcome.status)
+        if outcome.status is TaskStatus.SUCCEEDED:
+            self.success_finish_entered.set()
+            if not self.release_success_finish.wait(timeout=2):
+                raise TimeoutError("success finish test barrier was not released")
+        self._delegate.finish(attempt_id, worker_id, outcome)
+
+
+class _FinalBoundarySuccessHandler:
+    task_type = "BACKTEST"
+
+    def __init__(self) -> None:
+        self.observed: bool | None = None
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, progress
+        self.observed = cancellation.is_cancelled()
+        return TaskOutcome(status=TaskStatus.SUCCEEDED)
+
+
 class _IgnoresHeartbeatFailureHandler:
     task_type = "BACKTEST"
 
@@ -268,6 +361,103 @@ class _IgnoresHeartbeatFailureHandler:
         return TaskOutcome(status=TaskStatus.SUCCEEDED)
 
 
+class _ConcurrentHandler:
+    task_type = "BACKTEST"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rendezvous = threading.Barrier(2)
+        self.active = 0
+        self.max_active = 0
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, progress, cancellation
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            self._rendezvous.wait(timeout=1)
+        except threading.BrokenBarrierError:
+            pass
+        finally:
+            with self._lock:
+                self.active -= 1
+        return TaskOutcome(status=TaskStatus.SUCCEEDED)
+
+
+class _BlockingClaimQueue:
+    def __init__(self, delegate: TaskQueue) -> None:
+        self._delegate = delegate
+        self.claim_entered = threading.Event()
+        self.release_claim = threading.Event()
+
+    def claim(self, worker_id: str, now: datetime) -> Any:
+        self.claim_entered.set()
+        if not self.release_claim.wait(timeout=2):
+            raise TimeoutError("claim test barrier was not released")
+        return self._delegate.claim(worker_id, now)
+
+    def heartbeat(
+        self,
+        attempt_id: str,
+        worker_id: str,
+        progress: TaskProgress,
+        now: datetime,
+    ) -> None:
+        self._delegate.heartbeat(attempt_id, worker_id, progress, now)
+
+    def is_cancel_requested(self, attempt_id: str, worker_id: str) -> bool:
+        return self._delegate.is_cancel_requested(attempt_id, worker_id)
+
+    def finish(
+        self, attempt_id: str, worker_id: str, outcome: TaskOutcome
+    ) -> None:
+        self._delegate.finish(attempt_id, worker_id, outcome)
+
+
+class _DelayedCancellationHandler:
+    task_type = "BACKTEST"
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.allow_check = threading.Event()
+        self.observed: bool | None = None
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, progress
+        self.entered.set()
+        self.allow_check.wait(timeout=2)
+        self.observed = cancellation.is_cancelled()
+        return TaskOutcome(
+            status=(
+                TaskStatus.CANCELLED
+                if self.observed
+                else TaskStatus.SUCCEEDED
+            )
+        )
+
+
+class _TraversalBombMapping(Mapping[str, object]):
+    def __init__(self) -> None:
+        self.visits = 0
+
+    def __getitem__(self, key: str) -> object:
+        return f"value-for-{key}"
+
+    def __iter__(self) -> Iterator[str]:
+        while True:
+            self.visits += 1
+            if self.visits > 50:
+                raise RuntimeError("normalizer traversed beyond its input cap")
+            yield f"opaque_{self.visits}"
+
+    def __len__(self) -> int:
+        return 1_000_000
+
+    def items(self) -> Any:
+        raise RuntimeError("normalizer invoked an untrusted eager items method")
+
+
 def _run_in_thread(operation: Callable[[], bool]) -> tuple[threading.Thread, list[Any]]:
     results: list[Any] = []
 
@@ -277,7 +467,7 @@ def _run_in_thread(operation: Callable[[], bool]) -> tuple[threading.Thread, lis
         except BaseException as error:  # noqa: BLE001 - surfaced in test thread
             results.append(error)
 
-    thread = threading.Thread(target=run, name="worker-test-runner", daemon=True)
+    thread = threading.Thread(target=run, name="worker-test-runner", daemon=False)
     thread.start()
     return thread, results
 
@@ -308,6 +498,97 @@ def test_run_once_claims_only_one_task_and_shutdown_prevents_another_claim(
     assert sorted(_statuses(engine)) == ["QUEUED", "SUCCEEDED"]
 
 
+def test_same_worker_serializes_concurrent_run_once_claim_through_finish(
+    engine: Engine,
+) -> None:
+    """Removing the instance execution guard lets two handlers overlap."""
+    queue = TaskQueue(engine, clock=lambda: NOW)
+    queue.enqueue("BACKTEST", {}, 0)
+    queue.enqueue("BACKTEST", {}, 0)
+    handler = _ConcurrentHandler()
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(handler,),
+        clock=lambda: NOW,
+    )
+    start = threading.Barrier(3)
+    results: list[bool] = []
+    failures: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            start.wait(timeout=2)
+            results.append(worker.run_once())
+        except BaseException as error:  # noqa: BLE001 - surfaced below
+            failures.append(error)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    try:
+        start.wait(timeout=2)
+    finally:
+        for thread in threads:
+            thread.join(timeout=3)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert failures == []
+    assert results == [True, True]
+    assert handler.max_active == 1
+    assert _statuses(engine) == ["SUCCEEDED", "SUCCEEDED"]
+
+
+def test_claim_started_before_shutdown_holds_the_shared_linearization_gate(
+    engine: Engine,
+) -> None:
+    """A shutdown call cannot linearize between the pre-claim check and claim."""
+    delegate = TaskQueue(engine, clock=lambda: NOW)
+    task_id = delegate.enqueue("BACKTEST", {}, 0)
+    queue = _BlockingClaimQueue(delegate)
+    handler = _DelayedCancellationHandler()
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(handler,),
+        clock=lambda: NOW,
+    )
+    run_thread, results = _run_in_thread(worker.run_once)
+    shutdown_invoked = threading.Event()
+    shutdown_completed = threading.Event()
+
+    def request_shutdown() -> None:
+        shutdown_invoked.set()
+        worker.request_shutdown()
+        shutdown_completed.set()
+
+    shutdown_thread = threading.Thread(target=request_shutdown)
+    completed_before_claim = False
+    try:
+        assert queue.claim_entered.wait(timeout=2)
+        shutdown_thread.start()
+        assert shutdown_invoked.wait(timeout=2)
+        completed_before_claim = shutdown_completed.wait(timeout=0.2)
+        queue.release_claim.set()
+        assert shutdown_completed.wait(timeout=2)
+        assert handler.entered.wait(timeout=2)
+        handler.allow_check.set()
+    finally:
+        queue.release_claim.set()
+        handler.allow_check.set()
+        run_thread.join(timeout=3)
+        if shutdown_thread.ident is not None:
+            shutdown_thread.join(timeout=3)
+
+    assert completed_before_claim is False
+    assert not run_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert results == [True]
+    assert handler.observed is True
+    task, attempt = _runtime_rows(engine, task_id)
+    assert task["status"] == attempt["status"] == "CANCELLED"
+
+
 def test_run_forever_uses_default_two_second_idle_poll(engine: Engine) -> None:
     """Changing the default idle delay or busy-spinning must change this observation."""
     queue = TaskQueue(engine, clock=lambda: NOW)
@@ -330,6 +611,35 @@ def test_run_forever_uses_default_two_second_idle_poll(engine: Engine) -> None:
     worker.run_forever()
 
     assert waits == [2.0]
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["poll_interval", "heartbeat_interval", "heartbeat_join_timeout"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [True, 0.0, -0.1, float("nan"), float("inf")],
+)
+def test_worker_rejects_invalid_timing_before_claim(
+    engine: Engine,
+    parameter: str,
+    value: float,
+) -> None:
+    """Invalid waits must fail during construction, before durable work is claimed."""
+    queue = TaskQueue(engine, clock=lambda: NOW)
+    queue.enqueue("BACKTEST", {}, 0)
+
+    with pytest.raises(ValueError, match="finite positive number"):
+        _worker_type()(
+            queue,
+            worker_id="worker-1",
+            handlers=(_SuccessHandler(),),
+            clock=lambda: NOW,
+            **{parameter: value},
+        )
+
+    assert _statuses(engine) == ["QUEUED"]
 
 
 def test_progress_is_immediate_and_periodic_heartbeat_reuses_latest_value(
@@ -372,6 +682,51 @@ def test_progress_is_immediate_and_periodic_heartbeat_reuses_latest_value(
     assert queue.heartbeat_stopped_before_finish is True
 
 
+def test_periodic_heartbeat_cannot_overwrite_newer_immediate_progress(
+    engine: Engine,
+) -> None:
+    """Releasing progress locking before persistence permits stale overwrite."""
+    delegate = TaskQueue(engine, clock=lambda: NOW)
+    task_id = delegate.enqueue("BACKTEST", {}, 0)
+    queue = _ProgressRaceQueue(delegate)
+    handler = _ProgressRaceHandler()
+    waiter_calls = 0
+
+    def heartbeat_waiter(stop: threading.Event, timeout: float) -> bool:
+        nonlocal waiter_calls
+        waiter_calls += 1
+        if waiter_calls == 1:
+            return False
+        return stop.wait(timeout)
+
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(handler,),
+        clock=lambda: NOW,
+        heartbeat_waiter=heartbeat_waiter,
+    )
+    thread, results = _run_in_thread(worker.run_once)
+    immediate_wrote_while_old_blocked = False
+    try:
+        assert queue.periodic_captured.wait(timeout=2)
+        assert handler.update_started.wait(timeout=2)
+        immediate_wrote_while_old_blocked = queue.immediate_persisted.wait(
+            timeout=0.2
+        )
+        queue.release_periodic.set()
+    finally:
+        queue.release_periodic.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert results == [True]
+    assert immediate_wrote_while_old_blocked is False
+    task, attempt = _runtime_rows(engine, task_id)
+    assert json.loads(task["progress_json"]) == LATEST_PROGRESS.model_dump()
+    assert task["progress_json"] == attempt["progress_json"]
+
+
 def test_queue_cancellation_is_observed_at_handler_boundary(engine: Engine) -> None:
     """Returning False after CANCEL_REQUESTED would let owned work continue."""
     queue = TaskQueue(engine, clock=lambda: NOW)
@@ -388,13 +743,44 @@ def test_queue_cancellation_is_observed_at_handler_boundary(engine: Engine) -> N
         assert handler.at_boundary.wait(timeout=2)
         queue.request_cancel(task_id, "user-1")
         handler.continue_from_boundary.set()
-        thread.join(timeout=2)
     finally:
         handler.continue_from_boundary.set()
+        thread.join(timeout=2)
 
     assert not thread.is_alive()
     assert results == [True]
     assert handler.observations == [False, True]
+    task, attempt = _runtime_rows(engine, task_id)
+    assert task["status"] == attempt["status"] == "CANCELLED"
+
+
+def test_cancel_winning_after_last_boundary_converges_success_to_cancelled(
+    engine: Engine,
+) -> None:
+    """Letting the success conflict escape strands a valid CANCEL_REQUESTED pair."""
+    delegate = TaskQueue(engine, clock=lambda: NOW)
+    task_id = delegate.enqueue("BACKTEST", {}, 0)
+    queue = _FinishCancellationRaceQueue(delegate)
+    handler = _FinalBoundarySuccessHandler()
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(handler,),
+        clock=lambda: NOW,
+    )
+    thread, results = _run_in_thread(worker.run_once)
+    try:
+        assert queue.success_finish_entered.wait(timeout=2)
+        delegate.request_cancel(task_id, "user-1")
+        queue.release_success_finish.set()
+    finally:
+        queue.release_success_finish.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert results == [True]
+    assert handler.observed is False
+    assert queue.finish_statuses == [TaskStatus.SUCCEEDED, TaskStatus.CANCELLED]
     task, attempt = _runtime_rows(engine, task_id)
     assert task["status"] == attempt["status"] == "CANCELLED"
 
@@ -418,9 +804,9 @@ def test_shutdown_cancels_current_boundary_and_leaves_next_task_queued(
         assert handler.at_boundary.wait(timeout=2)
         worker.request_shutdown()
         handler.continue_from_boundary.set()
-        thread.join(timeout=2)
     finally:
         handler.continue_from_boundary.set()
+        thread.join(timeout=2)
 
     assert not thread.is_alive()
     assert results == [True]
@@ -473,6 +859,58 @@ def test_cancel_query_is_owner_fenced_and_rejects_inconsistent_or_terminal_state
     with pytest.raises(QuantError) as terminal:
         queue.is_cancel_requested(claimed.attempt_id, "worker-1")
     assert terminal.value.detail.code == "TASK_STATE_CONFLICT"
+
+
+def test_cancel_query_reads_task_and_attempt_from_one_concurrent_snapshot(
+    engine: Engine,
+) -> None:
+    """Separate SELECTs can invent a state mismatch during valid cancellation."""
+    queue = TaskQueue(engine, clock=lambda: NOW)
+    task_id = queue.enqueue("BACKTEST", {}, 0)
+    claimed = queue.claim("worker-1", NOW)
+    assert claimed is not None
+    read_completed = threading.Event()
+    release_read = threading.Event()
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def pause_after_attempt_read(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if (
+            not read_completed.is_set()
+            and "from task_attempt" in normalized
+            and "task_attempt.id" in normalized
+        ):
+            read_completed.set()
+            if not release_read.wait(timeout=2):
+                raise TimeoutError("cancellation read barrier was not released")
+
+    thread, results = _run_in_thread(
+        lambda: queue.is_cancel_requested(claimed.attempt_id, "worker-1")
+    )
+    try:
+        assert read_completed.wait(timeout=2)
+        queue.request_cancel(task_id, "user-1")
+    finally:
+        release_read.set()
+        thread.join(timeout=3)
+        event.remove(engine, "after_cursor_execute", pause_after_attempt_read)
+
+    assert not thread.is_alive()
+    assert results == [False]
+    task, attempt = _runtime_rows(engine, task_id)
+    assert task["status"] == attempt["status"] == "CANCEL_REQUESTED"
+    queue.finish(
+        claimed.attempt_id,
+        "worker-1",
+        TaskOutcome(status=TaskStatus.CANCELLED),
+    )
 
 
 def test_handler_registry_names_standard_types_and_rejects_duplicate_registration() -> None:
@@ -535,21 +973,33 @@ def test_quant_error_keeps_machine_fields_and_redacts_every_persistent_surface(
         "quant-password-secret",
         "quant-environment-secret",
         "quant-opaque-secret",
+        "quant-dataset-secret",
+        "quant-stage-secret",
+        "quant-host-secret",
+        "quant-list-secret",
+        "quant-nested-secret",
+        "quant-key-name-secret",
     }
     detail = ErrorDetail(
         code="DATA_PROVIDER_TIMEOUT",
         severity=Severity.SEVERE,
         message="provider failed with quant-message-secret",
         context={
-            "dataset": "daily_prices",
-            "stage": "download",
+            "dataset": "quant-dataset-secret",
+            "stage": "quant-stage-secret",
             "api_key": "quant-api-key-secret",
+            "api_key_quant-key-name-secret": "already redacted",
             "connection": {
-                "host": "localhost",
+                "host": "quant-host-secret",
                 "password": "quant-password-secret",
             },
             "environment": {"DATABASE_URL": "quant-environment-secret"},
             "opaque": "quant-opaque-secret",
+            "target": [
+                "quant-list-secret",
+                {"provider": "quant-nested-secret"},
+            ],
+            "attempt": 3,
         },
         remediation="rotate quant-remediation-secret",
         retryable=True,
@@ -572,14 +1022,20 @@ def test_quant_error_keeps_machine_fields_and_redacts_every_persistent_surface(
     expected = {
         "code": "DATA_PROVIDER_TIMEOUT",
         "context": {
+            "attempt": 3,
             "api_key": "[REDACTED]",
             "connection": {
-                "host": "localhost",
+                "host": "[REDACTED]",
                 "password": "[REDACTED]",
             },
-            "dataset": "daily_prices",
+            "dataset": "[REDACTED]",
             "environment": "[REDACTED]",
-            "stage": "download",
+            "redacted": "[REDACTED]",
+            "stage": "[REDACTED]",
+            "target": [
+                "[REDACTED]",
+                {"provider": "[REDACTED]"},
+            ],
         },
         "retryable": True,
     }
@@ -603,6 +1059,90 @@ def test_quant_error_keeps_machine_fields_and_redacts_every_persistent_surface(
         )
     )
     assert all(secret not in disclosed for secret in secrets)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        (
+            ["x" * 1_024],
+            {
+                "code": "BUDGETED_CONTEXT",
+                "context": {"target": ["[REDACTED]"]},
+                "retryable": False,
+            },
+        ),
+        (
+            ["x" * 2_048 for _ in range(50)],
+            {
+                "code": "WORKER_ERROR_NORMALIZATION_FAILED",
+                "retryable": False,
+            },
+        ),
+    ],
+)
+def test_error_normalization_has_one_global_utf8_budget_and_safe_fallback(
+    engine: Engine,
+    target: list[str],
+    expected: dict[str, Any],
+) -> None:
+    """Per-value caps can exceed TaskOutcome's bound and strand RUNNING work."""
+    detail = ErrorDetail(
+        code="BUDGETED_CONTEXT",
+        severity=Severity.SEVERE,
+        message="bounded failure",
+        context={"target": target},
+        remediation="inspect bounded context",
+        retryable=False,
+    )
+    queue = TaskQueue(engine, clock=lambda: NOW)
+    task_id = queue.enqueue("BACKTEST", {}, 0)
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(_RaisingHandler(QuantError(detail)),),
+        clock=lambda: NOW,
+    )
+
+    assert worker.run_once() is True
+
+    task, attempt = _runtime_rows(engine, task_id)
+    assert task["status"] == attempt["status"] == "FAILED"
+    assert json.loads(task["error_json"]) == expected
+    assert json.loads(attempt["error_json"]) == expected
+    assert _finished_audit(engine, task_id)["error"] == expected
+
+
+def test_error_normalization_stops_mapping_input_at_global_traversal_cap(
+    engine: Engine,
+) -> None:
+    """Eagerly enumerating a Mapping lets untrusted context make work unbounded."""
+    context = _TraversalBombMapping()
+    detail = ErrorDetail(
+        code="BOUNDED_CONTEXT",
+        severity=Severity.SEVERE,
+        message="bounded traversal",
+        context=context,
+        remediation="inspect bounded context",
+        retryable=False,
+    )
+    queue = TaskQueue(engine, clock=lambda: NOW)
+    task_id = queue.enqueue("BACKTEST", {}, 0)
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(_RaisingHandler(QuantError(detail)),),
+        clock=lambda: NOW,
+    )
+
+    assert worker.run_once() is True
+
+    expected = {"code": "BOUNDED_CONTEXT", "retryable": False}
+    assert context.visits == 50
+    task, attempt = _runtime_rows(engine, task_id)
+    assert json.loads(task["error_json"]) == expected
+    assert json.loads(attempt["error_json"]) == expected
+    assert _finished_audit(engine, task_id)["error"] == expected
 
 
 def test_unknown_exception_maps_without_message_but_logs_sanitized_frames(
@@ -667,7 +1207,7 @@ def test_returned_failed_outcome_is_normalized_before_persistence(
         "code": "HANDLER_FAILED",
         "context": {
             "api_key": "[REDACTED]",
-            "stage": "publish",
+            "stage": "[REDACTED]",
         },
         "retryable": True,
     }
@@ -680,6 +1220,7 @@ def test_returned_failed_outcome_is_normalized_before_persistence(
     assert "returned-message-secret" not in serialized
     assert "returned-api-key-secret" not in serialized
     assert "returned-opaque-secret" not in serialized
+    assert "returned-stage-secret" not in serialized
 
 
 def test_background_heartbeat_failure_propagates_without_success_finish(

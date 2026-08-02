@@ -360,7 +360,37 @@ class TaskQueue:
         attempt_identifier = _bounded_identity(attempt_id, "attempt_id", 36)
         worker = _bounded_identity(worker_id, "worker_id", 128)
         with self._engine.connect() as connection:
-            attempt, task = _attempt_and_task(connection, attempt_identifier)
+            row = connection.execute(
+                select(
+                    TaskAttemptORM.id.label("attempt_id"),
+                    TaskAttemptORM.task_id.label("attempt_task_id"),
+                    TaskAttemptORM.worker_id.label("attempt_worker_id"),
+                    TaskAttemptORM.status.label("attempt_status"),
+                    TaskORM.id.label("task_id"),
+                    TaskORM.worker_id.label("task_worker_id"),
+                    TaskORM.status.label("task_status"),
+                )
+                .select_from(TaskAttemptORM)
+                .join(TaskORM, TaskORM.id == TaskAttemptORM.task_id)
+                .where(TaskAttemptORM.id == attempt_identifier)
+            ).mappings().one_or_none()
+            if row is None:
+                _raise_not_found(
+                    "TASK_ATTEMPT_NOT_FOUND",
+                    f"task attempt does not exist: {attempt_identifier}",
+                    {"attempt_id": attempt_identifier},
+                )
+            attempt: dict[str, object] = {
+                "id": row["attempt_id"],
+                "task_id": row["attempt_task_id"],
+                "worker_id": row["attempt_worker_id"],
+                "status": row["attempt_status"],
+            }
+            task: dict[str, object] = {
+                "id": row["task_id"],
+                "worker_id": row["task_worker_id"],
+                "status": row["task_status"],
+            }
             _require_owner(attempt, task, worker, attempt_identifier)
             _require_active_pair(attempt, task, "is_cancel_requested")
             status = cast(str, task["status"])
@@ -796,8 +826,8 @@ def _attempt_and_task(
 
 
 def _require_owner(
-    attempt: RowMapping,
-    task: RowMapping,
+    attempt: RowMapping | Mapping[str, object],
+    task: RowMapping | Mapping[str, object],
     worker_id: str,
     attempt_id: str,
 ) -> None:
@@ -815,7 +845,9 @@ def _require_owner(
 
 
 def _require_active_pair(
-    attempt: RowMapping, task: RowMapping, operation: str
+    attempt: RowMapping | Mapping[str, object],
+    task: RowMapping | Mapping[str, object],
+    operation: str,
 ) -> None:
     attempt_status = cast(str, attempt["status"])
     task_status = cast(str, task["status"])

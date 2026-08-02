@@ -9,10 +9,11 @@ import threading
 import traceback
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Protocol, cast
 
-from quant_core.data.contracts import JsonValue
+from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.errors import ErrorDetail, QuantError
 from quant_core.tasks.handlers import HandlerRegistry, TaskHandler
 from quant_core.tasks.models import (
@@ -21,6 +22,7 @@ from quant_core.tasks.models import (
     TaskProgress,
     TaskStatus,
 )
+from quant_core.tasks.queue import TaskQueueConflict
 
 type _Waiter = Callable[[threading.Event, float], bool]
 
@@ -56,8 +58,39 @@ _SECRET_KEY_MARKERS = (
     "secret",
     "token",
 )
-_SECRET_CONTAINER_KEYS = frozenset({"env", "environ", "environment"})
+_SECRET_CONTAINER_KEYS = frozenset(
+    {"env", "environ", "environment", "redacted"}
+)
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
+_MAX_CONTEXT_ITEMS = 50
+_MAX_CONTEXT_DEPTH = 4
+_MAX_NORMALIZATION_NODES = 128
+_MAX_NORMALIZATION_INPUT_BYTES = 16_384
+_MAX_NORMALIZED_ERROR_BYTES = 16_384
+_NORMALIZATION_FAILED_ERROR: dict[str, JsonValue] = {
+    "code": "WORKER_ERROR_NORMALIZATION_FAILED",
+    "retryable": False,
+}
+
+
+class _NormalizationBudget:
+    def __init__(self) -> None:
+        self._nodes = 0
+        self._input_bytes = 0
+
+    def visit(self) -> None:
+        self._nodes += 1
+        if self._nodes > _MAX_NORMALIZATION_NODES:
+            raise ValueError("error normalization node budget exceeded")
+
+    def consume_text(self, value: str) -> None:
+        remaining = _MAX_NORMALIZATION_INPUT_BYTES - self._input_bytes
+        if len(value) > remaining:
+            raise ValueError("error normalization UTF-8 budget exceeded")
+        size = len(value.encode("utf-8"))
+        if size > remaining:
+            raise ValueError("error normalization UTF-8 budget exceeded")
+        self._input_bytes += size
 
 
 class _Queue(Protocol):
@@ -86,13 +119,18 @@ class _LatestProgress:
         self._value = initial
         self._lock = threading.Lock()
 
-    def get(self) -> TaskProgress:
-        with self._lock:
-            return self._value
-
-    def set(self, progress: TaskProgress) -> None:
+    def update_and_persist(
+        self,
+        progress: TaskProgress,
+        persist: Callable[[TaskProgress], None],
+    ) -> None:
         with self._lock:
             self._value = progress
+            persist(progress)
+
+    def persist_latest(self, persist: Callable[[TaskProgress], None]) -> None:
+        with self._lock:
+            persist(self._value)
 
 
 class _CoordinationFailure:
@@ -133,17 +171,22 @@ class _DurableProgressSink:
     def update(self, progress: TaskProgress) -> None:
         if not isinstance(progress, TaskProgress):
             raise TypeError("progress must be a TaskProgress")
-        self._latest.set(progress)
         try:
-            self._queue.heartbeat(
-                self._task.attempt_id,
-                self._task.worker_id,
+            self._latest.update_and_persist(
                 progress,
-                self._clock(),
+                self._persist,
             )
         except Exception as error:
             self._failure.record(error)
             raise
+
+    def _persist(self, progress: TaskProgress) -> None:
+        self._queue.heartbeat(
+            self._task.attempt_id,
+            self._task.worker_id,
+            progress,
+            self._clock(),
+        )
 
 
 class _QueueCancellationToken:
@@ -193,17 +236,26 @@ class Worker:
         self._worker_id = worker_id
         self._handlers = HandlerRegistry(handlers)
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._poll_interval = poll_interval
-        self._heartbeat_interval = heartbeat_interval
+        self._poll_interval = _positive_seconds(poll_interval, "poll_interval")
+        self._heartbeat_interval = _positive_seconds(
+            heartbeat_interval,
+            "heartbeat_interval",
+        )
         self._poll_waiter = poll_waiter or _wait
         self._heartbeat_waiter = heartbeat_waiter or _wait
-        self._heartbeat_join_timeout = heartbeat_join_timeout
+        self._heartbeat_join_timeout = _positive_seconds(
+            heartbeat_join_timeout,
+            "heartbeat_join_timeout",
+        )
         self._logger = logger or logging.getLogger(__name__)
         self._shutdown = threading.Event()
+        self._execution_lock = threading.Lock()
+        self._claim_gate = threading.Lock()
 
     def request_shutdown(self) -> None:
         """Stop polling and ask active cooperative work to cancel."""
-        self._shutdown.set()
+        with self._claim_gate:
+            self._shutdown.set()
 
     def run_forever(self) -> None:
         """Poll until shutdown is requested."""
@@ -218,9 +270,14 @@ class Worker:
 
     def run_once(self) -> bool:
         """Claim and finish at most one task, returning whether one was claimed."""
-        if self._shutdown.is_set():
-            return False
-        task = self._queue.claim(self._worker_id, self._clock())
+        with self._execution_lock:
+            return self._run_once_serialized()
+
+    def _run_once_serialized(self) -> bool:
+        with self._claim_gate:
+            if self._shutdown.is_set():
+                return False
+            task = self._queue.claim(self._worker_id, self._clock())
         if task is None:
             return False
 
@@ -284,8 +341,27 @@ class Worker:
         if outcome is None:
             raise AssertionError("handler completed without outcome or error")
         outcome = _normalize_outcome(outcome)
-        self._queue.finish(task.attempt_id, self._worker_id, outcome)
+        self._finish(task, outcome)
         return True
+
+    def _finish(self, task: ClaimedTask, outcome: TaskOutcome) -> None:
+        try:
+            self._queue.finish(task.attempt_id, self._worker_id, outcome)
+        except TaskQueueConflict:
+            if (
+                outcome.status is TaskStatus.SUCCEEDED
+                and self._queue.is_cancel_requested(
+                    task.attempt_id,
+                    self._worker_id,
+                )
+            ):
+                self._queue.finish(
+                    task.attempt_id,
+                    self._worker_id,
+                    TaskOutcome(status=TaskStatus.CANCELLED),
+                )
+                return
+            raise
 
     def _heartbeat(
         self,
@@ -296,11 +372,13 @@ class Worker:
     ) -> None:
         try:
             while not self._heartbeat_waiter(stop, self._heartbeat_interval):
-                self._queue.heartbeat(
-                    task.attempt_id,
-                    self._worker_id,
-                    latest.get(),
-                    self._clock(),
+                latest.persist_latest(
+                    lambda progress: self._queue.heartbeat(
+                        task.attempt_id,
+                        self._worker_id,
+                        progress,
+                        self._clock(),
+                    )
                 )
         except Exception as error:  # noqa: BLE001 - transfer from heartbeat thread
             failure.record(error)
@@ -325,15 +403,31 @@ def _wait(event: threading.Event, timeout: float) -> bool:
     return event.wait(timeout)
 
 
+def _positive_seconds(value: float, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{label} must be a finite positive number")
+    return float(value)
+
+
 def _failure_outcome(error: Exception) -> TaskOutcome:
-    if isinstance(error, QuantError):
-        persisted = _quant_error(error.detail)
-    else:
-        persisted = {
-            "code": "WORKER_UNHANDLED_ERROR",
-            "retryable": False,
-        }
-    return TaskOutcome(status=TaskStatus.FAILED, error=persisted)
+    try:
+        if isinstance(error, QuantError):
+            persisted = _quant_error(error.detail)
+        else:
+            persisted = _validated_error(
+                {
+                    "code": "WORKER_UNHANDLED_ERROR",
+                    "retryable": False,
+                }
+            )
+        return TaskOutcome(status=TaskStatus.FAILED, error=persisted)
+    except Exception:  # noqa: BLE001 - normalization must fail to fixed JSON
+        return _normalization_failed_outcome()
 
 
 def _normalize_outcome(outcome: TaskOutcome) -> TaskOutcome:
@@ -341,85 +435,141 @@ def _normalize_outcome(outcome: TaskOutcome) -> TaskOutcome:
         return outcome
     if outcome.error is None:
         raise AssertionError("validated FAILED outcome is missing error")
+    try:
+        return TaskOutcome(
+            status=TaskStatus.FAILED,
+            error=_normalized_error(outcome.error),
+        )
+    except Exception:  # noqa: BLE001 - normalization must fail to fixed JSON
+        return _normalization_failed_outcome()
+
+
+def _normalization_failed_outcome() -> TaskOutcome:
     return TaskOutcome(
         status=TaskStatus.FAILED,
-        error=_normalized_error(outcome.error),
+        error=dict(_NORMALIZATION_FAILED_ERROR),
     )
 
 
 def _quant_error(detail: ErrorDetail) -> dict[str, JsonValue]:
+    budget = _NormalizationBudget()
+    budget.visit()
+    code = _safe_code(detail.code)
+    budget.consume_text(code)
+    budget.visit()
     result: dict[str, JsonValue] = {
-        "code": _safe_code(detail.code),
+        "code": code,
         "retryable": detail.retryable,
     }
-    context = _safe_mapping(detail.context)
+    context = _safe_mapping(detail.context, budget=budget, depth=0)
     if context:
         result["context"] = context
-    return result
+    return _validated_error(result)
 
 
 def _normalized_error(error: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    budget = _NormalizationBudget()
+    budget.visit()
     raw_code = error.get("code")
+    code = _safe_code(raw_code)
+    budget.consume_text(code)
+    budget.visit()
     result: dict[str, JsonValue] = {
-        "code": _safe_code(raw_code),
+        "code": code,
         "retryable": error.get("retryable")
         if isinstance(error.get("retryable"), bool)
         else False,
     }
     raw_context = error.get("context")
     if isinstance(raw_context, dict):
-        context = _safe_mapping(cast(dict[str, object], raw_context))
+        context = _safe_mapping(
+            cast(dict[str, object], raw_context),
+            budget=budget,
+            depth=0,
+        )
         if context:
             result["context"] = context
-    return result
+    return _validated_error(result)
 
 
 def _safe_code(value: object) -> str:
-    if isinstance(value, str) and _ERROR_CODE.fullmatch(value) is not None:
+    if (
+        isinstance(value, str)
+        and len(value) <= 128
+        and _ERROR_CODE.fullmatch(value) is not None
+    ):
         return value
     return "WORKER_INVALID_ERROR_CODE"
 
 
-def _safe_mapping(value: Mapping[str, object]) -> dict[str, JsonValue]:
-    pairs = [(key, item) for key, item in value.items() if isinstance(key, str)]
-    return _safe_mapping_pairs(pairs, depth=0)
-
-
-def _safe_mapping_pairs(
-    pairs: list[tuple[str, object]], *, depth: int
+def _safe_mapping(
+    value: Mapping[str, object],
+    *,
+    budget: _NormalizationBudget,
+    depth: int,
 ) -> dict[str, JsonValue]:
+    budget.visit()
+    pairs: list[tuple[str, object]] = []
+    for key in islice(value, _MAX_CONTEXT_ITEMS):
+        if not isinstance(key, str):
+            continue
+        budget.consume_text(key)
+        pairs.append((key, value[key]))
     result: dict[str, JsonValue] = {}
-    for index, (key, item) in enumerate(sorted(pairs, key=lambda pair: pair[0])):
-        if index >= 50:
-            break
-        name = key[:128]
-        normalized = name.casefold().replace("-", "_")
-        if normalized in _SECRET_CONTAINER_KEYS or any(
-            marker in normalized for marker in _SECRET_KEY_MARKERS
+    for raw_name, item in sorted(pairs, key=lambda pair: pair[0]):
+        normalized = raw_name.casefold().replace("-", "_")
+        if (
+            normalized in _SECRET_CONTAINER_KEYS
+            or normalized in _SECRET_KEY_MARKERS
         ):
-            result[name] = "[REDACTED]"
+            result[normalized] = "[REDACTED]"
+        elif any(marker in normalized for marker in _SECRET_KEY_MARKERS):
+            result["redacted"] = "[REDACTED]"
         elif normalized in _SAFE_CONTEXT_FIELDS:
-            result[name] = _safe_value(item, depth=depth)
+            result[normalized] = _safe_value(
+                item,
+                budget=budget,
+                depth=depth,
+            )
     return result
 
 
-def _safe_value(value: object, *, depth: int) -> JsonValue:
-    if depth >= 4:
+def _safe_value(
+    value: object,
+    *,
+    budget: _NormalizationBudget,
+    depth: int,
+) -> JsonValue:
+    budget.visit()
+    if depth >= _MAX_CONTEXT_DEPTH:
         return "[TRUNCATED]"
-    if value is None or isinstance(value, (bool, int)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        if abs(value) <= 9_007_199_254_740_991:
+            return value
+        return "[OUT_OF_RANGE]"
     if isinstance(value, str):
-        return value[:2048]
+        budget.consume_text(value)
+        return "[REDACTED]"
     if isinstance(value, float):
         return value if math.isfinite(value) else "[NONFINITE]"
     if isinstance(value, Mapping):
-        pairs = [
-            (key, item) for key, item in value.items() if isinstance(key, str)
-        ]
-        return _safe_mapping_pairs(pairs, depth=depth + 1)
+        return _safe_mapping(value, budget=budget, depth=depth + 1)
     if isinstance(value, (list, tuple)):
-        return [_safe_value(item, depth=depth + 1) for item in value[:50]]
-    return f"[UNSERIALIZABLE:{type(value).__name__}]"
+        return [
+            _safe_value(item, budget=budget, depth=depth + 1)
+            for item in islice(value, _MAX_CONTEXT_ITEMS)
+        ]
+    kind = type(value).__name__[:128]
+    return f"[UNSERIALIZABLE:{kind}]"
+
+
+def _validated_error(error: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    encoded = canonical_json_bytes(cast(JsonValue, error))
+    if len(encoded) > _MAX_NORMALIZED_ERROR_BYTES:
+        raise ValueError("normalized error JSON exceeds worker budget")
+    return error
 
 
 def _failure_code(error: Exception) -> str:
