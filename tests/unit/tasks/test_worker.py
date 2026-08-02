@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import multiprocessing
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
@@ -305,10 +306,15 @@ class _ProgressRaceHandler:
 
 
 class _FinishCancellationRaceQueue:
-    def __init__(self, delegate: TaskQueue) -> None:
+    def __init__(
+        self,
+        delegate: TaskQueue,
+        blocked_status: TaskStatus = TaskStatus.SUCCEEDED,
+    ) -> None:
         self._delegate = delegate
-        self.success_finish_entered = threading.Event()
-        self.release_success_finish = threading.Event()
+        self._blocked_status = blocked_status
+        self.finish_entered = threading.Event()
+        self.release_finish = threading.Event()
         self.finish_statuses: list[TaskStatus] = []
 
     def claim(self, worker_id: str, now: datetime) -> Any:
@@ -330,10 +336,10 @@ class _FinishCancellationRaceQueue:
         self, attempt_id: str, worker_id: str, outcome: TaskOutcome
     ) -> None:
         self.finish_statuses.append(outcome.status)
-        if outcome.status is TaskStatus.SUCCEEDED:
-            self.success_finish_entered.set()
-            if not self.release_success_finish.wait(timeout=2):
-                raise TimeoutError("success finish test barrier was not released")
+        if outcome.status is self._blocked_status:
+            self.finish_entered.set()
+            if not self.release_finish.wait(timeout=2):
+                raise TimeoutError("finish test barrier was not released")
         self._delegate.finish(attempt_id, worker_id, outcome)
 
 
@@ -347,6 +353,21 @@ class _FinalBoundarySuccessHandler:
         del task, progress
         self.observed = cancellation.is_cancelled()
         return TaskOutcome(status=TaskStatus.SUCCEEDED)
+
+
+class _FinalBoundaryFailedHandler:
+    task_type = "BACKTEST"
+
+    def __init__(self) -> None:
+        self.observed: bool | None = None
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, progress
+        self.observed = cancellation.is_cancelled()
+        return TaskOutcome(
+            status=TaskStatus.FAILED,
+            error={"code": "HANDLER_FAILED", "retryable": False},
+        )
 
 
 class _IgnoresHeartbeatFailureHandler:
@@ -472,6 +493,33 @@ def _run_in_thread(operation: Callable[[], bool]) -> tuple[threading.Thread, lis
     return thread, results
 
 
+def _run_shutdown_from_claim(
+    claim_entered: Any,
+    shutdown_returned: Any,
+    output: Any,
+) -> None:
+    from quant_core.tasks.worker import Worker
+
+    class ShutdownFromClaimQueue:
+        worker: Worker
+
+        def claim(self, worker_id: str, now: datetime) -> None:
+            del worker_id, now
+            claim_entered.set()
+            self.worker.request_shutdown()
+            shutdown_returned.set()
+
+    queue = ShutdownFromClaimQueue()
+    worker = Worker(
+        queue,  # type: ignore[arg-type] - claim is the only reachable operation
+        worker_id="worker-1",
+        handlers=(),
+        clock=lambda: NOW,
+    )
+    queue.worker = worker
+    output.put(worker.run_once())
+
+
 def test_run_once_claims_only_one_task_and_shutdown_prevents_another_claim(
     engine: Engine,
 ) -> None:
@@ -537,6 +585,36 @@ def test_same_worker_serializes_concurrent_run_once_claim_through_finish(
     assert results == [True, True]
     assert handler.max_active == 1
     assert _statuses(engine) == ["SUCCEEDED", "SUCCEEDED"]
+
+
+def test_claim_can_request_shutdown_reentrantly_without_deadlock() -> None:
+    """Replacing the claim gate with a non-reentrant lock deadlocks this call."""
+    context = multiprocessing.get_context("spawn")
+    claim_entered = context.Event()
+    shutdown_returned = context.Event()
+    output = context.Queue()
+    process = context.Process(
+        target=_run_shutdown_from_claim,
+        args=(claim_entered, shutdown_returned, output),
+        name="worker-reentrant-shutdown-test",
+    )
+    process.start()
+    try:
+        assert claim_entered.wait(timeout=2)
+        assert shutdown_returned.wait(timeout=0.5)
+        process.join(timeout=2)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        assert output.get(timeout=0.5) is False
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=0.5)
+        output.cancel_join_thread()
+        output.close()
 
 
 def test_claim_started_before_shutdown_holds_the_shared_linearization_gate(
@@ -770,17 +848,77 @@ def test_cancel_winning_after_last_boundary_converges_success_to_cancelled(
     )
     thread, results = _run_in_thread(worker.run_once)
     try:
-        assert queue.success_finish_entered.wait(timeout=2)
+        assert queue.finish_entered.wait(timeout=2)
         delegate.request_cancel(task_id, "user-1")
-        queue.release_success_finish.set()
+        queue.release_finish.set()
     finally:
-        queue.release_success_finish.set()
+        queue.release_finish.set()
         thread.join(timeout=3)
 
     assert not thread.is_alive()
     assert results == [True]
     assert handler.observed is False
     assert queue.finish_statuses == [TaskStatus.SUCCEEDED, TaskStatus.CANCELLED]
+    task, attempt = _runtime_rows(engine, task_id)
+    assert task["status"] == attempt["status"] == "CANCELLED"
+
+
+def test_cancel_winning_after_final_boundary_converges_handler_failed_outcome(
+    engine: Engine,
+) -> None:
+    """Restricting cancellation convergence to success strands failed work."""
+    delegate = TaskQueue(engine, clock=lambda: NOW)
+    task_id = delegate.enqueue("BACKTEST", {}, 0)
+    queue = _FinishCancellationRaceQueue(delegate, TaskStatus.FAILED)
+    handler = _FinalBoundaryFailedHandler()
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(handler,),
+        clock=lambda: NOW,
+    )
+    thread, results = _run_in_thread(worker.run_once)
+    try:
+        assert queue.finish_entered.wait(timeout=2)
+        delegate.request_cancel(task_id, "user-1")
+        queue.release_finish.set()
+    finally:
+        queue.release_finish.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert results == [True]
+    assert handler.observed is False
+    assert queue.finish_statuses == [TaskStatus.FAILED, TaskStatus.CANCELLED]
+    task, attempt = _runtime_rows(engine, task_id)
+    assert task["status"] == attempt["status"] == "CANCELLED"
+
+
+def test_cancel_winning_unknown_task_finish_converges_to_cancelled(
+    engine: Engine,
+) -> None:
+    """Bypassing the shared finish policy strands an unknown claimed task."""
+    delegate = TaskQueue(engine, clock=lambda: NOW)
+    task_id = delegate.enqueue("UNKNOWN_TASK", {}, 0)
+    queue = _FinishCancellationRaceQueue(delegate, TaskStatus.FAILED)
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(),
+        clock=lambda: NOW,
+    )
+    thread, results = _run_in_thread(worker.run_once)
+    try:
+        assert queue.finish_entered.wait(timeout=2)
+        delegate.request_cancel(task_id, "user-1")
+        queue.release_finish.set()
+    finally:
+        queue.release_finish.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert results == [True]
+    assert queue.finish_statuses == [TaskStatus.FAILED, TaskStatus.CANCELLED]
     task, attempt = _runtime_rows(engine, task_id)
     assert task["status"] == attempt["status"] == "CANCELLED"
 

@@ -250,7 +250,7 @@ class Worker:
         self._logger = logger or logging.getLogger(__name__)
         self._shutdown = threading.Event()
         self._execution_lock = threading.Lock()
-        self._claim_gate = threading.Lock()
+        self._claim_gate = threading.RLock()
 
     def request_shutdown(self) -> None:
         """Stop polling and ask active cooperative work to cancel."""
@@ -283,9 +283,8 @@ class Worker:
 
         handler = self._handlers.get(task.task_type)
         if handler is None:
-            self._queue.finish(
-                task.attempt_id,
-                self._worker_id,
+            self._finish(
+                task,
                 TaskOutcome(
                     status=TaskStatus.FAILED,
                     error={
@@ -349,7 +348,7 @@ class Worker:
             self._queue.finish(task.attempt_id, self._worker_id, outcome)
         except TaskQueueConflict:
             if (
-                outcome.status is TaskStatus.SUCCEEDED
+                outcome.status is not TaskStatus.CANCELLED
                 and self._queue.is_cancel_requested(
                     task.attempt_id,
                     self._worker_id,
