@@ -25,6 +25,10 @@ from quant_core.backtest.artifacts import (
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.domain.enums import Severity
 from quant_core.errors import ErrorDetail, QuantError
+from quant_core.experiments.fingerprint import (
+    ExperimentFingerprintInput,
+    compute_fingerprint,
+)
 from quant_core.experiments.models import (
     ExperimentSpec,
     ExperimentStatus,
@@ -36,6 +40,7 @@ from quant_core.persistence.orm import (
     ExperimentMetricORM,
     ExperimentORM,
     ExperimentTagORM,
+    SnapshotORM,
 )
 
 ALLOWED_TRANSITIONS: frozenset[tuple[ExperimentStatus, ExperimentStatus]] = (
@@ -50,6 +55,35 @@ ALLOWED_TRANSITIONS: frozenset[tuple[ExperimentStatus, ExperimentStatus]] = (
         }
     )
 )
+
+_REASON_CONTEXT_ALLOWLIST = frozenset(
+    {
+        "actual",
+        "attempt",
+        "connection",
+        "dataset",
+        "error_code",
+        "expected",
+        "experiment_id",
+        "host",
+        "operation",
+        "provider",
+        "stage",
+        "status",
+        "target",
+    }
+)
+_REASON_SECRET_KEY_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_REASON_SECRET_CONTAINER_KEYS = frozenset({"env", "environ", "environment"})
 
 
 class InvalidTransition(QuantError):
@@ -204,10 +238,13 @@ class _ImmutableExperiment:
     strategy_id: str
     strategy_version: str
     snapshot_id: str | None
+    snapshot_manifest_hash: str
+    catalog_snapshot_manifest_hash: str | None
     source_tree_hash: str | None
     git_commit_hash: str | None
     lockfile_hash: str
     rulebook_version: str
+    fingerprint: str
     status: ExperimentStatus
     queued_at: datetime | None
     started_at: datetime | None
@@ -248,14 +285,6 @@ class ExperimentRegistry:
         subject = _subject(actor)
         request = _request_id(request_id)
         with Session(self._engine) as session, session.begin():
-            duplicate_count = int(
-                session.scalar(
-                    select(func.count())
-                    .select_from(ExperimentORM)
-                    .where(ExperimentORM.fingerprint == fingerprint)
-                )
-                or 0
-            )
             session.add(
                 ExperimentORM(
                     id=identifier,
@@ -278,7 +307,21 @@ class ExperimentRegistry:
                     completed_at=None,
                 )
             )
+            # The insert reserves SQLite's writer before any fingerprint read.
+            # Concurrent creators then serialize instead of upgrading deferred
+            # read transactions, so the following count is linearizable.
             session.flush()
+            duplicate_count = int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(ExperimentORM)
+                    .where(
+                        ExperimentORM.fingerprint == fingerprint,
+                        ExperimentORM.id != identifier,
+                    )
+                )
+                or 0
+            )
             _add_audit(
                 session,
                 identifier,
@@ -608,6 +651,20 @@ class ExperimentRegistry:
             row = session.get(ExperimentORM, experiment_id)
             if row is None:
                 raise ExperimentNotFound(experiment_id)
+            catalog_snapshot_manifest_hash = (
+                session.scalar(
+                    select(SnapshotORM.manifest_hash).where(
+                        SnapshotORM.id == row.snapshot_id
+                    )
+                )
+                if row.snapshot_id is not None
+                else None
+            )
+            if (
+                row.snapshot_id is not None
+                and catalog_snapshot_manifest_hash is None
+            ):
+                raise ValueError("referenced experiment snapshot does not exist")
             config = json.loads(row.config_json)
             canonical_json_bytes(cast(JsonValue, config))
             return _ImmutableExperiment(
@@ -616,10 +673,13 @@ class ExperimentRegistry:
                 strategy_id=row.strategy_id,
                 strategy_version=row.strategy_version,
                 snapshot_id=row.snapshot_id,
+                snapshot_manifest_hash=row.snapshot_manifest_hash,
+                catalog_snapshot_manifest_hash=catalog_snapshot_manifest_hash,
                 source_tree_hash=row.source_tree_hash,
                 git_commit_hash=row.git_commit_hash,
                 lockfile_hash=row.lockfile_hash,
                 rulebook_version=row.rulebook_version,
+                fingerprint=row.fingerprint,
                 status=ExperimentStatus(row.status),
                 queued_at=_parse_optional_timestamp(row.queued_at),
                 started_at=_parse_optional_timestamp(row.started_at),
@@ -694,6 +754,10 @@ def _validate_success_identity(
     manifest = publication.manifest
     if manifest.get("experiment_id") != experiment_id:
         raise ValueError("artifact manifest experiment ID does not match registry")
+    if publication.artifact_dir.name != f"experiment_id={experiment_id}":
+        raise ValueError(
+            "artifact publication directory identity does not match registry"
+        )
     strategy = manifest.get("strategy")
     if not isinstance(strategy, Mapping) or (
         strategy.get("strategy_id") != experiment.strategy_id
@@ -702,11 +766,22 @@ def _validate_success_identity(
         raise ValueError("artifact manifest strategy identity does not match registry")
     if manifest.get("snapshot_id") != experiment.snapshot_id:
         raise ValueError("artifact manifest snapshot identity does not match registry")
+    if (
+        experiment.catalog_snapshot_manifest_hash is None
+        or experiment.snapshot_manifest_hash
+        != experiment.catalog_snapshot_manifest_hash
+    ):
+        raise ValueError(
+            "experiment snapshot manifest hash does not match snapshot catalog"
+        )
     if manifest.get("rulebook_version") != experiment.rulebook_version:
         raise ValueError("artifact manifest RuleBook identity does not match registry")
     environment = _read_json_object(
         publication.artifact_dir / "environment.json", "environment.json"
     )
+    source_hash = environment.get("source_hash")
+    if not isinstance(source_hash, str):
+        raise TypeError("artifact source hash identity must be a string")
     if environment.get("lockfile_hash") != experiment.lockfile_hash:
         raise ValueError("artifact lockfile identity does not match registry")
     if experiment.source_tree_hash is not None and (
@@ -717,6 +792,19 @@ def _validate_success_identity(
         environment.get("git_commit") != experiment.git_commit_hash
     ):
         raise ValueError("artifact Git identity does not match registry")
+    expected_fingerprint = compute_fingerprint(
+        ExperimentFingerprintInput(
+            strategy_id=experiment.strategy_id,
+            strategy_version=experiment.strategy_version,
+            resolved_config=experiment.config,
+            snapshot_manifest_hash=experiment.catalog_snapshot_manifest_hash,
+            source_hash=source_hash,
+            lockfile_hash=experiment.lockfile_hash,
+            rulebook_version=experiment.rulebook_version,
+        )
+    )
+    if experiment.fingerprint != expected_fingerprint:
+        raise ValueError("experiment fingerprint does not match validated identity")
 
 
 def _validated_metrics(
@@ -827,9 +915,7 @@ def _reason_payload(reason: ErrorDetail) -> dict[str, JsonValue]:
     return {
         "code": _bounded_text(reason.code, "reason code", 128),
         "severity": reason.severity.value,
-        "message": _bounded_text(reason.message, "reason message", 2048),
         "context": _safe_mapping(reason.context),
-        "remediation": _bounded_text(reason.remediation, "remediation", 2048),
         "retryable": reason.retryable,
     }
 
@@ -846,9 +932,16 @@ def _safe_mapping_at_depth(
         if index >= 50:
             break
         name = _bounded_text(key, "reason context key", 128)
-        if any(secret in name.casefold() for secret in ("token", "password", "secret")):
+        normalized_name = name.casefold().replace("-", "_")
+        if (
+            normalized_name in _REASON_SECRET_CONTAINER_KEYS
+            or any(
+                marker in normalized_name
+                for marker in _REASON_SECRET_KEY_MARKERS
+            )
+        ):
             result[name] = "[REDACTED]"
-        else:
+        elif normalized_name in _REASON_CONTEXT_ALLOWLIST:
             result[name] = _safe_value(item, depth=depth)
     return result
 

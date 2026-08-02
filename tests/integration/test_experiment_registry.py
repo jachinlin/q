@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,10 @@ from quant_core.backtest.artifacts import (
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
 from quant_core.domain.enums import Severity
 from quant_core.errors import ErrorDetail
+from quant_core.experiments.fingerprint import (
+    ExperimentFingerprintInput,
+    compute_fingerprint,
+)
 from quant_core.experiments.models import (
     ExperimentSpec,
     ExperimentStatus,
@@ -46,6 +51,16 @@ CONFIG: dict[str, JsonValue] = {
     "strategy": {"lookback": 20, "winsorize": True},
     "universe": "CSI300",
 }
+SNAPSHOT_MANIFEST_HASH = "a" * 64
+SOURCE_TREE_HASH = (
+    "53fd8112fee36c83793bd60832189d656"
+    "c084b824a031717589647d32c4647bd"
+)
+SOURCE_HASH = "93c640fa75452491587d36abbbfaf8369449091856829410fdc6aef81c9c55d1"
+LOCKFILE_HASH = (
+    "dbab12665d98aef021ba64953c61b0ed"
+    "8a908cfb56a1c01e2fcb4b052b71a2a1"
+)
 
 
 @pytest.fixture
@@ -88,6 +103,7 @@ def _spec(
     strategy_id: str = "timeline",
     strategy_version: str = "1",
     snapshot_id: str | None = SNAPSHOT_ID,
+    snapshot_manifest_hash: str = SNAPSHOT_MANIFEST_HASH,
 ) -> ExperimentSpec:
     return ExperimentSpec(
         strategy_id=strategy_id,
@@ -95,18 +111,28 @@ def _spec(
         config=CONFIG,
         config_hash=hashlib.sha256(canonical_json_bytes(CONFIG)).hexdigest(),
         snapshot_id=snapshot_id,
-        snapshot_manifest_hash="a" * 64,
-        source_tree_hash=(
-            "53fd8112fee36c83793bd60832189d656"
-            "c084b824a031717589647d32c4647bd"
-        ),
-        lockfile_hash=(
-            "dbab12665d98aef021ba64953c61b0ed"
-            "8a908cfb56a1c01e2fcb4b052b71a2a1"
-        ),
+        snapshot_manifest_hash=snapshot_manifest_hash,
+        source_tree_hash=SOURCE_TREE_HASH,
+        lockfile_hash=LOCKFILE_HASH,
         rulebook_version="test-v1",
         fingerprint=fingerprint,
         created_at=created_at,
+    )
+
+
+def _canonical_fingerprint(
+    *, snapshot_manifest_hash: str = SNAPSHOT_MANIFEST_HASH
+) -> str:
+    return compute_fingerprint(
+        ExperimentFingerprintInput(
+            strategy_id="timeline",
+            strategy_version="1",
+            resolved_config=CONFIG,
+            snapshot_manifest_hash=snapshot_manifest_hash,
+            source_hash=SOURCE_HASH,
+            lockfile_hash=LOCKFILE_HASH,
+            rulebook_version="test-v1",
+        )
     )
 
 
@@ -135,12 +161,21 @@ def _audit(engine: Engine, experiment_id: str) -> list[dict[str, Any]]:
 
 
 def _running_experiment(
-    engine: Engine, *, fingerprint: str = "f" * 64
+    engine: Engine,
+    *,
+    fingerprint: str | None = None,
+    snapshot_manifest_hash: str = SNAPSHOT_MANIFEST_HASH,
 ) -> tuple[ExperimentRegistry, str]:
+    resolved_fingerprint = fingerprint or _canonical_fingerprint(
+        snapshot_manifest_hash=snapshot_manifest_hash
+    )
     registry = ExperimentRegistry(engine)
     experiment_id = registry.create(
-        _spec(fingerprint=fingerprint),
-        fingerprint,
+        _spec(
+            fingerprint=resolved_fingerprint,
+            snapshot_manifest_hash=snapshot_manifest_hash,
+        ),
+        resolved_fingerprint,
         actor="researcher",
         request_id="create-running",
         now=NOW,
@@ -232,6 +267,70 @@ def test_create_always_uses_a_new_id_and_audits_duplicate_research(
 
     with pytest.raises(ValueError, match="fingerprint"):
         registry.create(_spec(), "e" * 64)
+
+
+def test_two_concurrent_creates_linearize_duplicate_evidence(
+    engine: Engine,
+) -> None:
+    """Same-fingerprint creates must both commit with counts zero then one."""
+    fingerprint = "7" * 64
+    insert_barrier = Barrier(2)
+
+    def synchronize_experiment_inserts(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.casefold().split())
+        if normalized.startswith("insert into experiment "):
+            insert_barrier.wait(timeout=10)
+
+    def create(label: str) -> str | BaseException:
+        registry = ExperimentRegistry(engine)
+        try:
+            return registry.create(
+                _spec(fingerprint=fingerprint),
+                fingerprint,
+                actor=label,
+                request_id=f"create-{label}",
+                now=NOW,
+            )
+        except BaseException as error:  # noqa: BLE001 - assertion captures lock errors
+            return error
+
+    event.listen(engine, "before_cursor_execute", synchronize_experiment_inserts)
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(create, ("creator-a", "creator-b")))
+    finally:
+        event.remove(engine, "before_cursor_execute", synchronize_experiment_inserts)
+
+    errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    assert errors == []
+    successes = [outcome for outcome in outcomes if isinstance(outcome, str)]
+    assert len(successes) == 2
+    assert len(set(successes)) == 2
+    warning_counts = sorted(
+        warning.message.existing_count
+        for warning in caught
+        if isinstance(warning.message, DuplicateResearchWarning)
+    )
+    assert warning_counts == [1]
+
+    audit_counts = sorted(
+        json.loads(row["details_json"])["duplicate_count"]
+        for row in _rows(
+            engine,
+            "SELECT details_json FROM audit_event "
+            "WHERE event_type='EXPERIMENT_CREATED'",
+        )
+    )
+    assert audit_counts == [0, 1]
 
 
 def test_two_independent_registry_sessions_make_one_cas_winner(
@@ -360,6 +459,78 @@ def test_transition_distinguishes_not_found_and_sanitizes_failure_reason(
     assert "nested-secret" not in audit["details_json"]
 
 
+def test_transition_audit_uses_allowlisted_error_disclosure(
+    engine: Engine,
+) -> None:
+    """Free text and alternate credential fields must never enter audit bytes."""
+    registry, experiment_id = _running_experiment(engine)
+    secrets = {
+        "free-text-message-secret",
+        "free-text-remediation-secret",
+        "authorization-secret",
+        "api-key-secret",
+        "credential-secret",
+        "cookie-secret",
+        "environment-secret",
+        "nested-environment-secret",
+    }
+    reason = ErrorDetail(
+        code="BACKTEST_FAILED",
+        severity=Severity.SEVERE,
+        message="failure cause free-text-message-secret",
+        context={
+            "dataset": "prices",
+            "authorization": "Bearer authorization-secret",
+            "api_key": "api-key-secret",
+            "credential": "credential-secret",
+            "cookie": "session=cookie-secret",
+            "environment": {
+                "DATABASE_URL": "environment-secret",
+                "nested": {"value": "nested-environment-secret"},
+            },
+            "connection": {
+                "host": "localhost",
+                "password": "connection-password-secret",
+            },
+        },
+        remediation="rotate free-text-remediation-secret",
+        retryable=False,
+    )
+
+    registry.transition(
+        experiment_id,
+        ExperimentStatus.RUNNING,
+        ExperimentStatus.FAILED,
+        reason,
+        request_id="allowlisted-reason",
+        now=NOW + timedelta(minutes=3),
+    )
+
+    audit = _audit(engine, experiment_id)[-1]
+    disclosure = audit["details"]["reason"]
+    assert disclosure == {
+        "code": "BACKTEST_FAILED",
+        "severity": "SEVERE",
+        "context": {
+            "api_key": "[REDACTED]",
+            "authorization": "[REDACTED]",
+            "connection": {
+                "host": "localhost",
+                "password": "[REDACTED]",
+            },
+            "cookie": "[REDACTED]",
+            "credential": "[REDACTED]",
+            "dataset": "prices",
+            "environment": "[REDACTED]",
+        },
+        "retryable": False,
+    }
+    assert "message" not in disclosure
+    assert "remediation" not in disclosure
+    assert "connection-password-secret" not in audit["details_json"]
+    assert all(secret not in audit["details_json"] for secret in secrets)
+
+
 def test_register_success_revalidates_before_writes_and_indexes_eighteen_files(
     engine: Engine,
     tmp_path: Path,
@@ -428,6 +599,91 @@ def test_register_success_revalidates_before_writes_and_indexes_eighteen_files(
             now=NOW + timedelta(minutes=4),
         )
     assert len(ExperimentQuery(engine).get(experiment_id).artifacts) == 18
+
+
+def test_register_success_rejects_inconsistent_persisted_fingerprint(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored digest not derived from the validated identity cannot succeed."""
+    registry, experiment_id = _running_experiment(engine, fingerprint="0" * 64)
+    publication = _publication(tmp_path, monkeypatch, experiment_id)
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        registry.register_success(
+            experiment_id, publication, _finite_metrics(publication)
+        )
+
+    assert ExperimentQuery(engine).get(experiment_id).record.status is (
+        ExperimentStatus.RUNNING
+    )
+    assert "EXPERIMENT_SUCCEEDED" not in {
+        event["event_type"] for event in _audit(engine, experiment_id)
+    }
+
+
+def test_register_success_rejects_snapshot_manifest_hash_not_in_catalog(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The experiment's snapshot hash must equal its catalog snapshot hash."""
+    wrong_snapshot_hash = "b" * 64
+    registry, experiment_id = _running_experiment(
+        engine,
+        fingerprint=_canonical_fingerprint(
+            snapshot_manifest_hash=wrong_snapshot_hash
+        ),
+        snapshot_manifest_hash=wrong_snapshot_hash,
+    )
+    publication = _publication(tmp_path, monkeypatch, experiment_id)
+
+    with pytest.raises(ValueError, match="snapshot manifest"):
+        registry.register_success(
+            experiment_id, publication, _finite_metrics(publication)
+        )
+
+    assert ExperimentQuery(engine).get(experiment_id).record.status is (
+        ExperimentStatus.RUNNING
+    )
+    assert "EXPERIMENT_SUCCEEDED" not in {
+        event["event_type"] for event in _audit(engine, experiment_id)
+    }
+
+
+def test_register_success_rejects_renamed_publication_partition(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid manifest cannot be indexed from another experiment partition."""
+    registry, experiment_id = _running_experiment(engine)
+    publication = _publication(tmp_path, monkeypatch, experiment_id)
+    renamed_dir = publication.artifact_dir.with_name(
+        "experiment_id=00000000-0000-0000-0000-000000000099"
+    )
+    publication.artifact_dir.rename(renamed_dir)
+    renamed = replace(
+        publication,
+        artifact_dir=renamed_dir,
+        manifest_path=renamed_dir / "manifest.json",
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "validate_experiment_artifacts",
+        lambda *_args, **_kwargs: renamed,
+    )
+
+    with pytest.raises(ValueError, match="directory identity"):
+        registry.register_success(experiment_id, renamed, _finite_metrics(renamed))
+
+    assert ExperimentQuery(engine).get(experiment_id).record.status is (
+        ExperimentStatus.RUNNING
+    )
+    assert "EXPERIMENT_SUCCEEDED" not in {
+        event["event_type"] for event in _audit(engine, experiment_id)
+    }
 
 
 def test_register_success_rejects_mutable_dto_and_rolls_back_partial_writes(
