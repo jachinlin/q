@@ -470,8 +470,13 @@ def test_factor_matrix_rejects_null_availability_and_duplicate_request_refs() ->
             "unique",
         ),
         (
-            _universe_pair().with_columns(pl.lit("BAD").alias("instrument_id")),
-            "canonical",
+            _universe_pair().with_columns(
+                pl.when(pl.col("instrument_id") == _ID.canonical())
+                .then(pl.lit("BAD"))
+                .otherwise(pl.col("instrument_id"))
+                .alias("instrument_id")
+            ),
+            r"^instrument_id must be canonical$",
         ),
     ],
 )

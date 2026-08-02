@@ -260,12 +260,14 @@ def test_etf_excludes_one_instrument_for_each_unusable_signal(mode: str) -> None
             .otherwise(pl.col("invalid_reason"))
             .alias("invalid_reason"),
         )
-    target = EtfRotationStrategy(_config(top_n=1)).generate_targets(
+    target = EtfRotationStrategy(_config(top_n=3)).generate_targets(
         _context(_Data(frame)), _SIGNAL, _empty_state()
     )
-    assert [position.instrument_id.canonical() for position in target.positions] == [
-        _ETF_B
-    ]
+    selected = [position.instrument_id.canonical() for position in target.positions]
+    assert selected == [_ETF_B, _ETF_C]
+    assert _ETF_A not in selected
+    assert [position.target_weight for position in target.positions] == [0.5, 0.5]
+    assert target.cash_weight == 0.0
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])

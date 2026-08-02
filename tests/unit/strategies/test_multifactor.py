@@ -302,6 +302,7 @@ def test_multifactor_audits_insufficient_factor_coverage_with_source_reason() ->
 
     selected = {position.instrument_id.canonical() for position in target.positions}
     assert _IDS[0] not in selected
+    assert target.cash_weight == 0.0
     decision = next(
         item for item in decisions if item.instrument_id.canonical() == _IDS[0]
     )
