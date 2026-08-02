@@ -35,6 +35,7 @@ from quant_core.tasks.models import (
     ClaimedTask,
     TaskOutcome,
     TaskProgress,
+    TaskRecord,
     TaskStatus,
 )
 
@@ -67,6 +68,7 @@ _RETRYABLE_STATUSES = (
     TaskStatus.CANCELLED.value,
     TaskStatus.ORPHANED.value,
 )
+_BACKTEST_IDEMPOTENCY_KEY = "experiment-backtest-v1"
 
 _T = TypeVar("_T")
 
@@ -220,6 +222,179 @@ class TaskQueue:
             return identifier
 
         return self._immediate(write)
+
+    def submit_backtest(
+        self,
+        experiment_id: str,
+        config_hash: str,
+        *,
+        priority: int = 0,
+        actor: str = "notebook",
+        request_id: str | None = None,
+    ) -> str:
+        """Atomically queue one immutable experiment or return its active task."""
+        experiment = _bounded_identity(experiment_id, "experiment_id", 36)
+        expected_hash = _sha256(config_hash, "config_hash")
+        subject = _bounded_identity(actor, "actor", 128)
+        request = _optional_identity(request_id, "request_id", 128)
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise TypeError("priority must be an int and not bool")
+        payload: dict[str, JsonValue] = {
+            "experiment_id": experiment,
+            "config_hash": expected_hash,
+        }
+        payload_json = _mapping_json_text(payload, "payload", MAX_PAYLOAD_BYTES)
+        submitted_at = self._time()
+        timestamp = _timestamp(submitted_at)
+        progress_json = _progress_json(DEFAULT_PROGRESS)
+
+        def write(connection: Connection) -> str:
+            record = (
+                connection.execute(
+                    select(ExperimentORM.__table__).where(
+                        ExperimentORM.id == experiment
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if record is None:
+                _raise_not_found(
+                    "TASK_EXPERIMENT_NOT_FOUND",
+                    f"experiment does not exist: {experiment}",
+                    {"experiment_id": experiment},
+                )
+            if record["config_hash"] != expected_hash:
+                _raise_conflict(
+                    "EXPERIMENT_CONFIG_HASH_CONFLICT",
+                    "experiment config hash changed before submission",
+                    {"experiment_id": experiment},
+                )
+
+            existing = (
+                connection.execute(
+                    select(TaskORM.__table__).where(
+                        TaskORM.task_type == "BACKTEST",
+                        TaskORM.experiment_id == experiment,
+                        TaskORM.idempotency_key == _BACKTEST_IDEMPOTENCY_KEY,
+                        TaskORM.status.in_(_ACTIVE_STATUSES),
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is not None:
+                if (
+                    existing["payload_json"] != payload_json
+                    or record["status"] not in {"QUEUED", "RUNNING"}
+                ):
+                    _raise_idempotency_conflict(
+                        cast(str, existing["id"]),
+                        "BACKTEST",
+                        experiment,
+                        _BACKTEST_IDEMPOTENCY_KEY,
+                    )
+                _add_audit(
+                    connection,
+                    experiment_id=experiment,
+                    task_id=cast(str, existing["id"]),
+                    event_type="TASK_ENQUEUE_DEDUPLICATED",
+                    actor=subject,
+                    details={
+                        "request_id": request,
+                        "idempotency_key": _BACKTEST_IDEMPOTENCY_KEY,
+                        "status": cast(str, existing["status"]),
+                    },
+                    created_at=submitted_at,
+                )
+                return cast(str, existing["id"])
+
+            status = cast(str, record["status"])
+            if status != "CREATED":
+                _raise_conflict(
+                    "EXPERIMENT_SUBMIT_CONFLICT",
+                    "experiment cannot be submitted from its current state",
+                    {"experiment_id": experiment, "status": status},
+                )
+
+            identifier = str(uuid4())
+            connection.execute(
+                insert(TaskORM).values(
+                    id=identifier,
+                    experiment_id=experiment,
+                    task_type="BACKTEST",
+                    payload_json=payload_json,
+                    status=TaskStatus.QUEUED.value,
+                    priority=priority,
+                    progress_json=progress_json,
+                    created_at=timestamp,
+                    available_at=timestamp,
+                    updated_at=timestamp,
+                    heartbeat_at=None,
+                    completed_at=None,
+                    idempotency_key=_BACKTEST_IDEMPOTENCY_KEY,
+                    worker_id=None,
+                    locked_at=None,
+                    error_json=None,
+                )
+            )
+            transitioned = connection.execute(
+                update(ExperimentORM)
+                .where(
+                    ExperimentORM.id == experiment,
+                    ExperimentORM.status == "CREATED",
+                )
+                .values(status="QUEUED", queued_at=timestamp)
+            )
+            if transitioned.rowcount != 1:
+                _raise_conflict(
+                    "EXPERIMENT_SUBMIT_CONFLICT",
+                    "experiment changed state during submission",
+                    {"experiment_id": experiment, "status": status},
+                )
+            _add_audit(
+                connection,
+                experiment_id=experiment,
+                task_id=None,
+                event_type="EXPERIMENT_STATE_TRANSITIONED",
+                actor=subject,
+                details={
+                    "subject": subject,
+                    "action": "submit",
+                    "object": {"type": "experiment", "id": experiment},
+                    "old_value": {"status": "CREATED"},
+                    "new_value": {
+                        "status": "QUEUED",
+                        "queued_at": timestamp,
+                    },
+                    "request_id": request,
+                },
+                created_at=submitted_at,
+            )
+            # Keep this audit last so every earlier mutation is covered by the
+            # same rollback boundary if durable observability cannot be written.
+            _add_audit(
+                connection,
+                experiment_id=experiment,
+                task_id=identifier,
+                event_type="TASK_ENQUEUED",
+                actor=subject,
+                details={
+                    "request_id": request,
+                    "idempotency_key": _BACKTEST_IDEMPOTENCY_KEY,
+                    "status": TaskStatus.QUEUED.value,
+                },
+                created_at=submitted_at,
+            )
+            return identifier
+
+        return self._immediate(write)
+
+    def get(self, task_id: str) -> TaskRecord:
+        """Read one immutable task record without claiming or mutating it."""
+        identifier = _bounded_identity(task_id, "task_id", 36)
+        with self._engine.connect() as connection:
+            return _task_record(_task(connection, identifier))
 
     def claim(self, worker_id: str, now: datetime) -> ClaimedTask | None:
         """Atomically claim the first available task under SQLite BEGIN IMMEDIATE."""
@@ -931,7 +1106,7 @@ def _add_audit(
     connection: Connection,
     *,
     experiment_id: str | None,
-    task_id: str,
+    task_id: str | None,
     event_type: str,
     actor: str,
     details: Mapping[str, JsonValue],
@@ -950,6 +1125,48 @@ def _add_audit(
     )
 
 
+def _task_record(row: RowMapping) -> TaskRecord:
+    progress = cast(
+        dict[str, JsonValue],
+        _parse_progress(cast(str, row["progress_json"])).model_dump(mode="json"),
+    )
+    error = (
+        _parse_json_object(cast(str, row["error_json"]), "error")
+        if row["error_json"] is not None
+        else None
+    )
+    return TaskRecord(
+        id=cast(str, row["id"]),
+        experiment_id=cast(str | None, row["experiment_id"]),
+        task_type=cast(str, row["task_type"]),
+        payload=_parse_json_object(cast(str, row["payload_json"]), "payload"),
+        status=TaskStatus(cast(str, row["status"])),
+        priority=cast(int, row["priority"]),
+        progress=progress,
+        created_at=_parse_timestamp(cast(str, row["created_at"])),
+        available_at=_parse_timestamp(cast(str, row["available_at"])),
+        updated_at=_parse_timestamp(cast(str, row["updated_at"])),
+        heartbeat_at=(
+            _parse_timestamp(cast(str, row["heartbeat_at"]))
+            if row["heartbeat_at"] is not None
+            else None
+        ),
+        completed_at=(
+            _parse_timestamp(cast(str, row["completed_at"]))
+            if row["completed_at"] is not None
+            else None
+        ),
+        idempotency_key=cast(str | None, row["idempotency_key"]),
+        worker_id=cast(str | None, row["worker_id"]),
+        locked_at=(
+            _parse_timestamp(cast(str, row["locked_at"]))
+            if row["locked_at"] is not None
+            else None
+        ),
+        error=error,
+    )
+
+
 def _bounded_identity(value: str, label: str, limit: int) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} must be a string")
@@ -964,6 +1181,15 @@ def _optional_identity(
     value: str | None, label: str, limit: int
 ) -> str | None:
     return None if value is None else _bounded_identity(value, label, limit)
+
+
+def _sha256(value: str, label: str) -> str:
+    normalized = _bounded_identity(value, label, 64)
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
+    return normalized
 
 
 def _utc(value: datetime, label: str) -> datetime:

@@ -366,11 +366,14 @@ def _run_with_constraints(
 
 
 def _multifactor_mapping() -> dict[str, object]:
-    return yaml.safe_load(
+    envelope = yaml.safe_load(
         Path("configs/experiments/examples/multifactor.yaml").read_text(
             encoding="utf-8"
         )
     )
+    mapping = envelope["strategy_config"]
+    assert isinstance(mapping, dict)
+    return mapping
 
 
 def _mapping_section(mapping: dict[str, object], name: str) -> dict[object, object]:

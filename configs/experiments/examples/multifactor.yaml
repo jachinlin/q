@@ -1,20 +1,30 @@
-factor_definitions:
-  earnings_yield_ttm_v1@1.0.0: {category: VALUE, direction: 1}
-  book_to_price_mrq_v1@1.0.0: {category: VALUE, direction: 1}
-  roe_avg_pit_v1@1.0.0: {category: QUALITY, direction: 1}
-  cfo_to_np_pit_v1@1.0.0: {category: QUALITY, direction: 1}
-  momentum_120_20_v1@1.0.0: {category: MOMENTUM, direction: 1}
-  volatility_60d_v1@1.0.0: {category: RISK, direction: -1}
-  downside_volatility_60d_v1@1.0.0: {category: RISK, direction: -1}
-  max_drawdown_120d_v1@1.0.0: {category: RISK, direction: -1}
-category_weights: {VALUE: 0.25, QUALITY: 0.25, MOMENTUM: 0.30, RISK: 0.20}
-min_valid_factors: 6
-mad_multiplier: 3.0
-frequency: WEEKLY
-constraints:
-  max_position_weight: 0.10
-  max_industry_weight: 0.30
-  min_positions: 20
-  max_positions: 50
-  min_adv_amount: 10000000.0
-  max_turnover: 0.50
+schema_version: 1
+strategy_id: stock_multifactor
+strategy_version: 1.0.0
+snapshot_id: latest
+start_date: snapshot_start
+end_date: snapshot_end
+benchmark: SSE:000300
+initial_cash_fen: 100000000
+rulebook_version: a-share-v1
+strategy_config:
+  factor_definitions:
+    earnings_yield_ttm_v1@1.0.0: {category: VALUE, direction: 1}
+    book_to_price_mrq_v1@1.0.0: {category: VALUE, direction: 1}
+    roe_avg_pit_v1@1.0.0: {category: QUALITY, direction: 1}
+    cfo_to_np_pit_v1@1.0.0: {category: QUALITY, direction: 1}
+    momentum_120_20_v1@1.0.0: {category: MOMENTUM, direction: 1}
+    volatility_60d_v1@1.0.0: {category: RISK, direction: -1}
+    downside_volatility_60d_v1@1.0.0: {category: RISK, direction: -1}
+    max_drawdown_120d_v1@1.0.0: {category: RISK, direction: -1}
+  category_weights: {VALUE: 0.25, QUALITY: 0.25, MOMENTUM: 0.30, RISK: 0.20}
+  min_valid_factors: 6
+  mad_multiplier: 3.0
+  frequency: WEEKLY
+  constraints:
+    max_position_weight: 0.10
+    max_industry_weight: 0.30
+    min_positions: 20
+    max_positions: 50
+    min_adv_amount: 10000000.0
+    max_turnover: 0.50

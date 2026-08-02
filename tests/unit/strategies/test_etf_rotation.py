@@ -155,11 +155,14 @@ def _empty_account_snapshot() -> AccountSnapshot:
 
 
 def _etf_mapping() -> dict[str, object]:
-    return yaml.safe_load(
+    envelope = yaml.safe_load(
         Path("configs/experiments/examples/etf_rotation.yaml").read_text(
             encoding="utf-8"
         )
     )
+    mapping = envelope["strategy_config"]
+    assert isinstance(mapping, dict)
+    return mapping
 
 
 def test_etf_rotation_scores_selected_etfs_and_normalizes_equal_weights() -> None:

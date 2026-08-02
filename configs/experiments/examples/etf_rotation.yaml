@@ -1,17 +1,27 @@
-etf_pool:
-  - SSE:510001
-  - SSE:510002
-  - SSE:510003
-  - SSE:510004
-  - SSE:510005
-return_factor_weights:
-  return_20d_v1@1.0.0: 0.2
-  return_60d_v1@1.0.0: 0.3
-  return_120d_v1@1.0.0: 0.5
-trend_factor_ref: trend_120d_v1@1.0.0
-volatility_factor_ref: volatility_60d_v1@1.0.0
-volatility_penalty: 0.5
-top_n: 3
-frequency: MONTHLY
-missing_signal_policy: EXCLUDE
-weighting: EQUAL
+schema_version: 1
+strategy_id: etf_rotation
+strategy_version: 1.0.0
+snapshot_id: latest
+start_date: snapshot_start
+end_date: snapshot_end
+benchmark: SSE:000300
+initial_cash_fen: 100000000
+rulebook_version: a-share-v1
+strategy_config:
+  etf_pool:
+    - SSE:510001
+    - SSE:510002
+    - SSE:510003
+    - SSE:510004
+    - SSE:510005
+  return_factor_weights:
+    return_20d_v1@1.0.0: 0.2
+    return_60d_v1@1.0.0: 0.3
+    return_120d_v1@1.0.0: 0.5
+  trend_factor_ref: trend_120d_v1@1.0.0
+  volatility_factor_ref: volatility_60d_v1@1.0.0
+  volatility_penalty: 0.5
+  top_n: 3
+  frequency: MONTHLY
+  missing_signal_policy: EXCLUDE
+  weighting: EQUAL
