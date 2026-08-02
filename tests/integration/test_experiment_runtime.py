@@ -30,6 +30,7 @@ from quant_core.domain.enums import DatasetKind, SnapshotStatus
 from quant_core.domain.identifiers import InstrumentId, QualityRunId, SnapshotId
 from quant_core.errors import QuantError
 from quant_core.experiments import build_default_experiment_worker
+from quant_core.experiments.adapters import SnapshotBacktestMarketData
 from quant_core.experiments.config import ExperimentCapabilityUnavailable
 from quant_core.experiments.fingerprint import (
     ExperimentFingerprintInput,
@@ -137,6 +138,7 @@ def _published_offline_snapshot(
     data_end: date = date(2024, 7, 1),
     bars_end: date | None = None,
     coverage: dict[DatasetKind, tuple[date, date]] | None = None,
+    sparse_case: str | None = None,
 ) -> SnapshotRecord:
     instrument = "SSE:510300"
     sessions: list[date] = []
@@ -158,6 +160,35 @@ def _published_offline_snapshot(
             **_audit(date(2023, 12, 25)),
         }
     ]
+    if sparse_case is not None:
+        if sparse_case not in {
+            "newly_listed",
+            "suspended_without_bar",
+            "post_delist",
+            "missing_status",
+        }:
+            raise ValueError(f"unknown sparse fixture case: {sparse_case}")
+        instruments.append(
+            {
+                "instrument_id": "SSE:510500",
+                "exchange": "SSE",
+                "board": "MAIN",
+                "name": "Sparse Synthetic ETF",
+                "instrument_type": "ETF",
+                "listing_status": (
+                    "DELISTED" if sparse_case == "post_delist" else "LISTED"
+                ),
+                "list_date": (
+                    date(2024, 6, 27)
+                    if sparse_case == "newly_listed"
+                    else date(2012, 1, 1)
+                ),
+                "delist_date": (
+                    date(2024, 6, 27) if sparse_case == "post_delist" else None
+                ),
+                **_audit(date(2023, 12, 25)),
+            }
+        )
     calendar = [
         {"trade_date": session, "is_trading_day": True, **_audit(session)}
         for session in sessions
@@ -203,6 +234,56 @@ def _published_offline_snapshot(
             }
         )
         previous = close
+    if sparse_case is not None:
+        previous = 5.0
+        for ordinal, session in enumerate(sessions):
+            outside_lifecycle = (
+                sparse_case == "newly_listed" and session < date(2024, 6, 27)
+            ) or (sparse_case == "post_delist" and session > date(2024, 6, 27))
+            missing_bar = sparse_case == "suspended_without_bar" and session == date(
+                2024, 6, 28
+            )
+            close = 5.0 + ordinal * 0.01
+            if not outside_lifecycle and not missing_bar:
+                bars.append(
+                    {
+                        "instrument_id": "SSE:510500",
+                        "trade_date": session,
+                        "open": close,
+                        "high": close + 0.01,
+                        "low": close - 0.01,
+                        "close": close,
+                        "preclose": previous,
+                        "volume": 2_000_000,
+                        "amount": close * 2_000_000,
+                        "adjustment_flag": "none",
+                        "turnover": 1.0,
+                        "pct_change": (close / previous - 1.0) * 100.0,
+                        "pe_ttm": 10.0,
+                        "pb_mrq": 1.0,
+                        "ps_ttm": 2.0,
+                        "pcf_ncf_ttm": 3.0,
+                        **_audit(session),
+                    }
+                )
+            missing_status = sparse_case == "missing_status" and session == date(
+                2024, 6, 28
+            )
+            if not outside_lifecycle and not missing_status:
+                statuses.append(
+                    {
+                        "instrument_id": "SSE:510500",
+                        "trade_date": session,
+                        "is_listed": True,
+                        "is_suspended": missing_bar,
+                        "is_risk_warning": False,
+                        "board": "MAIN",
+                        "price_limit_rule_id": "main",
+                        "tradable_reason": ("suspended" if missing_bar else "normal"),
+                        **_audit(session),
+                    }
+                )
+            previous = close
     rows_by_dataset = {
         DatasetKind.INSTRUMENT: instruments,
         DatasetKind.TRADE_CALENDAR: calendar,
@@ -246,10 +327,13 @@ def _runtime_for_snapshot(
     *,
     start: date = date(2024, 6, 27),
     end: date = date(2024, 6, 28),
+    etf_pool: tuple[str, ...] = ("SSE:510300",),
 ) -> tuple[object, Path, Path]:
     config = _resolved_etf_config(snapshot.id)
     config["start_date"] = start.isoformat()
     config["end_date"] = end.isoformat()
+    strategy_config = cast(dict[str, JsonValue], config["strategy_config"])
+    strategy_config["etf_pool"] = list(etf_pool)
     now = datetime(2024, 7, 1, tzinfo=UTC)
     experiment = ExperimentRecord(
         id="00000000-0000-0000-0000-000000000771",
@@ -306,6 +390,18 @@ def _assert_validate_rejects_without_writes(
         assert caught.value.detail.context["dataset"] == dataset.value
     assert not feature_root.exists()
     assert not artifact_root.exists()
+
+
+def _market_data(
+    catalog: MetadataRepository, snapshot: SnapshotRecord
+) -> SnapshotBacktestMarketData:
+    return SnapshotBacktestMarketData(
+        repository=SnapshotResearchRepository(catalog),
+        snapshot_id=snapshot.id,
+        benchmark=InstrumentId.parse("SSE:510300"),
+        capabilities=ProviderCapabilities.complete(),
+        provider="offline-complete-fixture",
+    )
 
 
 def test_validate_rejects_tampered_snapshot_manifest_bytes_without_writes(
@@ -552,6 +648,103 @@ def test_validate_rejects_missing_actual_benchmark_bars_without_writes(
         cause_code="SNAPSHOT_DATE_COVERAGE_INVALID",
         dataset=DatasetKind.DAILY_BAR,
     )
+
+
+def test_validate_accepts_newly_listed_instrument_without_prelisting_rows(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    catalog = MetadataRepository(create_sqlite_engine(database))
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, sparse_case="newly_listed"
+    )
+    runtime, _, _ = _runtime_for_snapshot(
+        catalog,
+        tmp_path,
+        snapshot,
+        etf_pool=("SSE:510300", "SSE:510500"),
+    )
+
+    runtime.validate()  # type: ignore[attr-defined]
+
+    market = _market_data(catalog, snapshot).market_slice(
+        snapshot.id.value, date(2024, 6, 27)
+    )
+    assert market.market.bars["instrument_id"].to_list() == [
+        "SSE:510300",
+        "SSE:510500",
+    ]
+
+
+def test_validate_accepts_suspended_session_without_a_bar(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    catalog = MetadataRepository(create_sqlite_engine(database))
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, sparse_case="suspended_without_bar"
+    )
+    runtime, _, _ = _runtime_for_snapshot(
+        catalog,
+        tmp_path,
+        snapshot,
+        etf_pool=("SSE:510300", "SSE:510500"),
+    )
+
+    runtime.validate()  # type: ignore[attr-defined]
+
+    market = _market_data(catalog, snapshot).market_slice(
+        snapshot.id.value, date(2024, 6, 28)
+    )
+    assert market.market.bars["instrument_id"].to_list() == ["SSE:510300"]
+
+
+def test_validate_accepts_post_delist_sessions_without_bar_or_status(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    catalog = MetadataRepository(create_sqlite_engine(database))
+    snapshot = _published_offline_snapshot(catalog, tmp_path, sparse_case="post_delist")
+    runtime, _, _ = _runtime_for_snapshot(
+        catalog,
+        tmp_path,
+        snapshot,
+        etf_pool=("SSE:510300", "SSE:510500"),
+    )
+
+    runtime.validate()  # type: ignore[attr-defined]
+
+    market = _market_data(catalog, snapshot).market_slice(
+        snapshot.id.value, date(2024, 7, 1)
+    )
+    assert market.market.bars["instrument_id"].to_list() == ["SSE:510300"]
+
+
+def test_validate_defers_missing_status_rows_to_market_slice_contract(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    catalog = MetadataRepository(create_sqlite_engine(database))
+    snapshot = _published_offline_snapshot(
+        catalog, tmp_path, sparse_case="missing_status"
+    )
+    runtime, _, _ = _runtime_for_snapshot(
+        catalog,
+        tmp_path,
+        snapshot,
+        etf_pool=("SSE:510300", "SSE:510500"),
+    )
+
+    runtime.validate()  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="status join is incomplete"):
+        _market_data(catalog, snapshot).market_slice(
+            snapshot.id.value, date(2024, 6, 28)
+        )
 
 
 def test_validate_rejects_missing_next_trading_session_without_writes(

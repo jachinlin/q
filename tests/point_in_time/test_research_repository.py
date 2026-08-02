@@ -13,6 +13,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import text
 
@@ -21,6 +23,7 @@ from quant_core.data.quality.models import QualityRunSpec
 from quant_core.data.repository import (
     SnapshotDatasetMissing,
     SnapshotResearchRepository,
+    verify_published_dataset,
 )
 from quant_core.data.schemas import CANONICAL_SCHEMAS
 from quant_core.domain.enums import DatasetKind, SnapshotStatus
@@ -168,6 +171,118 @@ def test_instruments_fail_closed_when_published_partition_is_corrupt(
 
     with pytest.raises(ValueError, match="catalog integrity"):
         SnapshotResearchRepository(fixture.repository).instruments(snapshot_id)
+
+
+def test_dataset_verification_does_not_use_whole_table_parquet_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = point_in_time_fixture(tmp_path)
+
+    def reject_whole_table_read(*_args: object, **_kwargs: object) -> pa.Table:
+        raise AssertionError("dataset verification used pq.read_table")
+
+    monkeypatch.setattr(repository_module.pq, "read_table", reject_whole_table_read)
+
+    record = verify_published_dataset(
+        fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+    )
+
+    assert record.dataset is DatasetKind.DAILY_BAR
+
+
+def test_dataset_verification_streams_hash_without_arrow_output_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = point_in_time_fixture(tmp_path)
+
+    def reject_output_buffer() -> pa.BufferOutputStream:
+        raise AssertionError("dataset verification materialized the IPC stream")
+
+    monkeypatch.setattr(
+        repository_module.pa, "BufferOutputStream", reject_output_buffer
+    )
+
+    record = verify_published_dataset(
+        fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+    )
+
+    assert record.dataset is DatasetKind.DAILY_BAR
+
+
+def test_dataset_verification_binds_parquet_reader_to_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = point_in_time_fixture(tmp_path)
+    original = repository_module.pq.ParquetFile
+    sources: list[object] = []
+
+    def observed_parquet_file(
+        source: object, *args: object, **kwargs: object
+    ) -> object:
+        sources.append(source)
+        return original(source, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module.pq, "ParquetFile", observed_parquet_file)
+
+    verify_published_dataset(
+        fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+    )
+
+    assert sources
+    assert all(not isinstance(source, (str, Path)) for source in sources)
+    assert all(callable(getattr(source, "fileno", None)) for source in sources)
+
+
+def test_dataset_verification_checks_partition_size_before_parquet_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = point_in_time_fixture(tmp_path)
+    monkeypatch.setattr(
+        repository_module, "_MAX_PARTITION_FILE_BYTES", 1, raising=False
+    )
+
+    with pytest.raises(ValueError, match="size limit"):
+        verify_published_dataset(
+            fixture.repository, fixture.early_snapshot_id, DatasetKind.DAILY_BAR
+        )
+
+
+def test_multi_row_group_verification_preserves_legacy_content_hash(
+    tmp_path: Path,
+) -> None:
+    fixture = point_in_time_fixture(tmp_path)
+    catalog = fixture.repository
+    original = catalog.get_dataset_version(
+        catalog.get_snapshot(fixture.early_snapshot_id).dataset_versions["daily_bar"]
+    )
+    table = pq.read_table(original.partitions[0].path)
+    path = tmp_path / "multi-row-group.parquet"
+    pq.write_table(table, path, row_group_size=1)
+    legacy = pq.read_table(path)
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, legacy.schema) as writer:
+        writer.write_table(legacy)
+    partition = replace(
+        original.partitions[0],
+        path=path,
+        content_hash=hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest(),
+        schema_fingerprint=hashlib.sha256(
+            legacy.schema.serialize().to_pybytes()
+        ).hexdigest(),
+        row_count=legacy.num_rows,
+    )
+    version = replace(
+        original,
+        id=type(original.id).new(),
+        partitions=(partition,),
+    )
+    snapshot_id = catalog.bind_dataset(
+        fixture.early_snapshot_id, DatasetKind.DAILY_BAR, version
+    )
+
+    verified = verify_published_dataset(catalog, snapshot_id, DatasetKind.DAILY_BAR)
+
+    assert verified.partitions[0].content_hash == partition.content_hash
 
 
 def test_trade_calendar_fail_closed_when_published_partition_is_replaced(
@@ -489,15 +604,15 @@ def test_bars_concurrent_plans_share_one_verified_owned_copy(
     """Concurrent same-content plans perform one bounded copy and both collect."""
     fixture = point_in_time_fixture(tmp_path)
     repository = SnapshotResearchRepository(fixture.repository)
-    copyfile = shutil.copyfile
+    copyfileobj = shutil.copyfileobj
     copies = 0
 
-    def recording_copy(source: Path, target: Path) -> str:
+    def recording_copy(source: object, target: object, length: int = 0) -> None:
         nonlocal copies
         copies += 1
-        return str(copyfile(source, target))
+        copyfileobj(source, target, length)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(repository_module.shutil, "copyfile", recording_copy)
+    monkeypatch.setattr(repository_module.shutil, "copyfileobj", recording_copy)
 
     def collect() -> list[float]:
         return (

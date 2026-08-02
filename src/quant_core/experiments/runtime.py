@@ -564,31 +564,19 @@ class _ConcreteExperimentRuntime:
                 "SNAPSHOT_DATE_COVERAGE_INVALID",
                 dataset=DatasetKind.DAILY_BAR,
             )
-        scope = tuple(
-            sorted({*self._instruments, self._benchmark}, key=InstrumentId.canonical)
-        )
-        required_sessions = tuple(
-            day for day in sessions if history_start <= day <= next_session
-        )
+        execution_sessions = (*requested, next_session)
         bars = self._repository.bars(
-            self._snapshot_id, scope, history_start, next_session
+            self._snapshot_id,
+            (self._benchmark,),
+            requested[0],
+            next_session,
         ).collect()
-        if not _complete_instrument_dates(bars, scope, required_sessions):
+        if not _complete_instrument_dates(bars, (self._benchmark,), execution_sessions):
             raise ExperimentSnapshotInvalid(
                 self._snapshot_id,
                 "SNAPSHOT_DATE_COVERAGE_INVALID",
                 dataset=DatasetKind.DAILY_BAR,
             )
-        for session in (*requested, next_session):
-            statuses = self._repository.security_status(
-                self._snapshot_id, session, scope
-            ).collect()
-            if not _complete_instrument_dates(statuses, scope, (session,)):
-                raise ExperimentSnapshotInvalid(
-                    self._snapshot_id,
-                    "SNAPSHOT_DATE_COVERAGE_INVALID",
-                    dataset=DatasetKind.SECURITY_STATUS,
-                )
 
     def build_universe(self) -> ExperimentUniverseResult:
         if not self._instruments:

@@ -19,6 +19,7 @@ import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
+from quant_core.data import snapshots as snapshots_module
 from quant_core.data.quality.models import QualityIssue, QualityRunSpec
 from quant_core.data.quality.runner import QualityRunner
 from quant_core.data.snapshots import SnapshotPublisher
@@ -899,19 +900,72 @@ def test_recovery_structures_manifest_read_errors(
     versions = {DatasetKind.DAILY_BAR.value: version.id}
     quality_run_id = _completed_quality_run(repository, versions)
     publisher = SnapshotPublisher(repository, tmp_path / "snapshots")
-    snapshot_id = publisher.publish(versions, quality_run_id)
-    manifest_path = repository.get_snapshot(snapshot_id).manifest_path
-    original_read_bytes = Path.read_bytes
+    publisher.publish(versions, quality_run_id)
 
-    def fail_manifest_read(path: Path) -> bytes:
-        if path == manifest_path:
-            raise PermissionError("injected unreadable manifest")
-        return original_read_bytes(path)
+    def fail_manifest_open(*_args: object, **_kwargs: object) -> object:
+        raise PermissionError("injected unreadable manifest")
 
-    monkeypatch.setattr(Path, "read_bytes", fail_manifest_read)
+    monkeypatch.setattr(snapshots_module, "open_verified_file", fail_manifest_open)
 
     with pytest.raises(QuantError) as raised:
         publisher.recover()
+
+    assert raised.value.detail.code == "SNAP_MANIFEST_MISMATCH"
+
+
+def test_published_manifest_verification_uses_bounded_descriptor_reads(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    publisher = SnapshotPublisher(repository, tmp_path / "snapshots")
+    snapshot_id = publisher.publish(versions, quality_run_id)
+    manifest_path = repository.get_snapshot(snapshot_id).manifest_path
+    original_os_read = snapshots_module.os.read
+    original_path_read = Path.read_bytes
+    requests: list[int] = []
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        requests.append(size)
+        return original_os_read(descriptor, size)
+
+    def reject_path_read(path: Path) -> bytes:
+        if path == manifest_path:
+            raise AssertionError("manifest verification reopened the path")
+        return original_path_read(path)
+
+    monkeypatch.setattr(snapshots_module.os, "read", bounded_read)
+    monkeypatch.setattr(Path, "read_bytes", reject_path_read)
+
+    verified = publisher.verify_published(snapshot_id, versions, quality_run_id)
+
+    assert verified.id == snapshot_id
+    assert requests
+    assert max(requests) <= 64 * 1024
+
+
+def test_published_manifest_size_limit_is_checked_before_reading(
+    repository: MetadataRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    version = repository.register_dataset_version(_version_spec(tmp_path))
+    versions = {DatasetKind.DAILY_BAR.value: version.id}
+    quality_run_id = _completed_quality_run(repository, versions)
+    publisher = SnapshotPublisher(repository, tmp_path / "snapshots")
+    snapshot_id = publisher.publish(versions, quality_run_id)
+    monkeypatch.setattr(snapshots_module, "_MAX_MANIFEST_BYTES", 1, raising=False)
+
+    def reject_read(_descriptor: int, _size: int) -> bytes:
+        raise AssertionError("oversized manifest was read")
+
+    monkeypatch.setattr(snapshots_module.os, "read", reject_read)
+
+    with pytest.raises(QuantError) as raised:
+        publisher.verify_published(snapshot_id, versions, quality_run_id)
 
     assert raised.value.detail.code == "SNAP_MANIFEST_MISMATCH"
 
@@ -1182,14 +1236,14 @@ def test_publish_structures_temporary_manifest_hash_mismatch(
     version = repository.register_dataset_version(_version_spec(tmp_path))
     versions = {DatasetKind.DAILY_BAR.value: version.id}
     quality_run_id = _completed_quality_run(repository, versions)
-    original_read_bytes = Path.read_bytes
+    original_read = snapshots_module._read_manifest_bytes
 
-    def corrupt_temp_readback(path: Path) -> bytes:
+    def corrupt_readback(path: Path, trusted_root: Path) -> bytes:
         if path.name.endswith(".manifest.tmp"):
             return b"corrupt readback"
-        return original_read_bytes(path)
+        return original_read(path, trusted_root)
 
-    monkeypatch.setattr(Path, "read_bytes", corrupt_temp_readback)
+    monkeypatch.setattr(snapshots_module, "_read_manifest_bytes", corrupt_readback)
 
     with pytest.raises(QuantError) as raised:
         SnapshotPublisher(repository, tmp_path / "snapshots").publish(
@@ -1208,14 +1262,14 @@ def test_publish_structures_temporary_manifest_read_failure(
     version = repository.register_dataset_version(_version_spec(tmp_path))
     versions = {DatasetKind.DAILY_BAR.value: version.id}
     quality_run_id = _completed_quality_run(repository, versions)
-    original_read_bytes = Path.read_bytes
+    original_read = snapshots_module._read_manifest_bytes
 
-    def fail_temp_readback(path: Path) -> bytes:
+    def fail_temp_readback(path: Path, trusted_root: Path) -> bytes:
         if path.name.endswith(".manifest.tmp"):
             raise PermissionError("injected temporary manifest read failure")
-        return original_read_bytes(path)
+        return original_read(path, trusted_root)
 
-    monkeypatch.setattr(Path, "read_bytes", fail_temp_readback)
+    monkeypatch.setattr(snapshots_module, "_read_manifest_bytes", fail_temp_readback)
 
     with pytest.raises(QuantError) as raised:
         SnapshotPublisher(repository, tmp_path / "snapshots").publish(

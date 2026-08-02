@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import shutil
 import stat
 import tempfile
 import threading
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Buffer, Callable, Sequence
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Never, Protocol, cast
@@ -19,6 +20,7 @@ import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from quant_core.data.safe_files import open_verified_file
 from quant_core.data.schemas import CANONICAL_SCHEMAS, CanonicalSchema
 from quant_core.domain.enums import DatasetKind, Severity, SnapshotStatus
 from quant_core.domain.identifiers import DatasetVersionId, InstrumentId, SnapshotId
@@ -30,6 +32,10 @@ from quant_core.persistence.repositories import (
 )
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_MAX_PARTITION_FILE_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_DATASET_FILE_BYTES = 64 * 1024 * 1024 * 1024
+_MAX_ROW_GROUP_BYTES = 512 * 1024 * 1024
+_COPY_CHUNK_BYTES = 64 * 1024
 
 
 class ResearchDataRepository(Protocol):
@@ -105,9 +111,17 @@ def verify_published_dataset(
 ) -> DatasetVersionRecord:
     """Read-verify every physical partition bound to one published dataset."""
     record = _published_dataset_record(catalog, snapshot_id, dataset)
+    verified_bytes = 0
     for partition in record.partitions:
-        source = _validated_regular_partition_path(partition.path)
-        _verify_owned_partition(source, partition)
+        remaining = _MAX_DATASET_FILE_BYTES - verified_bytes
+        if remaining < 0:
+            raise ValueError("published dataset exceeds the configured size limit")
+        verified_bytes += _verify_owned_partition(
+            partition.path,
+            partition,
+            trusted_root=partition.path.absolute().parent,
+            max_bytes=min(_MAX_PARTITION_FILE_BYTES, remaining),
+        )
     return record
 
 
@@ -395,14 +409,31 @@ class _SnapshotPartitionLease:
     """Own one immutable scan input for the lifetime of a lazy daily-bar plan."""
 
     def __init__(self, partition: DatasetPartitionRecord) -> None:
-        source = _validated_regular_partition_path(partition.path)
         self._directory = tempfile.TemporaryDirectory(
-            prefix=".snapshot-scan-", dir=str(source.parent)
+            prefix=".snapshot-scan-", dir=str(partition.path.absolute().parent)
         )
         self.path = Path(self._directory.name) / f"{partition.content_hash}.parquet"
         try:
-            shutil.copyfile(source, self.path)
-            _verify_owned_partition(self.path, partition)
+            try:
+                with (
+                    open_verified_file(
+                        partition.path,
+                        trusted_root=partition.path.absolute().parent,
+                        max_bytes=_MAX_PARTITION_FILE_BYTES,
+                    ) as source,
+                    self.path.open("xb") as target,
+                ):
+                    shutil.copyfileobj(source.file, target, length=_COPY_CHUNK_BYTES)
+            except ValueError as error:
+                if "link or reparse point" in str(error):
+                    raise
+                raise ValueError("published partition is unavailable") from error
+            _verify_owned_partition(
+                self.path,
+                partition,
+                trusted_root=self.path.parent,
+                max_bytes=_MAX_PARTITION_FILE_BYTES,
+            )
             self.path.chmod(stat.S_IREAD)
         except BaseException:
             self._directory.cleanup()
@@ -445,49 +476,80 @@ def _retain_partition_leases(
     return retain
 
 
-def _validated_regular_partition_path(path: Path) -> Path:
-    """Resolve a catalog path while rejecting symlink/reparse indirection."""
-    absolute = path.absolute()
-    components = (*reversed(absolute.parents), absolute)
-    for component in components:
-        try:
-            observed = component.stat(follow_symlinks=False)
-        except OSError as error:
-            raise ValueError("published partition is unavailable") from error
-        reparse_point = getattr(observed, "st_file_attributes", 0) & 0x400
-        if component.is_symlink() or reparse_point:
-            raise ValueError(
-                "published partition path contains a link or reparse point"
-            )
-    if not stat.S_ISREG(observed.st_mode):
-        raise ValueError("published partition must be a regular non-link file")
-    return absolute
-
-
-def _verify_owned_partition(path: Path, partition: DatasetPartitionRecord) -> None:
+def _verify_owned_partition(
+    path: Path,
+    partition: DatasetPartitionRecord,
+    *,
+    trusted_root: Path,
+    max_bytes: int,
+) -> int:
     """Bind copied bytes to all published logical catalog metadata."""
     message = "published partition fails catalog integrity checks"
     try:
-        table = pq.read_table(path)
-        content_hash = _arrow_table_content_hash(table)
-        schema_fingerprint = hashlib.sha256(
-            table.schema.serialize().to_pybytes()
-        ).hexdigest()
+        with open_verified_file(
+            path, trusted_root=trusted_root, max_bytes=max_bytes
+        ) as opened:
+            parquet = pq.ParquetFile(opened.file)
+            metadata = parquet.metadata
+            schema = parquet.schema_arrow
+            if metadata.num_rows != partition.row_count:
+                raise ValueError(message)
+            for index in range(metadata.num_row_groups):
+                if metadata.row_group(index).total_byte_size > _MAX_ROW_GROUP_BYTES:
+                    raise ValueError(
+                        "published partition row group exceeds the configured size limit"
+                    )
+            content_hash = _parquet_content_hash(parquet, schema)
+            file_size = opened.size
+        schema_fingerprint = hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+    except ValueError as error:
+        if "size limit" in str(error):
+            raise
+        raise ValueError(message) from error
     except Exception as error:
         raise ValueError(message) from error
     if (
         content_hash != partition.content_hash
         or schema_fingerprint != partition.schema_fingerprint
-        or table.num_rows != partition.row_count
     ):
         raise ValueError(message)
+    return file_size
 
 
-def _arrow_table_content_hash(table: pa.Table) -> str:
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+def _parquet_content_hash(parquet: pq.ParquetFile, schema: pa.Schema) -> str:
+    sink = _HashingSink()
+    output = pa.PythonFile(sink, mode="w")
+    try:
+        with pa.ipc.new_stream(output, schema) as writer:
+            for index in range(parquet.metadata.num_row_groups):
+                writer.write_table(parquet.read_row_group(index))
+    finally:
+        output.close()
+    return sink.hexdigest()
+
+
+class _HashingSink(io.RawIOBase):
+    """Minimal Arrow output stream that retains only the SHA-256 state."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._digest = hashlib.sha256()
+        self._position = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: Buffer, /) -> int:
+        size = memoryview(value).nbytes
+        self._digest.update(value)
+        self._position += size
+        return size
+
+    def tell(self) -> int:
+        return self._position
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
 
 
 def _raise_snapshot_not_published(snapshot_id: SnapshotId) -> Never:

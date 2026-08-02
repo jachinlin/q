@@ -14,6 +14,7 @@ from typing import Never
 from uuid import NAMESPACE_URL, uuid5
 
 from quant_core.data.contracts import JsonValue, canonical_json_bytes
+from quant_core.data.safe_files import open_verified_file
 from quant_core.domain.enums import Severity, SnapshotStatus
 from quant_core.domain.identifiers import (
     DatasetVersionId,
@@ -39,6 +40,8 @@ _SNAPSHOT_MANIFEST_FIELDS = {
     "snapshot_id",
     "status",
 }
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_MANIFEST_READ_CHUNK_BYTES = 64 * 1024
 
 
 class SnapshotPublisher:
@@ -123,8 +126,10 @@ class SnapshotPublisher:
                 {"snapshot_id": str(identifier)},
             )
         try:
-            readback_hash = hashlib.sha256(temporary_path.read_bytes()).hexdigest()
-        except OSError:
+            readback_hash = hashlib.sha256(
+                _read_manifest_bytes(temporary_path, self._snapshot_root)
+            ).hexdigest()
+        except (OSError, ValueError):
             _remove_temporary_manifest(temporary_path)
             _raise_snapshot_error(
                 "SNAP_MANIFEST_MISMATCH",
@@ -282,7 +287,7 @@ class SnapshotPublisher:
 
     def _manifest_matches_record(self, path: Path, snapshot: SnapshotRecord) -> bool:
         try:
-            manifest_bytes = path.read_bytes()
+            manifest_bytes = _read_manifest_bytes(path, self._snapshot_root)
             if hashlib.sha256(manifest_bytes).hexdigest() != snapshot.manifest_hash:
                 return False
             manifest = json.loads(manifest_bytes.decode("utf-8"))
@@ -448,6 +453,23 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("snapshot clock must return a timezone-aware timestamp")
     return value.astimezone(UTC)
+
+
+def _read_manifest_bytes(path: Path, trusted_root: Path) -> bytes:
+    chunks: list[bytes] = []
+    with open_verified_file(
+        path, trusted_root=trusted_root, max_bytes=_MAX_MANIFEST_BYTES
+    ) as opened:
+        remaining = opened.size
+        while remaining:
+            chunk = os.read(
+                opened.file.fileno(), min(_MANIFEST_READ_CHUNK_BYTES, remaining)
+            )
+            if not chunk:
+                raise ValueError("snapshot manifest ended before its verified size")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _remove_temporary_manifest(path: Path) -> None:

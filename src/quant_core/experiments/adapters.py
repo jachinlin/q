@@ -702,8 +702,10 @@ def _market_status_rows(
     rows: dict[str, dict[str, object]] = {}
     for row in frame.select(*sorted(columns)).iter_rows(named=True):
         identifier = row["instrument_id"]
-        if not isinstance(identifier, str) or identifier not in expected:
-            raise ValueError("market slice status has an unexpected instrument")
+        if not isinstance(identifier, str):
+            raise TypeError("market slice status has an unexpected instrument")
+        if identifier not in expected:
+            continue
         try:
             canonical = InstrumentId.parse(identifier).canonical()
         except ValueError as error:
