@@ -372,7 +372,15 @@ class QualityRunRequest(DashboardModel):
     @field_validator("dataset", mode="before")
     @classmethod
     def parse_dataset(cls, value: object) -> object:
-        """把可选 JSON 数据集名称解析为领域枚举。"""
+        """把可选 JSON 数据集名称解析为领域枚举。
+
+        入参：
+            value：待解析的数据集名称、领域枚举或空值。
+        返回值：
+            返回解析后的 ``DatasetKind``、空值或交由 Pydantic 校验的原值。
+        异常：
+            ``ValueError``：字符串不是已注册的数据集名称时抛出。
+        """
         if value is None or isinstance(value, DatasetKind):
             return value
         if isinstance(value, str):
