@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -31,11 +32,11 @@ from quant_research.backtest.models import (
     FillResult,
 )
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
-from quant_research.data.partitions import _PartitionLock
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.experiments.fingerprint import SourceIdentity
 from quant_research.portfolio.constructor import TargetPortfolio
 
+_EXPERIMENT_ARTIFACT_LOCK = threading.Lock()
 _COMPRESSION = "zstd"
 _NAV_SCHEMA = pa.schema(
     [
@@ -883,8 +884,7 @@ def validate_experiment_artifacts(
         raise ValueError("artifact_dir must have a published experiment identity")
     _ArtifactsSupport._require_plain_directory(artifact_dir.parent, "artifact_root")
     _ArtifactsSupport._require_plain_directory(artifact_dir, "artifact_dir")
-    lock_path = artifact_dir.parent / ".experiment-publish.lock"
-    with _PartitionLock(lock_path, timeout_seconds=60.0, stale_after_seconds=0.0):
+    with _EXPERIMENT_ARTIFACT_LOCK:
         manifest_path = artifact_dir / "manifest.json"
         raw, manifest = _ArtifactsSupport._read_experiment_manifest(manifest_path)
         if raw != canonical_json_bytes(cast(JsonValue, manifest)):
@@ -984,8 +984,7 @@ def publish_experiment_artifacts(
         )
         if candidate_entries != entries:
             raise ValueError("experiment artifacts changed while building candidate")
-        lock_path = artifact_root / ".experiment-publish.lock"
-        with _PartitionLock(lock_path, timeout_seconds=60.0, stale_after_seconds=0.0):
+        with _EXPERIMENT_ARTIFACT_LOCK:
             _ArtifactsSupport._require_same_directory(
                 candidate_dir, candidate_identity, "candidate"
             )

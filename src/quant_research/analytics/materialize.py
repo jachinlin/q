@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import date
 from math import isfinite
@@ -25,8 +26,9 @@ from quant_research.analytics.performance import (
     PerformanceResult,
     calculate_performance,
 )
-from quant_research.data.partitions import _PartitionLock
 from quant_research.domain.identifiers import InstrumentId
+
+_ANALYTICS_EXECUTION_LOCK = threading.Lock()
 
 _RAW_SCHEMAS = {
     "nav.parquet": pa.schema(
@@ -274,8 +276,7 @@ def materialize_analytics(artifact_dir: Path) -> AnalyticsResult:
         raise TypeError("artifact_dir must be a Path")
     if not artifact_dir.is_dir():
         raise ValueError("artifact_dir must be a published artifact directory")
-    lock_path = artifact_dir.parent / f".{artifact_dir.name}.analytics.lock"
-    with _PartitionLock(lock_path, timeout_seconds=60 * 60):
+    with _ANALYTICS_EXECUTION_LOCK:
         return _MaterializeSupport._materialize_analytics_locked(artifact_dir)
 
 

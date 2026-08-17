@@ -18,7 +18,17 @@ LOCALIZE → CURATE → VALIDATE
 - Canonical 指针发生变化时，全局读取门禁立即失效；内容完全相同时不会使门禁失效。
 - 实验提交时记录当前 `data_hash`。该哈希只用于检测数据漂移，不能选择或恢复历史数据。
 - 文件路径只负责定位文件，不参与内容身份计算。
+- 同一 `QUANT_DATA_ROOT` 同一时刻只允许一个会修改数据状态的流水线执行者；组合入口及
+  单阶段入口共享这一边界。
 - 不迁移不兼容的数据根目录。发生不兼容的结构变更后，应重新构建 `~/.q-data`。
+
+数据流水线使用固定的 `state/data-pipeline.lock` 实现数据根单写者：进程内使用可重入
+锁支持 `bootstrap`、`update` 对阶段入口的嵌套调用，进程间使用 Windows 文件字节范围
+锁阻止 CLI、Dashboard Worker 等执行者重叠。争用时立即以可重试错误
+`DATA_PIPELINE_ALREADY_RUNNING` 失败，不排队等待。锁文件本身可以永久存在，其存在不
+表示有执行者；所有权只由操作系统锁决定，进程退出或崩溃后由 Windows 自动释放。系统
+不保存 PID、owner token，不探测进程存活，也不执行陈旧锁回收。Raw 与 Canonical 的内容
+寻址、临时文件和原子重命名继续负责单次发布的崩溃一致性。
 
 ## 2. Canonical 数据集
 

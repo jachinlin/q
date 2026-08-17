@@ -3,6 +3,7 @@
 import json
 from datetime import UTC, date, datetime
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -91,13 +92,19 @@ def _partial_plan() -> DataUpdatePlan:
     )
 
 
-def _pipeline(source: _Source, logger: StructuredLogger | None = None) -> DataPipeline:
+def _pipeline(
+    source: _Source,
+    data_root: Path,
+    logger: StructuredLogger | None = None,
+) -> DataPipeline:
     return DataPipeline(
         source=source,  # type: ignore[arg-type]
         mapper=object(),  # type: ignore[arg-type]
         calendar=_Calendar(),  # type: ignore[arg-type]
-        raw_store=object(),  # type: ignore[arg-type]
-        curated_store=object(),  # type: ignore[arg-type]
+        raw_store=SimpleNamespace(root=data_root / "raw"),  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(  # type: ignore[arg-type]
+            root=data_root / "canonical"
+        ),
         repository=_Repository(),  # type: ignore[arg-type]
         quality_runner=object(),  # type: ignore[arg-type]
         routes=BAOSTOCK_ROUTES,
@@ -105,9 +112,9 @@ def _pipeline(source: _Source, logger: StructuredLogger | None = None) -> DataPi
     )
 
 
-def test_localize_reuses_an_active_outer_source_session() -> None:
+def test_localize_reuses_an_active_outer_source_session(tmp_path: Path) -> None:
     source = _Source()
-    pipeline = _pipeline(source)
+    pipeline = _pipeline(source, tmp_path)
     pipeline._source_session_active = True
 
     result = pipeline.localize(
@@ -121,9 +128,9 @@ def test_localize_reuses_an_active_outer_source_session() -> None:
     assert source.close_calls == 0
 
 
-def test_localize_all_opens_one_session_around_every_dataset() -> None:
+def test_localize_all_opens_one_session_around_every_dataset(tmp_path: Path) -> None:
     source = _Source()
-    pipeline = _pipeline(source)
+    pipeline = _pipeline(source, tmp_path)
     observed: list[DatasetKind] = []
 
     def localized(
@@ -150,9 +157,9 @@ def test_localize_all_opens_one_session_around_every_dataset() -> None:
     assert pipeline._source_session_active is False
 
 
-def test_localize_plan_only_visits_the_frozen_dataset_subset() -> None:
+def test_localize_plan_only_visits_the_frozen_dataset_subset(tmp_path: Path) -> None:
     source = _Source()
-    pipeline = _pipeline(source)
+    pipeline = _pipeline(source, tmp_path)
     plan = _partial_plan()
     observed: list[tuple[DatasetKind, tuple[date, date] | None]] = []
 
@@ -186,8 +193,10 @@ def test_localize_plan_only_visits_the_frozen_dataset_subset() -> None:
     assert source.login_calls == source.close_calls == 1
 
 
-def test_execute_partial_plan_curates_selection_then_validates_full_catalog() -> None:
-    pipeline = _pipeline(_Source())
+def test_execute_partial_plan_curates_selection_then_validates_full_catalog(
+    tmp_path: Path,
+) -> None:
+    pipeline = _pipeline(_Source(), tmp_path)
     plan = _partial_plan()
     observer = _Observer()
     quality_run_id = QualityRunId(uuid4())
@@ -220,9 +229,11 @@ def test_execute_partial_plan_curates_selection_then_validates_full_catalog() ->
     assert result.quality_run_id == quality_run_id
 
 
-def test_pipeline_stages_use_independent_business_log_contexts() -> None:
+def test_pipeline_stages_use_independent_business_log_contexts(
+    tmp_path: Path,
+) -> None:
     stream = StringIO()
-    pipeline = _pipeline(_Source(), StructuredLogger(stream))
+    pipeline = _pipeline(_Source(), tmp_path, StructuredLogger(stream))
 
     pipeline._localize_log(
         "localize.raw_completed",

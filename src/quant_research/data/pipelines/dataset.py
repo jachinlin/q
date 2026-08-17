@@ -39,6 +39,7 @@ from quant_research.data.quality.models import (
 from quant_research.data.quality.runner import QualityRunner
 from quant_research.data.routing import RoutingTable
 from quant_research.data.schemas import CANONICAL_SCHEMAS
+from quant_research.data.storage import DataRootExecutionLock
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.domain.identifiers import QualityRunId
@@ -950,6 +951,10 @@ class DataPipeline:
         self._clock = clock
         self._logger = logger
         self._source_session_active = False
+        data_root = raw_store.root.parent
+        if curated_store.root.parent != data_root:
+            raise ValueError("raw and canonical stores must share one data root")
+        self._execution_lock = DataRootExecutionLock(data_root)
         self._update_planner = DataUpdatePlanner(
             calendar=calendar,
             repository=repository,
@@ -980,8 +985,29 @@ class DataPipeline:
         返回值：
             返回``localize``（``LocalizeResult``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余数据或供应商错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._localize(
+                dataset,
+                start=start,
+                end=end,
+                full=full,
+                planned_window=planned_window,
+                observer=observer,
+            )
+
+    def _localize(
+        self,
+        dataset: DatasetKind,
+        *,
+        start: date | None,
+        end: date | None,
+        full: bool,
+        planned_window: tuple[date, date] | None,
+        observer: PipelineObserver | None,
+    ) -> LocalizeResult:
         progress = observer or _NullPipelineObserver()
         source_name = self._routes.source_for(dataset)
         if source_name != self._source.provider:
@@ -1484,8 +1510,27 @@ class DataPipeline:
         返回值：
             返回``all``（``tuple[LocalizeResult, ...]``）。
         异常：
-            RuntimeError：输入、供应商响应、目录状态或文件完整性不满足契约时抛出。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余数据或供应商错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._localize_all(
+                start=start,
+                end=end,
+                full=full,
+                plan=plan,
+                observer=observer,
+            )
+
+    def _localize_all(
+        self,
+        *,
+        start: date | None,
+        end: date | None,
+        full: bool,
+        plan: DataUpdatePlan | None,
+        observer: PipelineObserver | None,
+    ) -> tuple[LocalizeResult, ...]:
         executable = tuple(
             dataset for dataset in self._catalog if self._routes[dataset]
         )
@@ -1708,8 +1753,25 @@ class DataPipeline:
         返回值：
             返回``curate``（``DatasetCurateResult``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余数据错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._curate(
+                dataset,
+                start=start,
+                end=end,
+                full=full,
+            )
+
+    def _curate(
+        self,
+        dataset: DatasetKind,
+        *,
+        start: date | None,
+        end: date | None,
+        full: bool,
+    ) -> DatasetCurateResult:
         if (start is None) != (end is None):
             self._raise(
                 "DATA_PIPELINE_ARGUMENT", "start and end must be supplied together"
@@ -1735,8 +1797,18 @@ class DataPipeline:
         返回值：
             返回``all``（``tuple[DatasetCurateResult, ...]``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余数据错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._curate_all(full=full, observer=observer)
+
+    def _curate_all(
+        self,
+        *,
+        full: bool,
+        observer: PipelineObserver | None,
+    ) -> tuple[DatasetCurateResult, ...]:
         datasets = tuple(dataset for dataset in self._catalog if self._routes[dataset])
         return self._curate_many(datasets, full=full, observer=observer)
 
@@ -2261,8 +2333,18 @@ class DataPipeline:
         返回值：
             返回校验Canonical 数据后的``validate``（``QualityRunId``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余质量或文件错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._validate(dataset, heartbeat=heartbeat)
+
+    def _validate(
+        self,
+        dataset: DatasetKind | None,
+        *,
+        heartbeat: Callable[[], None],
+    ) -> QualityRunId:
         scope = "ALL" if dataset is None else "DATASET"
         heartbeat()
         command_request: dict[str, object] = {
@@ -2428,8 +2510,13 @@ class DataPipeline:
         返回值：
             返回``bootstrap``（``PipelineResult``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余阶段错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._bootstrap()
+
+    def _bootstrap(self) -> PipelineResult:
         run_id = uuid4().hex
         self.localize_all(full=True)
         self.curate_all()
@@ -2453,8 +2540,19 @@ class DataPipeline:
         返回值：
             返回``update``（``PipelineResult``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            QuantError：同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``；其余计划或阶段错误保持原错误码。
         """
+        with self._execution_lock:
+            return self._update(start=start, end=end, observer=observer)
+
+    def _update(
+        self,
+        *,
+        start: date | None,
+        end: date | None,
+        observer: PipelineObserver | None,
+    ) -> PipelineResult:
         plan = self.plan_update(start=start, end=end)
         return self.execute_update_plan(plan, observer=observer)
 
@@ -2478,7 +2576,18 @@ class DataPipeline:
 
         入参：已验证计划和可选进度观察器。返回值：完整流水线结果。
         异常：计划数据集与目录不一致或任一流水线阶段失败时传播对应异常。
+            同一数据根已有流水线运行时抛出
+            ``DATA_PIPELINE_ALREADY_RUNNING``。
         """
+        with self._execution_lock:
+            return self._execute_update_plan(plan, observer=observer)
+
+    def _execute_update_plan(
+        self,
+        plan: DataUpdatePlan,
+        *,
+        observer: PipelineObserver | None,
+    ) -> PipelineResult:
         run_id = uuid4().hex
         progress = observer or _NullPipelineObserver()
         self.localize_all(plan=plan, observer=progress)
