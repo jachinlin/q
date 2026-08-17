@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quant-research"
+version = "0.1.0"
+description = "Foundation data platform for quantitative research"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alembic",
+    "baostock",
+    "duckdb",
+    "fastapi",
+    "numpy",
+    "polars",
+    "pyarrow",
+    "pydantic",
+    "pydantic-settings",
+    "pyyaml",
+    "sqlalchemy",
+    "typer",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.164.0",
+    "httpx",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "types-pyyaml",
+]
+notebook = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.3",
+    "matplotlib>=3.11.1",
+    "plotly>=6.9.0",
+]
+
+[project.scripts]
+quant = "quant_research.bootstrap.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quant_research"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]

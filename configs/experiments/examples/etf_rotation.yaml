@@ -1,0 +1,22 @@
+strategy_id: etf_rotation
+start_date: 2026-07-08
+end_date: 2026-08-10
+benchmark: 000300.SH
+initial_cash_fen: 100000000
+strategy_config:
+  etf_pool:
+    - 510050.SH
+    - 510300.SH
+    - 513100.SH
+    - 588000.SH
+  return_factor_weights:
+    return_20d: 0.2
+    return_60d: 0.3
+    return_120d: 0.5
+  trend_factor_ref: trend_120d
+  volatility_factor_ref: volatility_60d
+  volatility_penalty: 0.5
+  top_n: 3
+  frequency: MONTHLY
+  missing_signal_policy: EXCLUDE
+  weighting: EQUAL

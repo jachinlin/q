@@ -1,0 +1,24 @@
+strategy_id: stock_multifactor
+start_date: 2024-01-02
+end_date: 2024-12-31
+benchmark: 000300.SH
+initial_cash_fen: 100000000
+strategy_config:
+  factor_definitions:
+    earnings_yield_ttm: {category: VALUE, direction: 1}
+    book_to_price_mrq: {category: VALUE, direction: 1}
+    roe_pit: {category: QUALITY, direction: 1}
+    momentum_120_20: {category: MOMENTUM, direction: 1}
+    volatility_60d: {category: RISK, direction: -1}
+    downside_volatility_60d: {category: RISK, direction: -1}
+    max_drawdown_120d: {category: RISK, direction: -1}
+  category_weights: {VALUE: 0.25, QUALITY: 0.25, MOMENTUM: 0.30, RISK: 0.20}
+  min_valid_factors: 5
+  mad_multiplier: 3.0
+  frequency: WEEKLY
+  constraints:
+    max_position_weight: 0.10
+    min_positions: 20
+    max_positions: 50
+    min_adv_amount: 10000000.0
+    max_turnover: 0.50

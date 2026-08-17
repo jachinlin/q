@@ -1,0 +1,29 @@
+strategy_id: etf_rotation
+start_date: 2024-06-27
+end_date: 2024-06-28
+benchmark: 510300.SH
+initial_cash_fen: 200000
+execution:
+  reference_price: CLOSE
+  slippage_bps: 0.0
+  max_volume_participation: 1.0
+strategy_config:
+  etf_pool:
+    - 510300.SH
+  return_factor_weights:
+    return_20d: 0.2
+    return_60d: 0.3
+    return_120d: 0.5
+  trend_factor_ref: trend_120d
+  volatility_factor_ref: volatility_60d
+  volatility_penalty: 0.5
+  top_n: 1
+universe:
+  allowed_boards:
+    - MAIN
+    - CHINEXT
+    - STAR
+  exclude_st: true
+  exclude_suspended: true
+  min_listing_days: 120
+  min_avg_amount_20d: null

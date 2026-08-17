@@ -1,0 +1,20 @@
+# Superpowers execution workspaces
+.worktrees/
+.superpowers/
+docs/superpowers/
+docs/handoffs/
+.uv-cache/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-task*/
+.mypy_cache/
+.ruff_cache/
+.env
+.claude
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/*.tsbuildinfo
+notebooks/
