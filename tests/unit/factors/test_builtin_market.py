@@ -95,6 +95,29 @@ def test_market_factors_match_hard_coded_window_oracles_and_share_one_read() -> 
     assert service.calls == 1
 
 
+def test_market_bars_cache_recomputes_only_when_context_changes() -> None:
+    frame = _frame([0.0, *([0.01] * 120)])
+    service = _PriceService(frame)
+    instrument = InstrumentId.parse("000001.SZ")
+    cache = MarketBarsCache(service, (instrument,), max_lookback_sessions=120)
+    first_context = _context(frame)
+    second_context = FactorContext(
+        "a" * 64,
+        "c" * 64,
+        first_context.start,
+        first_context.end,
+    )
+
+    first_bars = cache.load(first_context)
+    assert cache.load(first_context) is first_bars
+    assert service.calls == 1
+
+    second_bars = cache.load(second_context)
+    assert second_bars is not first_bars
+    assert cache.load(second_context) is second_bars
+    assert service.calls == 2
+
+
 def test_downside_volatility_uses_all_sessions_in_denominator() -> None:
     trailing = [-0.02 if index % 2 == 0 else 0.03 for index in range(60)]
     frame = _frame([0.0, *([0.0] * 60), *trailing])

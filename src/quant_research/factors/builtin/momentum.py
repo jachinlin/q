@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
 from datetime import date, datetime, timedelta
 from math import expm1, isfinite
-from threading import Lock, get_ident
+from threading import Lock
 from typing import Protocol
 
 import numpy as np
@@ -85,8 +84,6 @@ class MarketBarsCache:
         self._max_lookback_sessions = max_lookback_sessions
         self._ctx: FactorContext | None = None
         self._bars: pl.DataFrame | None = None
-        self._inflight: dict[FactorContext, tuple[Future[pl.DataFrame], int]] = {}
-        self._waiting_for_owner: dict[int, tuple[int, Future[pl.DataFrame]]] = {}
         self._lock = Lock()
 
     def matches(
@@ -123,77 +120,21 @@ class MarketBarsCache:
         返回值：
             返回加载并校验因子计算后的``load``（``pl.DataFrame``）。
         异常：
-            输入、状态或依赖结果违反契约时抛出 ``RuntimeError``。
+            输入或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
         Return the one normalized price frame for the active factor context.
         """
-        owner_thread_id = get_ident()
         with self._lock:
             if self._ctx == ctx and self._bars is not None:
                 return self._bars
-            active = self._inflight.get(ctx)
-            if active is None:
-                future: Future[pl.DataFrame] = Future()
-                self._inflight[ctx] = (future, owner_thread_id)
-                owns_load = True
-            else:
-                future, active_owner_thread_id = active
-                if active_owner_thread_id == owner_thread_id:
-                    raise RuntimeError(
-                        "recursive market bar load for the same factor context"
-                    )
-                if self._would_create_wait_cycle(
-                    owner_thread_id, active_owner_thread_id
-                ):
-                    raise RuntimeError("cyclic market bar cache wait detected")
-                wait_edge = (active_owner_thread_id, future)
-                self._waiting_for_owner[owner_thread_id] = wait_edge
-                owns_load = False
-
-        if not owns_load:
-            try:
-                return future.result()
-            finally:
-                with self._lock:
-                    if self._waiting_for_owner.get(owner_thread_id) == wait_edge:
-                        del self._waiting_for_owner[owner_thread_id]
-
-        try:
             bars = _MomentumSupport._load_log_returns(
                 self._price_service,
                 self._instruments,
                 ctx,
                 self._max_lookback_sessions,
             )
-        except BaseException as error:
-            with self._lock:
-                if self._inflight.get(ctx) == (future, owner_thread_id):
-                    del self._inflight[ctx]
-            future.set_exception(error)
-            raise
-
-        with self._lock:
             self._ctx = ctx
             self._bars = bars
-            if self._inflight.get(ctx) == (future, owner_thread_id):
-                del self._inflight[ctx]
-        future.set_result(bars)
-        return bars
-
-    def _would_create_wait_cycle(self, waiter: int, owner: int) -> bool:
-        current = owner
-        visited: set[int] = set()
-        while current not in visited:
-            if current == waiter:
-                return True
-            visited.add(current)
-            wait_edge = self._waiting_for_owner.get(current)
-            if wait_edge is None:
-                return False
-            waiting_for, future = wait_edge
-            if future.done():
-                return False
-            current = waiting_for
-        return False
+            return bars
 
 
 class _MarketFactor:
