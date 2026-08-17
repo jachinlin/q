@@ -123,6 +123,47 @@ def test_future_return_rejects_missing_next_session_status() -> None:
     assert result[1]["future_return"].item() is None
 
 
+def test_future_returns_vectorize_shuffled_multi_instrument_scope() -> None:
+    sessions = tuple(date(2026, 1, 5) + timedelta(days=index) for index in range(3))
+    bars = pl.DataFrame(
+        {
+            "instrument_id": [
+                "000002.SZ",
+                "000001.SZ",
+                "000002.SZ",
+                "000001.SZ",
+                "000002.SZ",
+                "000001.SZ",
+            ],
+            "trade_date": [
+                sessions[2],
+                sessions[1],
+                sessions[0],
+                sessions[2],
+                sessions[1],
+                sessions[0],
+            ],
+            "open": [22.0, 10.0, 18.0, 11.0, 20.0, 9.0],
+            "close": [24.0, 11.0, 19.0, 12.0, 21.0, 9.5],
+        }
+    )
+    eligible = pl.DataFrame(
+        {
+            "signal_date": [sessions[0], sessions[0], sessions[0]],
+            "instrument_id": ["000002.SZ", "000003.SZ", "000001.SZ"],
+            "eligible": [True, False, True],
+        }
+    )
+
+    result = build_future_returns(bars, sessions, eligible, (2,))[2]
+
+    assert result.select("instrument_id", "return_start", "return_end").rows() == [
+        ("000001.SZ", sessions[1], sessions[2]),
+        ("000002.SZ", sessions[1], sessions[2]),
+    ]
+    assert result["future_return"].to_list() == pytest.approx([0.2, 0.2])
+
+
 def test_analysis_produces_rank_quantiles_and_long_short_without_compounding() -> None:
     day = date(2026, 1, 5)
     instruments = [f"{index:06d}.SZ" for index in range(30)]

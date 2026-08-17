@@ -13,6 +13,7 @@ import pytest
 from quant_research.data.adjustments import FORWARD_LOG_RETURN_COLUMN
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors.base import FactorContext
+from quant_research.factors.builtin.auxiliary import AvgAmount20dFactor
 from quant_research.factors.builtin.momentum import MarketBarsCache, Momentum12020Factor
 from quant_research.factors.builtin.quality import RoePitFactor
 from quant_research.factors.builtin.risk import (
@@ -47,6 +48,7 @@ class _SyntheticInputs:
         self._basics = basics
         self._financials = financials
         self.market_reads = 0
+        self.bar_reads = 0
         self.basics_reads = 0
         self.calendar_reads = 0
         self.financial_reads = 0
@@ -80,7 +82,11 @@ class _SyntheticInputs:
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        raise AssertionError((instruments, start, end))
+        del instruments
+        self.bar_reads += 1
+        return self._market.filter(
+            pl.col("trade_date").is_between(start, end, closed="both")
+        ).select("instrument_id", "trade_date", "amount", "available_at").lazy()
 
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
         self.calendar_reads += 1
@@ -102,7 +108,7 @@ class _SyntheticInputs:
 
 
 def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
-    """All seven study factors must scale with constant boundary read counts."""
+    """Study factors and the liquidity auxiliary use bounded native reads."""
     current = date(2006, 1, 2)
     end = date(2025, 12, 31)
     session_values: list[date] = []
@@ -138,8 +144,13 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
     )
     market = (
         scope.join(session_frame, how="cross")
+        .with_columns(pl.lit(1_000_000.0).alias("amount"))
         .select(
-            "trade_date", "instrument_id", FORWARD_LOG_RETURN_COLUMN, "available_at"
+            "trade_date",
+            "instrument_id",
+            FORWARD_LOG_RETURN_COLUMN,
+            "amount",
+            "available_at",
         )
         .sort("instrument_id", "trade_date")
     )
@@ -188,6 +199,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
         Volatility60dFactor(inputs, instruments, market_bars=market_cache),
         DownsideVolatility60dFactor(inputs, instruments, market_bars=market_cache),
         MaxDrawdown120dFactor(inputs, instruments, market_bars=market_cache),
+        AvgAmount20dFactor(inputs, instruments),
     )
 
     stage_seconds: dict[str, float] = {}
@@ -208,6 +220,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
     }
     print(f"stock_factor_performance={json.dumps(evidence, sort_keys=True)}")
     assert inputs.market_reads == 1
+    assert inputs.bar_reads == 2
     assert inputs.basics_reads == 1
     assert inputs.calendar_reads == 1
     assert inputs.financial_reads == 1

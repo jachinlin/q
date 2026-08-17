@@ -4,21 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date
-from math import isfinite
 
 import polars as pl
 
 from quant_research.data.contracts import JsonValue
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors.base import (
+    FACTOR_OUTPUT_SCHEMA,
     FactorContext,
     FactorSpec,
 )
 from quant_research.factors.builtin._stock_common import (
     BarRepository,
-    _StockCommonSupport,
     canonical_scope,
-    output_frame,
 )
 
 
@@ -42,23 +40,20 @@ class _AuxiliarySupport:
     def _needs_amount_full_history(
         frame: pl.DataFrame, ctx: FactorContext, required_observations: int
     ) -> bool:
-        for group in frame.partition_by("instrument_id", maintain_order=True):
-            dates = group["trade_date"].to_list()
-            for index, trade_date in enumerate(dates):
-                if ctx.start <= trade_date <= ctx.end:
-                    if index + 1 < required_observations:
-                        return True
-                    break
-        return False
-
-    @staticmethod
-    def _nonnegative(value: object) -> bool:
-        return (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and isfinite(value)
-            and value >= 0
+        insufficient = (
+            frame.lazy()
+            .with_columns(
+                pl.int_range(1, pl.len() + 1, dtype=pl.UInt32)
+                .over("instrument_id")
+                .alias("_observed")
+            )
+            .filter(pl.col("trade_date").is_between(ctx.start, ctx.end, closed="both"))
+            .group_by("instrument_id")
+            .agg(pl.col("_observed").first())
+            .select((pl.col("_observed") < required_observations).any())
+            .collect()
         )
+        return bool(insufficient.item()) if insufficient.height else False
 
 
 def assert_alpha_eligible(specs: Sequence[FactorSpec]) -> None:
@@ -135,28 +130,78 @@ class AvgAmount20dFactor:
             frame, ctx, 20
         ):
             frame = self._load(ctx, date.min)
-        rows = []
-        for group in frame.partition_by("instrument_id", maintain_order=True):
-            data = group.to_dicts()
-            for index, row in enumerate(data):
-                day = row["trade_date"]
-                if not ctx.start <= day <= ctx.end:
-                    continue
-                window = data[max(0, index - 19) : index + 1]
-                amounts = [item["amount"] for item in window]
-                availability = [item["available_at"] for item in window]
-                valid = (
-                    len(window) == 20
-                    and all(_AuxiliarySupport._nonnegative(item) for item in amounts)
-                    and all(
-                        _StockCommonSupport._known_availability(item)
-                        for item in availability
+        amount = pl.col("amount")
+        finite_amount = (
+            amount.is_not_null() & amount.is_finite() & (amount >= 0.0)
+        ).fill_null(False)
+        finite_count = (
+            finite_amount.cast(pl.UInt32)
+            .rolling_sum(20, min_samples=20)
+            .over("instrument_id")
+        )
+        availability_count = (
+            pl.col("available_at")
+            .is_not_null()
+            .cast(pl.UInt32)
+            .rolling_sum(20, min_samples=20)
+            .over("instrument_id")
+        )
+        mean_amount = (
+            pl.when(finite_amount)
+            .then(amount)
+            .otherwise(0.0)
+            .rolling_mean(20, min_samples=20)
+            .over("instrument_id")
+        )
+        latest_availability = (
+            pl.col("available_at")
+            .rolling_max(20, min_samples=20)
+            .over("instrument_id")
+        )
+        return (
+            frame.lazy()
+            .with_columns(
+                finite_count.alias("_finite_count"),
+                availability_count.alias("_availability_count"),
+                mean_amount.alias("_mean_amount"),
+                latest_availability.alias("_latest_availability"),
+            )
+            .with_columns(
+                (
+                    (pl.col("_finite_count") == 20)
+                    & (pl.col("_availability_count") == 20)
+                    & pl.col("_mean_amount").is_not_null()
+                    & pl.col("_mean_amount").is_finite()
+                    & pl.col("_latest_availability").is_not_null()
+                    & (
+                        pl.col("_latest_availability")
+                        .dt.convert_time_zone("Asia/Shanghai")
+                        .dt.date()
+                        <= pl.col("trade_date")
                     )
                 )
-                value = sum(float(item) for item in amounts) / 20.0 if valid else None
-                available = max(availability) if valid else None
-                rows.append((day, row["instrument_id"], value, available))
-        return output_frame(self.spec, rows)
+                .fill_null(False)
+                .alias("_factor_valid")
+            )
+            .filter(pl.col("trade_date").is_between(ctx.start, ctx.end, closed="both"))
+            .select(
+                "trade_date",
+                "instrument_id",
+                pl.lit(self.spec.factor_id, dtype=pl.String).alias("factor_id"),
+                pl.when(pl.col("_factor_valid"))
+                .then(pl.col("_mean_amount"))
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .cast(pl.Float64)
+                .alias("value"),
+                pl.when(pl.col("_availability_count") == 20)
+                .then(pl.col("_latest_availability"))
+                .otherwise(pl.lit(None, dtype=pl.Datetime("us", "UTC")))
+                .alias("available_at"),
+                pl.col("_factor_valid").alias("is_valid"),
+            )
+            .cast(FACTOR_OUTPUT_SCHEMA)
+            .sort("trade_date", "instrument_id")
+        )
 
     def _load(self, ctx: FactorContext, start: date) -> pl.DataFrame:
         frame = self._repository.bars(self._instruments, start, ctx.end).collect()

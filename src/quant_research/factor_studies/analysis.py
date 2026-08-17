@@ -45,68 +45,86 @@ def build_future_returns(
     required = {"instrument_id", "trade_date", "open", "close"}
     if not required.issubset(bars.columns):
         raise ValueError("adjusted bars are missing future-return columns")
-    price = {
-        (cast(str, row["instrument_id"]), cast(date, row["trade_date"])): (
-            row["open"],
-            row["close"],
-        )
-        for row in bars.select(required).iter_rows(named=True)
-    }
-    position = {day: index for index, day in enumerate(sessions)}
-    tradable_keys: set[tuple[str, date]] | None = None
+    session_frame = pl.DataFrame(
+        {"signal_date": pl.Series(sessions, dtype=pl.Date)}
+    )
+    eligible_rows = eligible.filter(pl.col("eligible")).select(
+        "signal_date", "instrument_id"
+    )
+    entry_prices = bars.select(
+        "instrument_id",
+        pl.col("trade_date").alias("return_start"),
+        pl.col("open").cast(pl.Float64, strict=False).alias("_entry_open"),
+    )
+    exit_prices = bars.select(
+        "instrument_id",
+        pl.col("trade_date").alias("return_end"),
+        pl.col("close").cast(pl.Float64, strict=False).alias("_exit_close"),
+    )
+    tradable_entries: pl.DataFrame | None = None
     if tradability is not None:
         required_status = {"instrument_id", "trade_date", "is_listed", "is_suspended"}
         if not required_status.issubset(tradability.columns):
             raise ValueError("tradability data is missing required columns")
-        tradable_keys = {
-            (cast(str, row["instrument_id"]), cast(date, row["trade_date"]))
-            for row in tradability.select(required_status).iter_rows(named=True)
-            if bool(row["is_listed"]) and not bool(row["is_suspended"])
-        }
-    eligible_rows = eligible.filter(pl.col("eligible")).select(
-        "signal_date", "instrument_id"
-    )
+        tradable_entries = (
+            tradability.filter(
+                pl.col("is_listed").fill_null(False)
+                & ~pl.col("is_suspended").fill_null(True)
+            )
+            .select(
+                "instrument_id",
+                pl.col("trade_date").alias("return_start"),
+                pl.lit(True).alias("_entry_tradable"),
+            )
+            .unique(["instrument_id", "return_start"])
+        )
     output: dict[int, pl.DataFrame] = {}
     for horizon in horizons:
-        rows: list[tuple[date, str, date | None, date | None, float | None]] = []
-        for signal_day, instrument_id in eligible_rows.iter_rows():
-            index = position.get(signal_day)
-            start_index = None if index is None else index + 1
-            end_index = None if index is None else index + horizon
-            if start_index is None or end_index is None or end_index >= len(sessions):
-                rows.append((signal_day, instrument_id, None, None, None))
-                continue
-            start_day, end_day = sessions[start_index], sessions[end_index]
-            start = price.get((instrument_id, start_day))
-            end = price.get((instrument_id, end_day))
-            open_price = None if start is None else start[0]
-            close_price = None if end is None else end[1]
-            valid = (
-                isinstance(open_price, (int, float))
-                and isinstance(close_price, (int, float))
-                and open_price > 0
-                and close_price > 0
-                and (
-                    tradable_keys is None or (instrument_id, start_day) in tradable_keys
-                )
+        boundaries = session_frame.with_columns(
+            pl.col("signal_date").shift(-1).alias("return_start"),
+            pl.col("signal_date").shift(-horizon).alias("return_end"),
+        )
+        joined = (
+            eligible_rows.join(boundaries, on="signal_date", how="left")
+            .join(entry_prices, on=["instrument_id", "return_start"], how="left")
+            .join(exit_prices, on=["instrument_id", "return_end"], how="left")
+        )
+        if tradable_entries is not None:
+            joined = joined.join(
+                tradable_entries,
+                on=["instrument_id", "return_start"],
+                how="left",
             )
-            value: float | None = None
-            if valid:
-                assert isinstance(open_price, (int, float))
-                assert isinstance(close_price, (int, float))
-                value = float(close_price / open_price - 1.0)
-            rows.append((signal_day, instrument_id, start_day, end_day, value))
-        output[horizon] = pl.DataFrame(
-            rows,
-            schema={
-                "signal_date": pl.Date,
-                "instrument_id": pl.String,
-                "return_start": pl.Date,
-                "return_end": pl.Date,
-                "future_return": pl.Float64,
-            },
-            orient="row",
-        ).sort("signal_date", "instrument_id")
+            entry_tradable = pl.col("_entry_tradable").fill_null(False)
+        else:
+            entry_tradable = pl.lit(True)
+        raw_return = pl.col("_exit_close") / pl.col("_entry_open") - 1.0
+        valid = (
+            pl.col("return_start").is_not_null()
+            & pl.col("return_end").is_not_null()
+            & pl.col("_entry_open").is_not_null()
+            & pl.col("_entry_open").is_finite()
+            & (pl.col("_entry_open") > 0.0)
+            & pl.col("_exit_close").is_not_null()
+            & pl.col("_exit_close").is_finite()
+            & (pl.col("_exit_close") > 0.0)
+            & raw_return.is_finite()
+            & entry_tradable
+        ).fill_null(False)
+        output[horizon] = (
+            joined.select(
+                "signal_date",
+                "instrument_id",
+                "return_start",
+                "return_end",
+                pl.when(valid)
+                .then(raw_return)
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .cast(pl.Float64)
+                .alias("future_return"),
+            )
+            .sort("signal_date", "instrument_id")
+        )
     return output
 
 

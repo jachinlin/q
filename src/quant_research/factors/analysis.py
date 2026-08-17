@@ -440,54 +440,55 @@ def assign_quantiles(factors: pl.DataFrame, quantiles: int) -> pl.DataFrame:
     if type(quantiles) is not int or quantiles < 2:
         raise ValueError("quantiles must be an integer of at least 2")
     _AnalysisSupport._unique(factors, "factors")
-    valid = _AnalysisSupport._valid_factors(factors)
-    rows = []
-    for signal_date in sorted(set(factors["signal_date"].to_list())):
-        ordered = valid.filter(pl.col("signal_date") == signal_date).sort(
-            "value", "instrument_id"
+    ordered = _AnalysisSupport._valid_factors(factors).sort(
+        "signal_date", "value", "instrument_id"
+    )
+    assigned = (
+        ordered.with_columns(
+            pl.int_range(0, pl.len(), dtype=pl.Int64)
+            .over("signal_date")
+            .alias("_row_index"),
+            pl.len().over("signal_date").cast(pl.Int64).alias("_row_count"),
         )
-        count = ordered.height
-        bucket_counts = [0] * quantiles
-        for index, row in enumerate(ordered.to_dicts()):
-            bucket = index * quantiles // count + 1
-            bucket_counts[bucket - 1] += 1
-            rows.append(
-                (
-                    row["signal_date"],
-                    row["instrument_id"],
-                    row["value"],
-                    bucket,
-                    quantiles,
-                    1,
-                    False,
-                )
+        .select(
+            "signal_date",
+            "instrument_id",
+            pl.col("value").cast(pl.Float64),
+            (
+                (pl.col("_row_index") * quantiles) // pl.col("_row_count") + 1
             )
-        for bucket, bucket_count in enumerate(bucket_counts, start=1):
-            if bucket_count == 0:
-                rows.append(
-                    (
-                        signal_date,
-                        None,
-                        None,
-                        bucket,
-                        quantiles,
-                        0,
-                        True,
-                    )
-                )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "signal_date": pl.Date,
-            "instrument_id": pl.String,
-            "value": pl.Float64,
-            "quantile": pl.Int64,
-            "quantiles": pl.Int64,
-            "bucket_count": pl.Int64,
-            "is_empty": pl.Boolean,
-        },
-        orient="row",
-    ).sort("signal_date", "quantile", "instrument_id")
+            .cast(pl.Int64)
+            .alias("quantile"),
+            pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
+            pl.lit(1, dtype=pl.Int64).alias("bucket_count"),
+            pl.lit(False).alias("is_empty"),
+        )
+    )
+    domain = factors.select("signal_date").unique().join(
+        pl.DataFrame(
+            {"quantile": pl.Series(range(1, quantiles + 1), dtype=pl.Int64)}
+        ),
+        how="cross",
+    )
+    empty = (
+        domain.join(
+            assigned.select("signal_date", "quantile").unique(),
+            on=["signal_date", "quantile"],
+            how="anti",
+        )
+        .select(
+            "signal_date",
+            pl.lit(None, dtype=pl.String).alias("instrument_id"),
+            pl.lit(None, dtype=pl.Float64).alias("value"),
+            "quantile",
+            pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
+            pl.lit(0, dtype=pl.Int64).alias("bucket_count"),
+            pl.lit(True).alias("is_empty"),
+        )
+    )
+    return pl.concat([assigned, empty]).sort(
+        "signal_date", "quantile", "instrument_id"
+    )
 
 
 def quantile_future_returns(
