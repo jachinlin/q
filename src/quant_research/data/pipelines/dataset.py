@@ -8,15 +8,17 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
-from functools import partial
 from pathlib import Path
 from typing import Never, Protocol, cast
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
 import polars as pl
 
-from quant_research.data.catalog import DATASET_CATALOG, DatasetCatalog
+from quant_research.data.catalog import (
+    DATASET_CATALOG,
+    DatasetCatalog,
+    FetchPlan,
+)
 from quant_research.data.contracts import (
     CanonicalBatch,
     CanonicalMapper,
@@ -30,6 +32,10 @@ from quant_research.data.pipelines.curate import (
     CanonicalPartitionReplacement,
     CuratedPartitionStore,
 )
+from quant_research.data.pipelines.localize import (
+    LocalizePlanContext,
+    LocalizePlanExecutor,
+)
 from quant_research.data.quality.models import (
     QualityIssue,
     QualityRuleResult,
@@ -38,7 +44,6 @@ from quant_research.data.quality.models import (
 )
 from quant_research.data.quality.runner import QualityRunner
 from quant_research.data.routing import RoutingTable
-from quant_research.data.schemas import CANONICAL_SCHEMAS
 from quant_research.data.storage import DataRootExecutionLock
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
@@ -53,8 +58,6 @@ from quant_research.infrastructure.persistence.repositories import (
     RawPartitionSpec,
 )
 from quant_research.logging import StructuredLogger
-
-_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class DatasetSource(Protocol):
@@ -1009,6 +1012,8 @@ class DataPipeline:
         observer: PipelineObserver | None,
     ) -> LocalizeResult:
         progress = observer or _NullPipelineObserver()
+        spec = self._catalog[dataset]
+        is_financial_cell = spec.fetch_plan is FetchPlan.FINANCIAL_CELL
         source_name = self._routes.source_for(dataset)
         if source_name != self._source.provider:
             self._raise(
@@ -1094,6 +1099,17 @@ class DataPipeline:
             )
             return partition
 
+        def publish_fetched(batch: RawBatch) -> PublishedPartition:
+            nonlocal fetched
+            partition = publish_batch(
+                batch,
+                endpoint=batch.endpoint,
+                request=batch.request,
+            )
+            visible.append(partition)
+            fetched += 1
+            return partition
+
         def publish_or_reuse(
             endpoint: str,
             request: Mapping[str, JsonValue],
@@ -1112,7 +1128,7 @@ class DataPipeline:
                     request,
                     reject_filesystem=(
                         None
-                        if dataset is not DatasetKind.FINANCIAL_OBSERVATION
+                        if not is_financial_cell
                         else lambda partition: (
                             partition.row_count == 0
                             or not self._mapper.accepts_raw_schema(
@@ -1161,8 +1177,7 @@ class DataPipeline:
             try:
                 for batch in fetch():
                     if (
-                        dataset is DatasetKind.FINANCIAL_OBSERVATION
-                        and len(batch.rows) == 0
+                        is_financial_cell and len(batch.rows) == 0
                     ):
                         validate_batch(batch, endpoint=endpoint, request=request)
                         fetched += 1
@@ -1275,6 +1290,13 @@ class DataPipeline:
             )
             return tuple(pending)
 
+        def ensure_active() -> None:
+            if progress.is_cancelled():
+                raise DataPipelineCancelled("data pipeline cancellation requested")
+
+        def raise_source_contract(message: str) -> Never:
+            self._raise("DATA_SOURCE_CONTRACT", message)
+
         owns_source_session = not self._source_session_active
         if owns_source_session:
             self._localize_log(
@@ -1292,150 +1314,32 @@ class DataPipeline:
                 source=source_name,
             )
         try:
-            if dataset is DatasetKind.INSTRUMENT:
-                for batch in self._source.fetch_instruments():
-                    if progress.is_cancelled():
-                        raise DataPipelineCancelled(
-                            "data pipeline cancellation requested"
-                        )
-                    visible.append(
-                        publish_batch(
-                            batch,
-                            endpoint=batch.endpoint,
-                            request=batch.request,
-                        )
-                    )
-                    fetched += 1
-            elif dataset is DatasetKind.TRADE_CALENDAR:
-                request = self._source.trade_calendar_request(
-                    resolved_start, resolved_end
-                )
-                publish_or_reuse(
-                    "query_trade_dates",
-                    request,
-                    lambda: self._source.fetch_trade_calendar(
-                        resolved_start, resolved_end
+            LocalizePlanExecutor.execute(
+                spec.fetch_plan,
+                LocalizePlanContext(
+                    source=self._source,
+                    start=resolved_start,
+                    end=resolved_end,
+                    endpoints=tuple(
+                        endpoint.endpoint
+                        for endpoint in spec.source_endpoints[source_name]
                     ),
-                )
-            elif dataset is DatasetKind.INDEX_BAR:
-                units = tuple(
-                    ("query_history_k_data_plus", request)
-                    for request in self._source.index_bar_requests(
-                        resolved_start, resolved_end
-                    )
-                )
-                for endpoint, request, force_fetch in filter_completed_requests(
-                    units, plan="index_range"
-                ):
-                    publish_or_reuse(
-                        endpoint,
-                        request,
-                        partial(self._source.fetch_index_bars, request),
-                        force_fetch=force_fetch,
-                    )
-            elif dataset in {
-                DatasetKind.DAILY_BAR,
-                DatasetKind.DAILY_BASIC,
-                DatasetKind.SECURITY_STATUS,
-            }:
-                calendar_request = self._source.trade_calendar_request(
-                    resolved_start, resolved_end
-                )
-                calendar_partition = publish_or_reuse(
-                    "query_trade_dates",
-                    calendar_request,
-                    lambda: self._source.fetch_trade_calendar(
-                        resolved_start, resolved_end
-                    ),
-                )
-                if calendar_partition is None:
-                    self._raise(
-                        "DATA_SOURCE_CONTRACT", "trade calendar returned no batch"
-                    )
-                days = self._source.calendar_trading_days(
-                    calendar_partition, resolved_start, resolved_end
-                )
-                units = tuple(
-                    (
-                        "query_daily_history_k_AStock",
-                        self._source.daily_bars_request(day),
-                    )
-                    for day in days
-                )
-                for endpoint, request, force_fetch in filter_completed_requests(
-                    units, plan="daily_market"
-                ):
-                    day = date.fromisoformat(str(request["date"]))
-                    publish_or_reuse(
-                        endpoint,
-                        request,
-                        partial(self._source.fetch_daily_bars, day),
-                        force_fetch=force_fetch,
-                    )
-                if dataset in {
-                    DatasetKind.DAILY_BAR,
-                    DatasetKind.SECURITY_STATUS,
-                }:
-                    etf_units = tuple(
-                        ("query_etf_history_k_data_plus", request)
-                        for request in self._source.etf_bar_requests(
-                            resolved_start, resolved_end
-                        )
-                    )
-                    for endpoint, request, force_fetch in filter_completed_requests(
-                        etf_units, plan="etf_range"
-                    ):
+                    publish_batch=publish_fetched,
+                    publish_or_reuse=lambda endpoint, request, fetch, force: (
                         publish_or_reuse(
                             endpoint,
                             request,
-                            partial(self._source.fetch_etf_bars, request),
-                            force_fetch=force_fetch,
+                            fetch,
+                            force_fetch=force,
                         )
-            elif dataset is DatasetKind.FINANCIAL_OBSERVATION:
-                requests = self._source.financial_requests(resolved_start, resolved_end)
-                units = tuple(
-                    (str(request["endpoint"]), request) for request in requests
-                )
-                for endpoint, request, force_fetch in filter_completed_requests(
-                    units, plan="financial_cell"
-                ):
-                    publish_or_reuse(
-                        endpoint,
-                        request,
-                        partial(self._source.fetch_financials, request),
-                        force_fetch=force_fetch,
-                    )
-            elif dataset is DatasetKind.INDUSTRY_CLASSIFICATION:
-                calendar_request = self._source.trade_calendar_request(
-                    resolved_start, resolved_end
-                )
-                calendar_partition = publish_or_reuse(
-                    "query_trade_dates",
-                    calendar_request,
-                    lambda: self._source.fetch_trade_calendar(
-                        resolved_start, resolved_end
                     ),
-                )
-                if calendar_partition is None:
-                    self._raise(
-                        "DATA_SOURCE_CONTRACT", "trade calendar returned no batch"
-                    )
-                days = self._source.calendar_trading_days(
-                    calendar_partition, resolved_start, resolved_end
-                )
-                units = tuple(
-                    ("query_stock_industry", request)
-                    for request in self._source.industry_requests(days)
-                )
-                for endpoint, request, force_fetch in filter_completed_requests(
-                    units, plan="industry_as_of"
-                ):
-                    publish_or_reuse(
-                        endpoint,
-                        request,
-                        partial(self._source.fetch_industry, request),
-                        force_fetch=force_fetch,
-                    )
+                    filter_completed=lambda units, plan: filter_completed_requests(
+                        units, plan=plan
+                    ),
+                    ensure_active=ensure_active,
+                    raise_contract=raise_source_contract,
+                ),
+            )
         finally:
             if owns_source_session:
                 self._source_session_active = False
@@ -1480,7 +1384,7 @@ class DataPipeline:
         )
         localized_through = (
             resolved_end - timedelta(days=90)
-            if dataset is DatasetKind.TRADE_CALENDAR
+            if spec.fetch_plan is FetchPlan.TRADE_CALENDAR_RANGE
             else resolved_end
         )
         self._repository.record_dataset_stage(
@@ -1927,15 +1831,14 @@ class DataPipeline:
                     RawHeadIdentity.from_record(record) for record in ordered_records
                 ),
             )
-            if dataset is DatasetKind.INDUSTRY_CLASSIFICATION:
-                curate_now = self._now()
-                ordered_records = tuple(
-                    record
-                    for record in ordered_records
-                    if _DatasetPipelineSupport._industry_raw_is_complete(
-                        record, curate_now
-                    )
+            curate_now = self._now()
+            ordered_records = tuple(
+                record
+                for record in ordered_records
+                if self._mapper.raw_head_is_usable(
+                    dataset, record.request, curate_now
                 )
+            )
             records_by_dataset[dataset] = ordered_records
             accepts_raw_schema = getattr(self._mapper, "accepts_raw_schema", None)
             for record in ordered_records:
@@ -2034,7 +1937,7 @@ class DataPipeline:
             for partition_key in target_keys[dataset]:
                 for record in groups[dataset][partition_key]:
                     histories: tuple[RawPartitionRecord, ...] = (record,)
-                    if dataset is DatasetKind.FINANCIAL_OBSERVATION:
+                    if self._mapper.requires_raw_history(dataset):
                         endpoint_key = record.source, record.endpoint
                         if endpoint_key not in raw_history:
                             by_request: dict[str, list[RawPartitionRecord]] = (
@@ -2160,32 +2063,11 @@ class DataPipeline:
                 continue
 
             replacements: list[CanonicalPartitionReplacement] = []
-            definition = CANONICAL_SCHEMAS[dataset]
             for partition_key in sorted(target_keys[dataset]):
                 if progress.is_cancelled():
                     raise DataPipelineCancelled("data pipeline cancellation requested")
                 pieces = frames[dataset].get(partition_key, [])
-                if not pieces:
-                    complete = pl.DataFrame(schema=definition.columns)
-                elif dataset is DatasetKind.FINANCIAL_OBSERVATION:
-                    complete = _DatasetPipelineSupport._financial_revision_frame(
-                        pl.concat(pieces, how="vertical"), definition.columns
-                    )
-                elif dataset is DatasetKind.INDUSTRY_CLASSIFICATION:
-                    complete = _DatasetPipelineSupport._industry_event_frame(
-                        pl.concat(pieces, how="vertical"), definition.columns
-                    )
-                else:
-                    complete = (
-                        pl.concat(pieces, how="vertical")
-                        .unique(
-                            subset=list(definition.primary_key),
-                            keep="last",
-                            maintain_order=True,
-                        )
-                        .sort(list(definition.sort_key))
-                        .cast(definition.columns)
-                    )
+                complete = self._mapper.consolidate_partition(dataset, pieces)
                 replacements.append(
                     CanonicalPartitionReplacement(
                         partition_key=partition_key,
@@ -2217,13 +2099,13 @@ class DataPipeline:
             else:
                 today = self._now().date()
                 resolved_start = resolved_end = today
-            replace_industry_window = (
-                dataset is DatasetKind.INDUSTRY_CLASSIFICATION
+            replace_explicit_window = (
+                self._catalog[dataset].replace_explicit_full_window
                 and full
                 and start is not None
                 and end is not None
             )
-            if current is not None and not replace_industry_window:
+            if current is not None and not replace_explicit_window:
                 if current.start_date is not None:
                     resolved_start = min(resolved_start, current.start_date)
                 if current.end_date is not None:
@@ -2765,83 +2647,6 @@ class _DatasetPipelineSupport:
         record: RawPartitionRecord,
     ) -> tuple[str, str, str, str]:
         return record.source, record.endpoint, record.request_hash, record.content_hash
-
-    @staticmethod
-    def _financial_revision_frame(
-        frame: pl.DataFrame, columns: pl.Schema
-    ) -> pl.DataFrame:
-        """Collapse identical captures and number successive financial states."""
-        base_key = ["instrument_id", "report_period", "metric"]
-        state_columns = [
-            "value",
-            "announced_at",
-            "source",
-            "available_at",
-            "availability_source",
-            "pit_usable",
-        ]
-        ordered = frame.with_row_index("_input_order").sort(
-            [*base_key, "ingested_at", "_input_order"]
-        )
-        state_changed = pl.any_horizontal(
-            pl.col(name).ne_missing(pl.col(name).shift().over(base_key))
-            for name in state_columns
-        )
-        return (
-            ordered.filter(state_changed)
-            .with_columns(
-                (pl.col("ingested_at").cum_count().over(base_key) - 1)
-                .cast(pl.Int64)
-                .alias("revision")
-            )
-            .drop("_input_order")
-            .sort([*base_key, "revision"])
-            .cast(columns)
-        )
-
-    @staticmethod
-    def _industry_raw_is_complete(record: RawPartitionRecord, now: datetime) -> bool:
-        """仅让已完整结束日期的行业 Raw 当前头参与 Curate。"""
-        value = record.request.get("as_of", record.request.get("date"))
-        if not isinstance(value, str):
-            raise TypeError("industry Raw request requires an as_of date")
-        as_of_date = date.fromisoformat(value)
-        local_now = now.astimezone(_SHANGHAI)
-        latest_possible_date = local_now.date()
-        if local_now.hour < 18:
-            latest_possible_date -= timedelta(days=1)
-        return as_of_date <= latest_possible_date
-
-    @staticmethod
-    def _industry_event_frame(frame: pl.DataFrame, columns: pl.Schema) -> pl.DataFrame:
-        """将逐交易日行业快照压缩为年度基线与状态变化事件。"""
-        ordered = frame.cast(columns).sort(
-            ["as_of_date", "instrument_id", "taxonomy", "ingested_at"]
-        )
-        events: list[dict[str, object | None]] = []
-        states: dict[tuple[str, str], tuple[str | None, str | None, bool]] = {}
-        active_year: int | None = None
-        baseline_date: date | None = None
-        for row in ordered.iter_rows(named=True):
-            as_of_date = cast(date, row["as_of_date"])
-            if active_year != as_of_date.year:
-                active_year = as_of_date.year
-                baseline_date = as_of_date
-                states.clear()
-            key = (cast(str, row["instrument_id"]), cast(str, row["taxonomy"]))
-            state = (
-                cast(str | None, row["industry_code"]),
-                cast(str | None, row["industry_name"]),
-                cast(bool, row["is_classified"]),
-            )
-            if as_of_date == baseline_date or states.get(key) != state:
-                events.append(row)
-            states[key] = state
-        if not events:
-            return pl.DataFrame(schema=columns)
-        return pl.DataFrame(events, schema=columns).sort(
-            ["as_of_date", "instrument_id", "taxonomy"]
-        )
 
     @staticmethod
     def _curate_input_hash(

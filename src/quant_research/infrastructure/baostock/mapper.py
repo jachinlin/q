@@ -6,7 +6,7 @@ import hashlib
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Never, cast
 from zoneinfo import ZoneInfo
@@ -172,6 +172,70 @@ class BaoStockMapper:
         return ("all",)
 
     @staticmethod
+    def raw_head_is_usable(
+        dataset: DatasetKind,
+        request: Mapping[str, JsonValue],
+        observed_at: datetime,
+    ) -> bool:
+        """判断 Raw 当前头在本次 Curate 时点是否已经完整可用。
+
+        入参：目标数据集、规范化 Raw 请求和本次 Curate 观察时点。
+        返回值：普通数据集恒为 ``True``；行业快照日期完整结束后为 ``True``。
+        异常：行业请求缺少合法时点时传播 ``TypeError`` 或 ``ValueError``。
+        """
+        if dataset is not DatasetKind.INDUSTRY_CLASSIFICATION:
+            return True
+        value = request.get("as_of", request.get("date"))
+        if not isinstance(value, str):
+            raise TypeError("industry Raw request requires an as_of date")
+        as_of_date = date.fromisoformat(value)
+        local_now = observed_at.astimezone(_SHANGHAI)
+        latest_possible_date = local_now.date()
+        if local_now.hour < 18:
+            latest_possible_date -= timedelta(days=1)
+        return as_of_date <= latest_possible_date
+
+    @staticmethod
+    def requires_raw_history(dataset: DatasetKind) -> bool:
+        """判断重建分区时是否需要读取同一请求的历史 Raw 对象。
+
+        入参：目标数据集。返回值：财务观测返回 ``True``，其余返回 ``False``。异常：无。
+        """
+        return dataset is DatasetKind.FINANCIAL_OBSERVATION
+
+    @staticmethod
+    def consolidate_partition(
+        dataset: DatasetKind, frames: Sequence[pl.DataFrame]
+    ) -> pl.DataFrame:
+        """把映射片段折叠为符合目标 Schema 的最终 Canonical 分区。
+
+        入参：目标数据集与按 Raw 身份稳定排序的映射片段。
+        返回值：完成去重、修订编号或行业事件压缩的数据帧。
+        异常：输入字段或类型不满足目标契约时传播 Polars 异常。
+        """
+        definition = CANONICAL_SCHEMAS[dataset]
+        if not frames:
+            return pl.DataFrame(schema=definition.columns)
+        combined = pl.concat(frames, how="vertical")
+        if dataset is DatasetKind.FINANCIAL_OBSERVATION:
+            return _BaoStockMappingSupport._financial_revision_frame(
+                combined, definition.columns
+            )
+        if dataset is DatasetKind.INDUSTRY_CLASSIFICATION:
+            return _BaoStockMappingSupport._industry_event_frame(
+                combined, definition.columns
+            )
+        return (
+            combined.unique(
+                subset=list(definition.primary_key),
+                keep="last",
+                maintain_order=True,
+            )
+            .sort(list(definition.sort_key))
+            .cast(definition.columns)
+        )
+
+    @staticmethod
     def transform_hash(dataset: DatasetKind) -> str:
         """返回映射代码与目标 Canonical 契约的确定性身份。
 
@@ -203,6 +267,70 @@ class BaoStockMapper:
 
 class _BaoStockMappingSupport:
     """集中承载 BaoStock 映射器内部、无独立公开语义的转换逻辑。"""
+
+    @staticmethod
+    def _financial_revision_frame(
+        frame: pl.DataFrame, columns: pl.Schema
+    ) -> pl.DataFrame:
+        """合并相同财务抓取状态并为连续修订编号。"""
+        base_key = ["instrument_id", "report_period", "metric"]
+        state_columns = [
+            "value",
+            "announced_at",
+            "source",
+            "available_at",
+            "availability_source",
+            "pit_usable",
+        ]
+        ordered = frame.with_row_index("_input_order").sort(
+            [*base_key, "ingested_at", "_input_order"]
+        )
+        state_changed = pl.any_horizontal(
+            pl.col(name).ne_missing(pl.col(name).shift().over(base_key))
+            for name in state_columns
+        )
+        return (
+            ordered.filter(state_changed)
+            .with_columns(
+                (pl.col("ingested_at").cum_count().over(base_key) - 1)
+                .cast(pl.Int64)
+                .alias("revision")
+            )
+            .drop("_input_order")
+            .sort([*base_key, "revision"])
+            .cast(columns)
+        )
+
+    @staticmethod
+    def _industry_event_frame(frame: pl.DataFrame, columns: pl.Schema) -> pl.DataFrame:
+        """将逐交易日行业快照压缩为年度基线与状态变化事件。"""
+        ordered = frame.cast(columns).sort(
+            ["as_of_date", "instrument_id", "taxonomy", "ingested_at"]
+        )
+        events: list[dict[str, object | None]] = []
+        states: dict[tuple[str, str], tuple[str | None, str | None, bool]] = {}
+        active_year: int | None = None
+        baseline_date: date | None = None
+        for row in ordered.iter_rows(named=True):
+            as_of_date = cast(date, row["as_of_date"])
+            if active_year != as_of_date.year:
+                active_year = as_of_date.year
+                baseline_date = as_of_date
+                states.clear()
+            key = (cast(str, row["instrument_id"]), cast(str, row["taxonomy"]))
+            state = (
+                cast(str | None, row["industry_code"]),
+                cast(str | None, row["industry_name"]),
+                cast(bool, row["is_classified"]),
+            )
+            if as_of_date == baseline_date or states.get(key) != state:
+                events.append(row)
+            states[key] = state
+        if not events:
+            return pl.DataFrame(schema=columns)
+        return pl.DataFrame(events, schema=columns).sort(
+            ["as_of_date", "instrument_id", "taxonomy"]
+        )
 
     @staticmethod
     def _validated_table(

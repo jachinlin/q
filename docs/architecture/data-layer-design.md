@@ -180,6 +180,11 @@ BaoStock 默认采集国证A指、上证50、沪深300、中证500和中证1000�
 
 Localize 只执行供应商 I/O，不读取或校验此前已完成请求对应的 Parquet 和 manifest。普通增量断点过滤会使用 SQLite 中的 `schema_fingerprint` 与当前端点契约做纯元数据比较；指纹匹配的当前头跳过网络访问，指纹不匹配的当前头视为未完成并重新抓取。显式 `--full` 则绕过兼容当前头并重新请求解析窗口中的全部业务单元。财务数据唯一使用 BaoStock `query_dupont_data`，请求按证券生命周期过滤，只请求报告期末不早于上市日、且不晚于退市日的季度；不抓取 profit、cash-flow、operation、growth 或 balance 端点。每个实际处理的 Raw 操作最终只输出一条 `localize.raw_completed` 日志。
 
+`DatasetSpec.fetch_granularity` 继续描述供应商最小请求粒度；`fetch_plan` 则是 LOCALIZE
+执行分发键。`DataPipeline` 只从目录读取计划并委派给抓取计划注册表，不再按
+`DatasetKind` 展开抓取分支。日行情计划是否附加 ETF 区间抓取由数据集声明的供应端点
+决定；新增数据集必须在目录声明计划，并为新的计划类型注册独立执行器。
+
 Raw 文件布局：
 
 ```text
@@ -218,6 +223,11 @@ raw/source=<source>/endpoint=<endpoint>/<request_hash>/manifest.json
 ## 4. CURATE
 
 Curate 先使用 SQLite 中的 Raw 当前头元数据计算分区输入身份。输入未变化且当前 Canonical 文件存在的分区直接复用，不读取或校验 Raw Parquet；输入变化、文件丢失或显式请求 `--full` 的分区，使用该分区关联的全部 Raw 当前头从零重建。财务分区还会读取这些当前头所属请求的全部 Schema 兼容历史 Raw 对象，完全相同的连续观测合并，值或可用时间等业务状态发生变化时按抓取顺序追加 `revision`。重建结果写入内容寻址 Parquet并校验，最后在一个事务内确认 Raw 当前头未变化、切换数据集当前指针并更新增量检查点。
+
+`CanonicalMapper` 除 Raw 规范化和候选分区推导外，还负责数据集特化的 Curate 策略：
+判断 Raw 当前头是否已完整可用、声明是否需要同请求历史对象，以及把一个分区的映射
+片段折叠为最终 Canonical 数据帧。财务 revision 折叠和行业年度事件压缩均由 BaoStock
+mapper 实现；`DataPipeline` 只执行通用的输入快照、增量判断、发布和日志编排。
 
 各数据集的 Raw request 到 Canonical 分区映射如下：
 

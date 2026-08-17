@@ -280,6 +280,35 @@ class CanonicalMapper(Protocol):
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
 
+    def raw_head_is_usable(
+        self,
+        dataset: DatasetKind,
+        request: Mapping[str, JsonValue],
+        observed_at: datetime,
+    ) -> bool:
+        """判断 Raw 当前头在本次 Curate 时点是否已经完整可用。
+
+        入参：目标数据集、规范化 Raw 请求和本次 Curate 观察时点。
+        返回值：允许参与当前输入身份与映射时返回 ``True``。
+        异常：请求缺少策略所需字段或字段非法时传播 ``TypeError`` 或 ``ValueError``。
+        """
+
+    def requires_raw_history(self, dataset: DatasetKind) -> bool:
+        """判断重建分区时是否需要读取同一请求的历史 Raw 对象。
+
+        入参：目标数据集。返回值：需要历史观测时返回 ``True``。异常：无主动抛出的异常。
+        """
+
+    def consolidate_partition(
+        self, dataset: DatasetKind, frames: Sequence[pl.DataFrame]
+    ) -> pl.DataFrame:
+        """把一个 Canonical 分区的映射片段折叠为最终确定性数据帧。
+
+        入参：目标数据集和按 Raw 身份稳定排序的映射片段。
+        返回值：符合目标 Canonical Schema、主键和排序契约的数据帧。
+        异常：映射片段不满足数据集策略时传播 ``TypeError`` 或 ``ValueError``。
+        """
+
     def transform_hash(self, dataset: DatasetKind) -> str:
         """返回映射代码与目标 Canonical 契约的确定性身份。
 
@@ -397,6 +426,23 @@ class PipelineSource(Protocol):
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
 
+    def etf_bar_requests(
+        self, start: date, end: date
+    ) -> tuple[Mapping[str, JsonValue], ...]:
+        """构造配置中 ETF 白名单的确定性区间请求。
+
+        入参：日期闭区间。返回值：按稳定顺序返回 ETF 请求。异常：日期或配置非法时传播
+        ``ValueError``。
+        """
+
+    def fetch_etf_bars(
+        self, request: Mapping[str, JsonValue]
+    ) -> Iterable[RawBatch]:
+        """获取一个 ETF 区间的未复权 Raw 行情。
+
+        入参：规范化 ETF 请求。返回值：供应商 Raw 批次。异常：传播供应商边界异常。
+        """
+
     def benchmark_bars_request(self, trade_date: date) -> Mapping[str, JsonValue]:
         """构造单个开市日的基准指数行情请求。
 
@@ -417,6 +463,23 @@ class PipelineSource(Protocol):
             返回从供应商获取基准行情后的基准行情（``Iterable[RawBatch]``）。
         异常：
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+        """
+
+    def index_bar_requests(
+        self, start: date, end: date
+    ) -> tuple[Mapping[str, JsonValue], ...]:
+        """构造配置中指数的确定性区间请求。
+
+        入参：日期闭区间。返回值：按稳定顺序返回指数请求。异常：日期或配置非法时传播
+        ``ValueError``。
+        """
+
+    def fetch_index_bars(
+        self, request: Mapping[str, JsonValue]
+    ) -> Iterable[RawBatch]:
+        """获取一个指数区间的未复权 Raw 行情。
+
+        入参：规范化指数请求。返回值：供应商 Raw 批次。异常：传播供应商边界异常。
         """
 
     def financial_requests(

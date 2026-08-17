@@ -46,6 +46,20 @@ class FetchGranularity(StrEnum):
     INDEX_RANGE = "index_range"
 
 
+class FetchPlan(StrEnum):
+    """枚举 LOCALIZE 阶段的数据集抓取编排策略。
+
+    入参：按枚举值构造。返回值：返回枚举成员。异常：非法值抛出 ``ValueError``。
+    """
+
+    INSTRUMENT_SNAPSHOT = "instrument_snapshot"
+    TRADE_CALENDAR_RANGE = "trade_calendar_range"
+    DAILY_MARKET = "daily_market"
+    INDEX_RANGE = "index_range"
+    FINANCIAL_CELL = "financial_cell"
+    INDUSTRY_AS_OF = "industry_as_of"
+
+
 class UpdateCadence(StrEnum):
     """枚举数据集的计划更新频率。
 
@@ -151,11 +165,13 @@ class DatasetSpec:
         partitioning：构造对象所需的同名字段，约束见类型标注。
         pit_fields：构造对象所需的同名字段，约束见类型标注。
         fetch_granularity：构造对象所需的同名字段，约束见类型标注。
+        fetch_plan：LOCALIZE 阶段用于委派抓取编排的策略标识。
         cadence：构造对象所需的同名字段，约束见类型标注。
         reuse：构造对象所需的同名字段，约束见类型标注。
         overlap_days：构造对象所需的同名字段，约束见类型标注。
         source_endpoints：构造对象所需的同名字段，约束见类型标注。
         freshness：数据集的新鲜度判定策略。
+        replace_explicit_full_window：显式全量窗口是否替换而非扩展既有覆盖范围。
     返回值：
         构造并返回 ``DatasetSpec`` 实例。
     异常：
@@ -167,11 +183,13 @@ class DatasetSpec:
     partitioning: Partitioning
     pit_fields: tuple[str, ...]
     fetch_granularity: FetchGranularity
+    fetch_plan: FetchPlan
     cadence: UpdateCadence
     reuse: ReuseSemantics
     overlap_days: int
     source_endpoints: Mapping[str, tuple[EndpointMapping, ...]]
     freshness: FreshnessPolicy
+    replace_explicit_full_window: bool = False
 
     def __post_init__(self) -> None:
         if self.overlap_days < 0:
@@ -323,6 +341,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.YEAR,
             _AUDIT,
             FetchGranularity.TRADING_DAY,
+            FetchPlan.DAILY_MARKET,
             UpdateCadence.DAILY,
             ReuseSemantics.APPEND_ONLY,
             5,
@@ -372,6 +391,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.YEAR,
             _AUDIT,
             FetchGranularity.TRADING_DAY,
+            FetchPlan.DAILY_MARKET,
             UpdateCadence.DAILY,
             ReuseSemantics.APPEND_ONLY,
             5,
@@ -399,6 +419,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.YEAR,
             _AUDIT,
             FetchGranularity.TRADING_DAY,
+            FetchPlan.DAILY_MARKET,
             UpdateCadence.DAILY,
             ReuseSemantics.APPEND_ONLY,
             5,
@@ -434,6 +455,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.ALL,
             _AUDIT,
             FetchGranularity.DATE_RANGE,
+            FetchPlan.TRADE_CALENDAR_RANGE,
             UpdateCadence.DAILY,
             ReuseSemantics.APPEND_WITH_TAIL_REVISION,
             30,
@@ -456,6 +478,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.ALL,
             _AUDIT,
             FetchGranularity.FULL_SNAPSHOT,
+            FetchPlan.INSTRUMENT_SNAPSHOT,
             UpdateCadence.DAILY,
             ReuseSemantics.FULL_REFRESH,
             0,
@@ -482,6 +505,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.REPORT_YEAR,
             _AUDIT + ("announced_at",),
             FetchGranularity.FINANCIAL_CELL,
+            FetchPlan.FINANCIAL_CELL,
             UpdateCadence.WEEKLY,
             ReuseSemantics.APPEND_WITH_RESTATEMENT,
             370,
@@ -494,6 +518,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.YEAR,
             _AUDIT,
             FetchGranularity.TRADING_DAY,
+            FetchPlan.INDUSTRY_AS_OF,
             UpdateCadence.DAILY,
             ReuseSemantics.APPEND_WITH_RESTATEMENT,
             5,
@@ -511,6 +536,7 @@ DATASET_CATALOG = DatasetCatalog(
                 )
             },
             FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "as_of_date", 0),
+            True,
         ),
         DatasetSpec(
             DatasetKind.INDEX_BAR,
@@ -518,6 +544,7 @@ DATASET_CATALOG = DatasetCatalog(
             Partitioning.YEAR,
             _AUDIT,
             FetchGranularity.INDEX_RANGE,
+            FetchPlan.INDEX_RANGE,
             UpdateCadence.DAILY,
             ReuseSemantics.APPEND_ONLY,
             5,

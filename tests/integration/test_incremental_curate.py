@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -115,6 +115,22 @@ class _CountingMapper:
         self, dataset: DatasetKind, raw_partition: PublishedPartition
     ) -> tuple[str, ...]:
         return self.delegate.candidate_partition_keys(dataset, raw_partition)
+
+    def raw_head_is_usable(
+        self,
+        dataset: DatasetKind,
+        request: Mapping[str, JsonValue],
+        observed_at: datetime,
+    ) -> bool:
+        return self.delegate.raw_head_is_usable(dataset, request, observed_at)
+
+    def requires_raw_history(self, dataset: DatasetKind) -> bool:
+        return self.delegate.requires_raw_history(dataset)
+
+    def consolidate_partition(
+        self, dataset: DatasetKind, frames: Sequence[pl.DataFrame]
+    ) -> pl.DataFrame:
+        return self.delegate.consolidate_partition(dataset, frames)
 
     def transform_hash(self, dataset: DatasetKind) -> str:
         digest = hashlib.sha256()
