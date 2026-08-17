@@ -359,6 +359,32 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         return []
     issues: list[QualityIssue] = []
     traded = _QualityRuleSupport._traded_bar_rows(frame)
+    close = pl.col("close")
+    optional_price_invalid = pl.any_horizontal(
+        pl.col(column).is_not_null()
+        & (~pl.col(column).is_finite() | (pl.col(column) <= 0))
+        for column in ("open", "high", "low")
+    )
+    invalid_price = _QualityRuleSupport._count(
+        traded.filter(
+            close.is_null()
+            | ~close.is_finite()
+            | (close <= 0)
+            | optional_price_invalid
+        )
+    )
+    if invalid_price:
+        issues.append(
+            _QualityRuleSupport._issue(
+                "positive_finite_price",
+                Severity.SEVERE,
+                DatasetKind.DAILY_BAR,
+                actual=invalid_price,
+                threshold=0,
+                message="traded daily-bar prices must be finite and positive",
+                remediation="correct nonfinite or nonpositive OHLC source values",
+            )
+        )
     ohlc_invalid = _QualityRuleSupport._count(
         traded.filter(
             (pl.col("high") < pl.max_horizontal("open", "low", "close"))

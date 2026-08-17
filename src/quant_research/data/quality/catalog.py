@@ -97,6 +97,15 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(
+        "positive_finite_price",
+        "交易价格有限且为正",
+        "检查已交易日行情的开盘、最高、最低和收盘价格是否有限且严格大于零。",
+        "非法交易价格记录数为 0。",
+        Severity.SEVERE,
+        (DatasetKind.DAILY_BAR,),
+        prerequisite_rules=("canonical_schema", "required_dataset_empty"),
+    ),
+    QualityRuleDefinition(
         "ohlc_relationship",
         "OHLC 价格关系有效",
         "检查最高价和最低价是否包络开盘价与收盘价。",

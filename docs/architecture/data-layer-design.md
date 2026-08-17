@@ -301,6 +301,7 @@ Canonical 文件写入完成后，SQLite 事务会重新读取所选 endpoint �
 | `cross_partition_schema` | FATAL | 同一数据集不同分区的 Schema 不一致。 |
 | `primary_key_duplicate` | FATAL | Canonical 主键重复。 |
 | `required_value_null` | SEVERE | 必填值为空；`daily_basic.turnover` 在 `security_status.is_suspended=true` 的停牌日允许为空，非停牌或状态缺失时仍为错误。 |
+| `positive_finite_price` | SEVERE | 已交易日线的 open、high、low、close 必须有限且严格大于零。 |
 | `ohlc_relationship` | SEVERE | 最高价、最低价等 OHLC 关系不可能成立。 |
 | `negative_volume` | SEVERE | 已交易日线的成交量为负数。 |
 | `trading_day_coverage` | SEVERE | 日线在其最新可用日期以内缺少交易日历中的开市日期；交易日历的未来 90 日前瞻范围不要求存在日线。 |
