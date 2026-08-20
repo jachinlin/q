@@ -32,7 +32,7 @@ class RawPartitionStore:
     """以内容寻址 Parquet 和请求 manifest 原子发布 Raw 批次。
 
     入参：
-        raw_root：构造对象所需的同名字段，约束见类型标注。
+        raw_root：Raw 内容寻址对象和请求 manifest 所在的可信存储根目录。
     返回值：
         构造并返回 ``RawPartitionStore`` 实例。
     异常：

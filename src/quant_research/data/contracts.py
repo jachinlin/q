@@ -42,12 +42,12 @@ class ProviderCapabilities:
     """描述供应商能够可靠提供的数据能力。
 
     入参：
-        daily_bars：构造对象所需的同名字段，约束见类型标注。
-        trade_calendar：构造对象所需的同名字段，约束见类型标注。
-        instruments：需要读取或采集的证券标识集合。
-        security_status：构造对象所需的同名字段，约束见类型标注。
-        financials_with_announcement_date：构造对象所需的同名字段，约束见类型标注。
-        adjustment_factors：构造对象所需的同名字段，约束见类型标注。
+        daily_bars：是否能够提供证券日频价量行情。
+        trade_calendar：是否能够提供交易日历及开闭市状态。
+        instruments：是否能够提供证券主数据和上市状态。
+        security_status：是否能够提供停牌、ST 等逐日交易状态。
+        financials_with_announcement_date：是否能够提供带公告日期的财务数据。
+        adjustment_factors：是否能够提供复权因子或计算复权所需的等价数据。
     返回值：
         构造并返回 ``ProviderCapabilities`` 实例。
     异常：
@@ -108,9 +108,9 @@ class RawBatch:
         source：供应商标识。
         endpoint：供应商原生端点名称。
         request：包含完整业务字段的规范化供应商请求。
-        retrieved_at：构造对象所需的同名字段，约束见类型标注。
-        schema：构造对象所需的同名字段，约束见类型标注。
-        rows：构造对象所需的同名字段，约束见类型标注。
+        retrieved_at：供应商响应完成时的带时区时间，保存时统一转换为 UTC。
+        schema：供应商响应中字段的确定性顺序。
+        rows：与 ``schema`` 对应的供应商原始记录序列。
     返回值：
         构造并返回 ``RawBatch`` 实例。
     异常：
@@ -156,13 +156,13 @@ class PublishedPartition:
         source：供应商标识。
         endpoint：供应商原生端点名称。
         request：包含完整业务字段的规范化供应商请求。
-        retrieved_at：构造对象所需的同名字段，约束见类型标注。
-        data_path：构造对象所需的同名字段，约束见类型标注。
-        manifest_path：构造对象所需的同名字段，约束见类型标注。
-        request_hash：构造对象所需的同名字段，约束见类型标注。
-        content_hash：构造对象所需的同名字段，约束见类型标注。
-        schema_fingerprint：构造对象所需的同名字段，约束见类型标注。
-        row_count：构造对象所需的同名字段，约束见类型标注。
+        retrieved_at：该 Raw 响应从供应商取得的 UTC 时间。
+        data_path：可信 Raw 根目录内的内容寻址 Parquet 路径。
+        manifest_path：记录请求、内容身份和完整性元数据的 manifest 路径。
+        request_hash：规范化请求 JSON 的 SHA-256，用于请求级幂等定位。
+        content_hash：Raw 表逻辑内容的 SHA-256，用于内容寻址和完整性校验。
+        schema_fingerprint：Raw Arrow Schema 的稳定指纹。
+        row_count：已发布 Raw Parquet 的记录数。
     返回值：
         构造并返回 ``PublishedPartition`` 实例。
     异常：
@@ -188,7 +188,7 @@ class CanonicalBatch:
     入参：
         dataset：目标 Canonical 数据集标识。
         frame：待校验或转换的数据帧。
-        source_content_hashes：构造对象所需的同名字段，约束见类型标注。
+        source_content_hashes：生成该数据帧的 Raw 内容哈希，按确定性顺序保存。
     返回值：
         构造并返回 ``CanonicalBatch`` 实例。
     异常：

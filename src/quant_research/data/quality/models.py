@@ -101,14 +101,14 @@ class QualityIssue:
     """描述一个可执行修复的数据质量规则违例。
 
     入参：
-        rule_id：构造对象所需的同名字段，约束见类型标注。
-        severity：构造对象所需的同名字段，约束见类型标注。
+        rule_id：产生该问题的稳定质量规则标识。
+        severity：问题严重级别，用于决定是否阻断研究读取。
         dataset：目标 Canonical 数据集标识。
-        scope：构造对象所需的同名字段，约束见类型标注。
-        actual：构造对象所需的同名字段，约束见类型标注。
-        threshold：构造对象所需的同名字段，约束见类型标注。
-        message：构造对象所需的同名字段，约束见类型标注。
-        remediation：构造对象所需的同名字段，约束见类型标注。
+        scope：定位问题数据范围的确定性 JSON 对象，例如日期或证券集合。
+        actual：规则在该范围内观测到的实际值或统计证据。
+        threshold：规则用于判定通过与否的期望值或边界。
+        message：面向操作者的问题说明。
+        remediation：修复数据、配置或上游采集问题的建议。
     返回值：
         构造并返回 ``QualityIssue`` 实例。
     异常：
@@ -145,12 +145,12 @@ class QualityRunSpec:
     """绑定一个精确 Canonical 状态上的质量运行。
 
     入参：
-        dataset_hashes：构造对象所需的同名字段，约束见类型标注。
-        input_hash：构造对象所需的同名字段，约束见类型标注。
-        scope：构造对象所需的同名字段，约束见类型标注。
-        started_at：构造对象所需的同名字段，约束见类型标注。
-        completed_at：构造对象所需的同名字段，约束见类型标注。
-        issues：构造对象所需的同名字段，约束见类型标注。
+        dataset_hashes：本次运行绑定的数据集名称到当前内容哈希的映射。
+        input_hash：被校验 Canonical 状态的目录身份；全目录运行时即 ``catalog_hash``。
+        scope：质量运行范围，只允许 ``ALL`` 或 ``DATASET``。
+        started_at：质量规则开始执行的带时区时间。
+        completed_at：全部规则完成的带时区时间；运行中为 ``None``。
+        issues：由失败规则生成、需要处置的数据质量问题集合。
     返回值：
         构造并返回 ``QualityRunSpec`` 实例。
     异常：

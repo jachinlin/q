@@ -137,8 +137,8 @@ class EndpointMapping:
 
     入参：
         endpoint：供应商原生端点名称。
-        field_map：构造对象所需的同名字段，约束见类型标注。
-        fan_out：构造对象所需的同名字段，约束见类型标注。
+        field_map：供应商原生字段名到 Canonical 字段名的映射。
+        fan_out：同一 Raw 响应能够同时生成的 Canonical 数据集集合。
     返回值：
         构造并返回 ``EndpointMapping`` 实例。
     异常：
@@ -161,15 +161,15 @@ class DatasetSpec:
 
     入参：
         kind：Canonical 数据集枚举值。
-        schema：构造对象所需的同名字段，约束见类型标注。
-        partitioning：构造对象所需的同名字段，约束见类型标注。
-        pit_fields：构造对象所需的同名字段，约束见类型标注。
-        fetch_granularity：构造对象所需的同名字段，约束见类型标注。
+        schema：数据集必须满足的列、类型、主键和排序键契约。
+        partitioning：Canonical 文件采用的物理分区方式。
+        pit_fields：研究读取和质量校验依赖的 PIT 审计字段。
+        fetch_granularity：供应商请求能够独立执行和复用的最小粒度。
         fetch_plan：LOCALIZE 阶段用于委派抓取编排的策略标识。
-        cadence：构造对象所需的同名字段，约束见类型标注。
-        reuse：构造对象所需的同名字段，约束见类型标注。
-        overlap_days：构造对象所需的同名字段，约束见类型标注。
-        source_endpoints：构造对象所需的同名字段，约束见类型标注。
+        cadence：计划器期望的数据集刷新频率。
+        reuse：CURATE 判断历史数据追加、尾部修订或全量刷新的语义。
+        overlap_days：增量抓取时向当前水位之前回看的自然日数。
+        source_endpoints：按供应商标识组织的可用端点及字段映射。
         freshness：数据集的新鲜度判定策略。
         replace_explicit_full_window：显式全量窗口是否替换而非扩展既有覆盖范围。
     返回值：

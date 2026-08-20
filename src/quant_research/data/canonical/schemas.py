@@ -15,9 +15,9 @@ class CanonicalSchema:
     """描述一个 Canonical 数据集的物理列、主键与排序键。
 
     入参：
-        columns：构造对象所需的同名字段，约束见类型标注。
-        primary_key：构造对象所需的同名字段，约束见类型标注。
-        sort_key：构造对象所需的同名字段，约束见类型标注。
+        columns：Canonical Parquet 必须具有的列名及 Polars 数据类型。
+        primary_key：用于唯一性校验和去重的业务键列。
+        sort_key：发布前用于形成确定性行顺序的列。
     返回值：
         构造并返回 ``CanonicalSchema`` 实例。
     异常：

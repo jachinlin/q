@@ -44,8 +44,8 @@ class CuratedResult:
     """描述一次 Canonical 分区发布的内容身份与物理结果。
 
     入参：
-        datasets：构造对象所需的同名字段，约束见类型标注。
-        frames：构造对象所需的同名字段，约束见类型标注。
+        datasets：按数据集名称索引的已发布 Canonical 元数据记录。
+        frames：按数据集索引、用于本次发布或后续校验的延迟数据帧集合。
     返回值：
         构造并返回 ``CuratedResult`` 实例。
     异常：
@@ -61,11 +61,11 @@ class CanonicalPartitionReplacement:
     """描述要在同一事务中替换的完整 Canonical 分区。
 
     入参：
-        partition_key：构造对象所需的同名字段，约束见类型标注。
+        partition_key：目标物理分区键，例如 ``year=2026`` 或 ``all``。
         frame：待校验或转换的数据帧。
-        input_hash：构造对象所需的同名字段，约束见类型标注。
-        raw_input_count：构造对象所需的同名字段，约束见类型标注。
-        rebuild_reason：构造对象所需的同名字段，约束见类型标注。
+        input_hash：绑定转换身份和全部 Raw 输入身份的分区生产输入哈希。
+        raw_input_count：参与该分区转换的当前 Raw 输入数量。
+        rebuild_reason：触发替换的稳定原因码，例如输入变化或文件缺失。
     返回值：
         构造并返回 ``CanonicalPartitionReplacement`` 实例。
     异常：

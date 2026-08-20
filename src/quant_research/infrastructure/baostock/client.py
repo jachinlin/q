@@ -131,8 +131,8 @@ class BaoStockResponse(Protocol):
     """约束 BaoStock SDK 响应共享的状态字段。
 
     入参：
-        error_code：构造对象所需的同名字段，约束见类型标注。
-        error_msg：构造对象所需的同名字段，约束见类型标注。
+        error_code：BaoStock 返回的状态码；``0`` 表示调用成功。
+        error_msg：供应商对当前状态码给出的诊断文本。
     返回值：
         构造并返回 ``BaoStockResponse`` 实例。
     异常：
@@ -343,7 +343,7 @@ class BaoStockSdkGateway:
     """隔离真实 BaoStock SDK 导入并转发供应商调用。
 
     入参：
-        sdk：构造对象所需的同名字段，约束见类型标注。
+        sdk：实现 BaoStock SDK 调用面的可选模块或测试替身；为空时延迟导入真实 SDK。
     返回值：
         构造并返回 ``BaoStockSdkGateway`` 实例。
     异常：
@@ -484,9 +484,9 @@ class InstrumentListing:
 
     入参：
         instrument_id：供应商无关的证券标识。
-        list_date：构造对象所需的同名字段，约束见类型标注。
-        delist_date：构造对象所需的同名字段，约束见类型标注。
-        provider_type：构造对象所需的同名字段，约束见类型标注。
+        list_date：证券首次上市交易日期。
+        delist_date：证券退市日期；仍在可用历史目录中时可以为空。
+        provider_type：BaoStock 使用的证券类型代码，用于选择历史采集范围。
     返回值：
         构造并返回 ``InstrumentListing`` 实例。
     异常：
@@ -527,7 +527,7 @@ class BaoStockHistoricalCatalog:
     """从不可变 Raw 行重建可复用的历史证券目录。
 
     入参：
-        listings：构造对象所需的同名字段，约束见类型标注。
+        listings：从证券主数据 Raw 证据恢复并按证券标识排序的完整上市区间。
     返回值：
         构造并返回 ``BaoStockHistoricalCatalog`` 实例。
     异常：
@@ -593,12 +593,12 @@ class BaoStockConfig:
     """保存显式的 BaoStock 采集上限与重试策略。
 
     入参：
-        max_instruments_per_batch：构造对象所需的同名字段，约束见类型标注。
-        max_days_per_batch：构造对象所需的同名字段，约束见类型标注。
-        max_attempts：构造对象所需的同名字段，约束见类型标注。
-        retry_backoff_seconds：构造对象所需的同名字段，约束见类型标注。
-        retryable_error_codes：构造对象所需的同名字段，约束见类型标注。
-        index_codes：构造对象所需的同名字段，约束见类型标注。
+        max_instruments_per_batch：一次批量计划允许包含的最大证券数量。
+        max_days_per_batch：一个区间行情请求允许覆盖的最大自然日数。
+        max_attempts：单次供应商请求包含首次调用在内的最大尝试次数。
+        retry_backoff_seconds：各次重试前依次采用的等待秒数。
+        retryable_error_codes：允许按退避策略重试的 BaoStock 状态码集合。
+        index_codes：需要采集区间行情的指数供应商代码白名单。
         etf_codes：需要补充采集日线的 ETF 供应商代码白名单。
     返回值：
         构造并返回 ``BaoStockConfig`` 实例。
@@ -724,12 +724,12 @@ class BaoStockClient:
     """将 BaoStock 响应采集为确定性的供应商原生 Raw 批次。
 
     入参：
-        gateway：构造对象所需的同名字段，约束见类型标注。
-        catalog：构造对象所需的同名字段，约束见类型标注。
-        config：构造对象所需的同名字段，约束见类型标注。
-        clock：构造对象所需的同名字段，约束见类型标注。
-        sleep：构造对象所需的同名字段，约束见类型标注。
-        logger：构造对象所需的同名字段，约束见类型标注。
+        gateway：隔离 BaoStock SDK 调用和响应类型的供应商网关。
+        catalog：独立于当前上市状态的历史证券目录；首次建库时可以为空。
+        config：批次上限、重试策略及指数和 ETF 白名单。
+        clock：为 Raw 批次生成带时区抓取时间的可注入时钟。
+        sleep：执行请求退避等待的可注入函数，测试可替换为无等待实现。
+        logger：记录请求、供应商响应和重试证据的结构化日志器。
     返回值：
         构造并返回 ``BaoStockClient`` 实例。
     异常：
@@ -1908,9 +1908,9 @@ class BaoStockCalendarPolicy:
     """基于供应商交易日历证据解析准确的采集窗口。
 
     入参：
-        client：构造对象所需的同名字段，约束见类型标注。
-        clock：构造对象所需的同名字段，约束见类型标注。
-        completion_hour：构造对象所需的同名字段，约束见类型标注。
+        client：用于读取 BaoStock 交易日历证据的数据源客户端。
+        clock：提供当前带时区时间、支持确定性测试的可注入时钟。
+        completion_hour：上海时区中当日行情被视为完整可采集的小时边界。
     返回值：
         构造并返回 ``BaoStockCalendarPolicy`` 实例。
     异常：

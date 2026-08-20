@@ -15,7 +15,7 @@ class Route:
     """描述一个数据集到供应商及端点集合的静态路由。
 
     入参：
-        priority：构造对象所需的同名字段，约束见类型标注。
+        priority：供应商选择顺序，正整数越小越优先。
         source：供应商标识。
     返回值：
         构造并返回 ``Route`` 实例。
@@ -35,8 +35,8 @@ class RoutingTable(Mapping[DatasetKind, tuple[Route, ...]]):
     """保存覆盖全部数据集的不可变路由表。
 
     入参：
-        routes：构造对象所需的同名字段，约束见类型标注。
-        catalog：构造对象所需的同名字段，约束见类型标注。
+        routes：每个 Canonical 数据集对应的候选供应商路由集合。
+        catalog：用于校验数据集覆盖和供应商能力的可执行数据目录。
     返回值：
         构造并返回 ``RoutingTable`` 实例。
     异常：

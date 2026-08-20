@@ -373,9 +373,9 @@ class LocalizeResult:
 
     入参：
         dataset：目标 Canonical 数据集标识。
-        fetched：构造对象所需的同名字段，约束见类型标注。
-        skipped：构造对象所需的同名字段，约束见类型标注。
-        raw_partitions：构造对象所需的同名字段，约束见类型标注。
+        fetched：实际访问供应商并发布的新 Raw 请求数量。
+        skipped：因已有可复用 Raw 当前头而未重新抓取的请求数量。
+        raw_partitions：本次窗口解析并确认可用的 Raw 请求总数。
     返回值：
         构造并返回 ``LocalizeResult`` 实例。
     异常：
@@ -394,12 +394,12 @@ class DatasetCurateResult:
 
     入参：
         dataset：目标 Canonical 数据集标识。
-        content_hash：构造对象所需的同名字段，约束见类型标注。
-        partitions：构造对象所需的同名字段，约束见类型标注。
-        rows：构造对象所需的同名字段，约束见类型标注。
-        rebuilt_partitions：构造对象所需的同名字段，约束见类型标注。
-        reused_partitions：构造对象所需的同名字段，约束见类型标注。
-        raw_inputs_read：构造对象所需的同名字段，约束见类型标注。
+        content_hash：发布后整个 Canonical 数据集当前状态的内容哈希。
+        partitions：发布后数据集包含的当前物理分区数量。
+        rows：发布后全部当前分区的记录数合计。
+        rebuilt_partitions：因输入、转换身份或文件状态变化而重新生成的分区数。
+        reused_partitions：输入身份未变且通过文件校验而直接复用的分区数。
+        raw_inputs_read：为重建目标分区实际读取的唯一 Raw 对象数。
     返回值：
         构造并返回 ``DatasetCurateResult`` 实例。
     异常：
@@ -420,9 +420,9 @@ class PipelineResult:
     """汇总一次完整数据流水线运行的阶段结果。
 
     入参：
-        run_id：构造对象所需的同名字段，约束见类型标注。
-        quality_run_id：构造对象所需的同名字段，约束见类型标注。
-        data_hash：构造对象所需的同名字段，约束见类型标注。
+        run_id：本次 LOCALIZE、CURATE、VALIDATE 编排运行的唯一标识。
+        quality_run_id：最终全目录质量运行的持久化标识。
+        data_hash：质量门通过时对应的 Canonical 全目录身份。
     返回值：
         构造并返回 ``PipelineResult`` 实例。
     异常：
@@ -905,18 +905,18 @@ class DataPipeline:
     """编排可独立恢复的 LOCALIZE、CURATE 与 VALIDATE 阶段。
 
     入参：
-        source：供应商标识。
-        mapper：构造对象所需的同名字段，约束见类型标注。
-        calendar：构造对象所需的同名字段，约束见类型标注。
-        raw_store：构造对象所需的同名字段，约束见类型标注。
-        curated_store：构造对象所需的同名字段，约束见类型标注。
-        repository：构造对象所需的同名字段，约束见类型标注。
-        quality_runner：构造对象所需的同名字段，约束见类型标注。
-        catalog：构造对象所需的同名字段，约束见类型标注。
-        routes：构造对象所需的同名字段，约束见类型标注。
-        bootstrap_years：构造对象所需的同名字段，约束见类型标注。
-        clock：构造对象所需的同名字段，约束见类型标注。
-        logger：构造对象所需的同名字段，约束见类型标注。
+        source：负责供应商会话、请求构造和 Raw 批次抓取的数据源端口。
+        mapper：把已发布 Raw 分区规范化为 Canonical 批次的映射端口。
+        calendar：解析最新完整交易日、显式窗口和首次建库窗口的日历策略。
+        raw_store：原子发布并校验内容寻址 Raw Parquet 的存储服务。
+        curated_store：合并、发布并校验 Canonical 当前分区的存储服务。
+        repository：登记 Raw、Canonical、质量运行和目录状态的元数据端口。
+        quality_runner：对绑定的 Canonical 状态执行数据质量规则的运行器。
+        catalog：声明全部数据集 Schema、分区、抓取和复用语义的目录。
+        routes：为每个数据集选择已启用供应商的静态路由表。
+        bootstrap_years：无现有水位时首次更新向前覆盖的自然年数。
+        clock：生成带时区当前时间的可注入时钟。
+        logger：记录各阶段请求、输入身份和发布结果的结构化日志器。
     返回值：
         构造并返回 ``DataPipeline`` 实例。
     异常：
