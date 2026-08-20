@@ -389,7 +389,7 @@ class QualityRunRequest(DashboardModel):
 
 
 class FreshnessResponse(DashboardModel):
-    """表示单个数据集的新鲜度判断及其水位证据。
+    """表示单个数据集的新鲜度判断及其水位或披露触发证据。
 
     入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
     """
@@ -400,6 +400,8 @@ class FreshnessResponse(DashboardModel):
     lag_days: int | None
     evaluated_at: str
     reason: str
+    trigger_date: str | None
+    update_required: bool | None
 
 
 class OperationalStateResponse(DashboardModel):

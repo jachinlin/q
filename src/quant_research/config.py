@@ -16,7 +16,6 @@ class Settings(BaseSettings):
         timezone：解析自然日边界和展示本地时间时使用的 IANA 时区。
         data_root：所有派生路径必须位于其中的数据可信根目录。
         max_partition_size：限制资源使用、数量或等待时间的上限分区字节数。
-        bootstrap_years：首次建立本地数据基线时向前回溯的完整自然年数。
     返回值：
         返回完成字段规范化和不变量校验的对象。
     异常：
@@ -29,7 +28,6 @@ class Settings(BaseSettings):
     timezone: ZoneInfo
     data_root: Path
     max_partition_size: int = 100
-    bootstrap_years: int = 20
 
     @field_validator("timezone", mode="before")
     @classmethod
@@ -64,22 +62,6 @@ class Settings(BaseSettings):
         """
         if type(value) is not int or value <= 0 or value > 100:
             raise ValueError("max_partition_size must be an integer from 1 through 100")
-        return value
-
-    @field_validator("bootstrap_years", mode="before")
-    @classmethod
-    def validate_bootstrap_years(cls, value: object) -> int:
-        """校验``bootstrap``年数。
-
-        入参：
-            value：待校验或转换的值，类型为 ``object``。
-        返回值：
-            返回校验``bootstrap``年数后的``bootstrap``年数（``int``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
-        if type(value) is not int or value <= 0:
-            raise ValueError("bootstrap_years must be a positive integer")
         return value
 
     @property

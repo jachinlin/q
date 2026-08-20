@@ -1,3 +1,2 @@
 timezone: Asia/Shanghai
 max_partition_size: 100
-bootstrap_years: 2

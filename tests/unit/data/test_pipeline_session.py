@@ -132,24 +132,33 @@ def test_localize_all_opens_one_session_around_every_dataset(tmp_path: Path) -> 
     source = _Source()
     pipeline = _pipeline(source, tmp_path)
     observed: list[DatasetKind] = []
+    windows = tuple(
+        DataUpdateWindow(
+            dataset=dataset,
+            basis=DataUpdateWindowBasis.EXPLICIT,
+            start=date(2026, 8, 10),
+            end=date(2026, 8, 14),
+            overlap_days=0,
+        )
+        for dataset in sorted(BAOSTOCK_ROUTES, key=lambda item: item.value)
+    )
 
     def localized(
         instance: DataPipeline,
         dataset: DatasetKind,
         *,
-        start: date | None = None,
-        end: date | None = None,
-        full: bool = False,
+        start: date,
+        end: date,
         observer: object | None = None,
     ) -> LocalizeResult:
         assert observer is not None
         assert instance._source_session_active
-        assert start is None and end is None and full is False
+        assert start == date(2026, 8, 10) and end == date(2026, 8, 14)
         observed.append(dataset)
         return LocalizeResult(dataset, 0, 1, 1)
 
     with patch.object(DataPipeline, "localize", autospec=True, side_effect=localized):
-        results = pipeline.localize_all()
+        results = pipeline.localize_all(windows=windows)
 
     assert len(results) == len(observed) == 8
     assert source.login_calls == 1
@@ -161,34 +170,31 @@ def test_localize_plan_only_visits_the_frozen_dataset_subset(tmp_path: Path) -> 
     source = _Source()
     pipeline = _pipeline(source, tmp_path)
     plan = _partial_plan()
-    observed: list[tuple[DatasetKind, tuple[date, date] | None]] = []
+    observed: list[tuple[DatasetKind, date, date]] = []
 
     def localized(
         instance: DataPipeline,
         dataset: DatasetKind,
         *,
-        start: date | None = None,
-        end: date | None = None,
-        full: bool = False,
-        planned_window: tuple[date, date] | None = None,
+        start: date,
+        end: date,
         observer: object | None = None,
     ) -> LocalizeResult:
         assert observer is not None
         assert instance._source_session_active
-        assert start is None and end is None and full is False
-        observed.append((dataset, planned_window))
+        observed.append((dataset, start, end))
         return LocalizeResult(dataset, 0, 1, 1)
 
     with patch.object(DataPipeline, "localize", autospec=True, side_effect=localized):
-        results = pipeline.localize_all(plan=plan)
+        results = pipeline.localize_all(windows=plan.dataset_windows)
 
     assert tuple(item.dataset for item in results) == (
         DatasetKind.DAILY_BAR,
         DatasetKind.DAILY_BASIC,
     )
     assert observed == [
-        (DatasetKind.DAILY_BAR, (date(2026, 8, 10), date(2026, 8, 14))),
-        (DatasetKind.DAILY_BASIC, (date(2026, 8, 10), date(2026, 8, 14))),
+        (DatasetKind.DAILY_BAR, date(2026, 8, 10), date(2026, 8, 14)),
+        (DatasetKind.DAILY_BASIC, date(2026, 8, 10), date(2026, 8, 14)),
     ]
     assert source.login_calls == source.close_calls == 1
 
@@ -217,11 +223,12 @@ def test_execute_partial_plan_curates_selection_then_validates_full_catalog(
     ):
         result = pipeline.execute_update_plan(plan, observer=observer)
 
-    localize_all.assert_called_once_with(pipeline, plan=plan, observer=observer)
+    localize_all.assert_called_once_with(
+        pipeline, windows=plan.dataset_windows, observer=observer
+    )
     curate_many.assert_called_once_with(
         pipeline,
         (DatasetKind.DAILY_BAR, DatasetKind.DAILY_BASIC),
-        full=False,
         observer=observer,
     )
     validate.assert_called_once_with(pipeline)

@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Never, Protocol, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -19,6 +20,7 @@ from quant_research.data.catalog import (
     DATASET_CATALOG,
     DatasetCatalog,
     FetchPlan,
+    ReuseSemantics,
 )
 from quant_research.data.contracts import (
     CanonicalBatch,
@@ -42,6 +44,7 @@ from quant_research.data.quality.models import (
     thaw_json,
 )
 from quant_research.data.quality.runner import QualityRunner
+from quant_research.data.sources.financials import FinancialDisclosureSchedule
 from quant_research.data.sources.routing import RoutingTable
 from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.data.storage.paths import DataRootExecutionLock
@@ -51,6 +54,7 @@ from quant_research.domain.identifiers import QualityRunId
 from quant_research.infrastructure.persistence.repositories import (
     CanonicalDatasetRecord,
     CanonicalPartitionRecord,
+    DataInitializationStateRecord,
     MetadataRepository,
     RawHeadIdentity,
     RawHeadSnapshot,
@@ -267,11 +271,11 @@ class DatasetSource(Protocol):
     def financial_requests(
         self, start: date, end: date
     ) -> tuple[Mapping[str, JsonValue], ...]:
-        """构造已达到保守披露截止日的财务请求单元。
+        """为报告期末闭区间构造已越过披露截止日的财务请求单元。
 
         入参：
-            start：日期闭区间的开始日期。
-            end：日期闭区间的结束日期。
+            start：最早报告期末日。
+            end：最晚报告期末日。
         返回值：
             返回``requests``（``tuple[Mapping[str, JsonValue], ...]``）。
         异常：
@@ -443,13 +447,15 @@ class DataUpdateWindowBasis(StrEnum):
     EXPLICIT = "EXPLICIT"
     BOOTSTRAP = "BOOTSTRAP"
     INCREMENTAL = "INCREMENTAL"
+    SNAPSHOT_REFRESH = "SNAPSHOT_REFRESH"
+    DISCLOSURE_TRIGGER = "DISCLOSURE_TRIGGER"
 
 
 @dataclass(frozen=True, slots=True)
 class DataUpdateWindow:
     """保存一个数据集在一次更新任务中的确定执行窗口。
 
-    入参：数据集、依据、闭区间、重叠天数和可选当前水位。
+    入参：数据集、依据、闭区间、重叠天数、可选当前水位和披露触发日。
     返回值：构造不可变窗口。异常：字段非法时由解析或计划校验抛出。
     """
 
@@ -459,6 +465,32 @@ class DataUpdateWindow:
     end: date
     overlap_days: int
     current_watermark: date | None = None
+    trigger_date: date | None = None
+
+    def __post_init__(self) -> None:
+        if self.start > self.end:
+            raise ValueError("DATA_UPDATE dataset window start must not follow end")
+        if self.overlap_days < 0:
+            raise ValueError("DATA_UPDATE overlap_days must be non-negative")
+        if self.basis is DataUpdateWindowBasis.DISCLOSURE_TRIGGER:
+            if (
+                self.dataset is not DatasetKind.FINANCIAL_OBSERVATION
+                or self.current_watermark is not None
+                or self.overlap_days != 0
+                or self.trigger_date is None
+            ):
+                raise ValueError("financial disclosure window fields are inconsistent")
+        elif self.basis is DataUpdateWindowBasis.SNAPSHOT_REFRESH:
+            if (
+                self.dataset is not DatasetKind.INSTRUMENT
+                or self.current_watermark is not None
+                or self.overlap_days != 0
+                or self.trigger_date is not None
+                or self.start != self.end
+            ):
+                raise ValueError("instrument snapshot window fields are inconsistent")
+        elif self.trigger_date is not None:
+            raise ValueError("only disclosure windows may declare trigger_date")
 
     def to_payload(self) -> dict[str, JsonValue]:
         """返回可持久化参数；不适用的当前水位字段直接省略。
@@ -474,6 +506,8 @@ class DataUpdateWindow:
         }
         if self.current_watermark is not None:
             payload["current_watermark"] = self.current_watermark.isoformat()
+        if self.trigger_date is not None:
+            payload["trigger_date"] = self.trigger_date.isoformat()
         return payload
 
     @classmethod
@@ -484,7 +518,7 @@ class DataUpdateWindow:
         异常：字段、类型、日期或范围非法时抛出 ``TypeError`` 或 ``ValueError``。
         """
         expected = {"dataset", "basis", "start", "end", "overlap_days"}
-        optional = {"current_watermark"}
+        optional = {"current_watermark", "trigger_date"}
         if not expected.issubset(payload) or not set(payload).issubset(
             expected | optional
         ):
@@ -495,6 +529,7 @@ class DataUpdateWindow:
         end_value = payload["end"]
         overlap_days = payload["overlap_days"]
         watermark_value = payload.get("current_watermark")
+        trigger_value = payload.get("trigger_date")
         if not all(
             isinstance(value, str)
             for value in (dataset_value, basis_value, start_value, end_value)
@@ -504,6 +539,8 @@ class DataUpdateWindow:
             raise TypeError("DATA_UPDATE overlap_days must be a non-negative integer")
         if watermark_value is not None and not isinstance(watermark_value, str):
             raise TypeError("DATA_UPDATE current_watermark must be an ISO date string")
+        if trigger_value is not None and not isinstance(trigger_value, str):
+            raise TypeError("DATA_UPDATE trigger_date must be an ISO date string")
         window = cls(
             dataset=DatasetKind(cast(str, dataset_value)),
             basis=DataUpdateWindowBasis(cast(str, basis_value)),
@@ -513,10 +550,66 @@ class DataUpdateWindow:
             current_watermark=(
                 None if watermark_value is None else date.fromisoformat(watermark_value)
             ),
+            trigger_date=(
+                None if trigger_value is None else date.fromisoformat(trigger_value)
+            ),
         )
-        if window.start > window.end:
-            raise ValueError("DATA_UPDATE dataset window start must not follow end")
         return window
+
+
+@dataclass(frozen=True, slots=True)
+class DataUpdateSkip:
+    """记录自动计划中经业务规则判定为无需执行的数据集。
+
+    入参：
+        dataset：未生成执行窗口的数据集。
+        reason：稳定的跳过原因代码。
+        trigger_date：下一次披露判断所依据的截止日。
+    返回值：构造不可变的计划跳过证据。
+    异常：仅财务数据集可使用披露截止日跳过原因，否则抛出 ``ValueError``。
+    """
+
+    dataset: DatasetKind
+    reason: str
+    trigger_date: date
+
+    def __post_init__(self) -> None:
+        if (
+            self.dataset is not DatasetKind.FINANCIAL_OBSERVATION
+            or self.reason != "DISCLOSURE_DEADLINE_PENDING"
+        ):
+            raise ValueError("unsupported DATA_UPDATE skip decision")
+
+    def to_payload(self) -> dict[str, JsonValue]:
+        """返回 Dashboard 与任务审计共用的 JSON 跳过证据。
+
+        入参：无。
+        返回值：包含数据集、原因代码和披露截止日的 JSON 对象。
+        异常：实例已在构造时完成校验，不主动抛出异常。
+        """
+        return {
+            "dataset": self.dataset.value,
+            "reason": self.reason,
+            "trigger_date": self.trigger_date.isoformat(),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, JsonValue]) -> DataUpdateSkip:
+        """从计划 payload 恢复并校验跳过证据。
+
+        入参：仅包含数据集、原因代码和 ISO 截止日的映射。
+        返回值：不可变跳过证据。
+        异常：字段集合或字段类型非法时抛出 ``TypeError`` 或 ``ValueError``。
+        """
+        if set(payload) != {"dataset", "reason", "trigger_date"}:
+            raise ValueError("DATA_UPDATE skipped dataset fields are invalid")
+        if not all(isinstance(payload[key], str) for key in payload):
+            raise TypeError("DATA_UPDATE skipped dataset fields must be strings")
+        return cls(
+            dataset=DatasetKind(cast(str, payload["dataset"])),
+            reason=cast(str, payload["reason"]),
+            trigger_date=date.fromisoformat(cast(str, payload["trigger_date"])),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,20 +628,23 @@ class DataUpdatePlan:
     dataset_windows: tuple[DataUpdateWindow, ...]
     requested_start: date | None = None
     requested_end: date | None = None
+    skipped_datasets: tuple[DataUpdateSkip, ...] = ()
 
     def __post_init__(self) -> None:
         if self.planned_at.tzinfo is None or self.planned_at.utcoffset() is None:
             raise ValueError("DATA_UPDATE planned_at must include a timezone")
-        if self.window_mode not in {"AUTO_INCREMENTAL", "EXPLICIT"}:
+        if self.window_mode not in {"AUTO_INCREMENTAL", "EXPLICIT", "BOOTSTRAP"}:
             raise ValueError("DATA_UPDATE window_mode is invalid")
-        if not self.dataset_windows:
-            raise ValueError("DATA_UPDATE plan must contain dataset windows")
+        if not self.dataset_windows and not self.skipped_datasets:
+            raise ValueError("DATA_UPDATE plan must contain decisions")
         if (self.requested_start is None) != (self.requested_end is None):
             raise ValueError("DATA_UPDATE requested dates must be supplied together")
         if self.window_mode == "EXPLICIT" and self.requested_start is None:
             raise ValueError("explicit DATA_UPDATE plan requires requested dates")
         if self.window_mode == "AUTO_INCREMENTAL" and self.requested_start is not None:
             raise ValueError("automatic DATA_UPDATE plan must omit requested dates")
+        if self.window_mode == "BOOTSTRAP" and self.requested_start is None:
+            raise ValueError("bootstrap plan requires its frozen base dates")
         ordered = tuple(
             sorted(self.dataset_windows, key=lambda item: item.dataset.value)
         )
@@ -556,10 +652,22 @@ class DataUpdatePlan:
             raise ValueError("DATA_UPDATE dataset windows must use deterministic order")
         if len({item.dataset for item in ordered}) != len(ordered):
             raise ValueError("DATA_UPDATE dataset windows must be unique")
-        if self.start != min(item.start for item in ordered):
-            raise ValueError("DATA_UPDATE summary start does not match dataset windows")
-        if self.end != max(item.end for item in ordered):
-            raise ValueError("DATA_UPDATE summary end does not match dataset windows")
+        skipped = tuple(
+            sorted(self.skipped_datasets, key=lambda item: item.dataset.value)
+        )
+        if skipped != self.skipped_datasets:
+            raise ValueError("DATA_UPDATE skipped datasets must use deterministic order")
+        if len({item.dataset for item in skipped}) != len(skipped):
+            raise ValueError("DATA_UPDATE skipped datasets must be unique")
+        if {item.dataset for item in ordered} & {item.dataset for item in skipped}:
+            raise ValueError("DATA_UPDATE dataset decisions must not overlap")
+        if ordered:
+            if self.start != min(item.start for item in ordered):
+                raise ValueError("DATA_UPDATE summary start does not match dataset windows")
+            if self.end != max(item.end for item in ordered):
+                raise ValueError("DATA_UPDATE summary end does not match dataset windows")
+        elif self.start != self.end:
+            raise ValueError("no-op DATA_UPDATE plan must use a single summary date")
 
     @property
     def plan_hash(self) -> str:
@@ -579,6 +687,9 @@ class DataUpdatePlan:
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
             "dataset_windows": [item.to_payload() for item in self.dataset_windows],
+            "skipped_datasets": [
+                item.to_payload() for item in self.skipped_datasets
+            ],
         }
         if self.requested_start is not None and self.requested_end is not None:
             payload["requested_start"] = self.requested_start.isoformat()
@@ -608,6 +719,7 @@ class DataUpdatePlan:
             "start",
             "end",
             "dataset_windows",
+            "skipped_datasets",
             "plan_hash",
         }
         optional = {"requested_start", "requested_end"}
@@ -628,6 +740,16 @@ class DataUpdatePlan:
             ):
                 raise TypeError("DATA_UPDATE dataset window must be an object")
             windows.append(DataUpdateWindow.from_payload(item))
+        raw_skipped = payload["skipped_datasets"]
+        if not isinstance(raw_skipped, list):
+            raise TypeError("DATA_UPDATE skipped_datasets must be a list")
+        skipped: list[DataUpdateSkip] = []
+        for item in raw_skipped:
+            if not isinstance(item, dict) or not all(
+                isinstance(key, str) for key in item
+            ):
+                raise TypeError("DATA_UPDATE skipped dataset must be an object")
+            skipped.append(DataUpdateSkip.from_payload(item))
         requested_start_value = payload.get("requested_start")
         requested_end_value = payload.get("requested_end")
         if requested_start_value is not None and not isinstance(
@@ -652,6 +774,7 @@ class DataUpdatePlan:
                 if requested_end_value is None
                 else date.fromisoformat(requested_end_value)
             ),
+            skipped_datasets=tuple(skipped),
         )
         if payload["plan_hash"] != plan.plan_hash:
             raise ValueError("DATA_UPDATE plan hash does not match its content")
@@ -674,12 +797,20 @@ class DataUpdatePlanningRepository(Protocol):
         """
         ...
 
+    def find_data_initialization(self) -> DataInitializationStateRecord | None:
+        """读取首次初始化状态。
+
+        入参：无。返回值：冻结状态；尚未启动时返回空值。
+        异常：仓储读取异常保持原语义。
+        """
+        ...
+
 
 class DataUpdatePlanner:
     """根据供应商交易日历和 Canonical 水位生成确定性更新计划。
 
-    入参：日历策略、水位仓储、路由、目录、首次构建年数和可注入时钟。
-    返回值：构造计划器。异常：首次构建年数非法时抛出 ``ValueError``。
+    入参：日历策略、水位仓储、路由、目录和可注入时钟。
+    返回值：构造计划器。异常：目录或窗口非法时抛出 ``ValueError``。
     """
 
     def __init__(
@@ -689,18 +820,68 @@ class DataUpdatePlanner:
         repository: DataUpdatePlanningRepository,
         routes: RoutingTable,
         catalog: DatasetCatalog = DATASET_CATALOG,
-        bootstrap_years: int = 20,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        """保存规划依赖并校验首次构建年数。"""
-        if bootstrap_years <= 0:
-            raise ValueError("bootstrap_years must be positive")
+        """保存更新计划所需的只读依赖。"""
         self._calendar = calendar
         self._repository = repository
         self._routes = routes
         self._catalog = catalog
-        self._bootstrap_years = bootstrap_years
         self._clock = clock
+
+    def plan_bootstrap(
+        self,
+        years: int,
+        *,
+        frozen_window: tuple[date, date] | None = None,
+        frozen_planned_at: datetime | None = None,
+    ) -> DataUpdatePlan:
+        """按调用方明确给出的年数冻结首次初始化窗口。
+
+        入参：向前覆盖的正整数年数。返回值：全部可执行数据集的不可变窗口。
+        异常：年数、供应商日历或目录非法时传播对应异常。
+        """
+        if type(years) is not int or years <= 0:
+            raise ValueError("bootstrap years must be a positive integer")
+        planned_at = self._clock() if frozen_planned_at is None else frozen_planned_at
+        planning_date = planned_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        start, end = (
+            self._calendar.bootstrap_window(years)
+            if frozen_window is None
+            else frozen_window
+        )
+        windows: list[DataUpdateWindow] = []
+        for dataset in sorted(
+            (item for item in self._catalog if self._routes[item]),
+            key=lambda item: item.value,
+        ):
+            if dataset is DatasetKind.INSTRUMENT:
+                actual = (planning_date, planning_date)
+                basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
+            else:
+                actual = _DatasetPipelineSupport._calendar_horizon(
+                    dataset, (start, end)
+                )
+                basis = DataUpdateWindowBasis.BOOTSTRAP
+            windows.append(
+                DataUpdateWindow(
+                    dataset=dataset,
+                    basis=basis,
+                    start=actual[0],
+                    end=actual[1],
+                    overlap_days=0,
+                )
+            )
+        ordered = tuple(windows)
+        return DataUpdatePlan(
+            window_mode="BOOTSTRAP",
+            planned_at=planned_at,
+            start=min(item.start for item in ordered),
+            end=max(item.end for item in ordered),
+            dataset_windows=ordered,
+            requested_start=start,
+            requested_end=end,
+        )
 
     def plan(
         self,
@@ -716,6 +897,8 @@ class DataUpdatePlanner:
         返回值：包含所选数据集窗口的 ``DataUpdatePlan``。
         异常：日期、数据集、供应商日历或水位非法时传播对应异常。
         """
+        planned_at = self._clock()
+        planning_date = planned_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
         if (start is None) != (end is None):
             raise ValueError("start and end must be supplied together")
         executable = tuple(
@@ -724,6 +907,21 @@ class DataUpdatePlanner:
                 key=lambda item: item.value,
             )
         )
+        initialization = self._repository.find_data_initialization()
+        if initialization is not None and initialization.status != "COMPLETED":
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_UPDATE_REQUIRES_BOOTSTRAP",
+                    severity=Severity.SEVERE,
+                    message="data initialization has not completed",
+                    context={"frozen_years": initialization.years},
+                    remediation=(
+                        "retry quant data bootstrap --years "
+                        f"{initialization.years}"
+                    ),
+                    retryable=False,
+                )
+            )
         if datasets is None:
             selected = executable
         else:
@@ -739,49 +937,90 @@ class DataUpdatePlanner:
                 names = sorted(item.value for item in unsupported)
                 raise ValueError(f"DATA_UPDATE datasets are not executable: {names}")
             selected = tuple(sorted(requested, key=lambda item: item.value))
-        records = {
+        all_records = {
             dataset: self._repository.find_canonical_dataset(dataset)
-            for dataset in selected
+            for dataset in executable
         }
+        missing_baseline = tuple(
+            dataset.value
+            for dataset, record in all_records.items()
+            if record is None or record.end_date is None
+        )
+        if missing_baseline:
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_UPDATE_REQUIRES_BOOTSTRAP",
+                    severity=Severity.SEVERE,
+                    message="data update requires a complete canonical baseline",
+                    context={"missing_datasets": list(missing_baseline)},
+                    remediation="run quant data bootstrap --years <years>",
+                    retryable=False,
+                )
+            )
+        records = {dataset: all_records[dataset] for dataset in selected}
         windows: list[DataUpdateWindow] = []
+        skipped: list[DataUpdateSkip] = []
         if start is not None and end is not None:
             resolved = self._calendar.explicit_window(start, end)
             for dataset in selected:
                 record = records[dataset]
-                actual = _DatasetPipelineSupport._calendar_horizon(dataset, resolved)
+                if dataset is DatasetKind.INSTRUMENT:
+                    actual = (planning_date, planning_date)
+                    basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
+                else:
+                    actual = _DatasetPipelineSupport._calendar_horizon(
+                        dataset, resolved
+                    )
+                    basis = DataUpdateWindowBasis.EXPLICIT
                 windows.append(
                     DataUpdateWindow(
                         dataset=dataset,
-                        basis=DataUpdateWindowBasis.EXPLICIT,
+                        basis=basis,
                         start=actual[0],
                         end=actual[1],
                         overlap_days=self._catalog[dataset].overlap_days,
-                        current_watermark=(None if record is None else record.end_date),
+                        current_watermark=(
+                            None
+                            if record is None
+                            or dataset
+                            in {
+                                DatasetKind.FINANCIAL_OBSERVATION,
+                                DatasetKind.INSTRUMENT,
+                            }
+                            else record.end_date
+                        ),
                     )
                 )
             mode = "EXPLICIT"
         else:
-            missing = any(
-                record is None or record.end_date is None for record in records.values()
-            )
-            if missing:
-                bootstrap_start, latest = self._calendar.bootstrap_window(
-                    self._bootstrap_years
-                )
-            else:
-                bootstrap_start = None
-                latest = self._calendar.latest_complete_day()
+            latest = self._calendar.latest_complete_day()
             for dataset in selected:
                 record = records[dataset]
-                overlap = self._catalog[dataset].overlap_days
                 if record is None or record.end_date is None:
-                    if bootstrap_start is None:
-                        raise RuntimeError("bootstrap window was not resolved")
-                    actual = _DatasetPipelineSupport._calendar_horizon(
-                        dataset, (bootstrap_start, latest)
-                    )
-                    basis = DataUpdateWindowBasis.BOOTSTRAP
+                    raise RuntimeError("validated baseline record unexpectedly missing")
+                overlap = self._catalog[dataset].overlap_days
+                if dataset is DatasetKind.INSTRUMENT:
+                    actual = (planning_date, planning_date)
+                    basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
                     watermark = None
+                    trigger_date = None
+                elif dataset is DatasetKind.FINANCIAL_OBSERVATION:
+                    batch = FinancialDisclosureSchedule.latest_completed_batch(
+                        planning_date
+                    )
+                    if planning_date <= batch.disclosure_deadline:
+                        skipped.append(
+                            DataUpdateSkip(
+                                dataset=dataset,
+                                reason="DISCLOSURE_DEADLINE_PENDING",
+                                trigger_date=batch.disclosure_deadline,
+                            )
+                        )
+                        continue
+                    actual = (batch.start, batch.end)
+                    basis = DataUpdateWindowBasis.DISCLOSURE_TRIGGER
+                    watermark = None
+                    trigger_date = batch.disclosure_deadline
                 else:
                     target_end = latest + (
                         timedelta(days=90)
@@ -794,6 +1033,7 @@ class DataUpdatePlanner:
                     )
                     basis = DataUpdateWindowBasis.INCREMENTAL
                     watermark = record.end_date
+                    trigger_date = None
                 windows.append(
                     DataUpdateWindow(
                         dataset=dataset,
@@ -802,18 +1042,22 @@ class DataUpdatePlanner:
                         end=actual[1],
                         overlap_days=overlap,
                         current_watermark=watermark,
+                        trigger_date=trigger_date,
                     )
                 )
             mode = "AUTO_INCREMENTAL"
         ordered = tuple(windows)
+        summary_start = min((item.start for item in ordered), default=planning_date)
+        summary_end = max((item.end for item in ordered), default=planning_date)
         return DataUpdatePlan(
             window_mode=mode,
-            planned_at=self._clock(),
-            start=min(item.start for item in ordered),
-            end=max(item.end for item in ordered),
+            planned_at=planned_at,
+            start=summary_start,
+            end=summary_end,
             dataset_windows=ordered,
             requested_start=start,
             requested_end=end,
+            skipped_datasets=tuple(skipped),
         )
 
 
@@ -914,7 +1158,6 @@ class DataPipeline:
         quality_runner：对绑定的 Canonical 状态执行数据质量规则的运行器。
         catalog：声明全部数据集 Schema、分区、抓取和复用语义的目录。
         routes：为每个数据集选择已启用供应商的静态路由表。
-        bootstrap_years：无现有水位时首次更新向前覆盖的自然年数。
         clock：生成带时区当前时间的可注入时钟。
         logger：记录各阶段请求、输入身份和发布结果的结构化日志器。
     返回值：
@@ -935,12 +1178,9 @@ class DataPipeline:
         quality_runner: QualityRunner,
         routes: RoutingTable,
         catalog: DatasetCatalog = DATASET_CATALOG,
-        bootstrap_years: int = 20,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         logger: StructuredLogger | None = None,
     ) -> None:
-        if bootstrap_years <= 0:
-            raise ValueError("bootstrap_years must be positive")
         self._source = source
         self._mapper = mapper
         self._calendar = calendar
@@ -950,7 +1190,6 @@ class DataPipeline:
         self._quality_runner = quality_runner
         self._catalog = catalog
         self._routes = routes
-        self._bootstrap_years = bootstrap_years
         self._clock = clock
         self._logger = logger
         self._source_session_active = False
@@ -963,7 +1202,6 @@ class DataPipeline:
             repository=repository,
             routes=routes,
             catalog=catalog,
-            bootstrap_years=bootstrap_years,
             clock=clock,
         )
 
@@ -971,10 +1209,8 @@ class DataPipeline:
         self,
         dataset: DatasetKind,
         *,
-        start: date | None = None,
-        end: date | None = None,
-        full: bool = False,
-        planned_window: tuple[date, date] | None = None,
+        start: date,
+        end: date,
         observer: PipelineObserver | None = None,
     ) -> LocalizeResult:
         """执行单个数据集的 LOCALIZE 阶段并记录 Raw 请求结果。
@@ -983,8 +1219,6 @@ class DataPipeline:
             dataset：目标 Canonical 数据集标识。
             start：日期闭区间的开始日期。
             end：日期闭区间的结束日期。
-            full：是否忽略增量检查点并强制全量重建。
-            planned_window：已固化且无需重新解析的单数据集闭区间。
         返回值：
             返回``localize``（``LocalizeResult``）。
         异常：
@@ -996,8 +1230,6 @@ class DataPipeline:
                 dataset,
                 start=start,
                 end=end,
-                full=full,
-                planned_window=planned_window,
                 observer=observer,
             )
 
@@ -1005,10 +1237,8 @@ class DataPipeline:
         self,
         dataset: DatasetKind,
         *,
-        start: date | None,
-        end: date | None,
-        full: bool,
-        planned_window: tuple[date, date] | None,
+        start: date,
+        end: date,
         observer: PipelineObserver | None,
     ) -> LocalizeResult:
         progress = observer or _NullPipelineObserver()
@@ -1019,23 +1249,16 @@ class DataPipeline:
             self._raise(
                 "DATA_ROUTE_SOURCE_MISMATCH", f"source {source_name} is unavailable"
             )
-        if planned_window is not None and (
-            start is not None or end is not None or full
-        ):
+        if start > end:
             self._raise(
                 "DATA_PIPELINE_ARGUMENT",
-                "planned_window cannot be combined with start, end, or full",
+                "localize start must not follow end",
             )
-        resolved_start, resolved_end = (
-            planned_window
-            if planned_window is not None
-            else self._window(dataset, start, end, full)
-        )
+        resolved_start, resolved_end = start, end
         command_request: dict[str, object] = {
             "dataset": dataset.value,
             "from": resolved_start.isoformat(),
             "to": resolved_end.isoformat(),
-            "full": full,
         }
         self._localize_log(
             "localize.started",
@@ -1247,9 +1470,6 @@ class DataPipeline:
             empty_checkpoints_ignored = 0
             incompatible_checkpoints_ignored = 0
             for endpoint, request in units:
-                if full:
-                    pending.append((endpoint, request, True))
-                    continue
                 request_hash = hashlib.sha256(
                     canonical_json_bytes(dict(request))
                 ).hexdigest()
@@ -1398,19 +1618,13 @@ class DataPipeline:
     def localize_all(
         self,
         *,
-        start: date | None = None,
-        end: date | None = None,
-        full: bool = False,
-        plan: DataUpdatePlan | None = None,
+        windows: Sequence[DataUpdateWindow],
         observer: PipelineObserver | None = None,
     ) -> tuple[LocalizeResult, ...]:
         """按目录顺序执行计划所选或全部数据集的 LOCALIZE 阶段。
 
         入参：
-            start：日期闭区间的开始日期。
-            end：日期闭区间的结束日期。
-            full：是否忽略增量检查点并强制全量重建。
-            plan：已固化的逐数据集更新计划；与日期和 ``full`` 互斥。
+            windows：按数据集稳定排序且日期均已解析完成的执行窗口。
         返回值：
             返回``all``（``tuple[LocalizeResult, ...]``）。
         异常：
@@ -1419,59 +1633,42 @@ class DataPipeline:
         """
         with self._execution_lock:
             return self._localize_all(
-                start=start,
-                end=end,
-                full=full,
-                plan=plan,
+                windows=windows,
                 observer=observer,
             )
 
     def _localize_all(
         self,
         *,
-        start: date | None,
-        end: date | None,
-        full: bool,
-        plan: DataUpdatePlan | None,
+        windows: Sequence[DataUpdateWindow],
         observer: PipelineObserver | None,
     ) -> tuple[LocalizeResult, ...]:
         executable = tuple(
             dataset for dataset in self._catalog if self._routes[dataset]
         )
-        if plan is not None and (start is not None or end is not None or full):
+        ordered_windows = tuple(windows)
+        if not ordered_windows:
             self._raise(
                 "DATA_PIPELINE_ARGUMENT",
-                "plan cannot be combined with start, end, or full",
+                "localize-all requires at least one explicit dataset window",
             )
-        plan_windows = (
-            {}
-            if plan is None
-            else {item.dataset: (item.start, item.end) for item in plan.dataset_windows}
-        )
-        if plan is None:
-            datasets = executable
-        else:
-            datasets = tuple(item.dataset for item in plan.dataset_windows)
-        if plan is not None and not set(datasets).issubset(set(executable)):
+        if ordered_windows != tuple(
+            sorted(ordered_windows, key=lambda item: item.dataset.value)
+        ) or len({item.dataset for item in ordered_windows}) != len(ordered_windows):
             self._raise(
-                "DATA_UPDATE_PLAN_INVALID",
-                "plan dataset windows are not an executable catalog subset",
+                "DATA_PIPELINE_ARGUMENT",
+                "localize-all windows must be unique and sorted by dataset",
             )
-        request: dict[str, object] = (
-            {
-                "from": None if start is None else start.isoformat(),
-                "to": None if end is None else end.isoformat(),
-                "full": full,
-            }
-            if plan is None
-            else {
-                "plan_hash": plan.plan_hash,
-                "window_mode": plan.window_mode,
-                "from": plan.start.isoformat(),
-                "to": plan.end.isoformat(),
-                "full": False,
-            }
-        )
+        datasets = tuple(item.dataset for item in ordered_windows)
+        if not set(datasets).issubset(set(executable)):
+            self._raise(
+                "DATA_PIPELINE_ARGUMENT",
+                "localize-all windows are not an executable catalog subset",
+            )
+        window_by_dataset = {item.dataset: item for item in ordered_windows}
+        request: dict[str, object] = {
+            "windows": [item.to_payload() for item in ordered_windows]
+        }
         progress = observer or _NullPipelineObserver()
         progress.stage_started("LOCALIZE", len(datasets))
         self._localize_log(
@@ -1501,20 +1698,13 @@ class DataPipeline:
             for index, dataset in enumerate(datasets, start=1):
                 if progress.is_cancelled():
                     raise DataPipelineCancelled("data pipeline cancellation requested")
-                if plan is None:
-                    result = self.localize(
-                        dataset,
-                        start=start,
-                        end=end,
-                        full=full,
-                        observer=progress,
-                    )
-                else:
-                    result = self.localize(
-                        dataset,
-                        planned_window=plan_windows[dataset],
-                        observer=progress,
-                    )
+                window = window_by_dataset[dataset]
+                result = self.localize(
+                    dataset,
+                    start=window.start,
+                    end=window.end,
+                    observer=progress,
+                )
                 completed_results.append(result)
                 progress.dataset_completed(
                     "LOCALIZE",
@@ -1645,7 +1835,6 @@ class DataPipeline:
         *,
         start: date | None = None,
         end: date | None = None,
-        full: bool = False,
     ) -> DatasetCurateResult:
         """执行单个数据集的增量 CURATE 阶段。
 
@@ -1653,7 +1842,6 @@ class DataPipeline:
             dataset：目标 Canonical 数据集标识。
             start：日期闭区间的开始日期。
             end：日期闭区间的结束日期。
-            full：是否忽略增量检查点并强制全量重建。
         返回值：
             返回``curate``（``DatasetCurateResult``）。
         异常：
@@ -1665,7 +1853,6 @@ class DataPipeline:
                 dataset,
                 start=start,
                 end=end,
-                full=full,
             )
 
     def _curate(
@@ -1674,7 +1861,6 @@ class DataPipeline:
         *,
         start: date | None,
         end: date | None,
-        full: bool,
     ) -> DatasetCurateResult:
         if (start is None) != (end is None):
             self._raise(
@@ -1683,7 +1869,6 @@ class DataPipeline:
         result = self._curate_datasets(
             (dataset,),
             windows={dataset: (start, end)},
-            full=full,
             observer=None,
         )[0]
         return result
@@ -1691,13 +1876,11 @@ class DataPipeline:
     def curate_all(
         self,
         *,
-        full: bool = False,
         observer: PipelineObserver | None = None,
     ) -> tuple[DatasetCurateResult, ...]:
         """共享 Raw 读取并执行全部数据集的 CURATE 阶段。
 
         入参：
-            full：是否忽略增量检查点并强制全量重建。
         返回值：
             返回``all``（``tuple[DatasetCurateResult, ...]``）。
         异常：
@@ -1705,22 +1888,20 @@ class DataPipeline:
             ``DATA_PIPELINE_ALREADY_RUNNING``；其余数据错误保持原错误码。
         """
         with self._execution_lock:
-            return self._curate_all(full=full, observer=observer)
+            return self._curate_all(observer=observer)
 
     def _curate_all(
         self,
         *,
-        full: bool,
         observer: PipelineObserver | None,
     ) -> tuple[DatasetCurateResult, ...]:
         datasets = tuple(dataset for dataset in self._catalog if self._routes[dataset])
-        return self._curate_many(datasets, full=full, observer=observer)
+        return self._curate_many(datasets, observer=observer)
 
     def _curate_many(
         self,
         datasets: Sequence[DatasetKind],
         *,
-        full: bool,
         observer: PipelineObserver | None,
     ) -> tuple[DatasetCurateResult, ...]:
         """共享 Raw 读取并发布指定的非空数据集序列。"""
@@ -1737,12 +1918,10 @@ class DataPipeline:
         self._curate_log(
             "curate_all.started",
             datasets=dataset_names,
-            full=full,
         )
         results = self._curate_datasets(
             datasets,
             windows={dataset: (None, None) for dataset in datasets},
-            full=full,
             observer=progress,
         )
         self._curate_log(
@@ -1772,7 +1951,6 @@ class DataPipeline:
         datasets: Sequence[DatasetKind],
         *,
         windows: Mapping[DatasetKind, tuple[date | None, date | None]],
-        full: bool,
         observer: PipelineObserver | None,
     ) -> tuple[DatasetCurateResult, ...]:
         progress = observer or _NullPipelineObserver()
@@ -1803,7 +1981,6 @@ class DataPipeline:
                     "from": None if start is None else start.isoformat(),
                     "to": None if end is None else end.isoformat(),
                 },
-                full=full,
             )
             endpoints = tuple(
                 sorted(
@@ -1910,9 +2087,7 @@ class DataPipeline:
                         removed_keys[dataset].add(partition_key)
                     continue
                 reason = None
-                if full:
-                    reason = "full_requested"
-                elif old is None:
+                if old is None:
                     reason = "new_partition"
                 elif not old.path.is_file():
                     reason = "canonical_file_missing"
@@ -2099,13 +2274,10 @@ class DataPipeline:
             else:
                 today = self._now().date()
                 resolved_start = resolved_end = today
-            replace_explicit_window = (
-                self._catalog[dataset].replace_explicit_full_window
-                and full
-                and start is not None
-                and end is not None
+            replace_existing_window = (
+                self._catalog[dataset].reuse is ReuseSemantics.FULL_REFRESH
             )
-            if current is not None and not replace_explicit_window:
+            if current is not None and not replace_existing_window:
                 if current.start_date is not None:
                     resolved_start = min(resolved_start, current.start_date)
                 if current.end_date is not None:
@@ -2384,11 +2556,11 @@ class DataPipeline:
             )
         return quality.id
 
-    def bootstrap(self) -> PipelineResult:
+    def bootstrap(self, *, years: int) -> PipelineResult:
         """从空数据根目录执行首次全量数据流水线。
 
         入参：
-            无。
+            years：首次基线向前覆盖的正整数年数。
         返回值：
             返回``bootstrap``（``PipelineResult``）。
         异常：
@@ -2396,15 +2568,86 @@ class DataPipeline:
             ``DATA_PIPELINE_ALREADY_RUNNING``；其余阶段错误保持原错误码。
         """
         with self._execution_lock:
-            return self._bootstrap()
+            return self._bootstrap(years=years)
 
-    def _bootstrap(self) -> PipelineResult:
+    def _bootstrap(self, *, years: int) -> PipelineResult:
+        if type(years) is not int or years <= 0:
+            self._raise(
+                "DATA_PIPELINE_ARGUMENT",
+                "bootstrap years must be a positive integer",
+            )
+        executable = {
+            dataset for dataset in self._catalog if self._routes[dataset]
+        }
+        existing = {
+            record.dataset for record in self._repository.list_canonical_datasets()
+        }
+        initialization = self._repository.find_data_initialization()
+        if (
+            initialization is not None and initialization.status == "COMPLETED"
+        ) or (initialization is None and executable.issubset(existing)):
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_BOOTSTRAP_ALREADY_INITIALIZED",
+                    severity=Severity.SEVERE,
+                    message=(
+                        "bootstrap is only available before the canonical baseline "
+                        "is complete"
+                    ),
+                    context={},
+                    remediation="run quant data update for subsequent refreshes",
+                    retryable=False,
+                )
+            )
+        if initialization is not None and initialization.years != years:
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_BOOTSTRAP_YEARS_MISMATCH",
+                    severity=Severity.SEVERE,
+                    message="bootstrap retry must use the frozen year count",
+                    context={
+                        "frozen_years": initialization.years,
+                        "requested_years": years,
+                    },
+                    remediation=(
+                        f"retry with quant data bootstrap --years {initialization.years}"
+                    ),
+                    retryable=False,
+                )
+            )
+        frozen = (
+            None
+            if initialization is None
+            else (initialization.start_date, initialization.end_date)
+        )
+        plan = self._update_planner.plan_bootstrap(
+            years,
+            frozen_window=frozen,
+            frozen_planned_at=(
+                None if initialization is None else initialization.started_at
+            ),
+        )
+        if initialization is None:
+            if plan.requested_start is None or plan.requested_end is None:
+                raise RuntimeError("bootstrap plan did not freeze its base window")
+            initialization = self._repository.begin_data_initialization(
+                years=years,
+                start_date=plan.requested_start,
+                end_date=plan.requested_end,
+                started_at=plan.planned_at,
+            )
         run_id = uuid4().hex
-        self.localize_all(full=True)
+        self.localize_all(windows=plan.dataset_windows)
         self.curate_all()
         quality = self.validate()
+        state = self._repository.catalog_state()
+        self._repository.complete_data_initialization(
+            catalog_hash=state.catalog_hash,
+            quality_run_id=quality,
+            completed_at=self._now(),
+        )
         return PipelineResult(
-            run_id, quality, self._repository.catalog_state().catalog_hash
+            run_id, quality, state.catalog_hash
         )
 
     def update(
@@ -2439,14 +2682,22 @@ class DataPipeline:
         return self.execute_update_plan(plan, observer=observer)
 
     def plan_update(
-        self, *, start: date | None = None, end: date | None = None
+        self,
+        *,
+        start: date | None = None,
+        end: date | None = None,
+        datasets: Sequence[DatasetKind] | None = None,
     ) -> DataUpdatePlan:
         """按当前水位和供应商日历生成确定性计划。
 
         入参：可选的完整日期闭区间。返回值：不可变更新计划。
         异常：参数、日历或水位解析失败时传播对应异常。
         """
-        return self._update_planner.plan(start=start, end=end)
+        return self._update_planner.plan(
+            start=start,
+            end=end,
+            datasets=datasets,
+        )
 
     def execute_update_plan(
         self,
@@ -2472,9 +2723,9 @@ class DataPipeline:
     ) -> PipelineResult:
         run_id = uuid4().hex
         progress = observer or _NullPipelineObserver()
-        self.localize_all(plan=plan, observer=progress)
+        self.localize_all(windows=plan.dataset_windows, observer=progress)
         selected = tuple(item.dataset for item in plan.dataset_windows)
-        self._curate_many(selected, full=False, observer=progress)
+        self._curate_many(selected, observer=progress)
         if progress.is_cancelled():
             raise DataPipelineCancelled("data pipeline cancellation requested")
         datasets = tuple(dataset for dataset in self._catalog if self._routes[dataset])
@@ -2492,45 +2743,21 @@ class DataPipeline:
             run_id, quality, self._repository.catalog_state().catalog_hash
         )
 
-    def _window(
-        self,
-        dataset: DatasetKind,
-        start: date | None,
-        end: date | None,
-        full: bool,
-    ) -> tuple[date, date]:
-        if (start is None) != (end is None):
-            self._raise(
-                "DATA_PIPELINE_ARGUMENT", "start and end must be supplied together"
-            )
-        if start is not None and end is not None:
-            if (
-                dataset is DatasetKind.INDUSTRY_CLASSIFICATION
-                and end > self._calendar.latest_complete_day()
-            ):
-                self._raise(
-                    "DATA_PIPELINE_ARGUMENT",
-                    "industry classification end date follows the latest complete session",
-                )
-            resolved = self._calendar.explicit_window(start, end)
-            return _DatasetPipelineSupport._calendar_horizon(dataset, resolved)
-        latest = self._calendar.latest_complete_day()
-        previous = None if full else self._repository.find_canonical_dataset(dataset)
-        if previous is None or previous.end_date is None:
-            return _DatasetPipelineSupport._calendar_horizon(
-                dataset,
-                self._calendar.bootstrap_window(self._bootstrap_years),
-            )
-        overlap = self._catalog[dataset].overlap_days
-        target_end = latest + (
-            timedelta(days=90) if dataset is DatasetKind.TRADE_CALENDAR else timedelta()
-        )
-        return min(previous.end_date, latest) - timedelta(days=overlap), target_end
-
     @staticmethod
     def _batch_window(
         batches: Sequence[CanonicalBatch], start: date | None, end: date | None
     ) -> tuple[date, date]:
+        if batches and all(
+            batch.dataset is DatasetKind.INSTRUMENT for batch in batches
+        ):
+            snapshot_dates = [
+                value.astimezone(ZoneInfo("Asia/Shanghai")).date()
+                for batch in batches
+                for value in batch.frame["ingested_at"].to_list()
+                if isinstance(value, datetime)
+            ]
+            if snapshot_dates:
+                return min(snapshot_dates), max(snapshot_dates)
         if start is not None and end is not None:
             return start, end
         dates: list[date] = []

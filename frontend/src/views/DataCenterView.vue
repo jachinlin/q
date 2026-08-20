@@ -14,6 +14,7 @@ import { formatDate, formatNumber, formatTime, shortHash } from '../format'
 import type {
   DataSummary,
   DataUpdatePlan,
+  DataUpdateWindow,
   Dataset,
   DatasetDetail,
   Page,
@@ -165,7 +166,10 @@ const update = useMutation({
       : {}
     return api.post<{ task_id: string; request_id: string; plan_hash: string }>('/api/v1/data/updates', {
       ...requestedWindow,
-      datasets: confirmedPlan.dataset_windows.map((item) => item.dataset),
+      datasets: [
+        ...confirmedPlan.dataset_windows.map((item) => item.dataset),
+        ...confirmedPlan.skipped_datasets.map((item) => item.dataset),
+      ].sort((left, right) => left.localeCompare(right)),
       plan_hash: confirmedPlan.plan_hash,
     })
   },
@@ -225,10 +229,69 @@ function openQualityRunDialog() {
   qualityRunDialog.value = true
 }
 
+function updateBasisLabel(basis: string) {
+  if (basis === 'BOOTSTRAP') return '首次构建'
+  if (basis === 'INCREMENTAL') return '增量水位'
+  if (basis === 'SNAPSHOT_REFRESH') return '全量快照'
+  if (basis === 'DISCLOSURE_TRIGGER') return '季度披露'
+  return '指定日期'
+}
+
+function freshnessEvidence(dataset: Dataset) {
+  if (dataset.dataset === 'instrument') {
+    return `全量快照 · 最近刷新 ${formatTime(dataset.operational.last_localized_at)}`
+  }
+  if (dataset.dataset === 'trade_calendar') {
+    return `日历覆盖至 ${formatDate(dataset.end_date)} · 已检查至 ${formatDate(dataset.operational.localized_through)}`
+  }
+  if (dataset.freshness.trigger_date) {
+    const state = dataset.freshness.update_required ? '待更新' : '无需更新'
+    return `季度披露 · ${dataset.freshness.trigger_date} · ${state}`
+  }
+  return `${formatDate(dataset.freshness.actual_watermark)} / ${formatDate(dataset.freshness.expected_watermark)}`
+}
+
+function coverageDate(dataset: Dataset, boundary: 'start' | 'end') {
+  if (dataset.dataset === 'instrument') {
+    return formatDate(dataset.operational.localized_through)
+  }
+  return formatDate(boundary === 'start' ? dataset.start_date : dataset.end_date)
+}
+
+function windowState(window: DataUpdateWindow) {
+  if (['financial_observation', 'instrument'].includes(window.dataset)) {
+    return '不适用'
+  }
+  if (window.dataset === 'trade_calendar') {
+    return `覆盖至 ${window.current_watermark ?? '—'}`
+  }
+  return window.current_watermark ?? '—'
+}
+
+function windowLookback(window: DataUpdateWindow) {
+  if (['financial_observation', 'instrument'].includes(window.dataset)) {
+    return '不适用'
+  }
+  return window.dataset === 'trade_calendar'
+    ? `修订回看 ${window.overlap_days} 天`
+    : `${window.overlap_days} 天`
+}
+
+function windowRange(window: DataUpdateWindow) {
+  if (window.basis === 'SNAPSHOT_REFRESH') {
+    return `快照日期 ${window.start}`
+  }
+  if (window.dataset === 'trade_calendar') {
+    return `抓取 ${window.start} 至 ${window.end}`
+  }
+  const trigger = window.trigger_date ? ` · 截止 ${window.trigger_date}` : ''
+  return `${window.start} 至 ${window.end}${trigger}`
+}
+
 async function submitUpdate() {
   const plan = updatePlan.data.value
   if (!plan) return
-  const windowText = `${plan.start} 至 ${plan.end}，共 ${plan.dataset_windows.length} 个数据集`
+  const windowText = `${plan.start} 至 ${plan.end}，执行 ${plan.dataset_windows.length} 个数据集，跳过 ${plan.skipped_datasets.length} 个`
   await ElMessageBox.confirm(
     `本次范围：${windowText}。Canonical 内容变化可能暂时关闭研究门；活动实验可能因 data_hash 漂移失败。`,
     '确认数据更新',
@@ -300,11 +363,11 @@ async function submitUpdate() {
         </div>
         <el-table data-testid="data-assets-table" :data="visibleDatasets" height="420" @row-click="(row: Dataset) => selectedDataset = row.dataset">
           <el-table-column label="数据集" prop="dataset" min-width="180" />
-          <el-table-column label="开始日期" width="120"><template #default="scope">{{ formatDate(scope.row.start_date) }}</template></el-table-column>
-          <el-table-column label="结束日期" width="120"><template #default="scope">{{ formatDate(scope.row.end_date) }}</template></el-table-column>
+          <el-table-column label="开始日期" width="120"><template #default="scope">{{ coverageDate(scope.row, 'start') }}</template></el-table-column>
+          <el-table-column label="结束日期" width="120"><template #default="scope">{{ coverageDate(scope.row, 'end') }}</template></el-table-column>
           <el-table-column label="研究门" width="110"><template #default><StatusBadge :status="summary.data.value?.gate.status === 'READY' ? 'VALIDATED' : 'BLOCKED'" /></template></el-table-column>
           <el-table-column label="新鲜度" width="110"><template #default="scope"><StatusBadge :status="scope.row.freshness.status" /></template></el-table-column>
-          <el-table-column label="实际 / 目标水位" min-width="210"><template #default="scope">{{ formatDate(scope.row.freshness.actual_watermark) }} / {{ formatDate(scope.row.freshness.expected_watermark) }}</template></el-table-column>
+          <el-table-column label="更新依据" min-width="250"><template #default="scope">{{ freshnessEvidence(scope.row) }}</template></el-table-column>
           <el-table-column label="延迟" width="90"><template #default="scope">{{ scope.row.freshness.lag_days == null ? '—' : `${scope.row.freshness.lag_days} 天` }}</template></el-table-column>
           <el-table-column label="质量问题" width="100" prop="quality_issue_count" align="right" />
           <el-table-column label="记录数" width="120" align="right"><template #default="scope">{{ formatNumber(scope.row.row_count) }}</template></el-table-column>
@@ -399,7 +462,7 @@ async function submitUpdate() {
     </el-drawer>
 
     <el-dialog v-model="updateDialog" title="创建数据更新任务" width="780">
-      <p style="color:var(--muted);font-size:12px;line-height:1.8">提交前会根据实时交易日历和当前 Canonical 水位固化各数据集窗口。内容变化会关闭研究门，直到 validate-all 成功。</p>
+      <p style="color:var(--muted);font-size:12px;line-height:1.8">提交前会根据实时交易日历、Canonical 水位和季度披露截止日固化各数据集计划。financial_observation 不使用水位；截止日尚未越过时自动判定为无需更新。</p>
       <div class="dataset-selector">
         <div class="dataset-selector-heading">
           <strong>目标数据集</strong>
@@ -447,16 +510,25 @@ async function submitUpdate() {
         <div class="plan-summary">
           <div><small>更新模式</small><strong>{{ updatePlan.data.value.window_mode === 'AUTO_INCREMENTAL' ? '自动增量' : '指定日期' }}</strong></div>
           <div><small>汇总范围</small><strong>{{ updatePlan.data.value.start }} 至 {{ updatePlan.data.value.end }}</strong></div>
-          <div><small>数据集</small><strong>{{ updatePlan.data.value.dataset_windows.length }} / {{ updateDatasetOptions.length }}</strong></div>
+          <div><small>执行 / 跳过</small><strong>{{ updatePlan.data.value.dataset_windows.length }} / {{ updatePlan.data.value.skipped_datasets.length }}</strong></div>
         </div>
+        <el-alert
+          v-if="updatePlan.data.value.skipped_datasets.length"
+          title="季度披露截止日尚未越过"
+          :description="updatePlan.data.value.skipped_datasets.map((item) => `${item.dataset}：${item.trigger_date} 截止，当前无需更新`).join('；')"
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin:12px 0"
+        />
         <el-collapse>
           <el-collapse-item title="查看各数据集执行窗口" name="windows">
             <el-table :data="updatePlan.data.value.dataset_windows" max-height="320" size="small">
               <el-table-column prop="dataset" label="数据集" min-width="155" />
-              <el-table-column label="依据" width="105"><template #default="scope">{{ scope.row.basis === 'BOOTSTRAP' ? '首次构建' : scope.row.basis === 'INCREMENTAL' ? '增量水位' : '指定日期' }}</template></el-table-column>
-              <el-table-column label="当前水位" width="115"><template #default="scope">{{ scope.row.current_watermark ?? '—' }}</template></el-table-column>
-              <el-table-column prop="overlap_days" label="重叠天数" width="90" />
-              <el-table-column label="计划窗口" min-width="215"><template #default="scope">{{ scope.row.start }} 至 {{ scope.row.end }}</template></el-table-column>
+              <el-table-column label="依据" width="105"><template #default="scope">{{ updateBasisLabel(scope.row.basis) }}</template></el-table-column>
+              <el-table-column label="当前状态" width="155"><template #default="scope">{{ windowState(scope.row) }}</template></el-table-column>
+              <el-table-column label="回看策略" width="145"><template #default="scope">{{ windowLookback(scope.row) }}</template></el-table-column>
+              <el-table-column label="计划窗口" min-width="245"><template #default="scope">{{ windowRange(scope.row) }}</template></el-table-column>
             </el-table>
           </el-collapse-item>
         </el-collapse>
@@ -466,7 +538,7 @@ async function submitUpdate() {
         <el-button
           type="primary"
           :loading="update.isPending.value"
-          :disabled="normalizedUpdateDatasets.length === 0 || !updatePlan.data.value || updatePlan.isFetching.value || updatePlan.isError.value"
+          :disabled="normalizedUpdateDatasets.length === 0 || !updatePlan.data.value || updatePlan.data.value.dataset_windows.length === 0 || updatePlan.isFetching.value || updatePlan.isError.value"
           @click="submitUpdate"
         >确认并提交计划</el-button>
       </template>

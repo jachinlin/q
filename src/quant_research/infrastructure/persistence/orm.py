@@ -292,6 +292,34 @@ class DataCatalogStateORM(Base):
     validated_at: Mapped[str | None] = mapped_column(String(32))
 
 
+class DataInitializationStateORM(Base):
+    """映射首次数据初始化的冻结窗口和完成状态。
+
+    入参：由 SQLAlchemy 在持久化时提供字段值。返回值：可由 Session 管理的 ORM 行。
+    异常：数据库约束拒绝非法状态、年数或单例标识。
+    """
+
+    __tablename__ = "data_initialization_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_data_initialization_state_singleton"),
+        CheckConstraint(
+            "status IN ('IN_PROGRESS', 'COMPLETED')",
+            name="ck_data_initialization_state_status",
+        ),
+        CheckConstraint("years > 0", name="ck_data_initialization_state_years"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    years: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    end_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    started_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    completed_at: Mapped[str | None] = mapped_column(String(32))
+    catalog_hash: Mapped[str | None] = mapped_column(String(64))
+    quality_run_id: Mapped[str | None] = mapped_column(String(36))
+
+
 class ExperimentORM(Base):
     """将实验``orm``记录映射到 SQLite 持久化表。
 

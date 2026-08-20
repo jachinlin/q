@@ -73,6 +73,7 @@ def test_fresh_database_contains_only_final_tables(tmp_path: Path) -> None:
         "canonical_dataset",
         "canonical_partition",
         "data_catalog_state",
+        "data_initialization_state",
         "dataset_operational_state",
         "quality_issue",
         "quality_rule_result",

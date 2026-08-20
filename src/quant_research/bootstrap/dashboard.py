@@ -149,7 +149,6 @@ class DashboardBootstrap:
                     calendar=BaoStockCalendarPolicy(calendar_client),
                     repository=MetadataRepository(engine),
                     routes=BAOSTOCK_ROUTES,
-                    bootstrap_years=settings.bootstrap_years,
                 ),
                 research.commands,
             )

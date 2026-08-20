@@ -1,10 +1,20 @@
 """CLI surface tests for the current-data-only design."""
 
-from typing import Never
+from datetime import UTC, date, datetime
+from types import SimpleNamespace
+from typing import Never, cast
 
 from typer.testing import CliRunner
 
 from quant_research.cli import create_app
+from quant_research.cli.app import ApplicationServices
+from quant_research.data.pipeline.dataset import (
+    DataUpdatePlan,
+    DataUpdateWindow,
+    DataUpdateWindowBasis,
+    LocalizeResult,
+)
+from quant_research.domain.enums import DatasetKind
 
 
 def _unexpected_services() -> Never:
@@ -21,13 +31,64 @@ def test_data_cli_exposes_validate_gate_without_snapshot_commands() -> None:
     assert "snapshot" not in result.stdout.lower()
 
 
-def test_curate_commands_expose_explicit_full_rebuild() -> None:
+def test_data_commands_do_not_expose_full_and_bootstrap_requires_years() -> None:
     app = create_app(_unexpected_services)
 
-    curate = CliRunner().invoke(app, ["data", "curate", "--help"])
-    curate_all = CliRunner().invoke(app, ["data", "curate-all", "--help"])
+    for command in ("bootstrap", "update", "localize", "localize-all", "curate", "curate-all"):
+        result = CliRunner().invoke(app, ["data", command, "--help"])
+        assert result.exit_code == 0
+        assert "--full" not in result.stdout
+    bootstrap = CliRunner().invoke(app, ["data", "bootstrap", "--help"])
+    assert "--years" in bootstrap.stdout
+    assert "required" in bootstrap.stdout.lower()
 
-    assert curate.exit_code == 0
-    assert curate_all.exit_code == 0
-    assert "--full" in curate.stdout
-    assert "--full" in curate_all.stdout
+
+def test_localize_cli_derives_dates_before_calling_strict_pipeline() -> None:
+    class _Pipeline:
+        planned: tuple[date | None, date | None] | None = None
+        localized: tuple[date, date] | None = None
+
+        def plan_update(
+            self,
+            *,
+            start: date | None,
+            end: date | None,
+            datasets: tuple[DatasetKind, ...],
+        ) -> DataUpdatePlan:
+            self.planned = (start, end)
+            window = DataUpdateWindow(
+                dataset=datasets[0],
+                basis=DataUpdateWindowBasis.INCREMENTAL,
+                start=date(2026, 8, 10),
+                end=date(2026, 8, 20),
+                overlap_days=4,
+                current_watermark=date(2026, 8, 14),
+            )
+            return DataUpdatePlan(
+                window_mode="AUTO_INCREMENTAL",
+                planned_at=datetime(2026, 8, 21, tzinfo=UTC),
+                start=window.start,
+                end=window.end,
+                dataset_windows=(window,),
+            )
+
+        def localize(
+            self, dataset: DatasetKind, *, start: date, end: date
+        ) -> LocalizeResult:
+            self.localized = (start, end)
+            return LocalizeResult(dataset, 0, 1, 1)
+
+    pipeline = _Pipeline()
+    result = CliRunner().invoke(
+        create_app(
+            lambda: cast(
+                ApplicationServices,
+                SimpleNamespace(pipeline=pipeline, close=lambda: None),
+            )
+        ),
+        ["data", "localize", "daily_bar"],
+    )
+
+    assert result.exit_code == 0
+    assert pipeline.planned == (None, None)
+    assert pipeline.localized == (date(2026, 8, 10), date(2026, 8, 20))

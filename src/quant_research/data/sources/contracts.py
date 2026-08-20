@@ -203,11 +203,11 @@ class PipelineSource(Protocol):
     def financial_requests(
         self, start: date, end: date
     ) -> tuple[Mapping[str, JsonValue], ...]:
-        """构造已达到保守披露截止日的财务请求单元。
+        """为报告期末闭区间构造已越过披露截止日的财务请求单元。
 
         入参：
-            start：日期闭区间的开始日期。
-            end：日期闭区间的结束日期。
+            start：最早报告期末日。
+            end：最晚报告期末日。
         返回值：
             返回``requests``（``tuple[Mapping[str, JsonValue], ...]``）。
         异常：

@@ -173,11 +173,18 @@ export type TaskPage = Page<Task> & { status_counts: Record<string, number> }
 
 export type DataUpdateWindow = {
   dataset: string
-  basis: 'EXPLICIT' | 'BOOTSTRAP' | 'INCREMENTAL'
+  basis: 'EXPLICIT' | 'BOOTSTRAP' | 'INCREMENTAL' | 'SNAPSHOT_REFRESH' | 'DISCLOSURE_TRIGGER'
   start: string
   end: string
   overlap_days: number
   current_watermark?: string
+  trigger_date?: string
+}
+
+export type DataUpdateSkip = {
+  dataset: string
+  reason: 'DISCLOSURE_DEADLINE_PENDING'
+  trigger_date: string
 }
 
 export type DataUpdatePlan = {
@@ -188,6 +195,7 @@ export type DataUpdatePlan = {
   requested_start?: string
   requested_end?: string
   dataset_windows: DataUpdateWindow[]
+  skipped_datasets: DataUpdateSkip[]
   plan_hash: string
 }
 
@@ -364,6 +372,8 @@ export type Freshness = {
   lag_days: number | null
   evaluated_at: string
   reason: string
+  trigger_date: string | null
+  update_required: boolean | null
 }
 
 export type Dataset = {

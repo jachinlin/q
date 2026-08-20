@@ -100,7 +100,6 @@ class CliBootstrap:
                 repository=repository,
                 quality_runner=QualityRunner(),
                 routes=BAOSTOCK_ROUTES,
-                bootstrap_years=settings.bootstrap_years,
                 logger=pipeline_logger,
             )
             queue = TaskQueue(

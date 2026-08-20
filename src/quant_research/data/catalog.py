@@ -73,6 +73,7 @@ class UpdateCadence(StrEnum):
 
     DAILY = "daily"
     WEEKLY = "weekly"
+    QUARTERLY_DISCLOSURE = "quarterly_disclosure"
 
 
 class FreshnessBasis(StrEnum):
@@ -84,6 +85,7 @@ class FreshnessBasis(StrEnum):
     TRADING_SESSION = "trading_session"
     CALENDAR_HORIZON = "calendar_horizon"
     SUCCESSFUL_REFRESH = "successful_refresh"
+    DISCLOSURE_DEADLINE = "disclosure_deadline"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +109,14 @@ class FreshnessPolicy:
     def __post_init__(self) -> None:
         if self.tolerance_days < 0:
             raise ValueError("freshness tolerance_days must not be negative")
-        if self.basis is FreshnessBasis.SUCCESSFUL_REFRESH:
+        if self.basis in {
+            FreshnessBasis.SUCCESSFUL_REFRESH,
+            FreshnessBasis.DISCLOSURE_DEADLINE,
+        }:
             if self.watermark_field is not None:
-                raise ValueError("refresh freshness must not declare a watermark field")
+                raise ValueError(
+                    "refresh and disclosure freshness must not declare a watermark field"
+                )
         elif not self.watermark_field:
             raise ValueError("watermark freshness requires a field")
 
@@ -171,7 +178,6 @@ class DatasetSpec:
         overlap_days：增量抓取时向当前水位之前回看的自然日数。
         source_endpoints：按供应商标识组织的可用端点及字段映射。
         freshness：数据集的新鲜度判定策略。
-        replace_explicit_full_window：显式全量窗口是否替换而非扩展既有覆盖范围。
     返回值：
         构造并返回 ``DatasetSpec`` 实例。
     异常：
@@ -189,7 +195,6 @@ class DatasetSpec:
     overlap_days: int
     source_endpoints: Mapping[str, tuple[EndpointMapping, ...]]
     freshness: FreshnessPolicy
-    replace_explicit_full_window: bool = False
 
     def __post_init__(self) -> None:
         if self.overlap_days < 0:
@@ -506,11 +511,11 @@ DATASET_CATALOG = DatasetCatalog(
             _AUDIT + ("announced_at",),
             FetchGranularity.FINANCIAL_CELL,
             FetchPlan.FINANCIAL_CELL,
-            UpdateCadence.WEEKLY,
+            UpdateCadence.QUARTERLY_DISCLOSURE,
             ReuseSemantics.APPEND_WITH_RESTATEMENT,
-            370,
+            0,
             {"baostock": (_DatasetSpecFactory.endpoint("query_dupont_data", {}),)},
-            FreshnessPolicy(FreshnessBasis.SUCCESSFUL_REFRESH, None, 7),
+            FreshnessPolicy(FreshnessBasis.DISCLOSURE_DEADLINE, None, 0),
         ),
         DatasetSpec(
             DatasetKind.INDUSTRY_CLASSIFICATION,
@@ -536,7 +541,6 @@ DATASET_CATALOG = DatasetCatalog(
                 )
             },
             FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "as_of_date", 0),
-            True,
         ),
         DatasetSpec(
             DatasetKind.INDEX_BAR,

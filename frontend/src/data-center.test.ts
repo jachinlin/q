@@ -29,17 +29,53 @@ describe('data center core loop', () => {
     dataset: 'daily_bar', source: 'baostock', start_date: '2026-01-01', end_date: '2026-08-13',
     partition_count: 2, row_count: 100, content_hash: 'a'.repeat(64), updated_at: '2026-08-14T10:00:00Z',
     partitioning: 'year', cadence: 'daily', fetch_granularity: 'trading_day', reuse: 'append_only', overlap_days: 0,
-    freshness: { status: 'STALE', actual_watermark: '2026-08-13', expected_watermark: '2026-08-14', lag_days: 1, evaluated_at: '2026-08-15T10:00:00Z', reason: 'watermark is behind target' },
+    freshness: { status: 'STALE', actual_watermark: '2026-08-13', expected_watermark: '2026-08-14', lag_days: 1, evaluated_at: '2026-08-15T10:00:00Z', reason: 'watermark is behind target', trigger_date: null, update_required: null },
     operational: { last_localized_at: '2026-08-14T10:00:00Z', localized_through: '2026-08-14', last_curated_at: '2026-08-14T10:01:00Z', last_validated_at: '2026-08-14T10:02:00Z' },
     quality_issue_count: 1, blocking_issue_count: 0,
   }
   const calendarDataset = {
     ...dataset,
     dataset: 'trade_calendar',
-    start_date: null,
-    end_date: null,
+    start_date: '2024-01-02',
+    end_date: '2026-11-18',
     partitioning: 'all',
     freshness: { ...dataset.freshness, status: 'CURRENT' },
+    operational: {
+      ...dataset.operational,
+      last_localized_at: '2026-08-20T12:41:12Z',
+      localized_through: '2026-08-20',
+    },
+  }
+  const financialDataset = {
+    ...dataset,
+    dataset: 'financial_observation',
+    cadence: 'quarterly_disclosure',
+    overlap_days: 0,
+    freshness: {
+      status: 'CURRENT', actual_watermark: null, expected_watermark: null, lag_days: null,
+      evaluated_at: '2026-08-20T10:00:00Z', reason: 'deadline pending',
+      trigger_date: '2026-08-31', update_required: false,
+    },
+  }
+  const instrumentDataset = {
+    ...dataset,
+    dataset: 'instrument',
+    start_date: '1990-12-10',
+    end_date: '2026-08-24',
+    cadence: 'daily',
+    fetch_granularity: 'full_snapshot',
+    reuse: 'full_refresh',
+    overlap_days: 0,
+    freshness: {
+      status: 'CURRENT', actual_watermark: '2026-08-20', expected_watermark: '2026-08-20', lag_days: 0,
+      evaluated_at: '2026-08-21T10:00:00Z', reason: 'watermark meets target',
+      trigger_date: null, update_required: null,
+    },
+    operational: {
+      ...dataset.operational,
+      last_localized_at: '2026-08-20T12:36:14Z',
+      localized_through: '2026-08-20',
+    },
   }
 
   beforeEach(() => {
@@ -51,7 +87,7 @@ describe('data center core loop', () => {
         freshness: { status: 'STALE', counts: { CURRENT: 7, STALE: 1, MISSING: 0, UNKNOWN: 0 }, evaluated_at: '2026-08-15T10:00:00Z', latest_complete_session: '2026-08-14' },
         gate_quality_run: null, latest_quality_run: null, active_update: null, last_successful_update: null, worker: null, active_research_task_count: 2,
       })
-      if (path === '/api/v1/data/datasets') return Promise.resolve({ items: [dataset, calendarDataset] })
+      if (path === '/api/v1/data/datasets') return Promise.resolve({ items: [dataset, calendarDataset, financialDataset, instrumentDataset] })
       if (path.startsWith('/api/v1/data/quality-runs?')) return Promise.resolve({ items: [{ run_id: 'run-1', scope: 'all', input_hash: 'a'.repeat(64), status: 'PASSED', started_at: '2026-08-14T10:00:00Z', completed_at: '2026-08-14T10:02:00Z', issue_count: 1, blocking_issue_count: 0 }], page: 1, page_size: 50, total: 1 })
       if (path.startsWith('/api/v1/tasks/')) return Promise.resolve({
         id: path.split('/').at(-1), task_type: 'DATA_VALIDATION', status: 'SUCCEEDED',
@@ -82,10 +118,14 @@ describe('data center core loop', () => {
 
   const updatePlan = {
     window_mode: 'AUTO_INCREMENTAL', planned_at: '2026-08-15T10:00:00Z',
-    start: '2026-08-10', end: '2026-11-12', plan_hash: 'b'.repeat(64),
+    start: '2026-08-10', end: '2026-11-18', plan_hash: 'b'.repeat(64),
     dataset_windows: [
       { dataset: 'daily_bar', basis: 'INCREMENTAL', start: '2026-08-10', end: '2026-08-14', overlap_days: 4, current_watermark: '2026-08-13' },
-      { dataset: 'trade_calendar', basis: 'INCREMENTAL', start: '2026-08-13', end: '2026-11-12', overlap_days: 1, current_watermark: '2026-11-10' },
+      { dataset: 'instrument', basis: 'SNAPSHOT_REFRESH', start: '2026-08-15', end: '2026-08-15', overlap_days: 0 },
+      { dataset: 'trade_calendar', basis: 'INCREMENTAL', start: '2026-07-21', end: '2026-11-18', overlap_days: 30, current_watermark: '2026-11-18' },
+    ],
+    skipped_datasets: [
+      { dataset: 'financial_observation', reason: 'DISCLOSURE_DEADLINE_PENDING', trigger_date: '2026-08-31' },
     ],
   }
 
@@ -108,8 +148,13 @@ describe('data center core loop', () => {
     const calendarCells = assetRows[1].findAll('td')
     expect(dailyCells[1].text()).toBe('2026-01-01')
     expect(dailyCells[2].text()).toBe('2026-08-13')
-    expect(calendarCells[1].text()).toBe('—')
-    expect(calendarCells[2].text()).toBe('—')
+    expect(calendarCells[1].text()).toBe('2024-01-02')
+    const instrumentRow = assetRows.find((row) => row.text().includes('instrument'))
+    expect(instrumentRow?.findAll('td')[1]?.text()).toBe('2026-08-20')
+    expect(instrumentRow?.findAll('td')[2]?.text()).toBe('2026-08-20')
+    expect(instrumentRow?.text()).toContain('全量快照 · 最近刷新')
+    expect(calendarCells[2].text()).toBe('2026-11-18')
+    expect(assetRows[1].text()).toContain('日历覆盖至 2026-11-18 · 已检查至 2026-08-20')
     expect(apiGet).not.toHaveBeenCalledWith('/api/v1/data/catalog')
     await wrapper.find('.el-table__row').trigger('click')
     await flushPromises()
@@ -162,7 +207,7 @@ describe('data center core loop', () => {
       if (path === '/api/v1/data/update-plans/preview') return Promise.resolve(updatePlan)
       if (path === '/api/v1/data/updates') {
         expect(body).toEqual({
-          datasets: ['daily_bar', 'trade_calendar'],
+          datasets: ['daily_bar', 'financial_observation', 'instrument', 'trade_calendar'],
           plan_hash: updatePlan.plan_hash,
         })
         return Promise.resolve({ task_id: 'task-plan-1', status: 'QUEUED', plan_hash: updatePlan.plan_hash })
@@ -181,10 +226,16 @@ describe('data center core loop', () => {
     await create?.trigger('click')
     await flushPromises()
     expect(apiPost).toHaveBeenCalledWith('/api/v1/data/update-plans/preview', {
-      datasets: ['daily_bar', 'trade_calendar'],
+      datasets: ['daily_bar', 'financial_observation', 'instrument', 'trade_calendar'],
     })
     expect(document.body.textContent).toContain('自动增量')
-    expect(document.body.textContent).toContain('2026-08-10 至 2026-11-12')
+    expect(document.body.textContent).toContain('2026-08-10 至 2026-11-18')
+    expect(document.body.textContent).toContain('2026-08-31 截止，当前无需更新')
+    expect(document.body.textContent).toContain('全量快照')
+    expect(document.body.textContent).toContain('快照日期 2026-08-15')
+    expect(document.body.textContent).toContain('覆盖至 2026-11-18')
+    expect(document.body.textContent).toContain('修订回看 30 天')
+    expect(document.body.textContent).toContain('抓取 2026-07-21 至 2026-11-18')
     expect(document.body.textContent).toContain('2')
 
     const submit = Array.from(document.body.querySelectorAll('button'))
@@ -193,7 +244,7 @@ describe('data center core loop', () => {
     await flushPromises()
     await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith(
       '/api/v1/data/updates', {
-        datasets: ['daily_bar', 'trade_calendar'],
+        datasets: ['daily_bar', 'financial_observation', 'instrument', 'trade_calendar'],
         plan_hash: updatePlan.plan_hash,
       },
     ))
@@ -277,6 +328,7 @@ describe('data center core loop', () => {
       return Promise.resolve({
         ...updatePlan,
         dataset_windows: updatePlan.dataset_windows.filter((item) => selected.includes(item.dataset)),
+        skipped_datasets: updatePlan.skipped_datasets.filter((item) => selected.includes(item.dataset)),
       })
     })
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -295,7 +347,7 @@ describe('data center core loop', () => {
     await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith(
       '/api/v1/data/update-plans/preview', { datasets: ['daily_bar'] },
     ))
-    expect(document.body.textContent).toContain('1 / 2')
+    expect(document.body.textContent).toContain('1 / 0')
 
     await Array.from(document.body.querySelectorAll('button'))
       .find((item) => item.textContent?.trim() === '清空')?.click()
@@ -316,6 +368,7 @@ describe('data center core loop', () => {
         return Promise.resolve({
           ...updatePlan,
           dataset_windows: updatePlan.dataset_windows.filter((item) => selected.includes(item.dataset)),
+          skipped_datasets: updatePlan.skipped_datasets.filter((item) => selected.includes(item.dataset)),
         })
       }
       if (path === '/api/v1/data/updates') {

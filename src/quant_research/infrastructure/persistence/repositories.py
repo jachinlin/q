@@ -38,6 +38,7 @@ from quant_research.infrastructure.persistence.orm import (
     CanonicalDatasetORM,
     CanonicalPartitionORM,
     DataCatalogStateORM,
+    DataInitializationStateORM,
     DatasetOperationalStateORM,
     ExperimentORM,
     QualityIssueORM,
@@ -418,6 +419,25 @@ class DataCatalogState:
             self.quality_run_id is not None
             and self.validated_catalog_hash == self.catalog_hash
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DataInitializationStateRecord:
+    """记录首次初始化的冻结年数、日期窗口和完成证据。
+
+    入参：初始化状态、年数、闭区间、时间戳及可选完成身份。
+    返回值：跨流水线与仓储边界传递的不可变状态。
+    异常：字段来自受约束的持久化记录，构造时不主动抛出异常。
+    """
+
+    status: str
+    years: int
+    start_date: date
+    end_date: date
+    started_at: datetime
+    completed_at: datetime | None
+    catalog_hash: str | None
+    quality_run_id: QualityRunId | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -959,6 +979,81 @@ class MetadataRepository:
         with Session(self._engine) as session, session.begin():
             return self._state_record(self._state_row(session, now))
 
+    def find_data_initialization(self) -> DataInitializationStateRecord | None:
+        """读取首次初始化状态。
+
+        入参：无。返回值：冻结状态；尚未启动时返回空值。
+        异常：SQLite 读取异常保持原语义。
+        """
+
+        with Session(self._engine) as session:
+            row = session.get(DataInitializationStateORM, 1)
+            return None if row is None else self._initialization_record(row)
+
+    def begin_data_initialization(
+        self,
+        *,
+        years: int,
+        start_date: date,
+        end_date: date,
+        started_at: datetime,
+    ) -> DataInitializationStateRecord:
+        """原子登记或恢复一份冻结的首次初始化。
+
+        入参：正整数年数、基础闭区间和首次开始时间。
+        返回值：新建或既有的不可变初始化状态。
+        异常：再次登记不同年数或窗口时抛出 ``ValueError``。
+        """
+
+        with Session(self._engine) as session, session.begin():
+            row = session.get(DataInitializationStateORM, 1)
+            if row is None:
+                row = DataInitializationStateORM(
+                    id=1,
+                    status="IN_PROGRESS",
+                    years=years,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                    started_at=_RepositoriesSupport._timestamp(started_at),
+                    completed_at=None,
+                    catalog_hash=None,
+                    quality_run_id=None,
+                )
+                session.add(row)
+                session.flush()
+            elif (
+                row.years != years
+                or row.start_date != start_date.isoformat()
+                or row.end_date != end_date.isoformat()
+            ):
+                raise ValueError("data initialization window is already frozen")
+            return self._initialization_record(row)
+
+    def complete_data_initialization(
+        self,
+        *,
+        catalog_hash: str,
+        quality_run_id: QualityRunId,
+        completed_at: datetime,
+    ) -> DataInitializationStateRecord:
+        """在全目录校验成功后原子标记首次初始化完成。
+
+        入参：最终目录哈希、质量运行标识和完成时间。
+        返回值：包含完成证据的不可变初始化状态。
+        异常：初始化尚未开始时抛出 ``RuntimeError``。
+        """
+
+        with Session(self._engine) as session, session.begin():
+            row = session.get(DataInitializationStateORM, 1)
+            if row is None:
+                raise RuntimeError("data initialization has not started")
+            row.status = "COMPLETED"
+            row.completed_at = _RepositoriesSupport._timestamp(completed_at)
+            row.catalog_hash = catalog_hash
+            row.quality_run_id = str(quality_run_id)
+            session.flush()
+            return self._initialization_record(row)
+
     def require_validated_catalog(self) -> DataCatalogState:
         """取得当前目录状态，并要求全局质量门禁处于开放状态。
 
@@ -1350,6 +1445,27 @@ class MetadataRepository:
                 _RepositoriesSupport._parse_timestamp(row.validated_at)
                 if row.validated_at is not None
                 else None
+            ),
+        )
+
+    @staticmethod
+    def _initialization_record(
+        row: DataInitializationStateORM,
+    ) -> DataInitializationStateRecord:
+        return DataInitializationStateRecord(
+            status=row.status,
+            years=row.years,
+            start_date=date.fromisoformat(row.start_date),
+            end_date=date.fromisoformat(row.end_date),
+            started_at=_RepositoriesSupport._parse_timestamp(row.started_at),
+            completed_at=_RepositoriesSupport._parse_optional_timestamp(
+                row.completed_at
+            ),
+            catalog_hash=row.catalog_hash,
+            quality_run_id=(
+                None
+                if row.quality_run_id is None
+                else QualityRunId.parse(row.quality_run_id)
             ),
         )
 

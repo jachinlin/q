@@ -2,14 +2,14 @@
 
 文档状态：设计草案，待用户书面审阅　·　日期：2026-08-20
 
-本文是 A 股个人量化策略研究工作台的**唯一权威设计文档**，按阅读顺序汇集项目诉求、需求规格、整体架构、各层设计、接口契约与实现计划。实现级细化见 `implementation.md`。文中形如 `第 N 章 §M` 的引用指向本文对应章节。
+本文是 A 股个人量化策略研究工作台的**总体设计入口**，按阅读顺序汇集项目诉求、需求规格、整体架构、各层边界、接口契约与实现计划。数据层的权威详细设计已拆分到[数据层设计](data-layer-design.md)；实现级细化见 `implemention.md`。文中形如 `第 N 章 §M` 的引用指向本文对应章节。
 
 ## 目录
 
 1. 项目主诉求与定位（对齐基准）
 2. 需求规格
 3. 整体架构
-4. 数据层设计
+4. [数据层设计（独立文档）](data-layer-design.md)
 5. 因子层设计
 6. 策略层设计（A+B 扩展 / 订单驱动）
 7. 回测层设计（订单级引擎 / 多空账务）
@@ -153,7 +153,7 @@
 
 依赖方向单向向下；策略作者只接触稳定公开契约（数据只读接口、因子、模型端口、回测引擎）。
 
-### 2.5 数据层需求（详见 `第 4 章`）
+### 2.5 数据层需求（详见[数据层设计](data-layer-design.md)）
 
 - **数据源隔离**：`SourceClient` 采集 + `CanonicalMapper` 规范化；上层不触供应商专有字段。
 - **三层**：Raw（原样、内容寻址、不可变）→ Canonical（统一代码/日历/字段/复权入口/PIT 时点）→ Feature（因子结果）。
@@ -454,159 +454,16 @@ CanonicalMapper(Protocol)       # 规范化：供应商字段 → Canonical sche
 
 ## 4. 数据层设计
 
-### 4.1 设计取向
+详细设计已经拆分到[数据层设计](data-layer-design.md)，该文档是数据目录、Schema、
+`LOCALIZE → CURATE → VALIDATE`、PIT 研究读取、质量门和数据身份的权威来源。
 
-- **不为跨运行复现付费**：无数据快照版本、无历史 catalog 回放。数据层只维护"当前一份"
-  Canonical，重性能与去重（不重算），不为跨运行复现付费。注意：Raw/Canonical 仍**内容寻址**
-  （content\_hash/request\_hash/schema\_fingerprint），那是为去重、增量、完整性服务，**不是**为回放旧数据——
-  边界见 `§3.4.2`。
-- **PIT 是唯一不让步的红线**：时点正确与防未来函数保持全部严格性。
-- **公司行为一等公民**：分红/送转/除权除息作为 Canonical 事件数据集，服务复权与回测账务。
-- **数据源可插拔**：SourceClient + CanonicalMapper 隔离，上层零改动切 TuShare。
+本总体设计只保留三个跨层边界：
 
-### 4.2 边界
+- 研究代码只能通过 `CanonicalResearchRepository` 读取，不得扫描 Raw 或 Canonical 文件。
+- Canonical 行必须遵守 PIT 审计列和可见性约束；严重或致命质量问题关闭研究读取门。
+- 实验捕获当前目录身份并执行运行内漂移检查，但不提供历史数据快照回放。
 
-**输入**：
-
-- 供应商原始响应（BaoStock/TuShare），经 `SourceClient.fetch(request)` 返回 `RawBatch`
-  （`source, endpoint, request:Mapping, retrieved_at, schema:tuple[str], rows:list[dict[str,str]]`，全 String）。
-- 采集窗口 `(start, end)` 与 `--full` 标志（由 CLI/Worker 传入）。
-- 交易规则/费率无关；数据层不消费策略配置。
-
-**输出**（下游唯一契约是 `ResearchDataRepository`，见 `§11.2.3`）：
-
-- 九个 Canonical 数据集（Parquet，强类型 + 五审计列），schema 见 `§11.2.2`：
-  `instrument / trade_calendar / daily_bar / daily_basic / security_status / corporate_action /
-  financial_observation / industry_classification / index_bar`。
-- 只读 PIT 接口返回 `pl.LazyFrame`，物理截断到 `available_at ≤ 截止 & pit_usable`：
-  `bars / adjusted_bars / log_returns / daily_basics / security_status_range / corporate_actions /
-  financials_as_of / financial_history / industry_as_of / trade_calendar / instruments`。
-- `catalog_version() -> str`（运行内一致性用）；质量门状态（关门则 Repository 抛
-  `DATA_QUALITY_GATE_CLOSED`）。
-- 副产物：SQLite 元数据（raw\_request/raw\_object/canonical\_dataset/canonical\_partition/
-  data\_catalog\_state/quality\_run…）、质量运行报告。
-
-**不输出**：复权后的持久化价（复权因子在读取侧算）、任何跨运行数据快照。
-
-### 4.3 三层与流水线
-
-```text
-供应商 → SourceClient → Raw(原样,内容寻址,不可变)
-      → CanonicalMapper → Canonical(统一/PIT/复权入口/公司行为)
-      → FeatureBuilder → Feature(因子结果,运行内缓存)
-```
-
-流水线阶段：`LOCALIZE → CURATE → VALIDATE`。
-
-- **LOCALIZE**：只做供应商 I/O，写 Raw；按 request 去重、断点续抓（性能，不为复现）。
-- **CURATE**：Raw → Canonical，规范化 + PIT 时点化 + 复权计算入口。
-- **VALIDATE**：质量规则；严重/致命失败关闭"研究读取门"。
-
-### 4.4 Canonical 数据集
-
-| 数据集                       | 主键                                               | 说明                   |
-| ------------------------- | ------------------------------------------------ | -------------------- |
-| `instrument`              | `instrument_id`                                  | 证券主数据、板块、上市生命周期      |
-| `trade_calendar`          | `trade_date`                                     | 开市/休市                |
-| `daily_bar`               | `instrument_id, trade_date`                      | 未复权 OHLCV + 成交额      |
-| `daily_basic`             | `instrument_id, trade_date`                      | 估值/换手                |
-| `security_status`         | `instrument_id, trade_date`                      | 上市/停牌/ST/可交易         |
-| `corporate_action`        | `instrument_id, ex_date, action_type`            | **分红/送转/除权除息事件（新增）** |
-| `financial_observation`   | `instrument_id, report_period, metric, revision` | PIT 财务 + 供应商重述       |
-| `industry_classification` | `as_of_date, instrument_id, taxonomy`            | 按请求日期重建的行业状态         |
-| `index_bar`               | `index_id, trade_date`                           | 指数行情（基准/全收益基准）       |
-
-#### 4.4.1 通用 PIT 审计列（每个数据集尾部）
-
-```text
-source                # 供应商
-available_at          # 业务上最早可用于决策的时间（PIT 截断依据）
-availability_source   # available_at 的确定依据
-pit_usable            # 是否足以支持 PIT（false 保留供审计但不参与 PIT）
-ingested_at           # 本地抓取时间（仅血缘，不替代 available_at）
-```
-
-#### 4.4.2 公司行为（新增，服务复权与回测账务）
-
-`corporate_action` 至少含：
-
-```text
-instrument_id, ex_date(除权除息日), action_type(CASH_DIVIDEND|STOCK_DIVIDEND|SPLIT|...),
-cash_per_share(每股现金红利, 税前), share_ratio(每股送转比例), announced_at, available_at, pit_usable
-```
-
-两个消费方向：
-
-1. **复权计算**：Canonical 提供统一前/后/不复权入口，前复权因子由公司行为事件推导。
-2. **回测账务（回测层 P3b-1 消费）**：回测引擎按 `ex_date` 给持仓派发现金红利（`DIVIDEND` ledger 事件）、
-   调整送转股数，使 NAV 在除权除息日不因未复权价跳水而失真。数据集本身在数据层首版即产出，
-   回测侧的消费是 P3b-1。
-
-### 4.5 复权语义
-
-- Canonical `daily_bar` 存**未复权**价（撮合真实性要求真实成交价）。
-- 提供 `AdjustmentService`：由 `corporate_action` 推导前复权因子，供因子/信号计算使用前复权序列。
-- **口径分离铁律**：回测撮合用未复权价 + 公司行为账务；因子信号用前复权价。二者不可混用。
-
-### 4.6 PIT 与研究读取
-
-- 研究代码只经 `CanonicalResearchRepository` 读取，禁止旁路扫描 Raw/Canonical 路径。
-- 读取按 `as_of / signal_date` 截断：物理上不返回 `available_at > 截断` 或 `pit_usable=false` 的行。
-- 财务：`financials_as_of` 选信号日已知的最新 revision；`financial_history` 保留截止时点全部 revision，
-  不用最终修订回填早期信号日。
-- 行业：按请求日期重建 as-of 状态，首次出现该状态的 `as_of_date` 起可见，不回写更早的 `supplier_update_date`。
-
-### 4.7 质量门（VALIDATE）
-
-阻断规则（严重/致命关闭研究门）：
-
-```text
-FATAL : 必需数据集缺失/为空、交易日历无开市日、Canonical schema 不符、跨分区 schema 不一致、主键重复
-SEVERE: 必填值空、OHLC 关系错误、成交量为负、交易日覆盖缺口、证券未知、财务可用时间缺失/倒置、
-        公司行为除权日与行情跳变不一致（新增校验）
-```
-
-- 质量规则语义要匹配业务真实：合法市场异常（如停牌日 turnover 为空）不误报。
-- 结果按"规则 × 数据集"记 PASS/FAIL/SKIPPED；只有全绿才开研究门。
-
-### 4.8 数据身份（轻量，去复现）
-
-- 维护 `catalog_version`（单调递增或当前内容摘要），仅表示"当前这一份 Canonical 的版本号"。
-- 用途：实验运行的**运行内一致性门**（运行中数据被更新则本次运行失败），**不做历史版本存储与回放**。
-- 无 `data_hash` 进实验身份、无快照复现（对齐 project-intent）。
-
-### 4.9 存储与性能
-
-- Raw/Canonical 为 Parquet；按 `year=` 分区（日更只重建当年分区，成本 O(当年)，见下）。
-- 去重：LOCALIZE 按 request 去重、断点续抓；CURATE 按分区输入变化增量重建。
-- DuckDB/Polars 向量化；投影下推、尽早过滤。
-- **性能取舍**：year 分区使日更成本随年内进度增长、跨年清零；若年底日更成为瓶颈可降级为月分区
-  （最小改动），append-only 追加因复杂度暂不做（对齐"不过度设计"）。
-
-### 4.10 数据源隔离
-
-```text
-SourceClient(Protocol): login/logout/fetch_* → RawBatch
-CanonicalMapper(Protocol): RawBatch → CanonicalBatch（供应商字段 → Canonical schema）
-```
-
-BaoStock 一期实现；TuShare 后续加适配器不动上层。ETF 行情、指数、行业、财务各端点的
-供应商差异全部吸收在 mapper 层。
-
-### 4.11 测试契约
-
-- **PIT**：财务/行业修订不回填旧信号日；`CanonicalResearchRepository` 截断物理有效；公司行为可见性时点正确。
-- **质量**：每条规则字面量 oracle；合法异常不误报。
-- **复权/公司行为**：前复权因子由事件推导正确；除权日行情跳变与事件对账。
-- **确定性**：排序稳定，不依赖 set/文件系统/DB 未声明顺序。
-- **隔离**：模拟 TuShare mapper 产出与 BaoStock 一致的 Canonical schema。
-
-### 4.12 明确不做
-
-- 数据快照版本与历史 catalog 回放。
-- 跨运行数据复现（source/env 指纹、旧数据回放）。注意：Raw/Canonical 的内容寻址哈希**保留**（去重/增量/完整性），不在此列。
-- 分钟/Tick、盘口、实时行情。
-- 北交所以外范围限制（范围按业界方式放开，不再人为设限）。
+接口落地基准仍见 `§11.2`，阶段性交付范围见 `§12.3`。
 
 ***
 

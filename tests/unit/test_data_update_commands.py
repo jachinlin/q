@@ -13,6 +13,7 @@ from quant_research.application.research import ResearchApplicationService
 from quant_research.data.contracts import JsonValue
 from quant_research.data.pipeline.publish import (
     DataUpdatePlan,
+    DataUpdateSkip,
     DataUpdateWindow,
     DataUpdateWindowBasis,
 )
@@ -214,6 +215,37 @@ def test_stale_preview_is_rejected_before_task_creation() -> None:
         )
 
     assert stale.value.detail.code == "DATA_UPDATE_PLAN_STALE"
+    assert queue.enqueued is None
+
+
+def test_disclosure_pending_plan_cannot_create_an_empty_update_task() -> None:
+    plan = DataUpdatePlan(
+        window_mode="AUTO_INCREMENTAL",
+        planned_at=NOW,
+        start=date(2026, 8, 15),
+        end=date(2026, 8, 15),
+        dataset_windows=(),
+        skipped_datasets=(
+            DataUpdateSkip(
+                dataset=DatasetKind.FINANCIAL_OBSERVATION,
+                reason="DISCLOSURE_DEADLINE_PENDING",
+                trigger_date=date(2026, 8, 31),
+            ),
+        ),
+    )
+    queue = _Queue()
+    service = _service(queue, _Planner(plan))
+
+    with pytest.raises(QuantError) as not_required:
+        service.enqueue_data_update(
+            start=None,
+            end=None,
+            datasets=(DatasetKind.FINANCIAL_OBSERVATION,),
+            expected_plan_hash=plan.plan_hash,
+            request_id="request-1",
+        )
+
+    assert not_required.value.detail.code == "DATA_UPDATE_NOT_REQUIRED"
     assert queue.enqueued is None
 
 

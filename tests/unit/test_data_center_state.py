@@ -11,6 +11,7 @@ from quant_research.data.quality.models import (
     QualityRunSpec,
 )
 from quant_research.domain.enums import DatasetKind, Severity
+from quant_research.domain.identifiers import QualityRunId
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -52,6 +53,40 @@ def test_migration_and_operational_stage_updates_preserve_prior_evidence(
     assert {column["name"] for column in inspector.get_columns("task_attempt")} >= {
         "result_json"
     }
+    engine.dispose()
+
+
+def test_data_initialization_state_freezes_and_completes(tmp_path: Path) -> None:
+    database = tmp_path / "initialization.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    repository = MetadataRepository(engine)
+    started = datetime(2026, 8, 21, 1, tzinfo=UTC)
+
+    initial = repository.begin_data_initialization(
+        years=20,
+        start_date=date(2006, 8, 20),
+        end_date=date(2026, 8, 20),
+        started_at=started,
+    )
+    resumed = repository.begin_data_initialization(
+        years=20,
+        start_date=date(2006, 8, 20),
+        end_date=date(2026, 8, 20),
+        started_at=started,
+    )
+
+    assert initial == resumed
+    assert initial.status == "IN_PROGRESS"
+    quality_run_id = QualityRunId.new()
+    completed = repository.complete_data_initialization(
+        catalog_hash="a" * 64,
+        quality_run_id=quality_run_id,
+        completed_at=started,
+    )
+    assert completed.status == "COMPLETED"
+    assert completed.quality_run_id == quality_run_id
+    assert repository.find_data_initialization() == completed
     engine.dispose()
 
 

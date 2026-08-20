@@ -18,9 +18,10 @@ class _DataCommands:
         services_factory: Callable[[], ApplicationServices],
     ) -> None:
         @group.command("bootstrap")
-        def bootstrap() -> None:
+        def bootstrap(years: int = typer.Option(..., "--years", min=1)) -> None:
             _CliSupport._invoke(
-                lambda services: services.pipeline.bootstrap(), services_factory
+                lambda services: services.pipeline.bootstrap(years=years),
+                services_factory,
             )
 
         @group.command("update")
@@ -61,42 +62,61 @@ class _DataCommands:
             dataset: str,
             from_: str | None = typer.Option(None, "--from"),
             to: str | None = typer.Option(None, "--to"),
-            full: bool = typer.Option(False, "--full"),
         ) -> None:
             parsed = _CliSupport._dataset_arg(dataset)
             start, end = _CliSupport._date_pair(from_, to)
-            _CliSupport._invoke(
-                lambda services: _CliSupport._localize_payload(
-                    services.pipeline.localize(parsed, start=start, end=end, full=full)
-                ),
-                services_factory,
-            )
+
+            def execute(services: ApplicationServices) -> dict[str, object]:
+                plan = services.pipeline.plan_update(
+                    start=start,
+                    end=end,
+                    datasets=(parsed,),
+                )
+                if not plan.dataset_windows:
+                    raise QuantError(
+                        ErrorDetail(
+                            code="DATA_LOCALIZE_NOT_REQUIRED",
+                            severity=Severity.INFO,
+                            message="the selected dataset has no localization window",
+                            context={"dataset": parsed.value},
+                            remediation="retry after the next update trigger",
+                            retryable=False,
+                        )
+                    )
+                window = plan.dataset_windows[0]
+                return _CliSupport._localize_payload(
+                    services.pipeline.localize(
+                        parsed, start=window.start, end=window.end
+                    )
+                )
+
+            _CliSupport._invoke(execute, services_factory)
 
         @group.command("localize-all")
         def localize_all(
             from_: str | None = typer.Option(None, "--from"),
             to: str | None = typer.Option(None, "--to"),
-            full: bool = typer.Option(False, "--full"),
         ) -> None:
             start, end = _CliSupport._date_pair(from_, to)
-            _CliSupport._invoke(
-                lambda services: {
+
+            def execute(services: ApplicationServices) -> dict[str, object]:
+                plan = services.pipeline.plan_update(start=start, end=end)
+                return {
                     "datasets": [
                         _CliSupport._localize_payload(item)
                         for item in services.pipeline.localize_all(
-                            start=start, end=end, full=full
+                            windows=plan.dataset_windows
                         )
                     ]
-                },
-                services_factory,
-            )
+                }
+
+            _CliSupport._invoke(execute, services_factory)
 
         @group.command("curate")
         def curate(
             dataset: str,
             from_: str | None = typer.Option(None, "--from"),
             to: str | None = typer.Option(None, "--to"),
-            full: bool = typer.Option(False, "--full"),
         ) -> None:
             start, end = _CliSupport._date_pair(from_, to)
             _CliSupport._invoke(
@@ -105,19 +125,18 @@ class _DataCommands:
                         _CliSupport._dataset_arg(dataset),
                         start=start,
                         end=end,
-                        full=full,
                     )
                 ),
                 services_factory,
             )
 
         @group.command("curate-all")
-        def curate_all(full: bool = typer.Option(False, "--full")) -> None:
+        def curate_all() -> None:
             _CliSupport._invoke(
                 lambda services: {
                     "datasets": [
                         _CliSupport._curate_payload(item)
-                        for item in services.pipeline.curate_all(full=full)
+                        for item in services.pipeline.curate_all()
                     ]
                 },
                 services_factory,

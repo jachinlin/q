@@ -108,7 +108,7 @@ def localize_one(request):
     dir = raw/source=.../endpoint=.../{rh}/
     # 断点续抓：SQLite 有该 request 的当前头且 schema_fingerprint 与当前端点契约一致 → 跳过网络
     head = sqlite.get_raw_request(source, endpoint, rh)
-    if head and head.schema_fingerprint == current_endpoint_fingerprint and not full:
+    if head and head.schema_fingerprint == current_endpoint_fingerprint:
         return REUSED
     batch = source.fetch(request)                 # 网络
     table = arrow_table_all_string(batch)         # 全 String
@@ -164,21 +164,33 @@ CREATE TABLE raw_object (
 | daily_bar / daily_basic / security_status（三者 fan-out 自同一日线） | `query_history_k_data_plus` | 每个开市日一条（`code=""` 全市场） | 对窗口内每个开市日生成 `{code:"", start_date:d, end_date:d, frequency:"d", adjustflag:"3", fields:...}` |
 | daily_bar（ETF 补充，全 A 接口不含 ETF） | `query_history_k_data_plus` | 每只 ETF 按区间 | 白名单 ETF 每只 `{code:etf, start_date, end_date, frequency:"d", adjustflag:"3", fields:...}` |
 | index_bar | `query_history_k_data_plus` | 每个指数按区间 | 每指数 `{code:idx, start_date, end_date, frequency:"d", fields:...}` |
-| trade_calendar | `query_trade_dates` | 整区间一条 | `{start_date, end_date}`；窗口向后延 90 日历日供调度 |
-| instrument | `query_stock_basic` | 全市场一条 | `{code:""}` |
-| financial_observation | `query_dupont_data` | 每 (证券, 年, 季) 一条 | 对每只证券生命周期内、报告期已过保守披露截止日的 (year, quarter) 生成 `{code, year, quarter}` |
+| trade_calendar | `query_trade_dates` | 整区间一条 | `{start_date, end_date}`；覆盖末日向后延 90 个自然日供调度，最近 30 个自然日作为日历修订回看窗口 |
+| instrument | `query_stock_basic` | 全市场一条 | `{code:""}`；固定为 `SNAPSHOT_REFRESH`，不读取 Canonical 水位或重叠窗口 |
+| financial_observation | `query_dupont_data` | 每 (证券, 年, 季) 一条 | 自动更新不使用 Canonical 水位；以最近已结束报告期为候选，严格越过其披露截止日后才生成 `{code, year, quarter}`。bootstrap 补齐范围内全部已到期报告期 |
 | industry_classification | `query_stock_industry` | 每个已完整结束开市日一条（全市场） | `{code:"", date:d}`；仅当 `d` 已完整结束（见 §1.6.4）才进 curate |
 | corporate_action | `query_dividend_data` | 每 (证券, 年) 一条 | 每只证券每年 `{code, year, yearType:"report"}` |
 
 `adjustflag="3"` = 不复权（Canonical 存未复权，复权在读取侧算）。
 
-财务保守披露截止日（`financial_disclosure_deadline`，用于决定 (year,quarter) 是否可抓）：
+财务保守披露截止日（`financial_disclosure_deadline`，用于决定 `(year, quarter)` 是否可抓）：
 
 ```text
 Q1 → 当年 4-30    Q2 → 当年 8-31    Q3 → 当年 10-31    Q4 → 次年 4-30
 report_period_end: Q1→3-31, Q2→6-30, Q3→9-30, Q4→12-31
-仅当 disclosure_deadline(year,quarter) <= 采集窗口 end 才生成该 request。
+自动更新仅当 planning_date > disclosure_deadline(year, quarter) 时生成该 request；截止日当天不抓取。
 ```
+
+自动更新不读取 `financial_observation` 的 Canonical 最大报告期作为水位，也不应用通用
+`overlap_days`。计划器先选择最近已结束报告期，再判断计划日是否严格越过该报告期的披露截止日；
+尚未越过时返回 `DISCLOSURE_DEADLINE_PENDING` 跳过证据，不展开财务请求。若多个报告期共享该截止日，
+必须一起刷新，例如 4 月 30 日对应上一年度 Q4 和本年度 Q1。重复运行同一批次由 Raw request 身份
+幂等复用，不重新扫描全部历史季度。Dashboard 使用后端返回的 `trigger_date` 展示“无需更新/待更新”，
+财务数据的水位和重叠天数统一显示为“不适用”。
+
+`trade_calendar` 的 `canonical_dataset.end_date` 是未来日历覆盖末日，不是市场数据当前水位；
+`dataset_operational_state.localized_through` 才表示最近一次自动计划已检查到的业务日。Dashboard 数据资产
+表分别显示“日历覆盖至”和“已检查至”，计划与运行详情将 `overlap_days=30` 显示为“修订回看 30 天”，
+不得将覆盖末日和回看窗口解释为行情更新水位或滞后。
 
 ---
 
@@ -247,6 +259,9 @@ preclose→preclose  volume→volume  amount→amount  pctChg→pct_change
 `is_listed` 由 instrument 生命周期推导（trade_date ∈ [list_date, delist_date)）；`board` 从 instrument 关联；
 `price_limit_rule_id` 由板块+日期按规则表推导。
 **instrument**（`query_stock_basic`）：`code→instrument_id code_name→name ipoDate→list_date outDate→delist_date type→instrument_type status→listing_status`；`exchange`/`board` 从 `code` 后缀与代码段推导。
+`list_date/delist_date` 只描述证券生命周期，不参与更新水位。Canonical 数据集覆盖日使用 Raw
+`ingested_at` 对应的上海快照日；Dashboard 显示“全量快照/最近刷新”，当前水位和重叠天数均为
+“不适用”。
 **trade_calendar**（`query_trade_dates`）：`calendar_date→trade_date is_trading_day→is_trading_day`。
 **financial_observation**（`query_dupont_data`，每行含多个 dupont 指标，需 **unpivot** 成长表）：
 ```text
@@ -312,7 +327,7 @@ transform_hash = SHA256(mapper 源码 + 分区规则 + 发布规则 + Canonical 
 ```
 
 curate 时：分区 `old.input_hash == new.input_hash` 且当前文件存在 → 复用（不读 Raw）；否则整分区重建。
-`--full` 强制重建。**注意（财务）**：Q4 年报次年才披露，落在 `report_year=<上一年>` 分区，
+不存在强制重抓或强制重建参数。**注意（财务）**：Q4 年报次年才披露，落在 `report_year=<上一年>` 分区，
 故 `curate financial --from/--to` 用**披露年**映射分区，或直接用 `curate-all` 避免漏跨年重述。
 
 #### 1.5.8 SQLite Canonical 表（DDL）

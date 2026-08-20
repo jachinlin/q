@@ -1220,28 +1220,32 @@ class BaoStockClient:
     def financial_requests(
         self, start: date, end: date
     ) -> tuple[Mapping[str, JsonValue], ...]:
-        """构造已达到保守披露截止日的财务请求单元。
+        """为报告期末闭区间构造已越过披露截止日的财务请求单元。
 
         入参：
-            start：日期闭区间的开始日期。
-            end：日期闭区间的结束日期。
+            start：最早报告期末日。
+            end：最晚报告期末日。
         返回值：
             返回``requests``（``tuple[Mapping[str, JsonValue], ...]``）。
         异常：
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
-        cutoff = min(end, self._clock().astimezone(_SHANGHAI).date())
+        if start > end:
+            raise ValueError("financial report-period start must not follow end")
+        cutoff = self._clock().astimezone(_SHANGHAI).date()
         requests: list[Mapping[str, JsonValue]] = []
         for listing in self._financial_listings():
-            for year in range(start.year - 1, end.year + 1):
+            for year in range(start.year, end.year + 1):
                 for quarter in range(1, 5):
+                    period_end = financial_report_period_end(year, quarter)
+                    if not start <= period_end <= end:
+                        continue
                     if not financial_request_is_eligible(
                         year,
                         quarter,
                         cutoff=cutoff,
                     ):
                         continue
-                    period_end = financial_report_period_end(year, quarter)
                     if listing.list_date > period_end:
                         continue
                     if (

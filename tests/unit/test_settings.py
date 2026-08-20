@@ -83,28 +83,3 @@ def test_settings_load_defaults_data_root_to_user_home(
     settings = Settings.load()
 
     assert settings.data_root == (Path.home() / ".q-data").resolve()
-
-
-def test_settings_loads_configured_bootstrap_years(tmp_path: Path) -> None:
-    config = tmp_path / "base.yaml"
-    config.write_text(
-        "timezone: Asia/Shanghai\nbootstrap_years: 25\n", encoding="utf-8"
-    )
-
-    settings = Settings.load(config, data_root=tmp_path / "runtime")
-
-    assert settings.bootstrap_years == 25
-
-
-@pytest.mark.parametrize("value", [0, -1, True, "20"])
-def test_settings_rejects_invalid_bootstrap_years(
-    tmp_path: Path, value: object
-) -> None:
-    config = tmp_path / "base.yaml"
-    config.write_text(
-        f"timezone: Asia/Shanghai\nbootstrap_years: {value!r}\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="bootstrap_years"):
-        Settings.load(config, data_root=tmp_path / "runtime")

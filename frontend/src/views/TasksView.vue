@@ -10,7 +10,7 @@ import { api, DashboardApiError } from '../api'
 import ErrorState from '../components/ErrorState.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { formatDuration, formatTime } from '../format'
-import type { DataUpdatePlan, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
+import type { DataUpdatePlan, DataUpdateWindow, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
 
 type RetryResult = { task_id: string; family_id?: string; execution_id?: string }
 
@@ -120,6 +120,7 @@ const dataUpdatePlan = computed<DataUpdatePlan | null>(() => {
     || typeof payload.planned_at !== 'string'
     || typeof payload.plan_hash !== 'string'
     || !Array.isArray(payload.dataset_windows)
+    || !Array.isArray(payload.skipped_datasets)
   ) return null
   return payload as DataUpdatePlan
 })
@@ -131,7 +132,29 @@ const legacyDataUpdate = computed(() =>
 function windowBasisLabel(value: string) {
   if (value === 'BOOTSTRAP') return '首次构建'
   if (value === 'INCREMENTAL') return '增量水位'
+  if (value === 'SNAPSHOT_REFRESH') return '全量快照'
+  if (value === 'DISCLOSURE_TRIGGER') return '季度披露'
   return '指定日期'
+}
+
+function windowState(window: DataUpdateWindow) {
+  if (['financial_observation', 'instrument'].includes(window.dataset)) return '不适用'
+  if (window.dataset === 'trade_calendar') return `覆盖至 ${window.current_watermark ?? '—'}`
+  return window.current_watermark ?? '—'
+}
+
+function windowLookback(window: DataUpdateWindow) {
+  if (['financial_observation', 'instrument'].includes(window.dataset)) return '不适用'
+  return window.dataset === 'trade_calendar'
+    ? `修订回看 ${window.overlap_days} 天`
+    : `${window.overlap_days} 天`
+}
+
+function windowRange(window: DataUpdateWindow) {
+  if (window.basis === 'SNAPSHOT_REFRESH') return `快照日期 ${window.start}`
+  if (window.dataset === 'trade_calendar') return `抓取 ${window.start} 至 ${window.end}`
+  const trigger = window.trigger_date ? ` · 截止 ${window.trigger_date}` : ''
+  return `${window.start} 至 ${window.end}${trigger}`
 }
 
 const selectedAttemptRecord = computed(() =>
@@ -479,10 +502,19 @@ onUnmounted(() => {
                 <el-table :data="dataUpdatePlan.dataset_windows" max-height="320" size="small" class="update-window-table">
                   <el-table-column prop="dataset" label="数据集" min-width="145" />
                   <el-table-column label="依据" width="100"><template #default="scope">{{ windowBasisLabel(scope.row.basis) }}</template></el-table-column>
-                  <el-table-column label="当前水位" width="115"><template #default="scope">{{ scope.row.current_watermark ?? '—' }}</template></el-table-column>
-                  <el-table-column prop="overlap_days" label="重叠" width="70" />
-                  <el-table-column label="执行窗口" min-width="215"><template #default="scope">{{ scope.row.start }} 至 {{ scope.row.end }}</template></el-table-column>
+                  <el-table-column label="当前状态" width="155"><template #default="scope">{{ windowState(scope.row) }}</template></el-table-column>
+                  <el-table-column label="回看策略" width="145"><template #default="scope">{{ windowLookback(scope.row) }}</template></el-table-column>
+                  <el-table-column label="执行窗口" min-width="245"><template #default="scope">{{ windowRange(scope.row) }}</template></el-table-column>
                 </el-table>
+                <el-alert
+                  v-if="dataUpdatePlan.skipped_datasets.length"
+                  title="自动计划跳过了尚未越过披露截止日的数据集"
+                  :description="dataUpdatePlan.skipped_datasets.map((item) => `${item.dataset}：${item.trigger_date}`).join('；')"
+                  type="info"
+                  :closable="false"
+                  show-icon
+                  style="margin-top:12px"
+                />
                 <details class="parameter-json">
                   <summary>展开完整 JSON</summary>
                   <pre>{{ formattedPayload }}</pre>

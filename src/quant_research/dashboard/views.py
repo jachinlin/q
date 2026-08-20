@@ -945,6 +945,8 @@ class DashboardViewService:
                 "lag_days": freshness.lag_days,
                 "evaluated_at": freshness.evaluated_at.isoformat(),
                 "reason": freshness.reason,
+                "trigger_date": _ServicesSupport._iso(freshness.trigger_date),
+                "update_required": freshness.update_required,
             },
             "operational": {
                 "last_localized_at": None

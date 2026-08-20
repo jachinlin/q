@@ -15,6 +15,7 @@ import pytest
 from quant_research.data.sources.financials import (
     financial_disclosure_deadline,
     financial_report_period_end,
+    financial_request_is_eligible,
 )
 from quant_research.domain.enums import Exchange
 from quant_research.domain.errors import QuantError
@@ -1610,15 +1611,9 @@ def test_financial_requests_only_include_periods_past_disclosure_deadline() -> N
     periods = {
         (request["report_year"], request["report_quarter"]) for request in requests
     }
-    assert periods == {
-        (2025, 1),
-        (2025, 2),
-        (2025, 3),
-        (2025, 4),
-        (2026, 1),
-    }
+    assert periods == {(2026, 1)}
     assert {request["endpoint"] for request in requests} == {"query_dupont_data"}
-    assert len(requests) == 10  # two instruments x five periods
+    assert len(requests) == 2  # two instruments x one eligible report period
 
 
 def test_financial_requests_respect_each_instrument_listing_lifecycle() -> None:
@@ -1673,10 +1668,6 @@ def test_financial_requests_respect_each_instrument_listing_lifecycle() -> None:
         (2026, 1),
     }
     assert periods_by_instrument["600001.SH"] == {
-        (2024, 1),
-        (2024, 2),
-        (2024, 3),
-        (2024, 4),
         (2025, 1),
         (2025, 2),
     }
@@ -1698,6 +1689,19 @@ def test_financial_disclosure_deadline(
     expected: date,
 ) -> None:
     assert financial_disclosure_deadline(year, quarter) == expected
+
+
+def test_financial_request_requires_the_deadline_to_be_strictly_passed() -> None:
+    assert not financial_request_is_eligible(
+        2026,
+        2,
+        cutoff=date(2026, 8, 31),
+    )
+    assert financial_request_is_eligible(
+        2026,
+        2,
+        cutoff=date(2026, 9, 1),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1725,7 +1729,7 @@ def test_fetch_financials_preserves_the_complete_dupont_response() -> None:
 
     batch = tuple(
         client.fetch_financials(
-            _financial_request(client, date(2025, 1, 1), date(2026, 6, 1))
+            _financial_request(client, date(2024, 12, 31), date(2024, 12, 31))
         )
     )
 

@@ -52,7 +52,6 @@ def test_data_datasets_lists_every_defined_dataset_before_curate(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -98,7 +97,6 @@ def test_data_summary_separates_gate_and_freshness_without_run_evidence(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -128,7 +126,6 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -225,7 +222,6 @@ def test_overview_uses_global_task_counts_without_legacy_research_payloads(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -266,7 +262,6 @@ def _legacy_factor_series_reads_ic_artifact_and_rejects_tampering(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -391,7 +386,6 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -535,7 +529,6 @@ def test_task_log_degrades_for_missing_file_and_ignores_malformed_jsonl(
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)
@@ -612,7 +605,6 @@ def test_task_log_keeps_trusted_path_and_file_size_boundaries(tmp_path: Path) ->
         timezone=ZoneInfo("Asia/Shanghai"),
         data_root=tmp_path,
         max_partition_size=100,
-        bootstrap_years=2,
     )
     upgrade_database(settings.state_db)
     engine = create_sqlite_engine(settings.state_db)

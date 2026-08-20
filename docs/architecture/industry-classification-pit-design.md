@@ -93,7 +93,7 @@ Localize 复用交易日历，为窗口内每个已完整结束的交易日 `D` 
 }
 ```
 
-请求按日期稳定排序并去重。显式未来日期或尚未完整结束的交易日必须拒绝，不能静默截断后假装完成。每个交易日请求是独立的断点续抓单元；普通 Localize 复用 Schema 兼容的 Raw 当前头，`--full` 则重新请求选定窗口内全部业务单元。
+请求按日期稳定排序并去重。显式未来日期或尚未完整结束的交易日必须拒绝，不能静默截断后假装完成。每个交易日请求是独立的断点续抓单元；Localize 始终复用 Schema 兼容且文件有效的 Raw 当前头，不提供强制重抓开关。
 
 ### 4.2 Raw 内容
 
@@ -296,14 +296,16 @@ Dashboard 需要先读取全市场状态，再与复盘证券集合求交：
 当前本地基线使用闭区间 `[2024-08-12, 2026-08-14]`：
 
 ```powershell
-uv run quant data localize industry_classification --from 2024-08-12 --to 2026-08-14 --full
-uv run quant data curate industry_classification --from 2024-08-12 --to 2026-08-14 --full
+uv run quant data localize industry_classification --from 2024-08-12 --to 2026-08-14
+uv run quant data curate industry_classification --from 2024-08-12 --to 2026-08-14
 uv run quant data validate-all
 ```
 
 两个日期选项必须同时传入。Localize 对区间内每个完整交易日请求一次；Curate 不访问供应商，而是读取 SQLite 登记的合格 Raw 当前头，按请求年份完整重建选中分区。必须先完成全部 Localize，再由 Curate 原子切换 Canonical，最后通过 `validate-all` 重开研究门禁。
 
-省略日期时，`localize --full` 使用动态 bootstrap 窗口，不能替代上述固定基线。普通后续更新继续使用每日增量语义和最近 5 个自然日重抓窗口。
+省略日期时，CLI 先按当前 Canonical 水位推导增量窗口，再把明确日期传给 Pipeline；空库必须先执行带
+`--years` 的 bootstrap。普通后续更新继续使用每日增量语义和最近 5 个自然日计划窗口，已有相同 Raw
+请求仍直接复用。
 
 不得手工修改 Raw、Canonical Parquet 或 SQLite 当前指针。
 

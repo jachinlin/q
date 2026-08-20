@@ -121,7 +121,7 @@ def test_calendar_refresh_and_missing_evidence_cover_all_states() -> None:
     )
     assert statuses[DatasetKind.TRADE_CALENDAR] is FreshnessStatus.CURRENT
     assert statuses[DatasetKind.INSTRUMENT] is FreshnessStatus.CURRENT
-    assert statuses[DatasetKind.FINANCIAL_OBSERVATION] is FreshnessStatus.STALE
+    assert statuses[DatasetKind.FINANCIAL_OBSERVATION] is FreshnessStatus.CURRENT
     assert statuses[DatasetKind.INDUSTRY_CLASSIFICATION] is FreshnessStatus.MISSING
 
 
@@ -132,3 +132,34 @@ def test_calendar_shortage_marks_dependent_datasets_unknown() -> None:
         session=None,
     )
     assert statuses[DatasetKind.INDEX_BAR] is FreshnessStatus.UNKNOWN
+
+
+def test_financial_freshness_turns_stale_only_after_disclosure_deadline() -> None:
+    evaluator = FreshnessEvaluator(
+        DATASET_CATALOG,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    result = evaluator.evaluate(
+        canonical=(
+            _canonical(DatasetKind.FINANCIAL_OBSERVATION, date(2026, 6, 30)),
+        ),
+        operational=(
+            _operational(
+                DatasetKind.FINANCIAL_OBSERVATION,
+                datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+        ),
+        evaluated_at=datetime(2026, 9, 1, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+        latest_complete_session=date(2026, 8, 31),
+    )
+    financial = next(
+        item
+        for item in result
+        if item.dataset is DatasetKind.FINANCIAL_OBSERVATION
+    )
+
+    assert financial.status is FreshnessStatus.STALE
+    assert financial.actual_watermark is None
+    assert financial.expected_watermark is None
+    assert financial.trigger_date == date(2026, 8, 31)
+    assert financial.update_required is True

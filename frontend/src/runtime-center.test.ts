@@ -205,10 +205,13 @@ describe('runtime center', () => {
   it('renders frozen data update windows as business parameters', async () => {
     const payload = {
       window_mode: 'AUTO_INCREMENTAL', planned_at: '2026-08-15T01:00:00Z',
-      start: '2026-08-10', end: '2026-11-12', plan_hash: 'a'.repeat(64),
+      start: '2026-08-10', end: '2026-11-18', plan_hash: 'a'.repeat(64),
       dataset_windows: [
         { dataset: 'daily_bar', basis: 'INCREMENTAL', start: '2026-08-10', end: '2026-08-14', overlap_days: 4, current_watermark: '2026-08-13' },
+        { dataset: 'instrument', basis: 'SNAPSHOT_REFRESH', start: '2026-08-15', end: '2026-08-15', overlap_days: 0 },
+        { dataset: 'trade_calendar', basis: 'INCREMENTAL', start: '2026-07-21', end: '2026-11-18', overlap_days: 30, current_watermark: '2026-11-18' },
       ],
+      skipped_datasets: [],
     }
     const wrapper = await mountRuntimeCenter(true, payload, 'DATA_UPDATE')
     await wrapper.find('.task-link').trigger('click')
@@ -218,6 +221,12 @@ describe('runtime center', () => {
     expect(document.body.textContent).toContain('daily_bar')
     expect(document.body.textContent).toContain('增量水位')
     expect(document.body.textContent).toContain('2026-08-10 至 2026-08-14')
+    expect(document.body.textContent).toContain('全量快照')
+    expect(document.body.textContent).toContain('快照日期 2026-08-15')
+    expect(document.body.textContent).toContain('不适用')
+    expect(document.body.textContent).toContain('覆盖至 2026-11-18')
+    expect(document.body.textContent).toContain('修订回看 30 天')
+    expect(document.body.textContent).toContain('抓取 2026-07-21 至 2026-11-18')
     wrapper.unmount()
   })
 

@@ -8,6 +8,7 @@ from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from quant_research.data.catalog import DatasetCatalog, FreshnessBasis
+from quant_research.data.sources.financials import FinancialDisclosureSchedule
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.persistence.repositories import (
     CanonicalDatasetRecord,
@@ -41,6 +42,8 @@ class DatasetFreshness:
     lag_days: int | None
     evaluated_at: datetime
     reason: str
+    trigger_date: date | None = None
+    update_required: bool | None = None
 
 
 class FreshnessEvaluator:
@@ -145,6 +148,12 @@ class FreshnessEvaluator:
             return self._watermark_record(
                 dataset, canonical.end_date, latest_session, evaluated_at
             )
+        if policy.basis is FreshnessBasis.DISCLOSURE_DEADLINE:
+            return self._disclosure_record(
+                dataset,
+                operational,
+                evaluated_at,
+            )
         if operational is None or operational.last_localized_at is None:
             return self._record(
                 dataset,
@@ -232,6 +241,58 @@ class FreshnessEvaluator:
             else "watermark is behind target",
         )
 
+    def _disclosure_record(
+        self,
+        dataset: DatasetKind,
+        operational: DatasetOperationalStateRecord | None,
+        evaluated_at: datetime,
+    ) -> DatasetFreshness:
+        """按最近已结束报告期的披露截止日评估财务数据，不使用内容水位。
+
+        入参：
+            dataset：财务观察数据集标识。
+            operational：最近成功 LOCALIZE 的运营证据；尚无证据时为空。
+            evaluated_at：带时区的评估时间。
+        返回值：
+            包含披露触发日和是否需要更新的确定性新鲜度记录。
+        异常：
+            日期计算异常按财务披露日程契约传播。
+        """
+        local_date = evaluated_at.astimezone(self._timezone).date()
+        batch = FinancialDisclosureSchedule.latest_completed_batch(local_date)
+        deadline = batch.disclosure_deadline
+        if local_date <= deadline:
+            return self._record(
+                dataset,
+                FreshnessStatus.CURRENT,
+                None,
+                None,
+                None,
+                evaluated_at,
+                "latest completed quarter has not passed its disclosure deadline",
+                trigger_date=deadline,
+                update_required=False,
+            )
+        localized_date = (
+            None
+            if operational is None or operational.last_localized_at is None
+            else operational.last_localized_at.astimezone(self._timezone).date()
+        )
+        refreshed = localized_date is not None and localized_date > deadline
+        return self._record(
+            dataset,
+            FreshnessStatus.CURRENT if refreshed else FreshnessStatus.STALE,
+            None,
+            None,
+            None if refreshed else (local_date - deadline).days,
+            evaluated_at,
+            "latest disclosure batch has been refreshed"
+            if refreshed
+            else "latest disclosure deadline has passed and refresh is required",
+            trigger_date=deadline,
+            update_required=not refreshed,
+        )
+
     @staticmethod
     def _record(
         dataset: DatasetKind,
@@ -241,6 +302,9 @@ class FreshnessEvaluator:
         lag: int | None,
         evaluated_at: datetime,
         reason: str,
+        *,
+        trigger_date: date | None = None,
+        update_required: bool | None = None,
     ) -> DatasetFreshness:
         return DatasetFreshness(
             dataset=dataset,
@@ -250,6 +314,8 @@ class FreshnessEvaluator:
             lag_days=lag,
             evaluated_at=evaluated_at,
             reason=reason,
+            trigger_date=trigger_date,
+            update_required=update_required,
         )
 
     def _cutoff_date(self, evaluated_at: datetime) -> date:

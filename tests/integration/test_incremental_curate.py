@@ -405,7 +405,7 @@ def test_changed_raw_head_rebuilds_partition_and_removes_disappeared_rows(
     assert frame.select("instrument_id", "close").rows() == [("600000.SH", 10.7)]
 
 
-def test_transform_change_missing_file_and_full_window_force_selected_rebuilds(
+def test_transform_change_and_missing_file_force_selected_rebuilds(
     tmp_path: Path,
 ) -> None:
     pipeline, mapper, raw_store, repository, _ = _pipeline(tmp_path)
@@ -441,18 +441,6 @@ def test_transform_change_missing_file_and_full_window_force_selected_rebuilds(
     assert repaired.rebuilt_partitions == 1
     assert len(mapper.normalized_requests) == 1
     assert year_2025.path.is_file()
-
-    mapper.normalized_requests.clear()
-    forced = pipeline.curate(
-        DatasetKind.DAILY_BAR,
-        start=date(2026, 1, 1),
-        end=date(2026, 12, 31),
-        full=True,
-    )
-
-    assert forced.rebuilt_partitions == 1
-    assert len(mapper.normalized_requests) == 1
-
 
 def test_localize_refetches_a_schema_incompatible_financial_checkpoint(
     tmp_path: Path,
@@ -516,8 +504,8 @@ def test_localize_refetches_a_schema_incompatible_financial_checkpoint(
     )
 
 
-def test_localize_full_refetches_a_compatible_raw_head(tmp_path: Path) -> None:
-    """显式 full 必须绕过兼容 Raw 当前头，而不只扩大解析窗口。"""
+def test_localize_always_reuses_a_compatible_raw_head(tmp_path: Path) -> None:
+    """相同请求的兼容 Raw 当前头始终复用，不提供强制重抓开关。"""
     request: Mapping[str, JsonValue] = {
         "endpoint": "query_dupont_data",
         "instrument_id": "000001.SZ",
@@ -538,12 +526,11 @@ def test_localize_full_refetches_a_compatible_raw_head(tmp_path: Path) -> None:
         DatasetKind.FINANCIAL_OBSERVATION,
         start=date(2025, 1, 1),
         end=date(2026, 5, 1),
-        full=True,
     )
 
-    assert result.fetched == 1
-    assert result.skipped == 0
-    assert source.fetch_calls == 1
+    assert result.fetched == 0
+    assert result.skipped == 1
+    assert source.fetch_calls == 0
 
 
 def test_curate_preserves_successive_financial_restatements(

@@ -356,6 +356,23 @@ class ResearchApplicationService:
                     retryable=True,
                 )
             )
+        if not plan.dataset_windows:
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_UPDATE_NOT_REQUIRED",
+                    severity=Severity.INFO,
+                    message="selected datasets do not require an update",
+                    context={
+                        "skipped_datasets": [
+                            item.dataset.value for item in plan.skipped_datasets
+                        ]
+                    },
+                    remediation=(
+                        "wait until the financial disclosure deadline has passed"
+                    ),
+                    retryable=False,
+                )
+            )
         payload = plan.to_payload()
         key = "dashboard-data-update-" + plan.plan_hash[:24]
         task_id = self._queue.enqueue(

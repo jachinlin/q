@@ -47,6 +47,8 @@ _MODULE_FUNCTION_ALLOWLIST: Mapping[str, str] = {
     "quant_research.bootstrap.research.build_research_platform": "stable_public_api",
     "quant_research.infrastructure.persistence.migrations.versions.0005_research_platform.upgrade": "framework_entry",
     "quant_research.infrastructure.persistence.migrations.versions.0005_research_platform.downgrade": "framework_entry",
+    "quant_research.infrastructure.persistence.migrations.versions.0006_data_initialization.upgrade": "framework_entry",
+    "quant_research.infrastructure.persistence.migrations.versions.0006_data_initialization.downgrade": "framework_entry",
     "quant_research.signals.builtin.signal_component_hash": "stable_public_api",
     "quant_research.signals.models._validate_rows": "stable_public_api",
     "quant_research.strategies.definitions._descriptor": "stable_public_api",
