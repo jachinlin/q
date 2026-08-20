@@ -6,17 +6,6 @@
 `quant_research`，安装后的命令为 `quant`。项目尚未发布，不兼容旧接口、旧包、
 旧数据库或旧产物；设计变化应直接落实到最终结构，不创建兼容转发层。
 
-修改前先阅读与任务相关的权威资料：
-
-- `docs/architecture/personal-a-share-quant-platform-design.md`：平台总体设计。
-- `docs/architecture/package-layout.md`：包职责和依赖方向。
-- `docs/architecture/data-layer-design.md`：数据层权威设计。
-- `docs/architecture/industry-classification-pit-design.md`：行业分类 PIT 整体设计。
-- `docs/architecture/factor-analysis-design.md`：因子研究总体设计。
-- `docs/architecture/cli_design.md`：CLI 外部契约。
-- `src/quant_research/data/catalog.py`：可执行数据目录。
-- `src/quant_research/data/schemas.py`：Canonical schema。
-- `configs/rules/a_share.yaml`：唯一交易规则。
 
 设计文档与代码契约冲突时，不要私自保留两套语义。确认权威口径后，在同一变更中
 同步实现、测试和文档。
