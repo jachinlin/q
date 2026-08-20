@@ -7,7 +7,8 @@ from typing import Never, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from quant_research.application.research import ResearchApplicationService
+from quant_research.application.operations import OperationalCommandService
+from quant_research.application.research_platform import ResearchCommandService
 from quant_research.bootstrap.dashboard import DashboardBootstrap, _LocalNotebookProbe
 from quant_research.dashboard.app import create_dashboard_app
 from quant_research.dashboard.models import (
@@ -24,6 +25,7 @@ from quant_research.dashboard.models import (
     MarketReviewValuation,
     QualityRunRequest,
 )
+from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.domain.enums import DatasetKind
 
@@ -159,21 +161,6 @@ class _Service:
                 },
                 "active": (),
             },
-            "experiments": {
-                "status_counts": {
-                    "CREATED": 0,
-                    "QUEUED": 0,
-                    "RUNNING": 0,
-                    "SUCCEEDED": 0,
-                    "FAILED": 0,
-                    "CANCELLED": 0,
-                },
-                "recent": (),
-                "benchmarks": (
-                    {"strategy_id": "etf_rotation", "experiment": None},
-                    {"strategy_id": "stock_multifactor", "experiment": None},
-                ),
-            },
         }
 
     def data_catalog(self) -> dict[str, object]:
@@ -203,8 +190,8 @@ class _Service:
             "latest_quality_run": None,
             "active_update": {
                 "id": "task-1",
-                "experiment_id": None,
-                "factor_run_id": None,
+                "subject_kind": None,
+                "subject_id": None,
                 "task_type": "DATA_UPDATE",
                 "status": "RUNNING",
                 "priority": 0,
@@ -289,6 +276,61 @@ class _Commands:
             **({} if dataset is None else {"dataset": cast(DatasetKind, dataset).value}),
         }
 
+    def delete_task(self, task_id: str, **_: object) -> dict[str, object]:
+        return {"task_id": task_id, "status": "DELETED"}
+
+
+class _ResearchViews:
+    def component_catalog(self) -> dict[str, object]:
+        return {"components": [], "templates": []}
+
+    def templates(self) -> dict[str, object]:
+        return {"items": []}
+
+    def families(self, *, page: int, page_size: int) -> dict[str, object]:
+        return {"items": [], "page": page, "page_size": page_size}
+
+    def family(self, family_id: str) -> dict[str, object]:
+        return {"id": family_id, "executions": []}
+
+    def artifact(
+        self, run_id: str, artifact_type: str, *, page: int, page_size: int
+    ) -> dict[str, object]:
+        return {
+            "run_id": run_id,
+            "artifact_type": artifact_type,
+            "items": [],
+            "page": page,
+            "page_size": page_size,
+            "total": 0,
+        }
+
+
+class _ResearchCommands:
+    def validate_yaml(self, config_yaml: str) -> dict[str, object]:
+        return {"normalized_yaml": config_yaml, "variant_count": 1}
+
+    def submit(self, config_yaml: str, *, request_id: str) -> dict[str, object]:
+        return {"family_id": "family-1", "execution_id": "execution-1", "task_id": "task-1", "status": "QUEUED"}
+
+    def rerun(self, family_id: str, *, request_id: str) -> dict[str, object]:
+        return {"family_id": family_id, "execution_id": "execution-2", "task_id": "task-2", "status": "QUEUED"}
+
+    def enqueue_data_update(self, **arguments: object) -> dict[str, object]:
+        self.enqueue_arguments = arguments
+        return {"task_id": "task-1", "status": "QUEUED"}
+
+    def enqueue_data_validation(self, **arguments: object) -> dict[str, object]:
+        self.validation_arguments = arguments
+        dataset = arguments.get("dataset")
+        return {
+            "task_id": "quality-task-1",
+            "request_id": arguments["request_id"],
+            "status": "QUEUED",
+            "scope": "ALL" if dataset is None else "DATASET",
+            **({} if dataset is None else {"dataset": cast(DatasetKind, dataset).value}),
+        }
+
     def create_factor_study(self, name: str, config: object) -> dict[str, object]:
         return {"id": "study-1", "name": name, "config": config}
 
@@ -318,7 +360,9 @@ def _client(
 ) -> TestClient:
     app = create_dashboard_app(
         service=cast(DashboardViewService, _Service()),
-        commands=cast(ResearchApplicationService, commands or _Commands()),
+        commands=cast(OperationalCommandService, commands or _Commands()),
+        research_service=cast(ResearchDashboardService, _ResearchViews()),
+        research_commands=cast(ResearchCommandService, _ResearchCommands()),
         notebook_probe=_NotebookProbe(notebook_ready),
         static_dir=tmp_path,
         allowed_hosts=("testserver",),
@@ -386,7 +430,7 @@ def test_task_delete_api_is_a_controlled_mutation(tmp_path: Path) -> None:
     assert response.json() == {"task_id": "task-1", "status": "DELETED"}
 
 
-def test_experiment_delete_api_is_a_controlled_mutation(tmp_path: Path) -> None:
+def test_removed_experiment_api_is_not_exposed(tmp_path: Path) -> None:
     headers = {"X-Request-ID": "delete-experiment", "Origin": "http://testserver"}
     with _client(tmp_path) as client:
         response = client.request(
@@ -395,11 +439,7 @@ def test_experiment_delete_api_is_a_controlled_mutation(tmp_path: Path) -> None:
             json={},
             headers=headers,
         )
-    assert response.status_code == 200
-    assert response.json() == {
-        "experiment_id": "experiment-1",
-        "status": "DELETED",
-    }
+    assert response.status_code in {404, 405}
 
 
 def test_market_review_api_exposes_dates_and_scope(tmp_path: Path) -> None:
@@ -573,7 +613,7 @@ def test_data_center_uses_new_contract_and_removes_legacy_routes(
     assert legacy_quality.status_code == 404
 
 
-def test_factor_study_creation_and_run_enqueue_are_controlled_mutations(
+def test_removed_factor_study_api_is_not_exposed(
     tmp_path: Path,
 ) -> None:
     headers = {"X-Request-ID": "factor-request", "Origin": "http://testserver"}
@@ -592,14 +632,11 @@ def test_factor_study_creation_and_run_enqueue_are_controlled_mutations(
         queued = client.post(
             "/api/v1/factor-studies/study-1/runs", json={}, headers=headers
         )
-    assert created.status_code == 201
-    assert created.json()["id"] == "study-1"
-    assert created.json()["config"]["industry"] == payload["industry"]
-    assert queued.status_code == 202
-    assert queued.json()["run_id"] == "run-1"
+    assert created.status_code in {404, 405}
+    assert queued.status_code in {404, 405}
 
 
-def test_factor_series_api_exposes_unified_ic_payload(tmp_path: Path) -> None:
+def test_removed_factor_series_api_is_not_exposed(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.get(
             "/api/v1/factor-runs/run-1/series",
@@ -614,31 +651,29 @@ def test_factor_series_api_exposes_unified_ic_payload(tmp_path: Path) -> None:
             },
         )
 
-    assert response.status_code == 422
-    assert valid.status_code == 200
-    assert valid.json()["ic"] == [{"pearson_ic": 0.2, "rank_ic": 0.1}]
-    assert valid.json()["signal_variant"] == "DIRECTION_ADJUSTED"
-    assert "rank_ic" not in valid.json()
+    assert response.status_code == 404
+    assert valid.status_code == 404
 
 
-def test_dashboard_submits_yaml_text_without_accepting_a_path(tmp_path: Path) -> None:
-    headers = {"X-Request-ID": "experiment-request", "Origin": "http://testserver"}
+def test_dashboard_submits_research_yaml_without_accepting_a_path(tmp_path: Path) -> None:
+    headers = {"X-Request-ID": "research-request", "Origin": "http://testserver"}
     with _client(tmp_path) as client:
         response = client.post(
-            "/api/v1/experiments",
+            "/api/v1/research/families",
             json={"config_yaml": "strategy_id: etf_rotation\n"},
             headers=headers,
         )
         rejected = client.post(
-            "/api/v1/experiments",
+            "/api/v1/research/families",
             json={"config_path": "C:/secrets/experiment.yaml"},
             headers=headers,
         )
 
     assert response.status_code == 202
     assert response.json() == {
-        "experiment_id": "experiment-1",
-        "task_id": "task-3",
+        "family_id": "family-1",
+        "execution_id": "execution-1",
+        "task_id": "task-1",
         "status": "QUEUED",
     }
     assert rejected.status_code == 422

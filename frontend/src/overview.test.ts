@@ -12,9 +12,9 @@ vi.mock('./api', () => ({ api: { get: apiGet } }))
 
 const activeTask = {
   id: 'task-active-0001',
-  experiment_id: 'experiment-active',
-  factor_run_id: null,
-  task_type: 'BACKTEST',
+  subject_kind: 'RESEARCH_RUN',
+  subject_id: 'run-active',
+  task_type: 'RESEARCH_RUN',
   status: 'RUNNING',
   priority: 0,
   progress: { stage: 'BACKTEST', completed: 3, total: 7 },
@@ -66,14 +66,6 @@ function overviewFixture(blocked = false): Overview {
       },
       active: blocked ? [activeTask] : [],
     },
-    experiments: {
-      status_counts: { CREATED: 0, QUEUED: 0, RUNNING: 0, SUCCEEDED: 0, FAILED: 0, CANCELLED: 0 },
-      recent: [],
-      benchmarks: [
-        { strategy_id: 'etf_rotation', experiment: null },
-        { strategy_id: 'stock_multifactor', experiment: null },
-      ],
-    },
   }
 }
 
@@ -85,8 +77,7 @@ async function mountOverview(payload: Overview) {
       { path: '/', component: OverviewView },
       { path: '/data', component: { template: '<div />' } },
       { path: '/tasks', component: { template: '<div />' } },
-      { path: '/experiments', component: { template: '<div />' } },
-      { path: '/experiments/:experimentId', component: { template: '<div />' } },
+      { path: '/research', component: { template: '<div />' } },
       { path: '/notebook', component: { template: '<div />' } },
     ],
   })
@@ -111,7 +102,7 @@ describe('research workbench overview', () => {
     expect(wrapper.text()).toContain('当前没有阻断事项')
     expect(wrapper.text()).toContain('当前没有活动任务')
     expect(wrapper.find('a[href="/data"]').exists()).toBe(true)
-    expect(wrapper.find('a[href="/experiments"]').exists()).toBe(true)
+    expect(wrapper.find('a[href="/research"]').exists()).toBe(true)
     const notebook = wrapper.get('a[href="/notebook"]')
     expect(notebook.attributes('target')).toBeUndefined()
     expect(notebook.text()).toBe('打开 Notebook')

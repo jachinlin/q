@@ -16,9 +16,21 @@ from quant_research.portfolio.rebalance import (
     RebalancePlan,
     RebalancePlanner,
 )
+from quant_research.portfolio.research import (
+    AllocationProjector,
+    AlphaRiskCostOptimizer,
+    ConstructedPortfolio,
+    DirectionalExposureMapper,
+    ObjectiveBreakdown,
+)
 
 __all__ = [
+    "AllocationProjector",
+    "AlphaRiskCostOptimizer",
     "ConstraintViolation",
+    "ConstructedPortfolio",
+    "DirectionalExposureMapper",
+    "ObjectiveBreakdown",
     "OrderIntent",
     "OrderSide",
     "PortfolioConstraints",

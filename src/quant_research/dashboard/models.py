@@ -573,8 +573,8 @@ class TaskSummaryResponse(DashboardModel):
     """
 
     id: str
-    experiment_id: str | None
-    factor_run_id: str | None
+    subject_kind: str | None
+    subject_id: str | None
     task_type: str
     status: str
     priority: int
@@ -739,7 +739,6 @@ class OverviewResponse(DashboardModel):
     worker: WorkerHeartbeatResponse | None
     last_successful_update: TaskSummaryResponse | None
     tasks: OverviewTasksResponse
-    experiments: OverviewExperimentsResponse
 
 
 class ResearchUpdateRequest(DashboardModel):

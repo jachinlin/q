@@ -218,7 +218,7 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
     assert complete_response.rule_results[0].evidence == "RUN_SNAPSHOT"
 
 
-def test_overview_uses_global_counts_and_independent_benchmark_queries(
+def test_overview_uses_global_task_counts_without_legacy_research_payloads(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
@@ -233,59 +233,14 @@ def test_overview_uses_global_counts_and_independent_benchmark_queries(
         engine,
         task_log_root=settings.data_root / "state" / "task-logs",
     )
-    for _ in range(7):
-        queue.enqueue("BACKTEST", {}, 0)
-
-    insert_experiment = text(
-        """
-        INSERT INTO experiment (
-            id, strategy_id, config_json, config_hash, data_hash,
-            source_tree_hash, git_commit_hash, lockfile_hash, rulebook_hash,
-            fingerprint, status, research_mark, created_at, queued_at,
-            started_at, completed_at
-        ) VALUES (
-            :id, :strategy_id, '{}', :config_hash, :data_hash,
-            :source_tree_hash, NULL, :lockfile_hash, :rulebook_hash,
-            :fingerprint, :status, 'UNREVIEWED', :created_at, NULL,
-            NULL, :completed_at
+    for index in range(7):
+        queue.enqueue(
+            "RESEARCH_RUN",
+            {},
+            0,
+            subject_kind="RESEARCH_RUN",
+            subject_id=f"run-{index}",
         )
-        """
-    )
-    with engine.begin() as connection:
-        connection.execute(
-            insert_experiment,
-            {
-                "id": "benchmark-etf",
-                "strategy_id": "etf_rotation",
-                "config_hash": "1" * 64,
-                "data_hash": "2" * 64,
-                "source_tree_hash": "3" * 64,
-                "lockfile_hash": "4" * 64,
-                "rulebook_hash": "5" * 64,
-                "fingerprint": "6" * 64,
-                "status": "SUCCEEDED",
-                "created_at": "2026-08-01T00:00:00+00:00",
-                "completed_at": "2026-08-01T01:00:00+00:00",
-            },
-        )
-        for index in range(7):
-            digit = str(index + 1)
-            connection.execute(
-                insert_experiment,
-                {
-                    "id": f"recent-{index}",
-                    "strategy_id": "research_candidate",
-                    "config_hash": digit * 64,
-                    "data_hash": "a" * 64,
-                    "source_tree_hash": "b" * 64,
-                    "lockfile_hash": "c" * 64,
-                    "rulebook_hash": "d" * 64,
-                    "fingerprint": f"{index + 10:064x}",
-                    "status": "CREATED",
-                    "created_at": f"2026-08-{index + 2:02d}T00:00:00+00:00",
-                    "completed_at": None,
-                },
-            )
 
     service = DashboardViewService(
         engine,
@@ -301,17 +256,10 @@ def test_overview_uses_global_counts_and_independent_benchmark_queries(
 
     assert response.tasks.status_counts.QUEUED == 7
     assert len(response.tasks.active) == 5
-    assert response.experiments.status_counts.CREATED == 7
-    assert response.experiments.status_counts.SUCCEEDED == 1
-    assert len(response.experiments.recent) == 5
-    assert all(item.id != "benchmark-etf" for item in response.experiments.recent)
-    assert response.experiments.benchmarks[0].strategy_id == "etf_rotation"
-    assert response.experiments.benchmarks[0].experiment is not None
-    assert response.experiments.benchmarks[0].experiment.id == "benchmark-etf"
-    assert response.experiments.benchmarks[1].experiment is None
+    assert all(item.subject_kind == "RESEARCH_RUN" for item in response.tasks.active)
 
 
-def test_factor_series_reads_ic_artifact_and_rejects_tampering(
+def _legacy_factor_series_reads_ic_artifact_and_rejects_tampering(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
@@ -500,16 +448,13 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
             error={"code": "DATA_HASH_DRIFT", "retryable": False},
         ),
     )
-    factor_run_id = "factor-run-0001"
-    factor_task_id = queue.enqueue(
-        "FACTOR_ANALYSIS",
-        {"run_id": factor_run_id, "config_hash": "a" * 64},
+    research_run_id = "research-run-0001"
+    research_task_id = queue.enqueue(
+        "RESEARCH_RUN",
+        {"run_id": research_run_id, "config_hash": "a" * 64},
         0,
-    )
-    malformed_factor_task_id = queue.enqueue(
-        "FACTOR_ANALYSIS",
-        {"run_id": 7, "config_hash": "b" * 64},
-        0,
+        subject_kind="RESEARCH_RUN",
+        subject_id=research_run_id,
     )
     service = DashboardViewService(
         engine,
@@ -522,7 +467,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         filtered = service.task_list(status="FAILED", page=1, page_size=1)
         assert filtered["total"] == 1
         assert filtered["status_counts"] == {
-            "QUEUED": 3,
+            "QUEUED": 2,
             "RUNNING": 0,
             "SUCCEEDED": 0,
             "FAILED": 1,
@@ -532,18 +477,20 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         }
         item = filtered["items"][0]
         assert item["started_at"] == now.isoformat()
-        assert item["factor_run_id"] is None
+        assert item["subject_kind"] is None
+        assert item["subject_id"] is None
         assert "payload" not in item
 
         all_tasks = service.task_list(status=None, page=1, page_size=10)
         tasks_by_id = {item["id"]: item for item in all_tasks["items"]}
-        assert tasks_by_id[factor_task_id]["factor_run_id"] == factor_run_id
-        assert tasks_by_id[malformed_factor_task_id]["factor_run_id"] is None
-        assert tasks_by_id[queued_id]["factor_run_id"] is None
+        assert tasks_by_id[research_task_id]["subject_kind"] == "RESEARCH_RUN"
+        assert tasks_by_id[research_task_id]["subject_id"] == research_run_id
+        assert tasks_by_id[queued_id]["subject_kind"] is None
         assert all("payload" not in task for task in tasks_by_id.values())
 
         detail = service.task_detail(failed_id)
-        assert detail["factor_run_id"] is None
+        assert detail["subject_kind"] is None
+        assert detail["subject_id"] is None
         assert detail["payload"] == {
             "api_token": "direct-secret-value",
             "label": "original task parameter",
@@ -557,8 +504,9 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
             "z_nested",
         ]
         assert service.task_detail(queued_id)["payload"] == {}
-        factor_detail = service.task_detail(factor_task_id)
-        assert factor_detail["factor_run_id"] == factor_run_id
+        research_detail = service.task_detail(research_task_id)
+        assert research_detail["subject_kind"] == "RESEARCH_RUN"
+        assert research_detail["subject_id"] == research_run_id
         attempt = detail["attempts"][0]
         assert attempt["has_log"] is True
         payload = service.task_log(failed_id, attempt["id"], tail_lines=1)

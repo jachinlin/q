@@ -12,7 +12,7 @@ import StatusBadge from '../components/StatusBadge.vue'
 import { formatDuration, formatTime } from '../format'
 import type { DataUpdatePlan, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
 
-type RetryResult = { task_id: string; experiment_id?: string | null; run_id?: string }
+type RetryResult = { task_id: string; family_id?: string; execution_id?: string }
 
 const client = useQueryClient()
 const route = useRoute()
@@ -58,8 +58,8 @@ const retry = useMutation({
   mutationFn: ({ id, orphaned }: { id: string; orphaned: boolean }) =>
     api.post<RetryResult>(`/api/v1/tasks/${id}/retry`, { confirm_orphaned: orphaned }),
   onSuccess: async (result) => {
-    const experiment = result.experiment_id ? `，新实验 ${result.experiment_id.slice(0, 8)}` : ''
-    ElMessage.success(`已创建安全重试：任务 ${result.task_id.slice(0, 8)}${experiment}`)
+    const execution = result.execution_id ? `，新 execution ${result.execution_id.slice(0, 8)}` : ''
+    ElMessage.success(`已创建安全重试：任务 ${result.task_id.slice(0, 8)}${execution}`)
     await Promise.all([
       client.invalidateQueries({ queryKey: ['tasks'] }),
       client.invalidateQueries({ queryKey: ['task'] }),
@@ -365,17 +365,10 @@ onUnmounted(() => {
           <el-table-column label="关联" min-width="135">
             <template #default="scope">
               <div class="association-cell">
-                <RouterLink
-                  v-if="scope.row.experiment_id"
-                  class="experiment-link"
-                  :to="{ name: 'experiment-detail', params: { experimentId: scope.row.experiment_id } }"
-                >实验 {{ scope.row.experiment_id.slice(0, 8) }}</RouterLink>
-                <RouterLink
-                  v-if="scope.row.factor_run_id"
-                  class="experiment-link factor-run-link"
-                  :to="{ name: 'factors', query: { run: scope.row.factor_run_id } }"
-                >因子运行 {{ scope.row.factor_run_id.slice(0, 8) }}</RouterLink>
-                <span v-if="!scope.row.experiment_id && !scope.row.factor_run_id" class="muted-value">—</span>
+                <span v-if="scope.row.subject_kind" class="experiment-link">
+                  {{ scope.row.subject_kind }} · {{ scope.row.subject_id?.slice(0, 8) }}
+                </span>
+                <span v-else class="muted-value">数据/系统任务</span>
               </div>
             </template>
           </el-table-column>
@@ -429,16 +422,10 @@ onUnmounted(() => {
           <div>
             <span class="eyebrow">{{ detail.data.value.task_type }}</span>
             <h2>{{ detail.data.value.id }}</h2>
-            <p>{{ detail.data.value.experiment_id ? `关联实验 ${detail.data.value.experiment_id}` : '独立后台任务' }}</p>
+            <p>{{ detail.data.value.subject_kind ? `${detail.data.value.subject_kind} · ${detail.data.value.subject_id}` : '数据或系统后台任务' }}</p>
           </div>
           <div class="drawer-task-actions">
             <StatusBadge :status="detail.data.value.status" />
-            <RouterLink
-              v-if="detail.data.value.factor_run_id"
-              :to="{ name: 'factors', query: { run: detail.data.value.factor_run_id } }"
-            >
-              <el-button type="primary" plain>打开对应因子分析</el-button>
-            </RouterLink>
           </div>
         </div>
 
@@ -473,7 +460,7 @@ onUnmounted(() => {
               <el-descriptions-item label="运行时长">{{ duration(detail.data.value.started_at, detail.data.value.completed_at) }}</el-descriptions-item>
               <el-descriptions-item label="最近心跳">{{ formatTime(detail.data.value.heartbeat_at) }}</el-descriptions-item>
               <el-descriptions-item label="完成时间">{{ formatTime(detail.data.value.completed_at) }}</el-descriptions-item>
-              <el-descriptions-item label="实验 ID" :span="2"><span class="hash">{{ detail.data.value.experiment_id ?? '—' }}</span></el-descriptions-item>
+              <el-descriptions-item label="关联对象" :span="2"><span class="hash">{{ detail.data.value.subject_kind ? `${detail.data.value.subject_kind}/${detail.data.value.subject_id}` : '—' }}</span></el-descriptions-item>
             </el-descriptions>
             <section class="parameter-panel">
               <header>

@@ -56,6 +56,8 @@ class TaskSpec(_TaskModel):
     priority: int = 0
     created_at: datetime
     available_at: datetime
+    subject_kind: str | None = None
+    subject_id: str | None = None
 
     @field_validator("created_at", "available_at")
     @classmethod
@@ -102,6 +104,8 @@ class TaskSpec(_TaskModel):
             raise ValueError("experiment_id must not be empty")
         if not self.task_type:
             raise ValueError("task_type must not be empty")
+        if (self.subject_kind is None) != (self.subject_id is None):
+            raise ValueError("task subject_kind and subject_id must be jointly present")
         return self
 
 
@@ -148,6 +152,8 @@ class TaskRecord(_TaskModel):
     locked_at: datetime | None = None
     error: dict[str, JsonValue] | None = None
     result: dict[str, JsonValue] | None = None
+    subject_kind: str | None = None
+    subject_id: str | None = None
 
 
 class TaskAttemptRecord(_TaskModel):
@@ -401,6 +407,8 @@ class ClaimedTask(_TaskModel):
     worker_id: str
     progress: TaskProgress
     claimed_at: datetime
+    subject_kind: str | None = None
+    subject_id: str | None = None
 
     @field_validator("claimed_at")
     @classmethod

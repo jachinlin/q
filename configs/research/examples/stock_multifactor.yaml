@@ -1,0 +1,59 @@
+name: 股票多因子自动实验族
+hypothesis: 价值与中期动量组合在控制风险、换手和交易成本后仍具有超额收益
+research_mode: BACKTEST_EXPERIMENT
+strategy_id: stock_multifactor
+benchmark: 000300.SH
+initial_cash_fen: 100000000
+research_protocol:
+  train: {start: 2018-01-02, end: 2021-12-31}
+  validation: {start: 2022-01-04, end: 2023-12-29}
+  test: {start: 2024-01-02, end: 2025-12-31}
+  parameter_search_space:
+    portfolio.risk_aversion: [0.05, 0.10, 0.20]
+    portfolio.cost_aversion: [0.50, 1.00]
+  selection:
+    primary_metric: sharpe
+    direction: MAXIMIZE
+    constraints:
+      - {metric: max_drawdown, operator: GTE, threshold: -0.30}
+    tie_breakers: [calmar]
+    multiple_testing_method: BENJAMINI_HOCHBERG
+    adjusted_alpha: 0.10
+  random_seed: 20260818
+universe:
+  component: cn_stock_standard
+  exclude_st: true
+  exclude_suspended: true
+  min_listing_days: 120
+features:
+  component: stock_research_features
+  components: [adv_20d, beta_252d, industry_exposure, valuation, momentum_120d]
+signal:
+  component: cross_sectional_multifactor
+  kind: CROSS_SECTIONAL_SCORE
+  factor_weights: {value: 0.50, momentum: 0.50}
+decision_schedule: {component: period_boundary, frequency: WEEKLY}
+risk:
+  estimator: fundamental_statistical
+  lookback_sessions: 60
+  covariance_shrinkage: 0.20
+pretrade_cost:
+  component: liquidity_impact_surface
+  fixed_bps: 2.0
+  impact_bps: 10.0
+  max_volume_participation: 0.10
+portfolio:
+  constructor: alpha_risk_cost_optimizer
+  min_positions: 20
+  max_positions: 50
+  max_position_weight: 0.10
+  max_turnover: 0.50
+  risk_aversion: 0.10
+  cost_aversion: 1.00
+rebalance: {policy: scheduled_with_drift_threshold, min_weight_drift: 0.005}
+execution:
+  simulator: a_share_daily
+  reference_price: OPEN
+  slippage_bps: 5.0
+  max_volume_participation: 0.10
+analytics: {analyzers: [cross_sectional_signal, portfolio_risk, execution, performance]}

@@ -43,6 +43,21 @@ _PUBLIC_SPECIAL_METHODS = frozenset(
 )
 _ALLOWED_REASONS = frozenset({"stable_public_api", "framework_entry"})
 _MODULE_FUNCTION_ALLOWLIST: Mapping[str, str] = {
+    "quant_research.backtest.__getattr__": "framework_entry",
+    "quant_research.bootstrap.research.build_research_platform": "stable_public_api",
+    "quant_research.infrastructure.persistence.migrations.versions.0005_research_platform.upgrade": "framework_entry",
+    "quant_research.infrastructure.persistence.migrations.versions.0005_research_platform.downgrade": "framework_entry",
+    "quant_research.signals.builtin.signal_component_hash": "stable_public_api",
+    "quant_research.signals.models._validate_rows": "stable_public_api",
+    "quant_research.strategies.definitions._descriptor": "stable_public_api",
+    "quant_research.strategies.definitions._descriptors": "stable_public_api",
+    "quant_research.strategies.definitions._boolean": "stable_public_api",
+    "quant_research.strategies.definitions._integer": "stable_public_api",
+    "quant_research.strategies.definitions._number": "stable_public_api",
+    "quant_research.strategies.definitions._enum": "stable_public_api",
+    "quant_research.strategies.definitions._array": "stable_public_api",
+    "quant_research.strategies.definitions._number_map": "stable_public_api",
+    "quant_research.strategies.definitions._templates": "stable_public_api",
     "quant_research.analytics.attribution.calculate_attribution": "stable_public_api",
     "quant_research.analytics.materialize.materialize_analytics": "stable_public_api",
     "quant_research.analytics.materialize.validate_published_analytics": "stable_public_api",

@@ -8,15 +8,15 @@ import { formatDuration, formatPercent, shortHash, statusType } from './format'
 import router from './router'
 
 describe('dashboard shell contract', () => {
-  it('keeps six top-level research areas and nests backtests under experiments', () => {
+  it('keeps one unified research center and no legacy research routes', () => {
     expect(router.getRoutes().map((route) => route.path).sort()).toEqual([
       '/',
       '/data',
-      '/experiments',
-      '/experiments/:experimentId',
-      '/factors',
       '/market',
       '/notebook',
+      '/research',
+      '/research/:familyId',
+      '/research/new',
       '/tasks',
     ].sort())
     expect(router.hasRoute('backtest')).toBe(false)
@@ -36,7 +36,7 @@ describe('dashboard shell contract', () => {
     const shellView = { template: '<div />' }
     const shellRouter = createRouter({
       history: createMemoryHistory(),
-      routes: ['/', '/market', '/data', '/experiments', '/factors', '/tasks', '/notebook'].map(
+      routes: ['/', '/market', '/data', '/research', '/tasks', '/notebook'].map(
         (path) => ({ path, component: shellView }),
       ),
     })

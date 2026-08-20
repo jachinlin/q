@@ -6,7 +6,7 @@ import { api } from '../api'
 import ErrorState from '../components/ErrorState.vue'
 import MetricCard from '../components/MetricCard.vue'
 import StatusBadge from '../components/StatusBadge.vue'
-import { formatDate, formatNumber, formatPercent, formatTime, shortHash } from '../format'
+import { formatDate, formatNumber, formatTime, shortHash } from '../format'
 import type { Overview, Task } from '../types'
 
 type AttentionItem = {
@@ -38,19 +38,19 @@ const freshnessLabel = {
 } as const
 const taskTypeLabel: Record<string, string> = {
   DATA_UPDATE: '数据更新',
-  BACKTEST: '策略回测',
-  FACTOR_ANALYSIS: '因子分析',
+  RESEARCH_EXPAND: '展开研究候选',
+  RESEARCH_RUN: '运行研究候选',
+  RESEARCH_SELECT: '锁定验证候选',
+  RESEARCH_REGISTER: '登记研究结论',
 }
 
 const taskCounts = computed(() => data.value?.tasks.status_counts)
-const experimentCounts = computed(() => data.value?.experiments.status_counts)
 const activeTaskCount = computed(() =>
   (taskCounts.value?.QUEUED ?? 0)
   + (taskCounts.value?.RUNNING ?? 0)
   + (taskCounts.value?.CANCEL_REQUESTED ?? 0),
 )
 const failureCount = computed(() => (taskCounts.value?.FAILED ?? 0) + (taskCounts.value?.ORPHANED ?? 0))
-const experimentCount = computed(() => Object.values(experimentCounts.value ?? {}).reduce((sum, value) => sum + value, 0))
 const freshnessTone = computed<'blue' | 'cyan' | 'red' | 'green'>(() => {
   const status = data.value?.freshness.status
   if (status === 'CURRENT') return 'green'
@@ -151,9 +151,6 @@ function taskName(task: Task) {
   return taskTypeLabel[task.task_type] ?? task.task_type
 }
 
-function benchmarkName(strategyId: string) {
-  return strategyId === 'etf_rotation' ? 'ETF 轮动' : '股票多因子'
-}
 </script>
 
 <template>
@@ -180,7 +177,7 @@ function benchmarkName(strategyId: string) {
         </div>
         <div class="overview-actions" aria-label="研究工作台快捷入口">
           <RouterLink to="/data"><el-button :type="data.gate.status === 'BLOCKED' ? 'danger' : 'primary'">进入数据中心</el-button></RouterLink>
-          <RouterLink to="/experiments"><el-button>进入实验中心</el-button></RouterLink>
+          <RouterLink to="/research"><el-button>进入研究中心</el-button></RouterLink>
           <RouterLink to="/notebook"><el-button text>打开 Notebook</el-button></RouterLink>
         </div>
       </section>
@@ -205,9 +202,9 @@ function benchmarkName(strategyId: string) {
           :tone="failureCount > 0 ? 'red' : 'green'"
         />
         <MetricCard
-          label="实验登记"
-          :value="formatNumber(experimentCount)"
-          :hint="`${experimentCounts?.SUCCEEDED ?? 0} 成功 · ${experimentCounts?.FAILED ?? 0} 失败`"
+          label="Canonical 数据集"
+          :value="formatNumber(data.dataset_count)"
+          hint="研究运行只通过统一 Repository 读取"
         />
       </div>
 
@@ -238,7 +235,7 @@ function benchmarkName(strategyId: string) {
           </div>
           <div v-else class="overview-empty compact">
             <strong>当前没有活动任务</strong>
-            <span>新的数据更新、因子分析或策略回测会显示在这里。</span>
+            <span>新的数据更新或研究任务链会显示在这里。</span>
           </div>
           <footer class="worker-evidence"><i />{{ workerEvidence }}</footer>
         </section>
@@ -260,53 +257,14 @@ function benchmarkName(strategyId: string) {
         </section>
       </div>
 
-      <section class="panel benchmark-panel">
-        <header class="panel-heading">
-          <div><h2>基准策略脉搏</h2><p>每个内置策略独立查询最近一次成功实验</p></div>
-          <span class="hash">{{ shortHash(data.gate.catalog_hash) }}</span>
-        </header>
-        <div class="benchmark-grid">
-          <template v-for="item in data.experiments.benchmarks" :key="item.strategy_id">
-            <RouterLink v-if="item.experiment" class="benchmark-summary" :to="`/experiments/${item.experiment.id}`">
-              <div class="benchmark-heading"><span>{{ benchmarkName(item.strategy_id) }}</span><StatusBadge status="SUCCEEDED" /></div>
-              <strong :class="Number(item.experiment.metrics.cumulative_return) >= 0 ? 'up' : 'down'">{{ formatPercent(item.experiment.metrics.cumulative_return) }}</strong>
-              <dl>
-                <div><dt>最大回撤</dt><dd>{{ formatPercent(item.experiment.metrics.max_drawdown) }}</dd></div>
-                <div><dt>Sharpe</dt><dd>{{ formatNumber(item.experiment.metrics.sharpe_ratio) }}</dd></div>
-                <div><dt>完成</dt><dd>{{ formatTime(item.experiment.completed_at) }}</dd></div>
-              </dl>
-            </RouterLink>
-            <article v-else class="benchmark-summary empty-benchmark">
-              <div class="benchmark-heading"><span>{{ benchmarkName(item.strategy_id) }}</span><StatusBadge status="UNKNOWN" /></div>
-              <strong>—</strong>
-              <p>尚无成功实验，进入实验中心提交首个基准运行。</p>
-            </article>
-          </template>
+      <section class="panel research-launch-panel">
+        <header class="panel-heading"><div><h2>参考研究模板</h2><p>同一套组件可运行信号研究、组合研究与完整回测</p></div><span class="hash">{{ shortHash(data.gate.catalog_hash) }}</span></header>
+        <div class="three-grid">
+          <article class="benchmark-card"><h3>股票多因子</h3><strong>CROSS SECTION</strong><p>动态股票池 · 价值/动量 · Alpha-Risk-Cost 优化</p></article>
+          <article class="benchmark-card"><h3>双均线趋势</h3><strong>LONG / FLAT</strong><p>固定标的 · 时序方向信号 · 状态变化调仓</p></article>
+          <article class="benchmark-card"><h3>ETF 轮动</h3><strong>ALLOCATION</strong><p>多周期动量 · 趋势过滤 · 月频约束投影</p></article>
         </div>
-      </section>
-
-      <section class="panel recent-experiments-panel">
-        <header class="panel-heading">
-          <div><h2>最近实验</h2><p>最新登记的不可变研究记录</p></div>
-          <RouterLink to="/experiments"><el-button text type="primary">查看全部</el-button></RouterLink>
-        </header>
-        <div class="experiment-list-heading" aria-hidden="true">
-          <span>策略</span><span>状态</span><span>研究标记</span><span>累计收益</span><span>Sharpe</span><span>创建时间</span>
-        </div>
-        <div v-if="data.experiments.recent.length" class="experiment-list">
-          <RouterLink v-for="experiment in data.experiments.recent" :key="experiment.id" class="experiment-row" :to="`/experiments/${experiment.id}`">
-            <span><strong>{{ experiment.strategy_id }}</strong><small class="hash">{{ experiment.id.slice(0, 8) }}</small></span>
-            <StatusBadge :status="experiment.status" />
-            <span>{{ experiment.research_mark }}</span>
-            <span :class="Number(experiment.metrics.cumulative_return) >= 0 ? 'up' : 'down'">{{ formatPercent(experiment.metrics.cumulative_return) }}</span>
-            <span>{{ formatNumber(experiment.metrics.sharpe_ratio) }}</span>
-            <time>{{ formatTime(experiment.created_at) }}</time>
-          </RouterLink>
-        </div>
-        <div v-else class="overview-empty compact">
-          <strong>尚无实验记录</strong>
-          <span>进入实验中心提交首个可复现研究配置。</span>
-        </div>
+        <div class="toolbar launch-action"><span class="spacer" /><RouterLink to="/research/new"><el-button type="primary">使用模板创建研究</el-button></RouterLink></div>
       </section>
     </template>
 

@@ -21,30 +21,24 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 class Base(DeclarativeBase):
     """表示基础设施流程中的``base``及其业务不变量。
 
-    入参：
-        无。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    Declarative base kept private to the persistence implementation.
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
 
 class RawRequestORM(Base):
     """将``raw``请求``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        source：数据来源。
-        endpoint：供应商端点。
-        request_hash：规范供应商请求的确定性身份，用于幂等定位 Raw 响应。
-        request_json：请求JSON。
-        current_content_hash：参与幂等、漂移或完整性校验的当前值内容哈希；使用 SHA-256 十六进制文本。
-        updated_at：记录最近持久化变更的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "raw_request"
@@ -63,21 +57,12 @@ class RawRequestORM(Base):
 class RawObjectORM(Base):
     """返回完成字段规范化和不变量校验的对象。
 
-    入参：
-        返回完成字段规范化和不变量校验的对象。
-        返回完成字段规范化和不变量校验的对象。
-        request_hash：规范供应商请求的确定性身份，用于幂等定位 Raw 响应。
-        content_hash：按规范字节计算、用于内容寻址和完整性校验的 SHA-256。
-        data_path：经可信根边界校验后使用的数据路径。
-        manifest_path：记录文件身份、Schema、行数和输入身份的清单路径。
-        schema_fingerprint：字段名称和类型形成的确定性 Schema 身份。
-        row_count：产物或分区中经验证的数据行数。
-        返回完成字段规范化和不变量校验的对象。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "raw_object"
@@ -109,17 +94,12 @@ class RawObjectORM(Base):
 class CanonicalDatasetORM(Base):
     """将Canonical数据集``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        dataset：目标数据集，类型为 ``Mapped[str]``。
-        content_hash：按规范字节计算、用于内容寻址和完整性校验的 SHA-256。
-        source：数据来源。
-        start_date：查询或运行覆盖区间的首日（含）。
-        end_date：查询或运行覆盖区间的末日（含）。
-        updated_at：记录最近持久化变更的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "canonical_dataset"
@@ -135,19 +115,12 @@ class CanonicalDatasetORM(Base):
 class CanonicalPartitionORM(Base):
     """将Canonical分区``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        dataset：目标数据集，类型为 ``Mapped[str]``。
-        partition_key：分区``key``。
-        ordinal：``ordinal``。
-        content_hash：按规范字节计算、用于内容寻址和完整性校验的 SHA-256。
-        path：待处理的文件系统路径，类型为 ``Mapped[str]``。
-        schema_fingerprint：字段名称和类型形成的确定性 Schema 身份。
-        input_hash：决定 Canonical 分区是否需要重建的 Raw 输入身份。
-        row_count：产物或分区中经验证的数据行数。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "canonical_partition"
@@ -167,7 +140,12 @@ class CanonicalPartitionORM(Base):
 class DatasetOperationalStateORM(Base):
     """持久化数据集最近成功的阶段和业务水位。
 
-    入参：由 ORM 字段声明给出。返回值：构造持久化实体。异常：数据库约束异常按原契约传播。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "dataset_operational_state"
@@ -183,18 +161,12 @@ class DatasetOperationalStateORM(Base):
 class QualityRunORM(Base):
     """将质量校验运行``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        scope：范围。
-        input_hash：决定 Canonical 分区是否需要重建的 Raw 输入身份。
-        status：当前记录所处的受控生命周期状态。
-        started_at：执行实际开始的 UTC 时间戳。
-        completed_at：执行进入终态的 UTC 时间戳。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "quality_run"
@@ -214,14 +186,12 @@ class QualityRunORM(Base):
 class QualityRunDatasetORM(Base):
     """将质量校验运行数据集``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        quality_run_id：用于持久化关联和日志追踪的质量校验运行标识。
-        dataset：目标数据集，类型为 ``Mapped[str]``。
-        content_hash：按规范字节计算、用于内容寻址和完整性校验的 SHA-256。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "quality_run_dataset"
@@ -236,21 +206,12 @@ class QualityRunDatasetORM(Base):
 class QualityIssueORM(Base):
     """将质量校验问题记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        quality_run_id：用于持久化关联和日志追踪的质量校验运行标识。
-        rule_id：用于持久化关联和日志追踪的规则标识。
-        severity：质量问题或应用错误的严重程度。
-        dataset：目标数据集，类型为 ``Mapped[str]``。
-        scope_json：范围JSON。
-        actual_json：实际值JSON。
-        threshold_json：判定阈值JSON。
-        message：面向用户且已脱敏的错误或状态说明。
-        remediation：调用者可执行的修复建议。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "quality_issue"
@@ -272,7 +233,12 @@ class QualityIssueORM(Base):
 class QualityRuleResultORM(Base):
     """持久化一次质量规则与数据集组合的完整执行证据。
 
-    入参：由 ORM 字段声明给出。返回值：构造持久化实体。异常：数据库约束异常按原契约传播。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "quality_rule_result"
@@ -303,17 +269,12 @@ class QualityRuleResultORM(Base):
 class DataCatalogStateORM(Base):
     """将数据数据目录``state``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        catalog_hash：提交时捕获并在运行阶段防漂移校验的 Canonical 数据目录身份。
-        validated_catalog_hash：参与幂等、漂移或完整性校验的``validated``数据目录哈希；使用 SHA-256 十六进制文本。
-        quality_run_id：用于持久化关联和日志追踪的质量校验运行标识。
-        updated_at：记录最近持久化变更的 UTC 时间戳。
-        返回完成字段规范化和不变量校验的对象。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "data_catalog_state"
@@ -334,27 +295,12 @@ class DataCatalogStateORM(Base):
 class ExperimentORM(Base):
     """将实验``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        strategy_id：用于持久化关联和日志追踪的策略标识。
-        config_json：配置JSON。
-        config_hash：确定性序列化后的实验或策略配置身份。
-        data_hash：Canonical 数据内容或本次研究输入的数据身份。
-        source_tree_hash：参与幂等、漂移或完整性校验的数据来源``tree``哈希；使用 SHA-256 十六进制文本。
-        返回完成字段规范化和不变量校验的对象。
-        lockfile_hash：参与幂等、漂移或完整性校验的依赖锁文件哈希；使用 SHA-256 十六进制文本。
-        rulebook_hash：唯一 A 股交易规则文件的内容身份。
-        fingerprint：由策略、数据、源码、依赖锁和交易规则共同形成的研究指纹。
-        status：当前记录所处的受控生命周期状态。
-        research_mark：用户对实验标记的基线、候选或废弃研究结论。
-        created_at：记录创建时的 UTC 时间戳。
-        queued_at：记录入队时间``at``的带时区 UTC 时间戳。
-        started_at：执行实际开始的 UTC 时间戳。
-        completed_at：执行进入终态的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "experiment"
@@ -397,13 +343,12 @@ class ExperimentORM(Base):
 class ExperimentTagORM(Base):
     """将实验标签``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        experiment_id：目标实验标识，类型为 ``Mapped[str]``。
-        tag：标签。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "experiment_tag"
@@ -417,17 +362,12 @@ class ExperimentTagORM(Base):
 class ExperimentMetricORM(Base):
     """将实验指标``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        experiment_id：目标实验标识，类型为 ``Mapped[str]``。
-        name：供用户识别研究、任务或数据对象的非空名称。
-        value：待校验或转换的值，类型为 ``Mapped[float]``。
-        unit：计量单位。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "experiment_metric"
@@ -448,19 +388,12 @@ class ExperimentMetricORM(Base):
 class ExperimentArtifactORM(Base):
     """将实验产物``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        experiment_id：目标实验标识，类型为 ``Mapped[str]``。
-        name：供用户识别研究、任务或数据对象的非空名称。
-        artifact_type：产物类型。
-        path：待处理的文件系统路径，类型为 ``Mapped[str]``。
-        content_hash：按规范字节计算、用于内容寻址和完整性校验的 SHA-256。
-        metadata_json：元数据JSON。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "experiment_artifact"
@@ -483,27 +416,12 @@ class ExperimentArtifactORM(Base):
 class TaskORM(Base):
     """将任务``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        experiment_id：目标实验标识，类型为 ``Mapped[str | None]``。
-        task_type：任务类型。
-        payload_json：任务载荷JSON。
-        status：当前记录所处的受控生命周期状态。
-        priority：任务在同一可运行集合中的调度优先级。
-        progress_json：执行进度JSON。
-        created_at：记录创建时的 UTC 时间戳。
-        available_at：该条观测首次可供研究使用的带时区时间戳。
-        updated_at：记录最近持久化变更的 UTC 时间戳。
-        heartbeat_at：Worker 最近证明仍持有任务的 UTC 时间戳。
-        completed_at：执行进入终态的 UTC 时间戳。
-        idempotency_key：幂等键``key``。
-        worker_id：当前 Worker 实例的稳定所有者标识。
-        返回完成字段规范化和不变量校验的对象。
-        error_json：错误JSON。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "task"
@@ -513,13 +431,13 @@ class TaskORM(Base):
             "'CANCEL_REQUESTED', 'CANCELLED', 'ORPHANED')",
             name="ck_task_status",
         ),
-        Index("ix_task_experiment", "experiment_id"),
+        Index("ix_task_subject", "subject_kind", "subject_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    experiment_id: Mapped[str | None] = mapped_column(
-        ForeignKey("experiment.id", ondelete="CASCADE")
-    )
+    experiment_id: Mapped[str | None] = mapped_column(String(36))
+    subject_kind: Mapped[str | None] = mapped_column(String(32))
+    subject_id: Mapped[str | None] = mapped_column(String(64))
     task_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_json: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -540,16 +458,12 @@ class TaskORM(Base):
 class FactorStudyORM(Base):
     """将因子因子研究``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        name：供用户识别研究、任务或数据对象的非空名称。
-        config_json：配置JSON。
-        config_hash：确定性序列化后的实验或策略配置身份。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "factor_study"
@@ -565,25 +479,12 @@ class FactorStudyORM(Base):
 class FactorRunORM(Base):
     """将因子运行``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        study_id：因子研究定义的 UUID 标识。
-        task_id：目标任务标识，类型为 ``Mapped[str | None]``。
-        config_json：配置JSON。
-        config_hash：确定性序列化后的实验或策略配置身份。
-        catalog_hash：提交时捕获并在运行阶段防漂移校验的 Canonical 数据目录身份。
-        source_hash：参与计算的实现源码身份。
-        status：当前记录所处的受控生命周期状态。
-        manifest_path：记录文件身份、Schema、行数和输入身份的清单路径。
-        manifest_hash：参与幂等、漂移或完整性校验的产物清单哈希；使用 SHA-256 十六进制文本。
-        error_json：错误JSON。
-        created_at：记录创建时的 UTC 时间戳。
-        started_at：执行实际开始的 UTC 时间戳。
-        completed_at：执行进入终态的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "factor_run"
@@ -627,7 +528,8 @@ Index(
 Index(
     "uq_task_active_idempotency",
     TaskORM.task_type,
-    text("COALESCE(experiment_id, '')"),
+    text("COALESCE(subject_kind, '')"),
+    text("COALESCE(subject_id, '')"),
     TaskORM.idempotency_key,
     unique=True,
     sqlite_where=text(
@@ -640,22 +542,12 @@ Index(
 class TaskAttemptORM(Base):
     """将任务执行尝试``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        task_id：目标任务标识，类型为 ``Mapped[str]``。
-        attempt_no：执行尝试从一开始计数的尝试序号。
-        status：当前记录所处的受控生命周期状态。
-        worker_id：当前 Worker 实例的稳定所有者标识。
-        started_at：执行实际开始的 UTC 时间戳。
-        heartbeat_at：Worker 最近证明仍持有任务的 UTC 时间戳。
-        completed_at：执行进入终态的 UTC 时间戳。
-        log_path：经可信根边界校验后使用的日志路径。
-        progress_json：执行进度JSON。
-        error_json：错误JSON。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "task_attempt"
@@ -689,30 +581,21 @@ class TaskAttemptORM(Base):
 class AuditEventORM(Base):
     """将审计事件事件``orm``记录映射到 SQLite 持久化表。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        experiment_id：目标实验标识，类型为 ``Mapped[str | None]``。
-        task_id：目标任务标识，类型为 ``Mapped[str | None]``。
-        event_type：事件类型。
-        actor：操作主体。
-        details_json：详情JSON。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     __tablename__ = "audit_event"
     __table_args__ = (
-        Index("ix_audit_event_experiment_created", "experiment_id", "created_at"),
         Index("ix_audit_event_task_created", "task_id", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    experiment_id: Mapped[str | None] = mapped_column(
-        ForeignKey("experiment.id", ondelete="SET NULL")
-    )
+    experiment_id: Mapped[str | None] = mapped_column(String(36))
     task_id: Mapped[str | None] = mapped_column(
         ForeignKey("task.id", ondelete="SET NULL")
     )
@@ -720,3 +603,232 @@ class AuditEventORM(Base):
     actor: Mapped[str | None] = mapped_column(String(128))
     details_json: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class ResearchFamilyORM(Base):
+    """持久化不可变研究族定义和可审计研究备注。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_family"
+    __table_args__ = (
+        CheckConstraint(
+            "research_mode IN ('SIGNAL_STUDY', 'PORTFOLIO_STUDY', 'BACKTEST_EXPERIMENT')",
+            name="ck_research_family_mode",
+        ),
+        CheckConstraint(
+            "mark IN ('UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED')",
+            name="ck_research_family_mark",
+        ),
+        Index("ix_research_family_created", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    research_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    mark: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    archived_at: Mapped[str | None] = mapped_column(String(32))
+
+
+class ResearchFamilyExecutionORM(Base):
+    """持久化研究族绑定的数据、源码、依赖和规则身份。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_family_execution"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('CREATED', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_research_execution_status",
+        ),
+        Index("ix_research_execution_family_created", "family_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    family_id: Mapped[str] = mapped_column(
+        ForeignKey("research_family.id", ondelete="CASCADE"), nullable=False
+    )
+    catalog_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    lockfile_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    rulebook_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    environment_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    selected_variant_id: Mapped[str | None] = mapped_column(String(36))
+    selection_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[str | None] = mapped_column(String(32))
+    completed_at: Mapped[str | None] = mapped_column(String(32))
+    error_json: Mapped[str | None] = mapped_column(Text)
+
+
+class ResearchVariantORM(Base):
+    """持久化一次执行内确定性展开的候选。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_variant"
+    __table_args__ = (
+        UniqueConstraint("execution_id", "ordinal", name="uq_research_variant_ordinal"),
+        UniqueConstraint("execution_id", "composition_hash", name="uq_research_variant_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    execution_id: Mapped[str] = mapped_column(
+        ForeignKey("research_family_execution.id", ondelete="CASCADE"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    composition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_json: Mapped[str] = mapped_column(Text, nullable=False)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False)
+    rejection_reasons_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class ResearchRunORM(Base):
+    """持久化候选在开发区间或锁定测试区间上的运行。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_run"
+    __table_args__ = (
+        UniqueConstraint("execution_id", "variant_id", "phase", name="uq_research_run_phase"),
+        CheckConstraint("phase IN ('TRAIN_VALIDATION', 'TEST')", name="ck_research_run_phase"),
+        CheckConstraint(
+            "status IN ('CREATED', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_research_run_status",
+        ),
+        CheckConstraint(
+            "stage IN ('VALIDATE', 'UNIVERSE', 'RESEARCH_COMPUTE', 'SIMULATE', 'ANALYTICS', 'ARTIFACT_VERIFY', 'REGISTER')",
+            name="ck_research_run_stage",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    execution_id: Mapped[str] = mapped_column(
+        ForeignKey("research_family_execution.id", ondelete="CASCADE"), nullable=False
+    )
+    variant_id: Mapped[str] = mapped_column(
+        ForeignKey("research_variant.id", ondelete="CASCADE"), nullable=False
+    )
+    phase: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    stage_status_json: Mapped[str] = mapped_column(Text, nullable=False)
+    manifest_path: Mapped[str | None] = mapped_column(String)
+    manifest_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[str | None] = mapped_column(String(32))
+    completed_at: Mapped[str | None] = mapped_column(String(32))
+    error_json: Mapped[str | None] = mapped_column(Text)
+
+
+class ResearchMetricORM(Base):
+    """持久化运行按 TRAIN、VALIDATION、TEST 分区的指标。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_metric"
+    __table_args__ = (
+        UniqueConstraint("run_id", "split", "category", "name", name="uq_research_metric_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("research_run.id", ondelete="CASCADE"), nullable=False
+    )
+    split: Mapped[str] = mapped_column(String(16), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(32))
+    p_value: Mapped[float | None] = mapped_column(Float)
+    adjusted_p_value: Mapped[float | None] = mapped_column(Float)
+
+
+class ResearchArtifactORM(Base):
+    """持久化可信 Manifest 中登记的研究产物。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_artifact"
+    __table_args__ = (
+        UniqueConstraint("execution_id", "relative_path", name="uq_research_artifact_path"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    execution_id: Mapped[str] = mapped_column(
+        ForeignKey("research_family_execution.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("research_run.id", ondelete="CASCADE")
+    )
+    relative_path: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    producer_component_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_count: Mapped[int | None] = mapped_column(Integer)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class ResearchTagORM(Base):
+    """持久化研究族用户标签。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+
+    __tablename__ = "research_tag"
+
+    family_id: Mapped[str] = mapped_column(
+        ForeignKey("research_family.id", ondelete="CASCADE"), primary_key=True
+    )
+    tag: Mapped[str] = mapped_column(String(64), primary_key=True)

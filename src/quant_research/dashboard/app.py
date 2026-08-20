@@ -15,9 +15,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
-from quant_research.application.research import ResearchApplicationService
+from quant_research.application.operations import OperationalCommandService
+from quant_research.application.research_platform import ResearchCommandService
 from quant_research.dashboard.notebook import NotebookProbe
+from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.dashboard.routes.api import _DashboardRoutes
+from quant_research.dashboard.routes.research import _ResearchRoutes
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.domain.errors import QuantError
 
@@ -25,7 +28,9 @@ from quant_research.domain.errors import QuantError
 def create_dashboard_app(
     *,
     service: DashboardViewService,
-    commands: ResearchApplicationService,
+    commands: OperationalCommandService,
+    research_service: ResearchDashboardService,
+    research_commands: ResearchCommandService,
     notebook_probe: NotebookProbe,
     static_dir: Path,
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "[::1]"),
@@ -166,6 +171,7 @@ def create_dashboard_app(
         )
 
     _DashboardRoutes.mount(app, service, commands, notebook_probe)
+    _ResearchRoutes.mount(app, research_service, research_commands)
 
     built = static_dir.resolve()
     index = built / "index.html"

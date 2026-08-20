@@ -1,0 +1,36 @@
+name: 双均线趋势自动实验族
+hypothesis: 中短期均线上穿长期均线后，宽基 ETF 存在可交易的趋势延续
+research_mode: BACKTEST_EXPERIMENT
+strategy_id: dual_ma_trend
+benchmark: 510300.SH
+initial_cash_fen: 100000000
+research_protocol:
+  train: {start: 2018-01-02, end: 2021-12-31}
+  validation: {start: 2022-01-04, end: 2023-12-29}
+  test: {start: 2024-01-02, end: 2025-12-31}
+  parameter_search_space:
+    signal.short_window_sessions: [10, 20, 40]
+    signal.long_window_sessions: [60, 120, 200]
+  selection:
+    primary_metric: calmar
+    direction: MAXIMIZE
+    constraints:
+      - {metric: max_drawdown, operator: GTE, threshold: -0.30}
+    tie_breakers: [sharpe]
+    multiple_testing_method: HOLM_BONFERRONI
+    adjusted_alpha: 0.10
+  random_seed: 20260818
+universe: {component: fixed_instruments, instruments: [510300.SH]}
+features: {component: price_trend_features, windows: [20, 120], volatility_window: 60, adv_window: 20}
+signal:
+  component: dual_ma_directional
+  kind: DIRECTIONAL
+  short_window_sessions: 20
+  long_window_sessions: 120
+decision_schedule: {component: every_session, frequency: DAILY}
+risk: {estimator: asset_volatility_and_liquidity, lookback_sessions: 60}
+pretrade_cost: {component: liquidity_impact_surface, fixed_bps: 2.0, impact_bps: 10.0, max_volume_participation: 0.10}
+portfolio: {constructor: directional_exposure_mapper, long_weight: 1.0, flat_weight: 0.0}
+rebalance: {policy: signal_state_change}
+execution: {simulator: a_share_daily, reference_price: OPEN, slippage_bps: 5.0, max_volume_participation: 0.10}
+analytics: {analyzers: [time_series_signal, regime, execution, performance]}

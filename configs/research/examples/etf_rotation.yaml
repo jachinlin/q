@@ -1,0 +1,41 @@
+name: ETF 轮动自动实验族
+hypothesis: 多周期动量与趋势过滤能在 ETF 之间形成稳定配置优势
+research_mode: BACKTEST_EXPERIMENT
+strategy_id: etf_rotation
+benchmark: 000300.SH
+initial_cash_fen: 100000000
+research_protocol:
+  train: {start: 2018-01-02, end: 2021-12-31}
+  validation: {start: 2022-01-04, end: 2023-12-29}
+  test: {start: 2024-01-02, end: 2025-12-31}
+  parameter_search_space:
+    signal.volatility_penalty: [0.0, 0.5, 1.0]
+    signal.top_n: [1, 2, 3]
+  selection:
+    primary_metric: sharpe
+    direction: MAXIMIZE
+    constraints:
+      - {metric: max_drawdown, operator: GTE, threshold: -0.30}
+    tie_breakers: [calmar]
+    multiple_testing_method: HOLM_BONFERRONI
+    adjusted_alpha: 0.10
+  random_seed: 20260818
+universe:
+  component: fixed_instruments
+  instruments: [510050.SH, 510300.SH, 513100.SH, 588000.SH]
+features: {component: price_trend_features, return_windows: [20, 60, 120], trend_window: 120, volatility_window: 60}
+signal:
+  component: etf_rotation_allocation
+  kind: ALLOCATION
+  return_weights: {'20': 0.20, '60': 0.30, '120': 0.50}
+  trend_window_sessions: 120
+  volatility_window_sessions: 60
+  volatility_penalty: 0.50
+  top_n: 3
+decision_schedule: {component: period_boundary, frequency: MONTHLY}
+risk: {estimator: asset_volatility_and_liquidity, lookback_sessions: 60}
+pretrade_cost: {component: liquidity_impact_surface, fixed_bps: 2.0, impact_bps: 10.0, max_volume_participation: 0.10}
+portfolio: {constructor: allocation_projector, max_position_weight: 1.0}
+rebalance: {policy: scheduled_with_drift_threshold, min_weight_drift: 0.005}
+execution: {simulator: a_share_daily, reference_price: OPEN, slippage_bps: 5.0, max_volume_participation: 0.10}
+analytics: {analyzers: [allocation_signal, portfolio_risk, execution, performance]}

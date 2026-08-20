@@ -15,8 +15,8 @@ export type NotebookStatus = {
 
 export type Task = {
   id: string
-  experiment_id: string | null
-  factor_run_id: string | null
+  subject_kind: string | null
+  subject_id: string | null
   task_type: string
   status: string
   priority: number
@@ -29,6 +29,106 @@ export type Task = {
   worker_id: string | null
   error: Record<string, unknown> | null
   result: Record<string, unknown> | null
+}
+
+export type ResearchVariantPreview = {
+  variant_id: string
+  composition_hash: string
+  parameters: Record<string, unknown>
+}
+
+export type ResearchValidation = {
+  config_hash: string
+  normalized_yaml: string
+  variant_count: number
+  variants: ResearchVariantPreview[]
+  required_datasets: string[]
+  signal_kind: 'CROSS_SECTIONAL_SCORE' | 'DIRECTIONAL' | 'ALLOCATION'
+}
+
+export type ResearchTemplate = {
+  strategy_id: 'stock_multifactor' | 'dual_ma_trend' | 'etf_rotation'
+  label: string
+  signal_kind: ResearchValidation['signal_kind']
+  yaml: string
+}
+
+export type ResearchExecutionSummary = {
+  id: string
+  status: string
+  catalog_hash: string
+  source_hash: string
+  rulebook_hash: string
+  selected_variant_id: string | null
+  selection_reason: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  error: Record<string, unknown> | null
+}
+
+export type ResearchFamily = {
+  id: string
+  name: string
+  hypothesis: string
+  strategy_id: string
+  research_mode: 'SIGNAL_STUDY' | 'PORTFOLIO_STUDY' | 'BACKTEST_EXPERIMENT'
+  config_hash: string
+  mark: string
+  created_at: string
+  latest_execution: ResearchExecutionSummary | null
+}
+
+export type ResearchMetric = {
+  split: 'TRAIN' | 'VALIDATION' | 'TEST'
+  category: string
+  name: string
+  value: number | null
+  unit: string | null
+  p_value: number | null
+  adjusted_p_value: number | null
+}
+
+export type ResearchVariant = {
+  id: string
+  ordinal: number
+  composition_hash: string
+  parameters: Record<string, unknown>
+  rejection_reasons: string[]
+}
+
+export type ResearchRun = {
+  id: string
+  variant_id: string
+  phase: 'TRAIN_VALIDATION' | 'TEST'
+  status: string
+  stage: string
+  stage_status: Record<string, unknown>
+  manifest_hash: string | null
+  created_at: string
+  completed_at: string | null
+  metrics: ResearchMetric[]
+}
+
+export type ResearchExecution = ResearchExecutionSummary & {
+  variants: ResearchVariant[]
+  runs: ResearchRun[]
+}
+
+export type ResearchFamilyDetail = Omit<ResearchFamily, 'latest_execution'> & {
+  config: Record<string, unknown>
+  note: string | null
+  executions: ResearchExecution[]
+}
+
+export type ResearchArtifactSeries = {
+  run_id: string
+  artifact_type: 'signals' | 'portfolio' | 'execution' | 'performance'
+  manifest_hash: string
+  items: Array<Record<string, unknown>>
+  page: number
+  page_size: number
+  total: number
 }
 
 export type TaskAttempt = {
@@ -146,11 +246,6 @@ export type Overview = {
   tasks: {
     status_counts: Record<'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCEL_REQUESTED' | 'CANCELLED' | 'ORPHANED', number>
     active: Task[]
-  }
-  experiments: {
-    status_counts: Record<'CREATED' | 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED', number>
-    recent: Experiment[]
-    benchmarks: Array<{ strategy_id: 'etf_rotation' | 'stock_multifactor'; experiment: Experiment | null }>
   }
 }
 

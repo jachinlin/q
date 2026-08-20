@@ -23,9 +23,9 @@ vi.mock('./api', () => ({
 
 const failedTask = {
   id: 'task-failed-0001',
-  experiment_id: 'experiment-1',
-  factor_run_id: null as string | null,
-  task_type: 'BACKTEST',
+  subject_kind: 'RESEARCH_RUN',
+  subject_id: 'research-run-0001',
+  task_type: 'RESEARCH_RUN',
   status: 'FAILED',
   priority: 10,
   progress: { stage: 'VALIDATE', completed: 1, total: 7 },
@@ -45,10 +45,9 @@ const defaultPayload = {
   note: '<img src=x onerror=alert(1)>',
 }
 
-function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType = 'BACKTEST') {
+function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType = 'RESEARCH_RUN') {
   return {
     ...failedTask,
-    factor_run_id: taskType === 'FACTOR_ANALYSIS' ? 'factor-run-0001' : null,
     task_type: taskType,
     payload,
     attempts: [
@@ -86,7 +85,7 @@ function taskLog(available = true) {
 async function mountRuntimeCenter(
   logAvailable = true,
   payload: Record<string, unknown> = defaultPayload,
-  taskType = 'BACKTEST',
+  taskType = 'RESEARCH_RUN',
   initialPath = '/tasks',
 ) {
   apiGet.mockImplementation((path?: string) => {
@@ -94,7 +93,6 @@ async function mountRuntimeCenter(
       return Promise.resolve({
         items: [{
           ...failedTask,
-          factor_run_id: taskType === 'FACTOR_ANALYSIS' ? 'factor-run-0001' : null,
           task_type: taskType,
         }], page: 1, page_size: 25, total: 1,
         status_counts: { QUEUED: 2, RUNNING: 1, SUCCEEDED: 4, FAILED: 1, CANCEL_REQUESTED: 0, CANCELLED: 0, ORPHANED: 1 },
@@ -109,8 +107,7 @@ async function mountRuntimeCenter(
     history: createMemoryHistory(),
     routes: [
       { path: '/tasks', component: TasksView },
-      { path: '/experiments/:experimentId', name: 'experiment-detail', component: { template: '<div />' } },
-      { path: '/factors', name: 'factors', component: { template: '<div />' } },
+      { path: '/research/:familyId', name: 'research-detail', component: { template: '<div />' } },
     ],
   })
   await router.push(initialPath)
@@ -144,7 +141,7 @@ describe('runtime center', () => {
     expect(headers).not.toContain('任务 / 关联')
     expect(wrapper.find('.task-link').element.closest('td'))
       .not.toBe(wrapper.find('.association-cell').element.closest('td'))
-    expect(wrapper.find('.association-cell').text()).toContain('实验 experime')
+    expect(wrapper.find('.association-cell').text()).toContain('RESEARCH_RUN · research')
     wrapper.unmount()
   })
 
@@ -233,17 +230,11 @@ describe('runtime center', () => {
     wrapper.unmount()
   })
 
-  it('links a factor analysis task to its exact immutable run', async () => {
-    const wrapper = await mountRuntimeCenter(true, { run_id: 'factor-run-0001' }, 'FACTOR_ANALYSIS')
-    const listLink = wrapper.find('.factor-run-link')
-    expect(listLink.exists()).toBe(true)
-    expect(listLink.attributes('href')).toBe('/factors?run=factor-run-0001')
-
+  it('shows the generic research subject in task detail', async () => {
+    const wrapper = await mountRuntimeCenter(true, { run_id: 'research-run-0001' })
     await wrapper.find('.task-link').trigger('click')
     await flushPromises()
-    const detailLink = document.body.querySelector<HTMLAnchorElement>('.drawer-task-actions a')
-    expect(detailLink?.getAttribute('href')).toBe('/factors?run=factor-run-0001')
-    expect(document.body.textContent).toContain('打开对应因子分析')
+    expect(document.body.textContent).toContain('RESEARCH_RUN · research-run-0001')
     wrapper.unmount()
   })
 

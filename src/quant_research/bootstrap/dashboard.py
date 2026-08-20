@@ -4,25 +4,21 @@ from __future__ import annotations
 
 import urllib.request
 from contextlib import suppress
-from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
 
-from quant_research.application.experiments import ExperimentClient
-from quant_research.application.research import ResearchApplicationService
+from quant_research.application.operations import OperationalCommandService
 from quant_research.backtest.rulebook import AShareRuleBook
-from quant_research.bootstrap.worker import strategy_factories
+from quant_research.bootstrap.research import build_research_platform
 from quant_research.config import Settings
 from quant_research.dashboard.app import create_dashboard_app as create_http_app
 from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.dashboard.notebook import NotebookProbe
+from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.data.pipelines.publish import DataUpdatePlanner
 from quant_research.data.repository import CanonicalResearchRepository
-from quant_research.experiments.fingerprint import capture_environment
-from quant_research.experiments.query import ExperimentQuery
-from quant_research.experiments.registry import ExperimentRegistry
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,
     BaoStockCalendarPolicy,
@@ -33,12 +29,6 @@ from quant_research.infrastructure.baostock import (
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
-)
-from quant_research.infrastructure.persistence.experiment_deletion import (
-    SqliteExperimentDeletion,
-)
-from quant_research.infrastructure.persistence.factor_studies import (
-    FactorStudyRepository,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
@@ -125,21 +115,11 @@ class DashboardBootstrap:
                 engine,
                 trusted_curated_root=settings.curated_root,
             )
-            catalog = repository.catalog()
             rulebook = AShareRuleBook.load(config_root / "rules" / "a_share.yaml")
             queue = TaskQueue(
                 engine,
                 task_log_root=settings.data_root / "state" / "task-logs",
             )
-            query = ExperimentQuery(engine)
-            registry = ExperimentRegistry(engine)
-            experiment_deletion = SqliteExperimentDeletion(
-                engine,
-                data_root=settings.data_root,
-                artifact_root=settings.artifact_root,
-                task_log_root=settings.data_root / "state" / "task-logs",
-            )
-            experiment_deletion.recover()
             source_config = BaoStockConfig(
                 max_instruments_per_batch=100,
                 max_days_per_batch=366,
@@ -148,34 +128,6 @@ class DashboardBootstrap:
                 retryable_error_codes=frozenset({"-1", "10002007"}),
             )
             calendar_client = BaoStockClient(BaoStockSdkGateway(), None, source_config)
-            commands = ResearchApplicationService(
-                queue=queue,
-                query=query,
-                registry=registry,
-                catalog=catalog,
-                source_root=source_root,
-                factor_studies=FactorStudyRepository(engine),
-                experiment_submitter=ExperimentClient(
-                    registry=registry,
-                    query=query,
-                    queue=queue,
-                    config_root=config_root,
-                    catalog=catalog,
-                    strategies=strategy_factories(),
-                    rulebook=rulebook,
-                    environment_factory=lambda: capture_environment(
-                        source_root, source_root / "uv.lock"
-                    ),
-                    clock=lambda: datetime.now(UTC),
-                ),
-                experiment_deletion=experiment_deletion,
-                data_update_planner=DataUpdatePlanner(
-                    calendar=BaoStockCalendarPolicy(calendar_client),
-                    repository=MetadataRepository(engine),
-                    routes=BAOSTOCK_ROUTES,
-                    bootstrap_years=settings.bootstrap_years,
-                ),
-            )
             service = DashboardViewService(
                 engine,
                 settings,
@@ -183,9 +135,34 @@ class DashboardBootstrap:
                 MarketReviewService(repository, rulebook),
                 BAOSTOCK_ROUTES,
             )
+            research = build_research_platform(
+                engine=engine,
+                queue=queue,
+                repository=repository,
+                source_root=source_root,
+                artifact_root=settings.artifact_root,
+                rulebook=rulebook,
+            )
+            commands = OperationalCommandService(
+                queue,
+                DataUpdatePlanner(
+                    calendar=BaoStockCalendarPolicy(calendar_client),
+                    repository=MetadataRepository(engine),
+                    routes=BAOSTOCK_ROUTES,
+                    bootstrap_years=settings.bootstrap_years,
+                ),
+                research.commands,
+            )
             return create_http_app(
                 service=service,
                 commands=commands,
+                research_service=ResearchDashboardService(
+                    research.registry,
+                    research.components,
+                    config_root / "research" / "examples",
+                    settings.artifact_root,
+                ),
+                research_commands=research.commands,
                 notebook_probe=notebook_probe or _LocalNotebookProbe(),
                 static_dir=static_dir or source_root / "frontend" / "dist",
                 allowed_hosts=allowed_hosts,

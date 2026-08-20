@@ -143,6 +143,8 @@ class TaskQueue:
         available_at: datetime | None = None,
         actor: str = "system",
         request_id: str | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
     ) -> str:
         """幂等入队基础设施。
 
@@ -168,6 +170,14 @@ class TaskQueue:
         )
         key = _QueueSupport._optional_identity(idempotency_key, "idempotency_key", 128)
         request = _QueueSupport._optional_identity(request_id, "request_id", 128)
+        generic_subject_kind = _QueueSupport._optional_identity(
+            subject_kind, "subject_kind", 32
+        )
+        generic_subject_id = _QueueSupport._optional_identity(
+            subject_id, "subject_id", 64
+        )
+        if (generic_subject_kind is None) != (generic_subject_id is None):
+            raise ValueError("subject_kind and subject_id must be jointly present")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise TypeError("priority must be an int and not bool")
         payload_json = _QueueSupport._mapping_json_text(
@@ -227,6 +237,8 @@ class TaskQueue:
                 insert(TaskORM).values(
                     id=identifier,
                     experiment_id=experiment,
+                    subject_kind=generic_subject_kind,
+                    subject_id=generic_subject_id,
                     task_type=task_kind,
                     payload_json=payload_json,
                     status=TaskStatus.QUEUED.value,
@@ -905,6 +917,8 @@ class TaskQueue:
                 worker_id=worker,
                 progress=progress,
                 claimed_at=claimed_at,
+                subject_kind=cast(str | None, task["subject_kind"]),
+                subject_id=cast(str | None, task["subject_id"]),
             )
 
         return self._immediate(write)
@@ -2189,6 +2203,8 @@ class _QueueSupport:
             ),
             error=error,
             result=result,
+            subject_kind=cast(str | None, row["subject_kind"]),
+            subject_id=cast(str | None, row["subject_id"]),
         )
 
     @staticmethod

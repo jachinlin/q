@@ -5,35 +5,30 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
 from sqlalchemy import Engine
 
 from quant_research.application.data import DataUpdateHandler, DataValidationHandler
-from quant_research.application.experiments import ExperimentClient
+from quant_research.application.worker import Worker
 from quant_research.backtest.rulebook import AShareRuleBook
-from quant_research.bootstrap.worker import (
-    build_default_experiment_worker,
-    strategy_factories,
-)
+from quant_research.bootstrap.research import build_research_platform
 from quant_research.cli.app import (
     ApplicationServices,
-    LocalExperimentCommands,
     LocalTaskCommands,
     LocalWorkerCommands,
     create_app,
     run,
 )
+from quant_research.cli.research import LocalResearchCommands
 from quant_research.config import Settings
+from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.data.partitions import RawPartitionStore
 from quant_research.data.pipelines.curate import CuratedPartitionStore
 from quant_research.data.pipelines.publish import DataPipeline
 from quant_research.data.quality.runner import QualityRunner
-from quant_research.experiments.fingerprint import capture_environment
-from quant_research.experiments.query import ExperimentQuery
-from quant_research.experiments.registry import ExperimentRegistry
+from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,
     BaoStockCalendarPolicy,
@@ -108,31 +103,50 @@ class CliBootstrap:
                 bootstrap_years=settings.bootstrap_years,
                 logger=pipeline_logger,
             )
-            queue = TaskQueue(engine)
-            query = ExperimentQuery(engine)
-            client = cls._experiment_client(
-                source_root=source_root,
-                repository=repository,
-                queue=queue,
-                query=query,
-                registry=ExperimentRegistry(engine),
+            queue = TaskQueue(
+                engine,
+                task_log_root=settings.data_root / "state" / "task-logs",
             )
-            worker = build_default_experiment_worker(
-                worker_id=f"cli-worker-{os.getpid()}",
+            research_repository = CanonicalResearchRepository.from_sqlite(
+                engine,
+                trusted_curated_root=settings.curated_root,
+            )
+            rulebook = AShareRuleBook.load(
+                source_root / "configs" / "rules" / "a_share.yaml"
+            )
+            research = build_research_platform(
                 engine=engine,
-                extra_handlers=(
+                queue=queue,
+                repository=research_repository,
+                source_root=source_root,
+                artifact_root=settings.artifact_root,
+                rulebook=rulebook,
+            )
+            worker = Worker(
+                queue,
+                worker_id=f"cli-worker-{os.getpid()}",
+                handlers=(
                     DataUpdateHandler(pipeline),
                     DataValidationHandler(pipeline),
+                    *research.handlers,
                 ),
             )
             return ApplicationServices(
                 pipeline,
                 task_commands=LocalTaskCommands(queue),
-                experiment_commands=LocalExperimentCommands(client),
                 worker_commands=LocalWorkerCommands(
                     worker,
                     queue=queue,
-                    experiments=query,
+                ),
+                research_commands=LocalResearchCommands(
+                    research.commands,
+                    ResearchDashboardService(
+                        research.registry,
+                        research.components,
+                        source_root / "configs" / "research" / "examples",
+                        settings.artifact_root,
+                    ),
+                    source_root / "configs",
                 ),
                 close_callback=lambda: cls._close_resources(
                     pipeline_logger, pipeline_stream, engine
@@ -142,30 +156,6 @@ class CliBootstrap:
             with suppress(BaseException):
                 cls._close_resources(pipeline_logger, pipeline_stream, engine)
             raise
-
-    @staticmethod
-    def _experiment_client(
-        *,
-        source_root: Path,
-        repository: MetadataRepository,
-        queue: TaskQueue,
-        query: ExperimentQuery,
-        registry: ExperimentRegistry,
-    ) -> ExperimentClient:
-        config_root = source_root / "configs"
-        return ExperimentClient(
-            registry=registry,
-            query=query,
-            queue=queue,
-            config_root=config_root,
-            catalog=repository,
-            strategies=strategy_factories(),
-            rulebook=AShareRuleBook.load(config_root / "rules" / "a_share.yaml"),
-            environment_factory=lambda: capture_environment(
-                source_root, source_root / "uv.lock"
-            ),
-            clock=lambda: datetime.now(UTC),
-        )
 
     @staticmethod
     def _pipeline_logger(data_root: Path) -> tuple[StructuredLogger, TextIO]:

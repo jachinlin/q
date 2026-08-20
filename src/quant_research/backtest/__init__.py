@@ -1,51 +1,48 @@
-"""提供python-module-conventions与回测相关的公开模型、协议与处理流程。"""
+"""延迟暴露待迁移到 ``execution`` 的旧回测内核，避免包导入环。"""
 
-from quant_research.backtest.accounting import (
-    AccountExecutionView,
-    AccountSnapshot,
-    LedgerEvent,
-    LedgerEventType,
-    PortfolioAccount,
-    PositionSnapshot,
-)
-from quant_research.backtest.artifacts import (
-    ArtifactEntry,
-    BacktestArtifactRecovery,
-    BacktestArtifactWriter,
-    ManifestContext,
-    WriterState,
-    validate_backtest_artifacts,
-)
-from quant_research.backtest.calendar import TradingCalendar
-from quant_research.backtest.engine import (
-    BacktestCancelled,
-    BacktestEngine,
-    BacktestRequest,
-    BacktestResult,
-    BoundMarketSlice,
-    StrategyRef,
-)
-from quant_research.backtest.execution import ExecutionModel
-from quant_research.backtest.models import (
-    AccountView,
-    ExecutionBatch,
-    ExecutionConfig,
-    ExecutionPrice,
-    ExecutionReason,
-    FillResult,
-    MarketSlice,
-    RejectResult,
-)
-from quant_research.backtest.rulebook import (
-    AShareRuleBook,
-    FeeBreakdown,
-    InstrumentTradingProfile,
-    MarketRuleBook,
-    PriceBand,
-    SecurityStatus,
-    Side,
-    SimulatedFill,
-)
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
+
+_EXPORTS = {
+    "AShareRuleBook": "rulebook",
+    "AccountExecutionView": "accounting",
+    "AccountSnapshot": "accounting",
+    "AccountView": "models",
+    "ArtifactEntry": "artifacts",
+    "BacktestArtifactRecovery": "artifacts",
+    "BacktestArtifactWriter": "artifacts",
+    "BacktestCancelled": "engine",
+    "BacktestEngine": "engine",
+    "BacktestRequest": "engine",
+    "BacktestResult": "engine",
+    "BoundMarketSlice": "engine",
+    "ExecutionBatch": "models",
+    "ExecutionConfig": "models",
+    "ExecutionModel": "execution",
+    "ExecutionPrice": "models",
+    "ExecutionReason": "models",
+    "FeeBreakdown": "rulebook",
+    "FillResult": "models",
+    "InstrumentTradingProfile": "rulebook",
+    "LedgerEvent": "accounting",
+    "LedgerEventType": "accounting",
+    "ManifestContext": "artifacts",
+    "MarketRuleBook": "rulebook",
+    "MarketSlice": "models",
+    "PortfolioAccount": "accounting",
+    "PositionSnapshot": "accounting",
+    "PriceBand": "rulebook",
+    "RejectResult": "models",
+    "SecurityStatus": "rulebook",
+    "Side": "rulebook",
+    "SimulatedFill": "rulebook",
+    "StrategyRef": "engine",
+    "TradingCalendar": "calendar",
+    "WriterState": "artifacts",
+    "validate_backtest_artifacts": "artifacts",
+}
 
 __all__ = [
     "AShareRuleBook",
@@ -85,3 +82,21 @@ __all__ = [
     "WriterState",
     "validate_backtest_artifacts",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """按需加载旧内核符号；目标业务代码不得依赖本入口。
+
+该函数作为模块级确定性辅助或框架入口保留。
+
+入参：
+    参数和字段含义由公开签名及类型声明给出。
+返回值：
+    返回该操作构造、计算或查询得到的领域结果。
+异常：
+    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    """
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    return getattr(import_module(f"quant_research.backtest.{module_name}"), name)

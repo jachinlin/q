@@ -79,7 +79,10 @@ def test_final_schema_indexes_encode_claim_order_and_active_idempotency(
     ]
     unique_sql = index_sql["uq_task_active_idempotency"]
     assert "UNIQUE INDEX" in unique_sql
-    assert "TASK_TYPE, COALESCE(EXPERIMENT_ID, ''), IDEMPOTENCY_KEY" in unique_sql
+    assert (
+        "TASK_TYPE, COALESCE(SUBJECT_KIND, ''), COALESCE(SUBJECT_ID, ''), "
+        "IDEMPOTENCY_KEY"
+    ) in unique_sql
     assert "IDEMPOTENCY_KEY IS NOT NULL" in unique_sql
     assert "STATUS IN ('QUEUED', 'RUNNING', 'CANCEL_REQUESTED')" in unique_sql
     engine.dispose()
@@ -365,20 +368,22 @@ def test_enqueue_rejects_invalid_inputs_before_any_write(engine: Engine) -> None
         )
 
 
-def test_enqueue_requires_existing_optional_experiment(engine: Engine) -> None:
-    """A supplied experiment identity must be checked in the same write transaction."""
+def test_subject_identity_is_persisted_without_a_legacy_parent(engine: Engine) -> None:
+    """通用关联直接绑定调用方对象，不依赖已删除的实验父表。"""
     queue = _queue(engine)
 
-    with pytest.raises(QuantError) as captured:
-        queue.enqueue("BACKTEST", {}, 0, experiment_id="missing")
+    task_id = queue.enqueue(
+        "RESEARCH_RUN",
+        {},
+        0,
+        subject_kind="RESEARCH_RUN",
+        subject_id="run-1",
+    )
 
-    assert captured.value.detail.code == "TASK_EXPERIMENT_NOT_FOUND"
-    with engine.connect() as connection:
-        assert connection.execute(text("SELECT count(*) FROM task")).scalar_one() == 0
-
-    _insert_experiment(engine)
-    task_id = queue.enqueue("BACKTEST", {}, 0, experiment_id="experiment-1")
-    assert _task_row(engine, task_id)["experiment_id"] == "experiment-1"
+    row = _task_row(engine, task_id)
+    assert row["subject_kind"] == "RESEARCH_RUN"
+    assert row["subject_id"] == "run-1"
+    assert row["experiment_id"] is None
 
 
 def test_active_idempotency_returns_same_task_and_audits_canonical_hit(
@@ -611,40 +616,6 @@ def test_running_cancel_request_preserves_owner_until_cancel_finish(
         "TASK_CANCEL_REQUESTED",
         "TASK_FINISHED",
     ]
-
-
-def test_registered_backtest_success_wins_cancel_request_before_task_finish(
-    engine: Engine,
-) -> None:
-    _insert_experiment(engine)
-    queue = _queue(engine)
-    task_id = queue.enqueue(
-        "BACKTEST",
-        {},
-        0,
-        experiment_id="experiment-1",
-    )
-    claimed = queue.claim("worker-1", NOW)
-    assert claimed is not None
-    queue.request_cancel(task_id, "user-1")
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "UPDATE experiment SET status = 'SUCCEEDED', completed_at = :now "
-                "WHERE id = 'experiment-1'"
-            ),
-            {"now": NOW_TEXT},
-        )
-
-    queue.finish(
-        claimed.attempt_id,
-        "worker-1",
-        TaskOutcome(status=TaskStatus.SUCCEEDED),
-    )
-
-    task = _task_row(engine, task_id)
-    attempt = _attempt_rows(engine, task_id)[0]
-    assert task["status"] == attempt["status"] == "SUCCEEDED"
 
 
 def test_finish_is_owner_fenced_idempotent_and_persists_canonical_error(

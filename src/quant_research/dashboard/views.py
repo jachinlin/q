@@ -392,7 +392,6 @@ class DashboardViewService:
         """
         operations = self.data_summary()
         datasets = self._catalog.list_canonical_datasets()
-        experiments = self._experiments.list(limit=5)
         active_statuses = (
             TaskStatus.QUEUED,
             TaskStatus.RUNNING,
@@ -411,7 +410,6 @@ class DashboardViewService:
             )[:5]
         )
         task_status_counts = {status.value: 0 for status in TaskStatus}
-        experiment_status_counts = {status.value: 0 for status in ExperimentStatus}
         with Session(self._engine) as session:
             for status, count in session.execute(
                 select(TaskORM.status, func.count())
@@ -419,34 +417,10 @@ class DashboardViewService:
                 .group_by(TaskORM.status)
             ):
                 task_status_counts[str(status)] = int(count)
-            for status, count in session.execute(
-                select(ExperimentORM.status, func.count())
-                .select_from(ExperimentORM)
-                .group_by(ExperimentORM.status)
-            ):
-                experiment_status_counts[str(status)] = int(count)
         latest_trade_date = max(
             (item.end_date for item in datasets if item.end_date is not None),
             default=None,
         )
-        benchmarks: list[dict[str, object]] = []
-        for strategy_id in ("etf_rotation", "stock_multifactor"):
-            candidates = self._experiments.list(
-                statuses=ExperimentStatus.SUCCEEDED,
-                strategy_id=strategy_id,
-                limit=1,
-            )
-            candidate = candidates[0] if candidates else None
-            benchmarks.append(
-                {
-                    "strategy_id": strategy_id,
-                    "experiment": (
-                        None
-                        if candidate is None
-                        else self._experiment_summary(candidate)
-                    ),
-                }
-            )
         return {
             "gate": operations["gate"],
             "freshness": operations["freshness"],
@@ -459,11 +433,6 @@ class DashboardViewService:
             "tasks": {
                 "status_counts": task_status_counts,
                 "active": tuple(_ServicesSupport._task(item) for item in active_tasks),
-            },
-            "experiments": {
-                "status_counts": experiment_status_counts,
-                "recent": tuple(self._experiment_summary(item) for item in experiments),
-                "benchmarks": tuple(benchmarks),
             },
         }
 
@@ -1721,8 +1690,8 @@ class _ServicesSupport:
     def _task(item: TaskRecord) -> dict[str, object]:
         return {
             "id": item.id,
-            "experiment_id": item.experiment_id,
-            "factor_run_id": _ServicesSupport._factor_run_id(item),
+            "subject_kind": item.subject_kind,
+            "subject_id": item.subject_id,
             "task_type": item.task_type,
             "status": item.status.value,
             "priority": item.priority,
