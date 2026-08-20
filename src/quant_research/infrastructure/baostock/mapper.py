@@ -15,14 +15,14 @@ import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import (
     CanonicalBatch,
     JsonValue,
     PublishedPartition,
     canonical_json_bytes,
 )
-from quant_research.data.partitions import RawPartitionStore
-from quant_research.data.schemas import CANONICAL_SCHEMAS
+from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind, Exchange, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.infrastructure.baostock.client import (

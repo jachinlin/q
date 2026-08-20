@@ -18,8 +18,8 @@ import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
 
+from quant_research.data.canonical.schemas import PolarsDataType
 from quant_research.data.contracts import JsonScalar, JsonValue, canonical_json_bytes
-from quant_research.data.schemas import PolarsDataType
 from quant_research.domain.enums import DatasetKind
 
 type FrozenJsonValue = (

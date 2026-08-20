@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 from quant_research.data.catalog import DATASET_CATALOG
-from quant_research.data.pipelines.publish import (
+from quant_research.data.pipeline.publish import (
     DataUpdatePlan,
     DataUpdatePlanner,
     DataUpdateWindowBasis,

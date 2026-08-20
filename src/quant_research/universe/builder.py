@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from quant_research.data.canonical.schemas import PolarsDataType
 from quant_research.data.repository import ResearchDataRepository
-from quant_research.data.schemas import PolarsDataType
 from quant_research.domain.enums import Board
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.universe.rules import UniverseRules

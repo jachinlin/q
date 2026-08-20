@@ -5,9 +5,9 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-from quant_research.data.pipelines.curate import CuratedPartitionStore
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
+from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.quality.runner import QualityRunner
-from quant_research.data.schemas import CANONICAL_SCHEMAS
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.baostock.mapper import BaoStockMapper
 

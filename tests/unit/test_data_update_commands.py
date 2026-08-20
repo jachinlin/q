@@ -11,7 +11,7 @@ import pytest
 
 from quant_research.application.research import ResearchApplicationService
 from quant_research.data.contracts import JsonValue
-from quant_research.data.pipelines.publish import (
+from quant_research.data.pipeline.publish import (
     DataUpdatePlan,
     DataUpdateWindow,
     DataUpdateWindowBasis,

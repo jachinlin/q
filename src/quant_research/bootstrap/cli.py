@@ -24,11 +24,11 @@ from quant_research.cli.app import (
 from quant_research.cli.research import LocalResearchCommands
 from quant_research.config import Settings
 from quant_research.dashboard.research_views import ResearchDashboardService
-from quant_research.data.partitions import RawPartitionStore
-from quant_research.data.pipelines.curate import CuratedPartitionStore
-from quant_research.data.pipelines.publish import DataPipeline
+from quant_research.data.pipeline.curate import CuratedPartitionStore
+from quant_research.data.pipeline.publish import DataPipeline
 from quant_research.data.quality.runner import QualityRunner
 from quant_research.data.repository import CanonicalResearchRepository
+from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,
     BaoStockCalendarPolicy,

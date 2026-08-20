@@ -1,6 +1,6 @@
 from datetime import date
 
-from quant_research.data.pipelines.dataset import _DatasetPipelineSupport
+from quant_research.data.pipeline.dataset import _DatasetPipelineSupport
 from quant_research.domain.enums import DatasetKind
 
 

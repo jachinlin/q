@@ -13,8 +13,8 @@ from quant_research.data.contracts import (
     PublishedPartition,
     canonical_json_bytes,
 )
-from quant_research.data.partitions import RawPartitionStore
-from quant_research.data.storage import resolved_storage_root
+from quant_research.data.storage.partitions import RawPartitionStore
+from quant_research.data.storage.paths import resolved_storage_root
 
 
 def partition_to_json(partition: PublishedPartition) -> dict[str, JsonValue]:

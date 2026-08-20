@@ -11,7 +11,10 @@ from typing import Protocol
 import numpy as np
 import polars as pl
 
-from quant_research.data.adjustments import FORWARD_LOG_RETURN_COLUMN, AdjustmentMode
+from quant_research.data.canonical.adjustments import (
+    FORWARD_LOG_RETURN_COLUMN,
+    AdjustmentMode,
+)
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, FactorSpec
 

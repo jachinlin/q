@@ -12,11 +12,11 @@ import pytest
 from sqlalchemy import Engine
 
 import quant_research.data.repository as repository_module
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import CanonicalBatch
-from quant_research.data.pipelines.curate import CuratedPartitionStore
+from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.quality.models import QualityRunSpec
 from quant_research.data.repository import CanonicalResearchRepository
-from quant_research.data.schemas import CANONICAL_SCHEMAS
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.infrastructure.persistence.database import (

@@ -11,7 +11,7 @@ from typing import Protocol
 
 import pytest
 
-from quant_research.data.storage import DataRootExecutionLock
+from quant_research.data.storage.paths import DataRootExecutionLock
 from quant_research.domain.errors import QuantError
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="项目仅支持 Windows 本地运行")

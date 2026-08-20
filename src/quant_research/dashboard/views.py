@@ -23,7 +23,7 @@ from quant_research.data.freshness import DatasetFreshness, FreshnessEvaluator
 from quant_research.data.quality.catalog import QUALITY_RULE_CATALOG
 from quant_research.data.quality.models import QualityIssue, thaw_json
 from quant_research.data.repository import ResearchDataRepository
-from quant_research.data.routing import RoutingTable
+from quant_research.data.sources.routing import RoutingTable
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.errors import QuantError
 from quant_research.domain.identifiers import QualityRunId

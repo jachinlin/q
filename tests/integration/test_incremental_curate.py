@@ -14,11 +14,11 @@ from quant_research.data.contracts import (
     PublishedPartition,
     RawBatch,
 )
-from quant_research.data.partitions import RawPartitionStore
-from quant_research.data.pipelines.curate import CuratedPartitionStore
-from quant_research.data.pipelines.dataset import DataPipeline
+from quant_research.data.pipeline.curate import CuratedPartitionStore
+from quant_research.data.pipeline.dataset import DataPipeline
 from quant_research.data.quality.runner import QualityRunner
-from quant_research.data.routing import Route, RoutingTable
+from quant_research.data.sources.routing import Route, RoutingTable
+from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.baostock.client import (
     DAILY_BAR_FIELDS,

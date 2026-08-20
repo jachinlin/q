@@ -90,3 +90,31 @@ def test_legacy_package_is_absent() -> None:
         if "quant_core" in path.read_text(encoding="utf-8")
     ]
     assert legacy == []
+
+
+def test_data_layer_package_layout() -> None:
+    """锁定数据层子包职责，并确保供应商适配器只位于基础设施层。"""
+    data_root = _PACKAGE_ROOT / "data"
+    expected_packages = {"canonical", "pipeline", "quality", "sources", "storage"}
+    assert {
+        path.name
+        for path in data_root.iterdir()
+        if path.is_dir() and (path / "__init__.py").is_file()
+    } >= expected_packages
+
+    obsolete_paths = (
+        data_root / "pipelines",
+        data_root / "schemas.py",
+        data_root / "adjustments.py",
+        data_root / "routing.py",
+        data_root / "financials.py",
+        data_root / "partitions.py",
+        data_root / "storage.py",
+        data_root / "safe_files.py",
+    )
+    assert not any(path.exists() for path in obsolete_paths)
+    assert not any(
+        "baostock" in path.name.lower()
+        for path in (data_root / "sources").rglob("*.py")
+    )
+    assert (_PACKAGE_ROOT / "infrastructure" / "baostock").is_dir()

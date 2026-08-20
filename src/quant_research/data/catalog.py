@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
-from quant_research.data.schemas import CANONICAL_SCHEMAS, CanonicalSchema
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS, CanonicalSchema
 from quant_research.domain.enums import DatasetKind
 
 

@@ -17,7 +17,7 @@ from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.dashboard.notebook import NotebookProbe
 from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.dashboard.views import DashboardViewService
-from quant_research.data.pipelines.publish import DataUpdatePlanner
+from quant_research.data.pipeline.publish import DataUpdatePlanner
 from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,

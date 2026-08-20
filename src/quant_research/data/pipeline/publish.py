@@ -1,6 +1,6 @@
 """汇总数据流水线的稳定公开入口。"""
 
-from quant_research.data.pipelines.dataset import (
+from quant_research.data.pipeline.dataset import (
     DataPipeline,
     DataPipelineCancelled,
     DataUpdatePlan,

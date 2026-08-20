@@ -14,7 +14,7 @@ from typing import cast
 import pytest
 
 from quant_research.data.contracts import PublishedPartition, RawBatch
-from quant_research.data.partitions import RawPartitionStore
+from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.errors import QuantError
 
 
@@ -371,7 +371,7 @@ def test_publish_removes_temporary_files_when_write_fails_after_creating_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed temporary Parquet write never leaves files or a publication marker."""
-    from quant_research.data import partitions
+    from quant_research.data.storage import partitions
 
     write_table = partitions.pq.write_table
 

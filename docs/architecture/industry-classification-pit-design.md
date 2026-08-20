@@ -330,7 +330,7 @@ uv run quant data validate-all
 |---|---|
 | `infrastructure/baostock/client.py` | 逐交易日请求与 Raw 行合成 `as_of_date` |
 | `infrastructure/baostock/mapper.py` | Canonical 字段、tombstone 和可见性审计映射 |
-| `data/pipelines/dataset.py` | 窗口、未来 Raw 隔离、年度输入身份和事件压缩 |
+| `data/pipeline/dataset.py` | 窗口、未来 Raw 隔离、年度输入身份和事件压缩 |
 | `data/quality/` | Schema、日期关系、基线、状态和覆盖门禁 |
 | `data/repository.py` | 单日与批量 as-of 状态重建 |
 | `dashboard/market_review.py` | 无快照、零覆盖和有效行业展示 |

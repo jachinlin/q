@@ -8,7 +8,7 @@ from typing import Protocol
 
 from quant_research.application.research_platform import ResearchCommandService
 from quant_research.data.contracts import JsonValue
-from quant_research.data.pipelines.publish import DataUpdatePlan
+from quant_research.data.pipeline.publish import DataUpdatePlan
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.tasks.models import TaskRecord, TaskStatus

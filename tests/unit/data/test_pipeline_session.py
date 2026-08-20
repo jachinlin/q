@@ -10,7 +10,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from quant_research.data.contracts import RawBatch
-from quant_research.data.pipelines.dataset import (
+from quant_research.data.pipeline.dataset import (
     DataPipeline,
     DataUpdatePlan,
     DataUpdateWindow,

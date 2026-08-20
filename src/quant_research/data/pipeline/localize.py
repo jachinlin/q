@@ -12,10 +12,10 @@ from typing import Never, Protocol
 from quant_research.data.catalog import FetchPlan
 from quant_research.data.contracts import (
     JsonValue,
-    PipelineSource,
     PublishedPartition,
     RawBatch,
 )
+from quant_research.data.sources.contracts import PipelineSource
 
 type RawFetch = Callable[[], Iterable[RawBatch]]
 type RequestUnit = tuple[str, Mapping[str, JsonValue]]

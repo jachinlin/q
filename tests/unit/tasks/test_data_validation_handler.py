@@ -10,7 +10,7 @@ from uuid import uuid4
 import pytest
 
 from quant_research.application.data import DataValidationHandler
-from quant_research.data.pipelines.publish import DataPipeline
+from quant_research.data.pipeline.publish import DataPipeline
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.domain.identifiers import QualityRunId

@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import polars as pl
 
+from quant_research.data.canonical.mapper import CanonicalMapper
 from quant_research.data.catalog import (
     DATASET_CATALOG,
     DatasetCatalog,
@@ -21,18 +22,16 @@ from quant_research.data.catalog import (
 )
 from quant_research.data.contracts import (
     CanonicalBatch,
-    CanonicalMapper,
     JsonValue,
     PublishedPartition,
     RawBatch,
     canonical_json_bytes,
 )
-from quant_research.data.partitions import RawPartitionStore
-from quant_research.data.pipelines.curate import (
+from quant_research.data.pipeline.curate import (
     CanonicalPartitionReplacement,
     CuratedPartitionStore,
 )
-from quant_research.data.pipelines.localize import (
+from quant_research.data.pipeline.localize import (
     LocalizePlanContext,
     LocalizePlanExecutor,
 )
@@ -43,8 +42,9 @@ from quant_research.data.quality.models import (
     thaw_json,
 )
 from quant_research.data.quality.runner import QualityRunner
-from quant_research.data.routing import RoutingTable
-from quant_research.data.storage import DataRootExecutionLock
+from quant_research.data.sources.routing import RoutingTable
+from quant_research.data.storage.partitions import RawPartitionStore
+from quant_research.data.storage.paths import DataRootExecutionLock
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.domain.identifiers import QualityRunId

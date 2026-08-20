@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from quant_research.data.adjustments import FORWARD_LOG_RETURN_COLUMN
+from quant_research.data.canonical.adjustments import FORWARD_LOG_RETURN_COLUMN
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors.base import FactorContext, factor_table_content_hash
 from quant_research.factors.builtin.momentum import (

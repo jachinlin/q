@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from quant_research.data.contracts import JsonValue
-from quant_research.data.pipelines.publish import (
+from quant_research.data.pipeline.publish import (
     DataPipeline,
     DataPipelineCancelled,
     DataUpdatePlan,

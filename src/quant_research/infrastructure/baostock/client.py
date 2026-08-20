@@ -23,7 +23,7 @@ from quant_research.data.contracts import (
     PublishedPartition,
     RawBatch,
 )
-from quant_research.data.financials import (
+from quant_research.data.sources.financials import (
     financial_report_period_end,
     financial_request_is_eligible,
 )

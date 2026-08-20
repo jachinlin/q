@@ -11,11 +11,11 @@ import polars as pl
 import pytest
 from sqlalchemy import inspect
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import CanonicalBatch, canonical_json_bytes
-from quant_research.data.pipelines.curate import CuratedPartitionStore
+from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.quality.models import QualityIssue, QualityRunSpec
 from quant_research.data.repository import CanonicalResearchRepository
-from quant_research.data.schemas import CANONICAL_SCHEMAS
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import QuantError
 from quant_research.infrastructure.persistence.database import (

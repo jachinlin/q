@@ -16,9 +16,9 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 from sqlalchemy import Engine
 
-from quant_research.data.adjustments import _PriceAdjustmentEngine
-from quant_research.data.safe_files import open_verified_file
-from quant_research.data.schemas import CANONICAL_SCHEMAS, CanonicalSchema
+from quant_research.data.canonical.adjustments import _PriceAdjustmentEngine
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS, CanonicalSchema
+from quant_research.data.storage.verified_files import open_verified_file
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.domain.identifiers import InstrumentId

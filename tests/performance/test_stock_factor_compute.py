@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime, timedelta
 import polars as pl
 import pytest
 
-from quant_research.data.adjustments import FORWARD_LOG_RETURN_COLUMN
+from quant_research.data.canonical.adjustments import FORWARD_LOG_RETURN_COLUMN
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors.base import FactorContext
 from quant_research.factors.builtin.auxiliary import AvgAmount20dFactor

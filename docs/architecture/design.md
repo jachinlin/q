@@ -63,6 +63,8 @@
   覆盖大多数迭代（换因子、换权重、加约束）。ETF 轮动、股票多因子是"用底座拼出的内置策略"，
   不是写死的特例。
 - **B（策略即插件）**：`Strategy` 协议 + 注册表。给异构策略留口子，新策略 = 实现协议并注册。
+- **双均线趋势属于 B**：它不是截面 Alpha 的一种因子组合，而是独立的时序状态策略；内置
+  `dual_ma_trend` 插件以复权收盘价生成 LONG/FLAT 状态，并复用权重翻译、撮合、成本和分析能力。
 - 二者并存：底座覆盖 \~80% 微调（配置驱动），插件口子覆盖异构范式。
 
 **核心设计目标**：策略作者只跟稳定公开契约打交道（数据只读接口、因子、模型端口、回测引擎），
@@ -195,7 +197,8 @@ ETF 轮动、股票多因子退化为"底座的两个内置配置"。
 Strategy(Protocol)
  └ WeightTargetStrategy(权重→订单基类)
     └ CrossSectionalStrategy(五模块底座) → etf_rotation / stock_multifactor
- └ PairsStrategy / TimingStrategy / EventDrivenStrategy(直接实现 on_event)
+    └ DualMATrendStrategy(时序目标暴露) → dual_ma_trend
+ └ PairsStrategy / EventDrivenStrategy(直接实现 on_event)
 ```
 
 ### 2.8 回测引擎需求
@@ -263,7 +266,8 @@ ECharts/Plotly）；JupyterLab；pytest + Ruff + mypy；前端 Vitest + ESLint�
 
 1. BaoStock 初次全量 + 增量更新，形成 Raw/Canonical/Feature 与研究门。
 2. 关键质量失败阻止研究门开启。
-3. 四范式各有一个可运行示例（截面：多因子/ETF；择时；配对；事件驱动），从 Notebook/CLI 跑通并在 Dashboard 展示（首版择时/事件驱动为多头版，配对纯对冲随 P3b-2）。
+3. 四范式各有一个可运行示例（截面：多因子/ETF；择时：`dual_ma_trend`；配对；事件驱动），
+   从 Notebook/CLI 跑通并在 Dashboard 展示（双均线与事件驱动首版为多头版，配对纯对冲随 P3b-2）。
 4. 回测正确处理 T+1/涨跌停/停牌/费用/滑点/容量/整手碎股（首版 P3 纯多头）；**分红送转除权除息为 P3b-1、做空/保证金/融券费为 P3b-2 验收项**。
 5. **加一个新策略只需实现** **`Strategy`** **并注册（或写一份五模块配置），不改 runner/引擎/基础设施**。
 6. 事前成本与回测实际成本可对账。
@@ -341,6 +345,9 @@ src/quant_research/
 │   ├── corporate/     #   分红送转除权除息事件
 │   ├── pipeline/      #   localize → curate → validate
 │   ├── quality/       #   质量规则 + 门禁
+│   ├── storage/       #   Raw 分区、可信路径、原子文件发布与校验
+│   ├── catalog.py     #   数据集目录、更新策略和供应商端点能力
+│   ├── contracts.py   #   跨子包不可变 DTO 与确定性 JSON
 │   └── repository.py  #   CanonicalResearchRepository（只读、PIT 截断）
 ├── factors/           # 因子定义/注册/计算/统计内核
 ├── universe/          # PIT 股票池
@@ -826,7 +833,8 @@ Strategy (Protocol, B 的口子)
         └── CrossSectionalStrategy (A 的底座：五模块组装)
               ├── 内置配置: etf_rotation
               └── 内置配置: stock_multifactor
-  └── PairsStrategy / TimingStrategy / EventDrivenStrategy … (B: 直接实现 on_event)
+        └── DualMATrendStrategy (B: 时序状态 → 目标暴露 → OrderIntent)
+  └── PairsStrategy / EventDrivenStrategy … (B: 直接实现 on_event)
 ```
 
 A 是 B 之上的便利层，覆盖 \~80% 微调；B 覆盖异构范式。二者同一 `Strategy` 契约、同一回测引擎。
@@ -924,14 +932,104 @@ CrossSectionalStrategy(pipeline).target_weights(ctx):
 ### 6.6 必须支持的四类范式
 
 - 截面选股 → 目标权重 → 调仓（多因子、ETF 轮动）：走 A 底座。首版即可跑（多头）。
-- 择时 / CTA（单标的仓位随时间变化）：走 B 插件。多头择时首版即可；**空头腿随 P3b-2**。
+- 择时 / CTA（单标的仓位随时间变化）：走 B 插件。首个内置实现是 `dual_ma_trend`；多头择时
+  首版即可，**空头腿随 P3b-2**。
 - 配对交易（成对相对头寸，需做空）：走 B 插件。**纯多空对冲随 P3b-2**（依赖做空账务）。
 - 事件驱动（稀疏、按事件触发的离散订单）：走 B 插件。多头版首版即可。
 
 > 契约层面四范式都可表达；**依赖做空的腿在 P3b 解锁**（见 `§7.5`）。
 > P3 阶段策略产出的 `SHORT_OPEN/SHORT_COVER` 会被引擎拒绝 `SHORT_NOT_SUPPORTED`。
 
-### 6.7 错误码
+### 6.7 内置双均线趋势策略（`dual_ma_trend`）
+
+#### 6.7.1 定位与组装
+
+双均线是独立的时序方向模型，不进入 `CrossSectionalStrategy` 的 Alpha 五模块。它实现为
+`DualMATrendStrategy(WeightTargetStrategy)`：策略只决定单标的目标暴露，基类继续复用
+`RebalancePlanner` 将目标权重转换为整数股数订单，回测引擎继续统一负责 T+1、涨跌停、停牌、
+费用、滑点、容量和账务。
+
+```text
+fixed instrument
+  → adjusted close history
+  → short/long moving average
+  → LONG|FLAT state
+  → target exposure
+  → RebalancePlanner
+  → BUY|SELL OrderIntent
+  → common execution/account/analytics
+```
+
+首版只支持 LONG/FLAT：`LONG` 映射到 `long_weight`，`FLAT` 映射到 `flat_weight=0`。P3b-2
+完成后可新增 `SHORT` 状态及 `short_weight<0`，不得在首版用负权重绕过做空账务门禁。
+
+#### 6.7.2 信号和时间语义
+
+对交易日 `T`，使用截至 T 日决策截止时点可见的**前复权收盘价**计算：
+
+```text
+MA_n(T) = mean(adjusted_close[T-n+1 : T])
+state(T) = LONG  if MA_short(T) > MA_long(T)
+           FLAT  otherwise
+```
+
+- `short_window_sessions`、`long_window_sessions` 都按交易日计数，且必须满足
+  `2 ≤ short_window_sessions < long_window_sessions`；相等时明确为 FLAT。
+- 必须有连续 `long_window_sessions` 个有效价格才产生首个状态；停牌日是否有有效收盘价由
+  Canonical 行情契约决定，策略不得自行前向填充。窗口不足或价格无效时输出 `INVALID` 原因并且不下单。
+- 信号用 **as-of T 的前复权价**消除拆分、分红等机械跳变：调整因子只能消费截至 T 已可见的
+  公司行为，禁止使用“以回测结束日为基准”的整段前复权序列回写历史。成交与账户估值仍使用
+  T+1 的未复权市场价格。
+- T 日收盘数据形成状态后，最早在 `execute_date=T+1` 撮合，禁止按 T 日收盘价成交。
+- `state_changed` 与上一个**有效决策日状态**比较。首个有效状态为 LONG 时视为变化并建仓；
+  首个有效状态为 FLAT 时不产生空操作。无效日不更新前态。
+
+#### 6.7.3 调仓与失败恢复
+
+正常情况下只在 `state_changed=true` 时建立新的目标暴露，避免每天因价格漂移重复调仓。若订单因
+T+1 可卖、停牌、涨跌停、容量或部分成交未完成，策略保存本次目标状态，并在后续决策日仅对剩余差额
+续单，直到达到 `target_tolerance`、状态再次变化或运行结束。已达到目标后不做日常漂移再平衡。
+该待完成目标属于单次 Run 的确定性状态，可由此前信号和执行结果重建；Worker 重试不得依赖进程内
+未持久化对象而产生不同订单。
+
+状态改变与订单结果是两个不同事实：`state_changed` 只描述信号，拒单、部分成交和续单原因进入执行
+产物，不能回写或篡改均线状态。
+
+#### 6.7.4 严格配置
+
+```yaml
+strategy:
+  strategy_id: dual_ma_trend
+  params:
+    instrument_id: 510300.SH
+    price_field: adjusted_close       # 固定字面量，不允许改为未复权价
+    short_window_sessions: 20
+    long_window_sessions: 120
+    long_weight: 1.0                  # (0, 1]
+    flat_weight: 0.0                  # 首版固定为 0
+    target_tolerance: 0.005           # [0, 0.1]
+    retry_unfilled: true
+```
+
+配置对象拒绝额外字段。`instrument_id` 必须是 Canonical 证券标识；策略依赖声明至少包含
+`adjusted_bars`、`bars`、`security_status` 和 `trading_calendar`。窗口、权重和标的共同进入 Run 的
+冻结配置；参数搜索只能在 TRAIN/VALIDATION 中比较，TEST 不参与均线窗口或权重选择。
+
+#### 6.7.5 产物、分析与验收
+
+运行除通用订单、成交、账户和绩效产物外，还输出按决策日稳定排序的信号明细：
+
+```text
+signal_date, execute_date, instrument_id,
+short_ma, long_ma, state, previous_state, state_changed,
+target_weight, is_valid, invalid_reason
+```
+
+分析至少覆盖：LONG/FLAT 分状态收益、状态持续期、交叉次数、持仓率、换手、未成交恢复、费用拖累、
+参数稳定性和相对基准表现。验收使用字面量价格序列锁定首个有效日、金叉/死叉日、相等为 FLAT、
+无效窗口、T/T+1 分离、首次 LONG 建仓、死叉清仓、部分成交续单，以及 TEST 未参与参数选择。
+
+### 6.8 错误码
 
 ```text
 STRATEGY_CAPABILITY_UNAVAILABLE   策略声明的数据依赖不满足
@@ -940,7 +1038,7 @@ PIPELINE_MODEL_UNAVAILABLE        选定模型缺依赖（如 MVO 要求非退�
 
 （成本一致性错误码 `COST_MODEL_INCONSISTENT` 见 `第 7 章`。）
 
-### 6.8 包结构
+### 6.9 包结构
 
 ```text
 src/quant_research/
@@ -949,12 +1047,12 @@ src/quant_research/
 │   ├── registry.py       # StrategyRegistry
 │   ├── weight_target.py  # WeightTargetStrategy 基类（权重→订单）
 │   ├── cross_sectional.py# CrossSectionalStrategy（A 的五模块底座）
-│   └── builtins/         # etf_rotation / stock_multifactor / pairs / timing / event_driven
+│   └── builtins/         # etf_rotation / stock_multifactor / dual_ma_trend / pairs / event_driven
 ├── alpha/ risk/ costs/   # 五模块能力包之三 + 各自注册表
 └── portfolio/            # ConstructionModel + ConstraintSet + 注册表
 ```
 
-### 6.9 依赖方向
+### 6.10 依赖方向
 
 ```text
 experiments → strategies → {alpha,risk,costs,portfolio} → {data,factors,backtest}
@@ -962,15 +1060,17 @@ experiments → strategies → {alpha,risk,costs,portfolio} → {data,factors,ba
 
 策略与模块只经 `ResearchDataRepository` 等只读端口取数；不导入接口层或组合根。
 
-### 6.10 测试契约
+### 6.11 测试契约
 
 - **扩展性（核心诉求）**：新增一个 `Strategy` 插件无需改 runner/引擎即可跑通（最小 stub 策略测）。
 - **PIT**：`DecisionContext` 物理只暴露 ≤ 决策时点数据；RiskModel/CostModel 估计窗口不越界。
 - **五模块**：MultiFactorComposite 固定 MAD→zscore→方向→类别聚合、复用因子层 transform；oracle。
 - **权重翻译**：差额订单、整手取整、负权重→空头、清仓路径。
-- **回归黄金结果**：etf\_rotation / stock\_multifactor 固定小样本锁定输出。
+- **双均线**：字面量价格 oracle 锁定窗口、金叉/死叉、相等为 FLAT、`state_changed`、首次有效状态、
+  无效数据不推进状态、T+1 成交和部分成交续单。
+- **回归黄金结果**：etf\_rotation / stock\_multifactor / dual\_ma\_trend 固定小样本锁定输出。
 
-### 6.11 完成定义
+### 6.12 完成定义
 
 > 写一个新策略只需实现 `Strategy.on_event` 并注册（或对截面范式写一份组合五模块的配置），
 > 不改 runner / 回测引擎 / 基础设施即可跑通、出绩效、并排比较；四类范式可表达（依赖做空的腿随 P3b-2）；
@@ -2050,11 +2150,13 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 
 ### 12.10 阶段 P6 — 四范式策略 + 异构验收
 
-**交付**：`TimingStrategy`（CTA 多头版）、`EventDrivenStrategy`（稀疏订单，多头版）各一个示例，
-直接实现 `on_event`；`PairsStrategy`（做空对冲）**依赖 P3b-2**，在 P3b-2 完成后交付。
+**交付**：`DualMATrendStrategy`（`strategy_id=dual_ma_trend`，CTA 多头版）复用
+`WeightTargetStrategy`，`EventDrivenStrategy`（稀疏订单，多头版）直接实现 `on_event`；
+`PairsStrategy`（做空对冲）**依赖 P3b-2**，在 P3b-2 完成后交付。
 
-**验收**：多头范式（截面/择时/事件驱动）各跑通一个示例并在实验层登记；证明订单级接口对异构范式充分；
-配对纯对冲随 P3b-2 验收（做空账务正确）。
+**验收**：多头范式（截面/双均线择时/事件驱动）各跑通一个示例并在实验层登记；双均线满足
+`§6.7.5` 的信号、时序和续单 oracle；证明订单级接口对异构范式充分；配对纯对冲随 P3b-2
+验收（做空账务正确）。
 
 ### 12.11 阶段 P7 — Dashboard（FastAPI + Vue）
 

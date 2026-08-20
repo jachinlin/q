@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.quality.models import QualityIssue
-from quant_research.data.schemas import CANONICAL_SCHEMAS
 from quant_research.domain.enums import DatasetKind, Severity
 
 type CanonicalFrame = pl.DataFrame | pl.LazyFrame

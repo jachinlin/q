@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from quant_research.data.financials import (
+from quant_research.data.sources.financials import (
     financial_disclosure_deadline,
     financial_report_period_end,
 )

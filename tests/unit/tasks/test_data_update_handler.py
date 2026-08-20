@@ -7,7 +7,7 @@ from typing import cast
 from uuid import uuid4
 
 from quant_research.application.data import DataUpdateHandler
-from quant_research.data.pipelines.publish import (
+from quant_research.data.pipeline.publish import (
     DataPipeline,
     DataUpdatePlan,
     DataUpdateWindow,

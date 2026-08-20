@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime
 from typing import Protocol, cast
 
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
-from quant_research.data.pipelines.publish import DataUpdatePlan
+from quant_research.data.pipeline.publish import DataUpdatePlan
 from quant_research.data.repository import CanonicalCatalog
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError

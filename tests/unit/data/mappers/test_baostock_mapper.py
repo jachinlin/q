@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 
 from quant_research.data.contracts import RawBatch
-from quant_research.data.partitions import RawPartitionStore
+from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.errors import QuantError
 from quant_research.infrastructure.baostock.client import (

@@ -18,7 +18,9 @@ class _CodeHashSupport:
     def _builtin_source_bytes() -> Mapping[str, bytes]:
         """Read all production sources that affect bundled factor outputs."""
         sources: dict[str, bytes] = {
-            "quant_research/data/adjustments.py": resources.files("quant_research.data")
+            "quant_research/data/canonical/adjustments.py": resources.files(
+                "quant_research.data.canonical"
+            )
             .joinpath("adjustments.py")
             .read_bytes(),
             "quant_research/factors/base.py": resources.files("quant_research.factors")

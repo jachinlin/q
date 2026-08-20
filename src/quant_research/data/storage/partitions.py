@@ -18,7 +18,10 @@ from quant_research.data.contracts import (
     RawBatch,
     canonical_json_bytes,
 )
-from quant_research.data.storage import resolved_storage_root, validate_storage_path
+from quant_research.data.storage.paths import (
+    resolved_storage_root,
+    validate_storage_path,
+)
 from quant_research.domain.enums import Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 

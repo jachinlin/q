@@ -1,7 +1,7 @@
 """验证数据目录声明与抓取计划注册表保持完整一致。"""
 
 from quant_research.data.catalog import DATASET_CATALOG, FetchPlan
-from quant_research.data.pipelines.localize import LocalizePlanExecutor
+from quant_research.data.pipeline.localize import LocalizePlanExecutor
 from quant_research.domain.enums import DatasetKind
 
 

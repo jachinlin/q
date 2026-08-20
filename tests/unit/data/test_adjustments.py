@@ -5,7 +5,10 @@ from datetime import UTC, date, datetime
 import polars as pl
 import pytest
 
-from quant_research.data.adjustments import AdjustmentMode, _PriceAdjustmentEngine
+from quant_research.data.canonical.adjustments import (
+    AdjustmentMode,
+    _PriceAdjustmentEngine,
+)
 from quant_research.domain.identifiers import InstrumentId
 
 

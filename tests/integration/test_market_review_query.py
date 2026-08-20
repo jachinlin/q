@@ -9,11 +9,11 @@ import polars as pl
 
 from quant_research.backtest.rulebook import AShareRuleBook
 from quant_research.dashboard.market_review import MarketReviewService
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import CanonicalBatch
-from quant_research.data.pipelines.curate import CuratedPartitionStore
+from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.quality.models import QualityRunSpec
 from quant_research.data.repository import CanonicalResearchRepository
-from quant_research.data.schemas import CANONICAL_SCHEMAS
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,

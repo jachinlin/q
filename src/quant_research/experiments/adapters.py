@@ -25,9 +25,9 @@ from quant_research.backtest.engine import (
 )
 from quant_research.backtest.models import MarketSlice
 from quant_research.backtest.rulebook import MarketRuleBook
+from quant_research.data.canonical.schemas import PolarsDataType
 from quant_research.data.contracts import ProviderCapabilities
 from quant_research.data.repository import ResearchDataRepository
-from quant_research.data.schemas import PolarsDataType
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.experiments.config import require_provider_capabilities
 from quant_research.factors.base import (

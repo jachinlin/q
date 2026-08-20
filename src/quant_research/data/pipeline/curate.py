@@ -16,13 +16,16 @@ import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import (
     CanonicalBatch,
     JsonValue,
     canonical_json_bytes,
 )
-from quant_research.data.schemas import CANONICAL_SCHEMAS
-from quant_research.data.storage import resolved_storage_root, validate_storage_path
+from quant_research.data.storage.paths import (
+    resolved_storage_root,
+    validate_storage_path,
+)
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.infrastructure.persistence.repositories import (

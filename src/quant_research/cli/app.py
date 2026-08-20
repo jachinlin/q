@@ -18,8 +18,8 @@ from quant_research.application.experiments import (
     ExperimentInspection,
 )
 from quant_research.application.worker import WorkerRunResult
-from quant_research.data.pipelines.dataset import DatasetCurateResult, LocalizeResult
-from quant_research.data.pipelines.publish import DataPipeline, PipelineResult
+from quant_research.data.pipeline.dataset import DatasetCurateResult, LocalizeResult
+from quant_research.data.pipeline.publish import DataPipeline, PipelineResult
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.logging import redact_context, sensitive_environment_values
