@@ -23,7 +23,10 @@ const run = {
   artifacts: [{ artifact_type: 'performance', relative_path: 'performance.parquet', content_hash: 'd'.repeat(64), byte_count: 100, row_count: 2, schema: {} }],
 }
 
-function aggregate(kind: 'STRATEGY_BACKTEST' | 'FACTOR_STUDY') {
+function aggregate(
+  kind: 'STRATEGY_BACKTEST' | 'FACTOR_STUDY',
+  runs: Array<Record<string, unknown>> = [run],
+) {
   return {
     experiment: {
       id: 'exp-1', baseline_run_id: run.id, created_at: '2026-08-01T00:00:00Z',
@@ -33,7 +36,7 @@ function aggregate(kind: 'STRATEGY_BACKTEST' | 'FACTOR_STUDY') {
         governance: { test_budget: 1, correction: 'BONFERRONI' }, initial_run: {},
       },
     },
-    runs: [run], tags: [],
+    runs, tags: [],
   }
 }
 
@@ -42,7 +45,8 @@ async function mountDetail() {
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/experiments/:experimentId', component: ExperimentDetailView }] })
   await router.push('/experiments/exp-1')
   await router.isReady()
-  return mount(ExperimentDetailView, { global: { plugins: [[VueQueryPlugin, { queryClient }], router] } })
+  const wrapper = mount(ExperimentDetailView, { global: { plugins: [[VueQueryPlugin, { queryClient }], router] } })
+  return { wrapper, router }
 }
 
 async function clickTab(wrapper: ReturnType<typeof mount>, label: string) {
@@ -66,7 +70,7 @@ describe('unified experiment detail', () => {
       ], total: 2 })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
-    const wrapper = await mountDetail()
+    const { wrapper } = await mountDetail()
     await clickTab(wrapper, '绩效')
     await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/performance')))
     await flushPromises()
@@ -84,12 +88,40 @@ describe('unified experiment detail', () => {
       ], total: 1 })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
-    const wrapper = await mountDetail()
+    const { wrapper } = await mountDetail()
     await clickTab(wrapper, '摘要')
     await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/summary')))
     await flushPromises()
     expect(wrapper.findComponent({ name: 'VChart' }).exists()).toBe(true)
     expect(wrapper.text()).toContain('book_to_price_mrq')
     expect(wrapper.text()).not.toContain('cumulative_return')
+  })
+
+  it('defaults to the latest Run, marks it clearly, and persists explicit selection in the URL', async () => {
+    const failedRun = { ...run, id: '01JFAILED0000000000000001', status: 'FAILED', stage: 'STRATEGY_RUN', manifest_hash: null, metrics: [], artifacts: [] }
+    const latestRun = { ...run, id: '01JLATEST0000000000000002', tags: [`rerun-of:${failedRun.id}`] }
+    apiGet.mockImplementation((path: string) => {
+      if (typeof path !== 'string') return Promise.resolve({})
+      if (path === '/api/v1/experiments/exp-1') return Promise.resolve(aggregate('STRATEGY_BACKTEST', [failedRun, latestRun]))
+      return Promise.reject(new Error(`unexpected API path: ${path}`))
+    })
+
+    const { wrapper, router } = await mountDetail()
+    await vi.waitFor(() => expect(wrapper.text()).toContain('当前查看：01JLATEST000'))
+
+    expect(router.currentRoute.value.query.run).toBe(latestRun.id)
+    expect(wrapper.text()).toContain('左侧勾选框仅用于比较')
+    expect(wrapper.text()).toContain('实验协议')
+    expect(wrapper.text()).toContain('当前 Run 配置')
+    expect(wrapper.findAll('.viewing-run')).toHaveLength(1)
+    expect(wrapper.find('.viewing-run').text()).toContain('01JLATEST000')
+
+    const failedRunButton = wrapper.findAll('button').find((button) => button.text().includes('01JFAILED000'))
+    if (!failedRunButton) throw new Error('missing failed Run selector')
+    await failedRunButton.trigger('click')
+    await flushPromises()
+
+    expect(router.currentRoute.value.query.run).toBe(failedRun.id)
+    expect(wrapper.find('.viewing-run').text()).toContain('01JFAILED000')
   })
 })

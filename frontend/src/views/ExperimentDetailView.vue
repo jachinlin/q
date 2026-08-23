@@ -2,8 +2,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
-import { computed, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import VChart from 'vue-echarts'
 
 import { api } from '../api'
@@ -17,6 +17,7 @@ type ArtifactRow = Record<string, unknown>
 type ArtifactPayload = { items?: ArtifactRow[]; page?: number; page_size?: number; total?: number; value?: unknown }
 
 const route = useRoute()
+const router = useRouter()
 const queryClient = useQueryClient()
 const experimentId = computed(() => String(route.params.experimentId))
 const detail = useQuery({
@@ -32,6 +33,7 @@ const executionArtifact = ref('fills')
 const selectedRun = computed<ExperimentRun | undefined>(() =>
   detail.data.value?.runs.find((item) => item.id === selectedRunId.value) ?? detail.data.value?.runs.at(-1),
 )
+const selectedRunShortId = computed(() => selectedRun.value?.id.slice(0, 12) ?? '—')
 const isFactorStudy = computed(() => detail.data.value?.experiment.definition.kind === 'FACTOR_STUDY')
 const artifactType = computed(() => (isFactorStudy.value
   ? ({ signals: 'summary', portfolio: 'coverage', execution: 'correlation', performance: 'ic' } as Record<string, string>)[tab.value]
@@ -144,6 +146,27 @@ const mark = useMutation({ mutationFn: ({ id, value }: { id: string; value: Rese
 const addRun = useMutation({ mutationFn: () => api.post(`/api/v1/experiments/${experimentId.value}/runs`, { yaml: runYaml.value }), onSuccess: async () => { ElMessage.success('派生 Run 已入队'); runYaml.value = ''; await refresh() } })
 const comparison = useMutation({ mutationFn: () => api.post('/api/v1/experiments/compare', { run_ids: compareIds.value }) })
 function selectForCompare(rows: ExperimentRun[]) { compareIds.value = rows.map((item) => item.id) }
+function selectRun(run: ExperimentRun) {
+  selectedRunId.value = run.id
+  if (route.query.run !== run.id) void router.replace({ query: { ...route.query, run: run.id } })
+}
+function runRowClassName({ row }: { row: ExperimentRun }) {
+  return row.id === selectedRunId.value ? 'viewing-run' : ''
+}
+watch(
+  [() => detail.data.value?.runs, () => route.query.run],
+  ([runs, rawQueryRun]) => {
+    if (!runs?.length) return
+    const queryRun = Array.isArray(rawQueryRun) ? rawQueryRun[0] : rawQueryRun
+    const next = runs.find((item) => item.id === queryRun)
+      ?? runs.find((item) => item.id === selectedRunId.value)
+      ?? runs.at(-1)
+    if (!next) return
+    selectedRunId.value = next.id
+    if (queryRun !== next.id) void router.replace({ query: { ...route.query, run: next.id } })
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
@@ -155,9 +178,9 @@ function selectForCompare(rows: ExperimentRun[]) { compareIds.value = rows.map((
         <div><strong>{{ detail.data.value.runs.length }}</strong><small> RUNS</small></div>
       </section>
       <section class="panel">
-        <div class="panel-heading"><div><h2>Run 时间线</h2><p>TEST 使用只审计告警，不参与自动选型；预算 {{ detail.data.value.experiment.definition.governance.test_budget }} 次。</p></div><el-button :disabled="compareIds.length < 2" @click="comparison.mutate(); tab = 'compare'">比较所选 Run</el-button></div>
-        <el-table :data="detail.data.value.runs" highlight-current-row @current-change="(row: ExperimentRun) => selectedRunId = row.id" @selection-change="selectForCompare">
-          <el-table-column type="selection" width="46" /><el-table-column label="Run" width="150"><template #default="scope"><span class="hash">{{ scope.row.id.slice(0, 12) }}</span></template></el-table-column><el-table-column label="状态" width="115"><template #default="scope"><StatusBadge :status="scope.row.status" /></template></el-table-column><el-table-column prop="stage" label="阶段" width="150" /><el-table-column label="TEST" width="80"><template #default="scope">{{ scope.row.uses_test_region ? '是' : '否' }}</template></el-table-column><el-table-column prop="research_mark" label="标记" width="120" /><el-table-column label="操作" min-width="290"><template #default="scope"><el-button v-if="scope.row.task_id && ['QUEUED', 'RUNNING'].includes(scope.row.status)" size="small" type="danger" plain @click="cancel.mutate(scope.row.task_id)">取消</el-button><el-button size="small" @click="rerun.mutate(scope.row.id)">重跑</el-button><el-dropdown @command="(value: ResearchMark) => mark.mutate({ id: scope.row.id, value })"><el-button size="small">标记</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="value in ['UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED']" :key="value" :command="value">{{ value }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown></template></el-table-column>
+        <div class="panel-heading"><div><h2>Run 时间线</h2><p>当前查看：<strong class="hash">{{ selectedRunShortId }}</strong>。点击 Run 编号切换下方详情；左侧勾选框仅用于比较。TEST 预算 {{ detail.data.value.experiment.definition.governance.test_budget }} 次。</p></div><el-button :disabled="compareIds.length < 2" @click="comparison.mutate(); tab = 'compare'">比较所选 Run</el-button></div>
+        <el-table :data="detail.data.value.runs" :row-class-name="runRowClassName" @selection-change="selectForCompare">
+          <el-table-column type="selection" width="46" /><el-table-column label="Run" width="170"><template #default="scope"><el-button link type="primary" class="run-link" @click.stop="selectRun(scope.row)"><span class="hash">{{ scope.row.id.slice(0, 12) }}</span></el-button></template></el-table-column><el-table-column label="查看" width="105"><template #default="scope"><el-tag v-if="scope.row.id === selectedRun?.id" type="primary" effect="dark" size="small">当前查看</el-tag></template></el-table-column><el-table-column label="状态" width="115"><template #default="scope"><StatusBadge :status="scope.row.status" /></template></el-table-column><el-table-column prop="stage" label="阶段" width="150" /><el-table-column label="TEST" width="80"><template #default="scope">{{ scope.row.uses_test_region ? '是' : '否' }}</template></el-table-column><el-table-column prop="research_mark" label="标记" width="120" /><el-table-column label="操作" min-width="290"><template #default="scope"><el-button v-if="scope.row.task_id && ['QUEUED', 'RUNNING'].includes(scope.row.status)" size="small" type="danger" plain @click="cancel.mutate(scope.row.task_id)">取消</el-button><el-button size="small" @click="rerun.mutate(scope.row.id)">重跑</el-button><el-dropdown @command="(value: ResearchMark) => mark.mutate({ id: scope.row.id, value })"><el-button size="small">标记</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="value in ['UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED']" :key="value" :command="value">{{ value }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown></template></el-table-column>
         </el-table>
       </section>
       <section v-if="selectedRun?.metrics.length" class="metrics-grid">
@@ -165,7 +188,10 @@ function selectForCompare(rows: ExperimentRun[]) { compareIds.value = rows.map((
       </section>
       <section class="panel">
         <el-tabs v-model="tab"><el-tab-pane label="协议/配置" name="protocol" /><el-tab-pane :label="isFactorStudy ? '摘要' : '信号'" name="signals" /><el-tab-pane :label="isFactorStudy ? '覆盖率' : '持仓'" name="portfolio" /><el-tab-pane :label="isFactorStudy ? '相关性' : '成本/执行'" name="execution" /><el-tab-pane :label="isFactorStudy ? 'IC' : '绩效'" name="performance" /><el-tab-pane v-if="!isFactorStudy" label="归因" name="attribution" /><el-tab-pane label="产物" name="artifacts" /><el-tab-pane label="Run 比较" name="compare" /><el-tab-pane label="新增 Run" name="new-run" /></el-tabs>
-        <pre v-if="tab === 'protocol'">{{ JSON.stringify({ protocol: detail.data.value.experiment.definition, run: selectedRun }, null, 2) }}</pre>
+        <div v-if="tab === 'protocol'" class="config-grid">
+          <article class="config-block"><h3>实验协议</h3><p>Experiment 级定义，由全部 Run 共享且不可变。</p><pre>{{ JSON.stringify(detail.data.value.experiment.definition, null, 2) }}</pre></article>
+          <article class="config-block"><h3>当前 Run 配置</h3><p><span class="hash">{{ selectedRun?.id }}</span> · {{ selectedRun?.status }}</p><pre>{{ JSON.stringify(selectedRun, null, 2) }}</pre></article>
+        </div>
         <pre v-else-if="tab === 'compare'">{{ JSON.stringify(comparison.data.value ?? { message: '至少选择两个 Run 后比较' }, null, 2) }}</pre>
         <div v-else-if="tab === 'new-run'" class="run-editor"><el-input v-model="runYaml" type="textarea" :rows="18" placeholder="粘贴严格 Run YAML" /><el-button type="primary" :loading="addRun.isPending.value" @click="addRun.mutate()">创建 Run</el-button></div>
         <div v-else-if="tab === 'artifacts'" class="artifact-list"><el-table :data="selectedRun?.artifacts ?? []" empty-text="等待 Run 成功发布"><el-table-column prop="artifact_type" label="类型" width="180" /><el-table-column prop="relative_path" label="相对路径" min-width="240" /><el-table-column prop="row_count" label="行数" width="100" /><el-table-column prop="byte_count" label="字节数" width="120" /><el-table-column label="SHA-256" min-width="240"><template #default="scope"><span class="hash">{{ scope.row.content_hash }}</span></template></el-table-column></el-table></div>
@@ -189,4 +215,6 @@ function selectForCompare(rows: ExperimentRun[]) { compareIds.value = rows.map((
 <style scoped>
 .detail-head{display:flex;justify-content:space-between;align-items:center}.detail-head h2{margin:8px 0}.detail-head p{color:var(--muted)}.detail-head>div:last-child strong{font-size:34px}.detail-head small{color:var(--dim)}
 pre{max-height:620px;overflow:auto;padding:14px;border-radius:8px;background:var(--surface-raised);font:11px/1.55 ui-monospace,Consolas,monospace}.run-editor{display:flex;flex-direction:column;gap:12px;align-items:flex-end}.artifact-switch{display:flex;justify-content:flex-end;margin-bottom:12px}.artifact-chart{height:340px}.artifact-list,.page-note{margin-top:12px}.page-note{color:var(--dim);font-size:12px}.metric-small{font-size:20px;overflow-wrap:anywhere}
+.config-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}.config-block{min-width:0}.config-block h3{margin:8px 0}.config-block p{min-height:34px;color:var(--muted);font-size:12px}.run-link{padding:0}:deep(.el-table .viewing-run>td.el-table__cell){background:color-mix(in srgb,var(--el-color-primary) 10%,transparent)}
+@media(max-width:980px){.config-grid{grid-template-columns:1fr}}
 </style>
