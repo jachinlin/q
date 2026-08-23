@@ -28,8 +28,11 @@ from quant_research.strategies.registry import StrategyRegistry
 _ARTIFACT_TYPES = frozenset(
     {
         "correlation",
+        "cost_scenarios",
         "coverage",
         "ic",
+        "industry_coverage",
+        "label_quality",
         "signals",
         "orders",
         "fills",
@@ -47,17 +50,45 @@ _ARTIFACT_TYPES = frozenset(
         "quality_disclosure",
         "manifest",
         "long_short_returns",
+        "monotonicity",
         "quantile_returns",
+        "stability",
         "summary",
+        "turnover",
     }
 )
 _ARTIFACT_FILTERS: dict[str, frozenset[str]] = {
-    "summary": frozenset({"signal_variant", "factor_ref", "horizon"}),
+    "summary": frozenset(
+        {"signal_variant", "label_kind", "factor_ref", "horizon"}
+    ),
     "coverage": frozenset({"signal_variant", "factor_ref"}),
-    "ic": frozenset({"signal_variant", "factor_ref", "horizon"}),
-    "quantile_returns": frozenset({"signal_variant", "factor_ref", "horizon"}),
+    "label_quality": frozenset({"label_kind", "horizon", "reason"}),
+    "industry_coverage": frozenset({"taxonomy", "unclassified_policy"}),
+    "ic": frozenset(
+        {"signal_variant", "label_kind", "factor_ref", "horizon"}
+    ),
+    "quantile_returns": frozenset(
+        {"signal_variant", "label_kind", "factor_ref", "horizon"}
+    ),
     "long_short_returns": frozenset(
-        {"signal_variant", "factor_ref", "horizon"}
+        {"signal_variant", "label_kind", "factor_ref", "horizon"}
+    ),
+    "monotonicity": frozenset(
+        {"signal_variant", "label_kind", "factor_ref", "horizon"}
+    ),
+    "turnover": frozenset({"signal_variant", "factor_ref"}),
+    "stability": frozenset(
+        {
+            "signal_variant",
+            "label_kind",
+            "factor_ref",
+            "horizon",
+            "segment_type",
+            "segment_key",
+        }
+    ),
+    "cost_scenarios": frozenset(
+        {"signal_variant", "label_kind", "factor_ref", "horizon", "cost_bps"}
     ),
     "correlation": frozenset({"signal_variant"}),
     "attribution": frozenset({"dimension"}),
@@ -182,9 +213,14 @@ class ExperimentDashboardService:
         page_size: int,
         *,
         signal_variant: str | None = None,
+        label_kind: str | None = None,
         factor_ref: str | None = None,
         horizon: int | None = None,
         dimension: str | None = None,
+        reason: str | None = None,
+        segment_type: str | None = None,
+        segment_key: str | None = None,
+        cost_bps: int | None = None,
     ) -> dict[str, JsonValue]:
         """只从登记 Run 的可信 Manifest 读取并校验白名单产物。
 
@@ -202,9 +238,14 @@ class ExperimentDashboardService:
             name: value
             for name, value in {
                 "signal_variant": signal_variant,
+                "label_kind": label_kind,
                 "factor_ref": factor_ref,
                 "horizon": horizon,
                 "dimension": dimension,
+                "reason": reason,
+                "segment_type": segment_type,
+                "segment_key": segment_key,
+                "cost_bps": cost_bps,
             }.items()
             if value is not None
         }
@@ -709,9 +750,14 @@ class ExperimentRoutes:
             page: int = Query(1, ge=1),
             page_size: int = Query(100, ge=1, le=1000),
             signal_variant: str | None = Query(None, min_length=1),
+            label_kind: str | None = Query(None, min_length=1),
             factor_ref: str | None = Query(None, min_length=1),
             horizon: int | None = Query(None, gt=0),
             dimension: str | None = Query(None, min_length=1),
+            reason: str | None = Query(None, min_length=1),
+            segment_type: str | None = Query(None, min_length=1),
+            segment_key: str | None = Query(None, min_length=1),
+            cost_bps: int | None = Query(None, ge=0),
         ) -> dict[str, JsonValue]:
             return service.artifact(
                 run_id,
@@ -719,9 +765,14 @@ class ExperimentRoutes:
                 page,
                 page_size,
                 signal_variant=signal_variant,
+                label_kind=label_kind,
                 factor_ref=factor_ref,
                 horizon=horizon,
                 dimension=dimension,
+                reason=reason,
+                segment_type=segment_type,
+                segment_key=segment_key,
+                cost_bps=cost_bps,
             )
 
 

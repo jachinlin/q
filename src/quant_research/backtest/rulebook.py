@@ -348,6 +348,20 @@ class MarketRuleBook(Protocol):
 
         ...
 
+    def price_limit_parameters(
+        self,
+        profile: InstrumentTradingProfile,
+        trade_date: date,
+        status: SecurityStatus,
+    ) -> tuple[float, float]:
+        """返回向量化涨跌停判定所需的历史比例和价格步长。
+
+        入参：交易画像、交易日和风险状态。返回值：涨跌幅比例和价格步长。
+        异常：画像、日期、状态或规则覆盖非法时传播对应异常。
+        """
+
+        ...
+
     def fees(
         self, fill: SimulatedFill, profile: InstrumentTradingProfile
     ) -> FeeBreakdown:
@@ -581,6 +595,29 @@ class AShareRuleBook:
             profile.price_tick, rounding=ROUND_HALF_UP
         )
         return PriceBand(float(upper), float(lower))
+
+    def price_limit_parameters(
+        self,
+        profile: InstrumentTradingProfile,
+        trade_date: date,
+        status: SecurityStatus,
+    ) -> tuple[float, float]:
+        """返回向量化涨跌停判定所需的历史比例和价格步长。
+
+        入参：交易画像、交易日和风险状态。返回值：涨跌幅比例和价格步长。
+        异常：画像、日期、状态或规则覆盖非法时抛出 ``TypeError`` 或 ``ValueError``。
+        """
+        _RulebookSupport.validate_profile_and_date(profile, trade_date)
+        if not isinstance(status, SecurityStatus):
+            raise TypeError("status must be a SecurityStatus")
+        try:
+            rules = self._price_limits[(profile.price_limit_group, status)]
+        except KeyError as error:
+            raise ValueError(
+                "price limit group does not cover security status"
+            ) from error
+        rate = _RulebookSupport.matching_rate(rules, trade_date)
+        return float(rate), float(profile.price_tick)
 
     def fees(
         self, fill: SimulatedFill, profile: InstrumentTradingProfile

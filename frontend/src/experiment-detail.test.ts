@@ -97,8 +97,9 @@ describe('unified experiment detail', () => {
       if (typeof path !== 'string') return Promise.resolve({})
       if (path === '/api/v1/experiments/exp-1') return Promise.resolve(aggregate('FACTOR_STUDY'))
       if (path.includes('/artifacts/summary')) return Promise.resolve({ items: [
-        { signal_variant: 'raw', factor_ref: 'book_to_price_mrq', horizon: 5, rank_ic_mean: 0.06, long_short_mean: 0.02 },
+        { signal_variant: 'DIRECTION_ADJUSTED', label_kind: 'THEORETICAL_FORWARD_RETURN', factor_ref: 'book_to_price_mrq', horizon: 5, rank_ic_mean: 0.06, rank_ic_hac_t_stat: 2.4, monotonicity_mean: 0.9, long_short_mean: 0.02, break_even_cost_bps: 18, total_turnover_mean: 0.7 },
       ], total: 1 })
+      if (path.includes('/artifacts/ic')) return Promise.resolve({ items: [], total: 0 })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
     const { wrapper, router } = await mountDetail()
@@ -111,9 +112,9 @@ describe('unified experiment detail', () => {
     const matrixRow = wrapper.findAll('.el-table__body-wrapper tbody tr').find((row) => row.text().includes('book_to_price_mrq'))
     if (!matrixRow) throw new Error('missing factor matrix row')
     await matrixRow.trigger('click')
-    await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringMatching(/artifacts\/ic.*factor_ref=book_to_price_mrq.*horizon=5/)))
+    await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringMatching(/artifacts\/ic.*label_kind=THEORETICAL_FORWARD_RETURN.*factor_ref=book_to_price_mrq.*horizon=5/)))
     await vi.waitFor(() => expect(router.currentRoute.value.query).toMatchObject({
-      signal_variant: 'raw', factor: 'book_to_price_mrq', horizon: '5',
+      signal_variant: 'DIRECTION_ADJUSTED', label_kind: 'THEORETICAL_FORWARD_RETURN', factor: 'book_to_price_mrq', horizon: '5',
     }))
   })
 

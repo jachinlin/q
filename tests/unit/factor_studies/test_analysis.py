@@ -7,7 +7,60 @@ from io import BytesIO
 import polars as pl
 import pytest
 
-from quant_research.factor_studies.analysis import analyze, build_future_returns
+from quant_research.factor_studies.analysis import (
+    EXECUTABLE_FORWARD_RETURN,
+    THEORETICAL_FORWARD_RETURN,
+    HacMeanAnalyzer,
+    analyze,
+    build_future_returns,
+)
+
+
+def executable_state(
+    bars: pl.DataFrame, *, suspended: bool = False, limit_up: bool = False
+) -> pl.DataFrame:
+    """返回与行情日期对齐的可执行标签状态。"""
+    return bars.select("instrument_id", "trade_date").with_columns(
+        pl.lit(True).alias("is_listed"),
+        pl.lit(suspended).alias("is_suspended"),
+        pl.lit(limit_up).alias("entry_limit_up"),
+    )
+
+
+def study_labels(
+    values: dict[int, pl.DataFrame],
+) -> dict[tuple[int, str], pl.DataFrame]:
+    """把测试收益表适配为理论标签完整契约。"""
+    return {
+        (horizon, THEORETICAL_FORWARD_RETURN): frame.with_columns(
+            pl.lit(horizon).alias("horizon"),
+            pl.lit(THEORETICAL_FORWARD_RETURN).alias("label_kind"),
+            pl.col("future_return").is_not_null().alias("is_valid"),
+            pl.when(pl.col("future_return").is_null())
+            .then(pl.lit("MISSING_EXIT_PRICE"))
+            .otherwise(pl.lit(None, dtype=pl.String))
+            .alias("invalid_reason"),
+        )
+        for horizon, frame in values.items()
+    }
+
+
+def run_analysis(
+    factors: pl.DataFrame,
+    eligible: pl.DataFrame,
+    labels: dict[int, pl.DataFrame],
+    *,
+    quantiles: int = 5,
+) -> dict[str, pl.DataFrame]:
+    """使用固定成本和空样本分段运行统计内核。"""
+    return analyze(
+        factors,
+        eligible,
+        study_labels(labels),
+        quantiles=quantiles,
+        cost_bps_scenarios=(5, 10, 20),
+        sample_segments={},
+    )
 
 
 def test_future_return_uses_next_open_and_horizon_close() -> None:
@@ -28,11 +81,13 @@ def test_future_return_uses_next_open_and_horizon_close() -> None:
         }
     )
 
-    result = build_future_returns(bars, sessions, eligible, (1, 2))
+    result = build_future_returns(
+        bars, sessions, eligible, (1, 2), executable_state(bars)
+    )
 
-    assert result[1]["future_return"].item() == pytest.approx(0.1)
-    assert result[2]["future_return"].item() == pytest.approx(0.2)
-    assert result[1].select("return_start", "return_end").row(0) == (
+    assert result[(1, THEORETICAL_FORWARD_RETURN)]["future_return"].item() == pytest.approx(0.1)
+    assert result[(2, THEORETICAL_FORWARD_RETURN)]["future_return"].item() == pytest.approx(0.2)
+    assert result[(1, THEORETICAL_FORWARD_RETURN)].select("return_start", "return_end").row(0) == (
         sessions[1],
         sessions[1],
     )
@@ -56,7 +111,7 @@ def test_future_return_keeps_incomplete_window_null() -> None:
         }
     )
     assert (
-        build_future_returns(bars, sessions, eligible, (1,))[1]["future_return"].item()
+        build_future_returns(bars, sessions, eligible, (1,), executable_state(bars))[(1, THEORETICAL_FORWARD_RETURN)]["future_return"].item()
         is None
     )
 
@@ -84,12 +139,14 @@ def test_future_return_rejects_suspended_next_session() -> None:
             "trade_date": [sessions[1]],
             "is_listed": [True],
             "is_suspended": [True],
+            "entry_limit_up": [False],
         }
     )
 
     result = build_future_returns(bars, sessions, eligible, (1,), tradability)
 
-    assert result[1]["future_return"].item() is None
+    assert result[(1, EXECUTABLE_FORWARD_RETURN)]["future_return"].item() is None
+    assert result[(1, THEORETICAL_FORWARD_RETURN)]["future_return"].item() == pytest.approx(0.1)
 
 
 def test_future_return_rejects_missing_next_session_status() -> None:
@@ -115,12 +172,53 @@ def test_future_return_rejects_missing_next_session_status() -> None:
             "trade_date": pl.Date,
             "is_listed": pl.Boolean,
             "is_suspended": pl.Boolean,
+            "entry_limit_up": pl.Boolean,
         }
     )
 
     result = build_future_returns(bars, sessions, eligible, (1,), empty_status)
 
-    assert result[1]["future_return"].item() is None
+    assert result[(1, EXECUTABLE_FORWARD_RETURN)]["future_return"].item() is None
+
+
+def test_executable_label_reason_priority_does_not_contaminate_theoretical() -> None:
+    sessions = (date(2026, 1, 5), date(2026, 1, 6))
+    instruments = ["000001.SZ", "000002.SZ", "000003.SZ"]
+    bars = pl.DataFrame(
+        {
+            "instrument_id": instruments * 2,
+            "trade_date": [sessions[0]] * 3 + [sessions[1]] * 3,
+            "open": [9.0, 9.0, 9.0, 10.0, 10.0, 10.0],
+            "close": [9.5, 9.5, 9.5, 11.0, 11.0, 11.0],
+        }
+    )
+    eligible = pl.DataFrame(
+        {
+            "signal_date": [sessions[0]] * 3,
+            "instrument_id": instruments,
+            "eligible": [True] * 3,
+        }
+    )
+    state = pl.DataFrame(
+        {
+            "instrument_id": instruments,
+            "trade_date": [sessions[1]] * 3,
+            "is_listed": [False, True, True],
+            "is_suspended": [True, True, False],
+            "entry_limit_up": [True, True, True],
+        }
+    )
+
+    result = build_future_returns(bars, sessions, eligible, (1,), state)
+
+    assert result[(1, EXECUTABLE_FORWARD_RETURN)]["invalid_reason"].to_list() == [
+        "NOT_LISTED_AT_ENTRY",
+        "ENTRY_SUSPENDED",
+        "ENTRY_LIMIT_UP",
+    ]
+    theoretical = result[(1, THEORETICAL_FORWARD_RETURN)]
+    assert theoretical["is_valid"].to_list() == [True, True, True]
+    assert theoretical["future_return"].to_list() == pytest.approx([0.1] * 3)
 
 
 def test_future_returns_vectorize_shuffled_multi_instrument_scope() -> None:
@@ -155,7 +253,9 @@ def test_future_returns_vectorize_shuffled_multi_instrument_scope() -> None:
         }
     )
 
-    result = build_future_returns(bars, sessions, eligible, (2,))[2]
+    result = build_future_returns(
+        bars, sessions, eligible, (2,), executable_state(bars)
+    )[(2, THEORETICAL_FORWARD_RETURN)]
 
     assert result.select("instrument_id", "return_start", "return_end").rows() == [
         ("000001.SZ", sessions[1], sessions[2]),
@@ -193,7 +293,7 @@ def test_analysis_produces_rank_quantiles_and_long_short_without_compounding() -
         }
     )
 
-    result = analyze(factors, eligible, {1: returns}, quantiles=5)
+    result = run_analysis(factors, eligible, {1: returns})
 
     assert result["ic"].select("pearson_ic", "rank_ic").row(0) == pytest.approx(
         (1.0, 1.0)
@@ -236,7 +336,7 @@ def test_analysis_invalidates_horizon_with_too_few_future_pairs() -> None:
         }
     )
 
-    result = analyze(factors, eligible, {1: future}, quantiles=5)
+    result = run_analysis(factors, eligible, {1: future})
 
     assert result["ic"].select(
         "pearson_ic", "rank_ic", "is_valid", "invalid_reason"
@@ -248,6 +348,9 @@ def test_analysis_invalidates_horizon_with_too_few_future_pairs() -> None:
     )
     assert result["quantile_returns"]["mean_return"].null_count() == 5
     assert result["long_short_returns"]["is_valid"].item() is False
+    assert result["monotonicity"].select(
+        "is_valid", "invalid_reason"
+    ).row(0) == (False, "INSUFFICIENT_VALID_QUANTILES")
 
 
 def test_analysis_emits_stable_one_five_twenty_day_ic_decay() -> None:
@@ -287,12 +390,11 @@ def test_analysis_emits_stable_one_five_twenty_day_ic_decay() -> None:
         5: future(5, [value**2 for value in values]),
         20: future(20, [-value for value in values]),
     }
-    first = analyze(factors, eligible, labels, quantiles=5)
-    second = analyze(
+    first = run_analysis(factors, eligible, labels)
+    second = run_analysis(
         factors,
         eligible,
         {20: labels[20], 1: labels[1], 5: labels[5]},
-        quantiles=5,
     )
 
     decay = first["summary"].select("horizon", "pearson_ic_mean", "rank_ic_mean")
@@ -347,9 +449,91 @@ def test_analysis_invalidates_factor_correlation_with_too_few_common_pairs() -> 
         }
     )
 
-    result = analyze(factors, eligible, {1: future}, quantiles=5)
+    result = run_analysis(factors, eligible, {1: future})
     cross = result["correlation"].filter(
         (pl.col("factor_x") == "roe_pit") & (pl.col("factor_y") == "book_to_price_mrq")
     )
 
-    assert cross.select("correlation", "is_valid").row(0) == (None, False)
+    assert cross.select("rank_correlation", "is_valid").row(0) == (None, False)
+
+
+def test_hac_uses_horizon_overlap_lag_and_literal_mean() -> None:
+    summary = HacMeanAnalyzer.summarize([0.01, 0.02, 0.03, 0.04], 3)
+
+    assert summary.mean == pytest.approx(0.025)
+    assert summary.lag == 2
+    assert summary.standard_error == pytest.approx(0.005951190357119042)
+    assert summary.t_stat == pytest.approx(4.20084025208403)
+    assert summary.p_value == pytest.approx(2.6592618550786602e-05)
+    assert summary.ci_lower == pytest.approx(0.013335881234904616)
+    assert summary.ci_upper == pytest.approx(0.036664118765095385)
+    assert summary.invalid_reason is None
+
+
+def test_monotonicity_turnover_stability_and_cost_use_literal_oracles() -> None:
+    days = [date(2026, 1, 5) + timedelta(days=index) for index in range(3)]
+    instruments = [f"{index:06d}.SZ" for index in range(30)]
+    factor_rows: list[dict[str, object]] = []
+    return_rows: list[dict[str, object]] = []
+    eligible_rows: list[dict[str, object]] = []
+    for day_index, day in enumerate(days):
+        values = list(range(30)) if day_index == 0 else list(reversed(range(30)))
+        for instrument_index, instrument_id in enumerate(instruments):
+            value = float(values[instrument_index])
+            factor_rows.append(
+                {
+                    "signal_date": day,
+                    "instrument_id": instrument_id,
+                    "factor_id": "literal_factor",
+                    "value": value,
+                    "is_valid": True,
+                }
+            )
+            return_rows.append(
+                {
+                    "signal_date": day,
+                    "instrument_id": instrument_id,
+                    "return_start": day + timedelta(days=1),
+                    "return_end": day + timedelta(days=1),
+                    "future_return": value / 100.0,
+                }
+            )
+            eligible_rows.append(
+                {
+                    "signal_date": day,
+                    "instrument_id": instrument_id,
+                    "eligible": True,
+                }
+            )
+
+    result = analyze(
+        pl.DataFrame(factor_rows),
+        pl.DataFrame(eligible_rows),
+        study_labels({1: pl.DataFrame(return_rows)}),
+        quantiles=5,
+        cost_bps_scenarios=(5, 10, 20),
+        sample_segments={"TRAIN": (days[0], days[-1])},
+    )
+
+    monotonicity = result["monotonicity"]
+    assert monotonicity["quantile_rank_correlation"].to_list() == pytest.approx(
+        [1.0, 1.0, 1.0]
+    )
+    assert monotonicity["adjacent_inversion_count"].to_list() == [0, 0, 0]
+    assert monotonicity["terminal_spread"].to_list() == pytest.approx([0.24] * 3)
+    turnover = result["turnover"]
+    assert turnover["turnover_is_valid"].to_list() == [False, True, True]
+    assert turnover["rank_autocorrelation"].to_list()[1:] == pytest.approx(
+        [-1.0, 1.0]
+    )
+    assert turnover["total_turnover"].to_list()[1:] == pytest.approx([2.0, 0.0])
+    costs = result["cost_scenarios"]
+    assert costs["break_even_cost_bps"].to_list() == pytest.approx([2400.0] * 3)
+    assert costs.filter(pl.col("cost_bps") == 5)["net_spread_mean"].item() == pytest.approx(
+        0.2395
+    )
+    assert set(result["stability"]["segment_type"].to_list()) == {
+        "SAMPLE_REGION",
+        "CALENDAR_YEAR",
+        "CALENDAR_MONTH",
+    }

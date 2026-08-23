@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 from quant_research.application.experiments import ExperimentService
 from quant_research.experiments.config import ExperimentConfigParser
 from quant_research.experiments.models import ExperimentKind, MultipleTestingMethod
@@ -97,6 +99,34 @@ def test_all_checked_in_examples_are_strict_and_strategy_buildable() -> None:
             run = definition.initial_run
             assert run.kind is ExperimentKind.STRATEGY_BACKTEST
             strategies.validate(run.strategy.strategy_id, run.strategy.parameters)
+
+
+def test_factor_study_example_uses_final_industry_and_cost_contract() -> None:
+    parser = ExperimentConfigParser()
+    resolved = parser.parse_experiment_file(
+        Path("configs/experiments/examples/factor_study.yaml")
+    )
+    run = resolved.definition.initial_run
+
+    assert run.kind is ExperimentKind.FACTOR_STUDY
+    assert run.factor_study.cost_bps_scenarios == (5, 10, 20)
+    assert run.factor_study.industry is not None
+    assert run.factor_study.industry.taxonomy == "证监会行业分类"
+    assert run.factor_study.industry.unclassified_policy.value == "EXCLUDE"
+
+    legacy = Path("configs/experiments/examples/factor_study.yaml").read_text(
+        encoding="utf-8"
+    ).replace(
+        "    industry:\n      taxonomy: 证监会行业分类\n      unclassified_policy: EXCLUDE",
+        "    industry_neutral: true",
+    )
+    with pytest.raises(ValueError, match="industry_neutral"):
+        parser.parse_experiment(legacy)
+    unsupported_taxonomy = Path(
+        "configs/experiments/examples/factor_study.yaml"
+    ).read_text(encoding="utf-8").replace("证监会行业分类", "申万行业分类")
+    with pytest.raises(ValueError, match="taxonomy"):
+        parser.parse_experiment(unsupported_taxonomy)
 
 
 def test_multiple_testing_corrections_use_literal_oracles() -> None:

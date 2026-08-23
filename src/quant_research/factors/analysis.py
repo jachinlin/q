@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from math import isfinite
+from typing import cast
 
 import numpy as np
 import polars as pl
@@ -511,17 +512,22 @@ def quantile_future_returns(
     for day in sorted(set(factors["signal_date"].to_list())):
         day_rows = joined.filter(pl.col("signal_date") == day)
         for quantile in range(1, quantiles + 1):
-            values = (
-                day_rows.filter(pl.col("quantile") == quantile)["future_return"]
-                .drop_nulls()
-                .to_list()
-            )
+            bucket = day_rows.filter(pl.col("quantile") == quantile)
+            values = bucket["future_return"].drop_nulls().to_list()
+            factor_values = bucket.filter(pl.col("instrument_id").is_not_null())[
+                "value"
+            ]
+            numeric_values = cast(list[float], factor_values.to_list())
+            lower_bound = None if not numeric_values else min(numeric_values)
+            upper_bound = None if not numeric_values else max(numeric_values)
             rows.append(
                 (
                     day,
                     quantile,
                     len(values),
                     sum(values) / len(values) if values else None,
+                    lower_bound,
+                    upper_bound,
                     quantiles,
                     not values,
                 )
@@ -533,6 +539,8 @@ def quantile_future_returns(
             "quantile": pl.Int64,
             "count": pl.Int64,
             "mean_return": pl.Float64,
+            "factor_lower_bound": pl.Float64,
+            "factor_upper_bound": pl.Float64,
             "quantiles": pl.Int64,
             "is_empty": pl.Boolean,
         },
@@ -681,7 +689,8 @@ def factor_rank_correlation_matrix(
     rows = []
     for left in ids:
         for right in ids:
-            daily: list[float] = []
+            daily_rank: list[float] = []
+            daily_pearson: list[float] = []
             pair_count = 0
             left_frame = valid.filter(pl.col("factor_id") == left).select(
                 "signal_date", "instrument_id", pl.col("value").alias("left")
@@ -695,15 +704,32 @@ def factor_rank_correlation_matrix(
             for group in paired.partition_by("signal_date", maintain_order=False):
                 if group.height < minimum_pairs:
                     continue
-                correlation = _AnalysisSupport._correlation(
+                pearson = _AnalysisSupport._correlation(
+                    group["left"].to_numpy(), group["right"].to_numpy()
+                )
+                rank = _AnalysisSupport._correlation(
                     _AnalysisSupport._ranks(group["left"].to_numpy()),
                     _AnalysisSupport._ranks(group["right"].to_numpy()),
                 )
-                if correlation is not None:
-                    daily.append(correlation)
+                if pearson is not None and rank is not None:
+                    daily_pearson.append(pearson)
+                    daily_rank.append(rank)
                     pair_count += group.height
-            value = sum(daily) / len(daily) if daily else None
-            rows.append((left, right, len(daily), pair_count, value, value is not None))
+            pearson_value = (
+                sum(daily_pearson) / len(daily_pearson) if daily_pearson else None
+            )
+            rank_value = sum(daily_rank) / len(daily_rank) if daily_rank else None
+            rows.append(
+                (
+                    left,
+                    right,
+                    len(daily_rank),
+                    pair_count,
+                    pearson_value,
+                    rank_value,
+                    rank_value is not None,
+                )
+            )
     return pl.DataFrame(
         rows,
         schema={
@@ -711,7 +737,8 @@ def factor_rank_correlation_matrix(
             "factor_y": pl.String,
             "date_count": pl.Int64,
             "pair_count": pl.Int64,
-            "correlation": pl.Float64,
+            "pearson_correlation": pl.Float64,
+            "rank_correlation": pl.Float64,
             "is_valid": pl.Boolean,
         },
         orient="row",

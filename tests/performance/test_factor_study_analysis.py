@@ -64,9 +64,22 @@ def test_twenty_year_partition_labels_and_quantiles_record_evidence() -> None:
         pl.col("_instrument_rank").alias("value"),
         pl.lit(True).alias("is_valid"),
     )
+    executable_state = scope.select(
+        "instrument_id",
+        pl.col("signal_date").alias("trade_date"),
+        pl.lit(True).alias("is_listed"),
+        pl.lit(False).alias("is_suspended"),
+        pl.lit(False).alias("entry_limit_up"),
+    )
 
     labels_started = time.perf_counter()
-    labels = build_future_returns(bars, sessions, eligible, (1, 5, 20))
+    labels = build_future_returns(
+        bars,
+        sessions,
+        eligible,
+        (1, 5, 20),
+        executable_state,
+    )
     label_seconds = time.perf_counter() - labels_started
     quantiles_started = time.perf_counter()
     assigned = assign_quantiles(factors, 5)

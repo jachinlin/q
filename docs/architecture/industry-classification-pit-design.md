@@ -250,7 +250,7 @@ industry:
 
 未分类策略进入配置哈希。使用行业输入的 manifest 和质量披露至少记录 dataset、taxonomy、日期口径、未分类策略、覆盖率和 `BAOSTOCK_AS_OF_DATE_RECONSTRUCTED`。
 
-独立因子研究已经实现该显式消费契约：配置行业块后，同一运行发布 `DIRECTION_ADJUSTED` 与 `INDUSTRY_NEUTRALIZED` 两个版本。中性化固定使用信号日 `industry_code` 的等权组内去均值，状态通过一次 `industry_classifications_on_dates` 批量读取；逐日覆盖写入 `industry_coverage.parquet`，聚合覆盖和可见性语义写入 Manifest。股票策略、组合约束和回测归因仍未启用行业消费，不能仅凭实验 Manifest 中存在行业输入就推断策略使用了行业信号。
+统一因子 Run 已实现该显式消费契约：`industry: null` 只发布 `DIRECTION_ADJUSTED`；配置行业块后，同一 Run 同时发布 `DIRECTION_ADJUSTED` 与 `INDUSTRY_NEUTRALIZED`。中性化固定使用信号日 `industry_code` 的等权组内去均值，状态通过一次 `industry_classifications_on_dates` 批量读取；`EXCLUDE` 排除 tombstone 和缺失状态，`UNCLASSIFIED` 将二者放入固定未分类组。逐日分类、tombstone、缺失、可用数量和覆盖率写入 `industry_coverage.parquet`，策略写入 Manifest。股票策略、组合约束和回测归因仍未启用行业消费，不能仅凭实验 Manifest 中存在行业输入就推断策略使用了行业信号。
 
 Dashboard 需要先读取全市场状态，再与复盘证券集合求交：
 

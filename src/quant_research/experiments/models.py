@@ -57,6 +57,16 @@ class MultipleTestingMethod(StrEnum):
     BH_FDR = "BH_FDR"
 
 
+class IndustryUnclassifiedPolicy(StrEnum):
+    """定义行业状态缺失或 tombstone 时的因子研究处理策略。
+
+    入参：策略字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
+    """
+
+    EXCLUDE = "EXCLUDE"
+    UNCLASSIFIED = "UNCLASSIFIED"
+
+
 class RunStage(StrEnum):
     """列出两种实验共享编排器可能执行的阶段。
 
@@ -227,17 +237,30 @@ class StrategyBacktestRunConfig(_FrozenModel):
         return self
 
 
+class FactorIndustrySettings(_FrozenModel):
+    """定义因子研究显式使用的 PIT 行业分类口径。
+
+    入参：分类体系和未分类策略。返回值：冻结行业配置。异常：空分类体系或未知策略抛出校验错误。
+    """
+
+    taxonomy: Literal["证监会行业分类"]
+    unclassified_policy: IndustryUnclassifiedPolicy
+
+
 class FactorStudySettings(_FrozenModel):
     """定义统一 Run 中因子研究所需的分析参数。
 
-    入参：因子、股票池、收益期限、分层数和行业中性开关。返回值：冻结分析配置。异常：重复或乱序参数抛出值错误。
+    入参：因子、股票池、收益期限、分层数、可选行业策略和成本情景。
+    返回值：冻结分析配置。
+    异常：重复、乱序或非法参数抛出值错误。
     """
 
     factor_ids: tuple[str, ...] = Field(min_length=1)
     universe: dict[str, JsonValue]
     horizons: tuple[int, ...] = Field(min_length=1)
     quantiles: int = Field(default=5, ge=2)
-    industry_neutral: bool = False
+    industry: FactorIndustrySettings | None = None
+    cost_bps_scenarios: tuple[int, ...] = (5, 10, 20)
 
     @model_validator(mode="after")
     def _unique(self) -> FactorStudySettings:
@@ -250,6 +273,18 @@ class FactorStudySettings(_FrozenModel):
         ):
             raise ValueError(
                 "horizons must be unique positive values in ascending order"
+            )
+        if (
+            not self.cost_bps_scenarios
+            or tuple(sorted(set(self.cost_bps_scenarios)))
+            != self.cost_bps_scenarios
+            or any(
+                type(value) is not int or value < 0
+                for value in self.cost_bps_scenarios
+            )
+        ):
+            raise ValueError(
+                "cost_bps_scenarios must be unique nonnegative integers in ascending order"
             )
         return self
 
@@ -430,9 +465,11 @@ __all__ = [
     "ExperimentDefinition",
     "ExperimentKind",
     "ExperimentRecord",
+    "FactorIndustrySettings",
     "FactorStudyRunConfig",
     "FactorStudySettings",
     "GovernanceConfig",
+    "IndustryUnclassifiedPolicy",
     "MultipleTestingMethod",
     "ResearchMark",
     "RunArtifactRecord",

@@ -497,7 +497,8 @@ CanonicalMapper(Protocol)       # 规范化：供应商字段 → Canonical sche
 
 - `ResearchDataRepository`（只读、PIT 已截断）：行情/前复权收益/估值/状态/财务/行业等。
 - `FactorSpec`（factor\_id、lookback\_sessions、依赖、方向、参数、`data_dependencies`）+ `FactorContext(start, end)`（`end` = PIT 截止）。
-- 因子研究额外输入：PIT 股票池（`signal_date, instrument_id, eligible`）、持有期集合、`label_kind` 选择。
+- 因子研究额外输入：PIT 股票池（`signal_date, instrument_id, eligible`）、持有期集合、可选行业策略和
+  成本情景；理论与可执行 `label_kind` 固定同时生成，不提供开关。
 
 **输出**：
 
@@ -505,8 +506,9 @@ CanonicalMapper(Protocol)       # 规范化：供应商字段 → Canonical sche
   （见 `§11.3`，满足 7 条不变量）。
 - **未来收益标签**：主键 `signal_date, instrument_id, horizon, label_kind`，列
   `return_start, return_end, future_return, is_valid, invalid_reason`（固定优先级原因码）。
-- **统计诊断**（因子研究产物）：`coverage / ic / quantile_returns / long_short_returns /
-  correlation`（+ 可选 `significance / stability`），主键含 `signal_variant, factor_ref, horizon, signal_date`。
+- **统计诊断**（因子研究产物）：`summary / coverage / label_quality / industry_coverage / ic /
+  quantile_returns / long_short_returns / monotonicity / turnover / stability / cost_scenarios / correlation`；
+  收益相关主键含 `signal_variant, label_kind, factor_ref, horizon`。
 - 缺依赖能力时抛 `FACTOR_CAPABILITY_UNAVAILABLE`。
 
 **不输出**：跨运行持久化因子缓存（每次重算；运行内缓存仅性能）。
@@ -569,8 +571,8 @@ return_start, return_end, future_return, is_valid, invalid_reason
 
 ```text
 INCOMPLETE_FORWARD_WINDOW / NOT_LISTED_AT_ENTRY / ENTRY_SUSPENDED /
-ENTRY_LIMIT_UP / ENTRY_LIMIT_DOWN / MISSING_ENTRY_PRICE / MISSING_EXIT_PRICE /
-DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
+ENTRY_LIMIT_UP / MISSING_ENTRY_PRICE / DELISTED_WITHOUT_EXIT_PRICE /
+MISSING_EXIT_PRICE / NONFINITE_RETURN
 ```
 
 不得仅用 `future_return=null` 表达全部失败，不得在 join/聚合中静默删除无效样本。
@@ -579,20 +581,23 @@ DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
 
 - 覆盖率：`coverage = valid_count / eligible_count`。
 - IC：Pearson + Spearman RankIC（并列用平均秩）；滚动均值、累计、正值率；日度无效原因码。
-- 分位：可配并列策略（`STABLE_SPLIT` / `KEEP_TIES` / `PERCENTILE_BOUNDARY`），输出实际边界、样本数、均值收益、空组诊断。
-- 多空：Q−1 组合收益、单调性、胜率、年化、Sharpe、最大回撤。
+- 分位：继续使用稳定排序拆分并列值，输出实际因子边界、样本数、均值收益和空组诊断。
+- 多空：Q−1 毛 spread、至少三组时的单调性，以及相邻信号日高低分位成员换手。
 - 相关：同日同股票池的因子相关矩阵（Pearson + Rank）。
-- **显著性（补齐）**：5/20 日重叠持有期用 Newey-West/HAC 或 block bootstrap 处理序列相关，
-  发布 t-stat/CI/p-value；多因子并检记多重检验校正（Bonferroni/BH-FDR）。
+- **显著性**：以 Bartlett kernel Newey-West/HAC 处理重叠持有期，滞后固定为
+  `min(horizon-1, valid_count-1)`；分别对 Rank IC 和毛 spread family 做 Bonferroni/BH-FDR。
+- **成本代理**：`net_spread = gross_spread - total_turnover × bps / 10000`；不计算净值、Sharpe
+  或最大回撤。
 
 全部统计公式用硬编码 oracle 校验，覆盖并列、常数截面、单样本、NaN/Inf、空组、零方差。
 
 ### 5.9 因子研究作为一种实验 kind
 
-- 因子研究（覆盖率/IC/分层/相关/稳定性）由实验层 `FACTOR_STUDY` kind 编排，
+- 因子研究（质量/IC/分层/单调性/稳定性/换手/成本代理）由实验层 `FACTOR_STUDY` kind 编排，
   与策略回测共享同一 `Experiment → Run` 追踪主脊与比较视图（见
   [策略、回测与实验设计](strategy-backtest-experiment-design.md) `§4`）。
-- 产物：summary / coverage / ic / quantile\_returns / long\_short\_returns / correlation（+ 可选 significance/stability）。
+- 固定产物：summary / coverage / label\_quality / industry\_coverage / ic / quantile\_returns /
+  long\_short\_returns / monotonicity / turnover / stability / cost\_scenarios / correlation。
 
 ### 5.10 与其他层边界
 

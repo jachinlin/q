@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 
 import polars as pl
 
-from quant_research.bootstrap.worker import _FactorRunSession
+from quant_research.bootstrap.worker import _FactorPublisher, _FactorRunSession
+from quant_research.experiments.models import (
+    ExperimentKind,
+    FactorIndustrySettings,
+    FactorStudyRunConfig,
+    FactorStudySettings,
+    IndustryUnclassifiedPolicy,
+    MultipleTestingMethod,
+)
 from quant_research.factors import FACTOR_OUTPUT_SCHEMA, FactorArtifact
 
 
@@ -22,8 +31,68 @@ class _Artifact:
         return self._frame.lazy()
 
 
-def test_factor_study_maps_trade_date_to_signal_date_at_worker_boundary() -> None:
-    """真实因子产物的 trade_date 必须在进入研究内核前改名。"""
+class _IndustryRepository:
+    """返回包含分类、tombstone 和缺失状态的固定 PIT 行业表。"""
+
+    def __init__(self, frame: pl.DataFrame) -> None:
+        self._frame = frame
+
+    def industry_classifications_on_dates(
+        self, _: object, __: object
+    ) -> pl.LazyFrame:
+        """返回固定行业状态。
+
+        入参：
+            两个参数为本测试不使用的证券与日期范围。
+        返回值：
+            返回固定 LazyFrame。
+        异常：
+            无。
+        """
+        return self._frame.lazy()
+
+
+class _EmptyExecutableRepository:
+    """提供缺失证券状态时仍具固定 Schema 的研究输入。"""
+
+    def instruments(self) -> pl.LazyFrame:
+        """返回一个合法证券元数据行。"""
+        return pl.DataFrame(
+            {
+                "instrument_id": ["000001.SZ"],
+                "instrument_type": ["STOCK"],
+                "board": ["MAIN"],
+            }
+        ).lazy()
+
+    def bars(self, _: object, __: date, ___: date) -> pl.LazyFrame:
+        """返回固定未复权行情 Schema。"""
+        return pl.DataFrame(
+            schema={
+                "instrument_id": pl.String,
+                "trade_date": pl.Date,
+                "low": pl.Float64,
+                "preclose": pl.Float64,
+            }
+        ).lazy()
+
+    def security_status_range(
+        self, _: date, __: date, ___: object
+    ) -> pl.LazyFrame:
+        """返回固定空证券状态 Schema。"""
+        return pl.DataFrame(
+            schema={
+                "instrument_id": pl.String,
+                "trade_date": pl.Date,
+                "is_listed": pl.Boolean,
+                "is_suspended": pl.Boolean,
+                "is_st": pl.Boolean,
+            }
+        ).lazy()
+
+
+def test_factor_study_maps_date_applies_direction_and_pit_scope() -> None:
+    """研究边界必须改名、按方向翻转并排除不在 PIT 股票池的证券。"""
     signal_date = date(2026, 1, 5)
     frame = pl.DataFrame(
         {
@@ -41,7 +110,16 @@ def test_factor_study_maps_trade_date_to_signal_date_at_worker_boundary() -> Non
     }
 
     result = _FactorRunSession._analysis_factor_frame(
-        artifacts, ("momentum_120_20",)
+        artifacts,
+        ("momentum_120_20",),
+        {"momentum_120_20": -1},
+        pl.DataFrame(
+            {
+                "signal_date": [signal_date],
+                "instrument_id": ["000001.SZ"],
+                "eligible": [True],
+            }
+        ),
     )
 
     assert "trade_date" not in result.columns
@@ -50,3 +128,157 @@ def test_factor_study_maps_trade_date_to_signal_date_at_worker_boundary() -> Non
         "000001.SZ",
         "momentum_120_20",
     )
+    assert result["value"].item() == -1.5
+    assert result["signal_variant"].item() == "DIRECTION_ADJUSTED"
+
+
+def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() -> None:
+    day = date(2026, 1, 5)
+    instruments = [f"00000{index}.SZ" for index in range(1, 6)]
+    state = pl.DataFrame(
+        {
+            "query_date": [day] * 4,
+            "instrument_id": instruments[:4],
+            "taxonomy": ["证监会行业分类"] * 4,
+            "industry_code": ["A", "A", "B", None],
+            "is_classified": [True, True, True, False],
+        }
+    )
+    session = _FactorRunSession(
+        cast(Any, object()),
+        cast(Any, _IndustryRepository(state)),
+        cast(Any, object()),
+        cast(Any, object()),
+        Path("."),
+    )
+    factor_frame = pl.DataFrame(
+        {
+            "signal_date": [day] * 5,
+            "instrument_id": instruments,
+            "factor_id": ["value"] * 5,
+            "value": [1.0, 3.0, 5.0, 7.0, 9.0],
+            "is_valid": [True] * 5,
+            "invalid_reason": pl.Series([None] * 5, dtype=pl.String),
+            "signal_variant": ["DIRECTION_ADJUSTED"] * 5,
+        }
+    )
+    eligible = pl.DataFrame(
+        {
+            "signal_date": [day] * 5,
+            "instrument_id": instruments,
+            "eligible": [True] * 5,
+        }
+    )
+
+    def config(policy: IndustryUnclassifiedPolicy) -> FactorStudyRunConfig:
+        return FactorStudyRunConfig(
+            kind=ExperimentKind.FACTOR_STUDY,
+            start_date=day,
+            end_date=day,
+            factor_study=FactorStudySettings(
+                factor_ids=("value",),
+                universe={"kind": "ALL_A_SHARES"},
+                horizons=(1,),
+                industry=FactorIndustrySettings(
+                    taxonomy="证监会行业分类",
+                    unclassified_policy=policy,
+                ),
+            ),
+        )
+
+    excluded, exclude_coverage = session._industry_variants(
+        factor_frame,
+        eligible,
+        (),
+        (day,),
+        config(IndustryUnclassifiedPolicy.EXCLUDE),
+    )
+    unclassified, unclassified_coverage = session._industry_variants(
+        factor_frame,
+        eligible,
+        (),
+        (day,),
+        config(IndustryUnclassifiedPolicy.UNCLASSIFIED),
+    )
+
+    assert exclude_coverage.select(
+        "eligible_count",
+        "classified_count",
+        "tombstone_count",
+        "missing_state_count",
+        "usable_count",
+        "classified_coverage",
+        "usable_coverage",
+    ).row(0) == (5, 3, 1, 1, 3, 0.6, 0.6)
+    assert unclassified_coverage["usable_count"].item() == 5
+    exclude_neutral = excluded.filter(
+        pl.col("signal_variant") == "INDUSTRY_NEUTRALIZED"
+    )
+    unclassified_neutral = unclassified.filter(
+        pl.col("signal_variant") == "INDUSTRY_NEUTRALIZED"
+    )
+    assert exclude_neutral["is_valid"].to_list() == [True, True, False, False, False]
+    assert unclassified_neutral["is_valid"].to_list() == [True, True, False, True, True]
+
+
+def test_factor_metrics_keep_rank_and_spread_corrections_in_separate_families() -> None:
+    summary = pl.DataFrame(
+        {
+            "signal_variant": ["DIRECTION_ADJUSTED"] * 2,
+            "label_kind": [
+                "THEORETICAL_FORWARD_RETURN",
+                "EXECUTABLE_FORWARD_RETURN",
+            ],
+            "factor_ref": ["value", "value"],
+            "horizon": [1, 1],
+            "rank_ic_mean": [0.1, 0.2],
+            "rank_ic_hac_p_value": [0.03, 0.04],
+            "long_short_mean": [0.01, 0.02],
+            "long_short_hac_p_value": [0.01, 0.06],
+        }
+    )
+    tables = {
+        "summary": summary,
+        "coverage": pl.DataFrame({"coverage": [0.8, 1.0]}),
+        "ic": pl.DataFrame({"pair_coverage": [0.6, 0.8]}),
+    }
+
+    metrics = _FactorPublisher.metrics(
+        tables, MultipleTestingMethod.BONFERRONI
+    )
+
+    rank_names = sorted(
+        name for name in metrics if name.startswith("rank_ic_mean/")
+    )
+    spread_names = sorted(
+        name for name in metrics if name.startswith("long_short_mean/")
+    )
+    assert [metrics[name][3] for name in rank_names] == [0.08, 0.06]
+    assert [metrics[name][3] for name in spread_names] == [0.12, 0.02]
+    assert metrics["mean_factor_coverage"][0] == 0.9
+    assert metrics["mean_pair_coverage"][0] == 0.7
+    assert metrics["tested_rank_ic_count"][0] == 2.0
+    assert metrics["significant_rank_ic_count"][0] == 0.0
+
+
+def test_empty_security_status_keeps_executable_state_fixed_schema() -> None:
+    session = _FactorRunSession(
+        cast(Any, object()),
+        cast(Any, _EmptyExecutableRepository()),
+        cast(Any, object()),
+        cast(Any, object()),
+        Path("."),
+    )
+
+    state = session._executable_state(
+        (), date(2026, 1, 5), date(2026, 1, 6)
+    )
+
+    assert state.is_empty()
+    assert state.schema == {
+        "instrument_id": pl.String,
+        "trade_date": pl.Date,
+        "is_listed": pl.Boolean,
+        "is_suspended": pl.Boolean,
+        "entry_limit_up": pl.Boolean,
+    }

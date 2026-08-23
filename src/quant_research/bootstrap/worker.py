@@ -33,7 +33,7 @@ from quant_research.backtest.engine import (
     BoundMarketSlice,
 )
 from quant_research.backtest.models import ExecutionConfig, ExecutionPrice, MarketSlice
-from quant_research.backtest.rulebook import AShareRuleBook
+from quant_research.backtest.rulebook import AShareRuleBook, SecurityStatus
 from quant_research.backtest.run_artifacts import RunArtifactPublisher
 from quant_research.config import Settings
 from quant_research.data.contracts import (
@@ -42,9 +42,11 @@ from quant_research.data.contracts import (
     canonical_json_bytes,
 )
 from quant_research.data.repository import CanonicalResearchRepository
+from quant_research.domain.enums import Board
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.experiments.models import (
     FactorStudyRunConfig,
+    IndustryUnclassifiedPolicy,
     MultipleTestingMethod,
     RunRecord,
     RunStage,
@@ -53,7 +55,15 @@ from quant_research.experiments.models import (
 )
 from quant_research.experiments.runner import ExperimentRunHandler
 from quant_research.experiments.statistics import MultipleTestingCorrector
-from quant_research.factor_studies.analysis import analyze, build_future_returns
+from quant_research.factor_studies.analysis import (
+    DIRECTION_ADJUSTED,
+    EXECUTABLE_FORWARD_RETURN,
+    INDUSTRY_NEUTRALIZED,
+    LABEL_KINDS,
+    THEORETICAL_FORWARD_RETURN,
+    analyze,
+    build_future_returns,
+)
 from quant_research.factors import (
     FactorArtifact,
     FactorContext,
@@ -61,6 +71,7 @@ from quant_research.factors import (
     FactorRegistry,
 )
 from quant_research.factors.builtin import register_stock_factors
+from quant_research.factors.transforms import neutralize_industry
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -89,11 +100,20 @@ _MARKET_SCHEMA = {
     "board": pl.String,
 }
 _FACTOR_ARTIFACT_KEYS: dict[str, tuple[str, ...]] = {
-    "summary": ("signal_variant", "factor_ref", "horizon"),
+    "summary": ("signal_variant", "label_kind", "factor_ref", "horizon"),
     "coverage": ("signal_variant", "factor_ref", "signal_date"),
-    "ic": ("signal_variant", "factor_ref", "horizon", "signal_date"),
+    "label_quality": ("label_kind", "horizon", "signal_date", "reason"),
+    "industry_coverage": ("signal_date", "taxonomy", "unclassified_policy"),
+    "ic": (
+        "signal_variant",
+        "label_kind",
+        "factor_ref",
+        "horizon",
+        "signal_date",
+    ),
     "quantile_returns": (
         "signal_variant",
+        "label_kind",
         "factor_ref",
         "horizon",
         "signal_date",
@@ -101,9 +121,33 @@ _FACTOR_ARTIFACT_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "long_short_returns": (
         "signal_variant",
+        "label_kind",
         "factor_ref",
         "horizon",
         "signal_date",
+    ),
+    "monotonicity": (
+        "signal_variant",
+        "label_kind",
+        "factor_ref",
+        "horizon",
+        "signal_date",
+    ),
+    "turnover": ("signal_variant", "factor_ref", "signal_date"),
+    "stability": (
+        "signal_variant",
+        "label_kind",
+        "factor_ref",
+        "horizon",
+        "segment_type",
+        "segment_key",
+    ),
+    "cost_scenarios": (
+        "signal_variant",
+        "label_kind",
+        "factor_ref",
+        "horizon",
+        "cost_bps",
     ),
     "correlation": ("signal_variant", "factor_x", "factor_y"),
 }
@@ -752,11 +796,13 @@ class FactorRunExecutor:
         self,
         repository: CanonicalResearchRepository,
         registry: ExperimentRunRegistry,
+        rulebook: AShareRuleBook,
         artifact_root: Path,
     ) -> None:
-        self._repository, self._registry, self._artifact_root = (
+        self._repository, self._registry, self._rulebook, self._artifact_root = (
             repository,
             registry,
+            rulebook,
             artifact_root,
         )
 
@@ -769,7 +815,11 @@ class FactorRunExecutor:
         if not isinstance(run.config, FactorStudyRunConfig):
             raise TypeError("factor executor requires FACTOR_STUDY config")
         return _FactorRunSession(
-            run, self._repository, self._registry, self._artifact_root
+            run,
+            self._repository,
+            self._registry,
+            self._rulebook,
+            self._artifact_root,
         )
 
 
@@ -781,17 +831,20 @@ class _FactorRunSession:
         run: RunRecord,
         repository: CanonicalResearchRepository,
         registry: ExperimentRunRegistry,
+        rulebook: AShareRuleBook,
         artifact_root: Path,
     ) -> None:
         self._run = run
         self._repository = repository
         self._registry = registry
+        self._rulebook = rulebook
         self._artifact_root = artifact_root
         self._tables: dict[str, pl.DataFrame] | None = None
         self._metrics: dict[
             str, tuple[float, str | None, float | None, float | None]
         ] | None = None
         self._published_dir: Path | None = None
+        self._analysis_identity: dict[str, JsonValue] | None = None
 
     def execute(
         self,
@@ -831,15 +884,277 @@ class _FactorRunSession:
 
     @staticmethod
     def _analysis_factor_frame(
-        artifacts: Mapping[str, FactorArtifact], factor_ids: Sequence[str]
+        artifacts: Mapping[str, FactorArtifact],
+        factor_ids: Sequence[str],
+        directions: Mapping[str, int],
+        eligible: pl.DataFrame,
     ) -> pl.DataFrame:
-        """将标准因子产物显式适配为以信号日为主键的研究输入。"""
+        """将标准因子产物方向调整并限制在每日 PIT 股票池内。"""
+        direction_frame = pl.DataFrame(
+            {
+                "factor_id": sorted(directions),
+                "_direction": [directions[item] for item in sorted(directions)],
+            }
+        )
         return (
             pl.concat(
                 [artifacts[factor_id].lazy_frame().collect() for factor_id in factor_ids]
             )
             .rename({"trade_date": "signal_date"})
+            .join(direction_frame, on="factor_id", how="inner")
+            .join(
+                eligible.filter(pl.col("eligible")).select(
+                    "signal_date", "instrument_id"
+                ),
+                on=["signal_date", "instrument_id"],
+                how="inner",
+            )
+            .with_columns(
+                (pl.col("value") * pl.col("_direction")).alias("value"),
+                pl.lit(DIRECTION_ADJUSTED).alias("signal_variant"),
+                pl.lit(None, dtype=pl.String).alias("invalid_reason"),
+            )
+            .drop("_direction")
             .sort("signal_date", "instrument_id", "factor_id")
+        )
+
+    def _industry_variants(
+        self,
+        factor_frame: pl.DataFrame,
+        eligible: pl.DataFrame,
+        universe_ids: tuple[InstrumentId, ...],
+        sessions: tuple[date, ...],
+        config: FactorStudyRunConfig,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """按显式 PIT 行业配置生成中性版本和逐日覆盖证据。"""
+        industry = config.factor_study.industry
+        if industry is None:
+            return factor_frame, pl.DataFrame(
+                schema={
+                    "signal_date": pl.Date,
+                    "taxonomy": pl.String,
+                    "unclassified_policy": pl.String,
+                    "eligible_count": pl.Int64,
+                    "classified_count": pl.Int64,
+                    "tombstone_count": pl.Int64,
+                    "missing_state_count": pl.Int64,
+                    "usable_count": pl.Int64,
+                    "classified_coverage": pl.Float64,
+                    "usable_coverage": pl.Float64,
+                }
+            )
+        state = (
+            self._repository.industry_classifications_on_dates(
+                universe_ids, sessions
+            )
+            .collect()
+            .filter(pl.col("taxonomy") == industry.taxonomy)
+            .select(
+                pl.col("query_date").alias("signal_date"),
+                "instrument_id",
+                "industry_code",
+                "is_classified",
+            )
+            .with_columns(pl.lit(True).alias("_state_present"))
+        )
+        aligned = (
+            eligible.filter(pl.col("eligible"))
+            .select("signal_date", "instrument_id")
+            .join(state, on=["signal_date", "instrument_id"], how="left")
+            .with_columns(
+                pl.col("_state_present").fill_null(False),
+                (
+                    pl.col("is_classified").fill_null(False)
+                    & pl.col("industry_code").is_not_null()
+                    & (pl.col("industry_code").str.len_chars() > 0)
+                ).alias("_classified"),
+            )
+        )
+        if (
+            industry.unclassified_policy
+            is IndustryUnclassifiedPolicy.UNCLASSIFIED
+        ):
+            aligned = aligned.with_columns(
+                pl.when(pl.col("_classified"))
+                .then(pl.col("industry_code"))
+                .otherwise(pl.lit("__UNCLASSIFIED__"))
+                .alias("_neutralization_industry")
+            )
+        else:
+            aligned = aligned.with_columns(
+                pl.when(pl.col("_classified"))
+                .then(pl.col("industry_code"))
+                .otherwise(pl.lit(None, dtype=pl.String))
+                .alias("_neutralization_industry")
+            )
+        coverage = (
+            aligned.group_by("signal_date")
+            .agg(
+                pl.len().alias("eligible_count"),
+                pl.col("_classified").sum().cast(pl.Int64).alias("classified_count"),
+                (
+                    pl.col("_state_present") & ~pl.col("_classified")
+                ).sum().cast(pl.Int64).alias("tombstone_count"),
+                (~pl.col("_state_present"))
+                .sum()
+                .cast(pl.Int64)
+                .alias("missing_state_count"),
+                pl.col("_neutralization_industry")
+                .is_not_null()
+                .sum()
+                .cast(pl.Int64)
+                .alias("usable_count"),
+            )
+            .with_columns(
+                pl.lit(industry.taxonomy).alias("taxonomy"),
+                pl.lit(industry.unclassified_policy.value).alias(
+                    "unclassified_policy"
+                ),
+                (pl.col("classified_count") / pl.col("eligible_count")).alias(
+                    "classified_coverage"
+                ),
+                (pl.col("usable_count") / pl.col("eligible_count")).alias(
+                    "usable_coverage"
+                ),
+            )
+            .select(
+                "signal_date",
+                "taxonomy",
+                "unclassified_policy",
+                "eligible_count",
+                "classified_count",
+                "tombstone_count",
+                "missing_state_count",
+                "usable_count",
+                "classified_coverage",
+                "usable_coverage",
+            )
+            .sort("signal_date")
+        )
+        neutralized = neutralize_industry(
+            factor_frame.join(
+                aligned.select(
+                    "signal_date", "instrument_id", "_neutralization_industry"
+                ),
+                on=["signal_date", "instrument_id"],
+                how="left",
+            ),
+            "value",
+            "_neutralization_industry",
+            ("signal_date", "factor_id"),
+        ).with_columns(
+            pl.lit(INDUSTRY_NEUTRALIZED).alias("signal_variant")
+        ).drop("_neutralization_industry")
+        return (
+            pl.concat([factor_frame, neutralized], how="diagonal_relaxed").sort(
+                "signal_variant", "signal_date", "instrument_id", "factor_id"
+            ),
+            coverage,
+        )
+
+    def _executable_state(
+        self,
+        universe_ids: tuple[InstrumentId, ...],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        """使用未复权行情和规则簿向量化判定可执行标签入场涨停。"""
+        metadata = self._repository.instruments().collect().filter(
+            pl.col("instrument_id").is_in(
+                [item.canonical() for item in universe_ids]
+            )
+        ).select("instrument_id", "instrument_type", "board")
+        raw_bars = self._repository.bars(universe_ids, start, end).collect().select(
+            "instrument_id", "trade_date", "low", "preclose"
+        )
+        statuses = self._repository.security_status_range(
+            start, end, universe_ids
+        ).collect().select(
+            "instrument_id",
+            "trade_date",
+            "is_listed",
+            "is_suspended",
+            "is_st",
+        )
+        base = (
+            statuses.join(metadata, on="instrument_id", how="left")
+            .join(raw_bars, on=["instrument_id", "trade_date"], how="left")
+            .with_columns(
+                pl.when(pl.col("board").is_in(["MAIN", "CHINEXT", "STAR"]))
+                .then(pl.col("board"))
+                .otherwise(pl.lit("MAIN"))
+                .alias("board")
+            )
+        )
+        if base.is_empty():
+            return pl.DataFrame(
+                schema={
+                    "instrument_id": pl.String,
+                    "trade_date": pl.Date,
+                    "is_listed": pl.Boolean,
+                    "is_suspended": pl.Boolean,
+                    "entry_limit_up": pl.Boolean,
+                }
+            )
+        parameter_rows: list[dict[str, object]] = []
+        groups = base.select(
+            "trade_date", "instrument_type", "board", "is_st", "instrument_id"
+        ).unique(["trade_date", "instrument_type", "board", "is_st"]).sort(
+            "trade_date", "instrument_type", "board", "is_st"
+        )
+        for row in groups.iter_rows(named=True):
+            trade_date = cast(date, row["trade_date"])
+            profile = self._rulebook.trading_profile(
+                InstrumentId.parse(cast(str, row["instrument_id"])),
+                cast(str, row["instrument_type"]),
+                Board(cast(str, row["board"])),
+                trade_date,
+            )
+            rate, tick = self._rulebook.price_limit_parameters(
+                profile,
+                trade_date,
+                SecurityStatus.ST if row["is_st"] is True else SecurityStatus.NORMAL,
+            )
+            parameter_rows.append(
+                {
+                    "trade_date": trade_date,
+                    "instrument_type": row["instrument_type"],
+                    "board": row["board"],
+                    "is_st": row["is_st"],
+                    "_limit_rate": rate,
+                    "_price_tick": tick,
+                }
+            )
+        parameters = pl.DataFrame(parameter_rows)
+        upper = (
+            (
+                pl.col("preclose")
+                * (1.0 + pl.col("_limit_rate"))
+                / pl.col("_price_tick")
+                + 0.5
+            ).floor()
+            * pl.col("_price_tick")
+        )
+        return (
+            base.join(
+                parameters,
+                on=["trade_date", "instrument_type", "board", "is_st"],
+                how="left",
+            )
+            .select(
+                "instrument_id",
+                "trade_date",
+                "is_listed",
+                "is_suspended",
+                (
+                    pl.col("low").is_not_null()
+                    & pl.col("preclose").is_not_null()
+                    & (pl.col("low") >= upper - 1e-9)
+                )
+                .fill_null(False)
+                .alias("entry_limit_up"),
+            )
+            .sort("trade_date", "instrument_id")
         )
 
     def _analyze(
@@ -872,9 +1187,25 @@ class _FactorRunSession:
                 set(eligible.filter(pl.col("eligible"))["instrument_id"].to_list())
             )
         )
+        universe_membership = [
+            {
+                "signal_date": cast(date, row["signal_date"]).isoformat(),
+                "instrument_id": cast(str, row["instrument_id"]),
+            }
+            for row in eligible.filter(pl.col("eligible"))
+            .select("signal_date", "instrument_id")
+            .sort("signal_date", "instrument_id")
+            .iter_rows(named=True)
+        ]
         universe_hash = hashlib.sha256(
-            canonical_json_bytes([item.canonical() for item in universe_ids])
+            canonical_json_bytes(cast(list[JsonValue], universe_membership))
         ).hexdigest()
+        descriptor = source._factor_engine.execution_descriptor(
+            config.factor_study.factor_ids
+        )
+        directions = {
+            node.factor_ref: node.spec.direction for node in descriptor.plan
+        }
         artifacts_by_factor = source._factor_engine.compute(
             config.factor_study.factor_ids,
             FactorContext(
@@ -885,7 +1216,13 @@ class _FactorRunSession:
             ),
         )
         factor_frame = self._analysis_factor_frame(
-            artifacts_by_factor, config.factor_study.factor_ids
+            artifacts_by_factor,
+            config.factor_study.factor_ids,
+            directions,
+            eligible,
+        )
+        factor_frame, industry_coverage = self._industry_variants(
+            factor_frame, eligible, universe_ids, sessions, config
         )
         horizon_tail = max(config.factor_study.horizons)
         later = source._sessions(
@@ -896,25 +1233,85 @@ class _FactorRunSession:
         bars = self._repository.adjusted_bars(
             universe_ids, config.start_date, all_sessions[-1]
         ).collect()
+        executable_state = self._executable_state(
+            universe_ids, all_sessions[0], all_sessions[-1]
+        )
         future = build_future_returns(
-            bars, all_sessions, eligible, config.factor_study.horizons
+            bars,
+            all_sessions,
+            eligible,
+            config.factor_study.horizons,
+            executable_state,
         )
+        aggregate = self._registry.get_experiment(self._run.experiment_id)
+        windows = aggregate.experiment.definition.sample_windows
+        sample_segments = {
+            name: (max(config.start_date, window.start), min(config.end_date, window.end))
+            for name, window in (
+                ("TRAIN", windows.train),
+                ("VALIDATION", windows.validation),
+                ("TEST", windows.test),
+            )
+            if max(config.start_date, window.start) <= min(config.end_date, window.end)
+        }
         self._tables = analyze(
-            factor_frame, eligible, future, quantiles=config.factor_study.quantiles
+            factor_frame,
+            eligible,
+            future,
+            quantiles=config.factor_study.quantiles,
+            cost_bps_scenarios=config.factor_study.cost_bps_scenarios,
+            sample_segments=sample_segments,
         )
-        governance = self._registry.get_experiment(
-            self._run.experiment_id
-        ).experiment.definition.governance
+        self._tables["industry_coverage"] = industry_coverage
+        self._analysis_identity = {
+            "universe_hash": universe_hash,
+            "factor_execution_descriptor": descriptor.json_value(),
+            "factor_execution_descriptor_hash": descriptor.content_hash,
+            "rulebook_hash": self._rulebook.content_hash,
+            "label_kinds": list(LABEL_KINDS),
+            "label_definitions": {
+                THEORETICAL_FORWARD_RETURN: (
+                    "T+1 adjusted open to T+h adjusted close; endpoint prices required"
+                ),
+                EXECUTABLE_FORWARD_RETURN: (
+                    "theoretical label plus listed, not suspended and not one-price "
+                    "limit-up at T+1 entry"
+                ),
+            },
+            "industry": cast(
+                JsonValue,
+                config.factor_study.industry.model_dump(mode="json")
+                if config.factor_study.industry is not None
+                else None,
+            ),
+            "hac_kernel": "BARTLETT",
+            "hac_lag": "min(horizon-1, valid_count-1)",
+            "turnover_formula": "0.5*sum(abs(weight_t-weight_t_minus_1)) per leg",
+            "cost_formula": "gross_spread-total_turnover*bps/10000",
+            "cost_bps_scenarios": list(
+                config.factor_study.cost_bps_scenarios
+            ),
+        }
+        governance = aggregate.experiment.definition.governance
         self._metrics = _FactorPublisher.metrics(self._tables, governance.correction)
 
     def _persist(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
-        if self._tables is None or self._metrics is None:
+        if (
+            self._tables is None
+            or self._metrics is None
+            or self._analysis_identity is None
+        ):
             raise RuntimeError("factor persistence requires completed analysis")
         if cancellation.is_cancelled():
             raise RuntimeError("factor persistence cancelled before publication")
         directory, manifest_hash, artifacts = _FactorPublisher(
             self._artifact_root, self._run.experiment_id, self._run.id
-        ).publish(self._tables, self._run, self._metrics)
+        ).publish(
+            self._tables,
+            self._run,
+            self._metrics,
+            self._analysis_identity,
+        )
         self._published_dir = directory
         if cancellation.is_cancelled():
             self.abort()
@@ -940,6 +1337,7 @@ class _FactorPublisher:
         tables: Mapping[str, pl.DataFrame],
         run: RunRecord,
         metrics: Mapping[str, tuple[float, str | None, float | None, float | None]],
+        analysis_identity: Mapping[str, JsonValue],
     ) -> tuple[Path, str, tuple[dict[str, JsonValue], ...]]:
         """写入稳定排序 Parquet、配置和 Manifest，禁止覆盖。"""
         if self._target.exists():
@@ -987,6 +1385,7 @@ class _FactorPublisher:
                 "experiment_id": run.experiment_id,
                 "run_id": run.id,
                 "catalog_hash": run.catalog_hash,
+                "analysis_identity": dict(analysis_identity),
                 "artifacts": cast(list[JsonValue], entries),
             }
             manifest_path = staging / "manifest.json"
@@ -1055,9 +1454,13 @@ class _FactorPublisher:
         tables: Mapping[str, pl.DataFrame],
         correction: MultipleTestingMethod,
     ) -> dict[str, tuple[float, str | None, float | None, float | None]]:
-        """提取汇总指标并校正每个因子-期限 Rank IC 的 p-value。"""
+        """登记健康度指标并分别校正 Rank IC 和多空 spread 假设族。"""
         result: dict[str, tuple[float, str | None, float | None, float | None]] = {}
-        coverage, summary = tables.get("coverage"), tables.get("summary")
+        coverage, ic, summary = (
+            tables.get("coverage"),
+            tables.get("ic"),
+            tables.get("summary"),
+        )
         if (
             coverage is not None
             and not coverage.is_empty()
@@ -1065,49 +1468,87 @@ class _FactorPublisher:
         ):
             mean_coverage = cast(float | None, coverage["coverage"].drop_nulls().mean())
             if mean_coverage is not None:
-                result["mean_coverage"] = (mean_coverage, "ratio", None, None)
-        if summary is not None and not summary.is_empty():
-            for column in ("rank_ic_mean", "pearson_ic_mean", "long_short_mean"):
-                if column in summary.columns:
-                    mean_value = cast(float | None, summary[column].drop_nulls().mean())
-                    if mean_value is not None:
-                        result[column] = (mean_value, "ratio", None, None)
-            hypotheses: list[tuple[str, float, float]] = []
-            for row in summary.sort(
-                "signal_variant", "factor_ref", "horizon"
-            ).to_dicts():
-                mean_value = row.get("rank_ic_mean")
-                sample_std = row.get("rank_ic_sample_std")
-                count = row.get("rank_ic_valid_date_count")
-                if not isinstance(mean_value, (int, float)) or isinstance(
-                    mean_value, bool
-                ):
-                    continue
-                if not isinstance(sample_std, (int, float)) or isinstance(
-                    sample_std, bool
-                ):
-                    continue
-                if type(count) is not int or sample_std <= 0 or count < 2:
-                    continue
-                p_value = MultipleTestingCorrector.normal_mean_p_value(
-                    float(mean_value), float(sample_std), count
+                result["mean_factor_coverage"] = (
+                    mean_coverage,
+                    "ratio",
+                    None,
+                    None,
                 )
-                name = "/".join(
-                    (
-                        "rank_ic_mean",
-                        str(row["signal_variant"]),
-                        str(row["factor_ref"]),
-                        str(row["horizon"]),
-                    )
-                )
-                hypotheses.append((name, float(mean_value), p_value))
-            adjusted = MultipleTestingCorrector.adjust(
-                correction, tuple(item[2] for item in hypotheses)
+        if ic is not None and not ic.is_empty():
+            mean_pair_coverage = cast(
+                float | None, ic["pair_coverage"].drop_nulls().mean()
             )
-            for (name, value, p_value), adjusted_p_value in zip(
-                hypotheses, adjusted, strict=True
-            ):
-                result[name] = (value, None, p_value, adjusted_p_value)
+            if mean_pair_coverage is not None:
+                result["mean_pair_coverage"] = (
+                    mean_pair_coverage,
+                    "ratio",
+                    None,
+                    None,
+                )
+        if summary is not None and not summary.is_empty():
+            families: dict[str, list[tuple[str, float, float]]] = {
+                "rank_ic": [],
+                "long_short": [],
+            }
+            for row in summary.sort(
+                "signal_variant", "label_kind", "factor_ref", "horizon"
+            ).to_dicts():
+                dimensions = (
+                    str(row["signal_variant"]),
+                    str(row["label_kind"]),
+                    str(row["factor_ref"]),
+                    str(row["horizon"]),
+                )
+                for family, value_column, p_column in (
+                    ("rank_ic", "rank_ic_mean", "rank_ic_hac_p_value"),
+                    (
+                        "long_short",
+                        "long_short_mean",
+                        "long_short_hac_p_value",
+                    ),
+                ):
+                    value, p_value = row.get(value_column), row.get(p_column)
+                    if (
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and isinstance(p_value, (int, float))
+                        and not isinstance(p_value, bool)
+                    ):
+                        families[family].append(
+                            (
+                                "/".join((value_column, *dimensions)),
+                                float(value),
+                                float(p_value),
+                            )
+                        )
+            significant_rank = 0
+            for family, hypotheses in families.items():
+                adjusted = MultipleTestingCorrector.adjust(
+                    correction, tuple(item[2] for item in hypotheses)
+                )
+                for (name, value, p_value), adjusted_p_value in zip(
+                    hypotheses, adjusted, strict=True
+                ):
+                    result[name] = (
+                        value,
+                        "ratio",
+                        p_value,
+                        adjusted_p_value,
+                    )
+                    if family == "rank_ic" and adjusted_p_value <= 0.05:
+                        significant_rank += 1
+            result["tested_rank_ic_count"] = (
+                float(len(families["rank_ic"])),
+                "count",
+                None,
+                None,
+            )
+            result["significant_rank_ic_count"] = (
+                float(significant_rank),
+                "count",
+                None,
+                None,
+            )
         return result
 
 
@@ -1204,7 +1645,7 @@ def build_experiment_worker(
             rulebook,
             artifact_root,
         ),
-        FactorRunExecutor(repository, registry, artifact_root),
+        FactorRunExecutor(repository, registry, rulebook, artifact_root),
     )
     logs = TaskLogManager(
         diagnostic_root=log_root, artifact_root=artifact_root, sensitive_values=()

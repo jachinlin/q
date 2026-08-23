@@ -662,11 +662,10 @@ future_return = exit/entry - 1
 2 NOT_LISTED_AT_ENTRY
 3 ENTRY_SUSPENDED
 4 ENTRY_LIMIT_UP              # 仅 EXECUTABLE
-5 ENTRY_LIMIT_DOWN           # 仅 EXECUTABLE（卖出场景对称，视用途）
-6 MISSING_ENTRY_PRICE
+5 MISSING_ENTRY_PRICE
+6 DELISTED_WITHOUT_EXIT_PRICE
 7 MISSING_EXIT_PRICE
-8 DELISTED_WITHOUT_EXIT_PRICE
-9 NONFINITE_RETURN
+8 NONFINITE_RETURN
 ```
 
 向量化实现（join + shift，**无 per-(date,instrument) 循环**）：
@@ -721,19 +720,20 @@ oracle 例：`factor=[1,2,3]`, `ret=[1,2,3]` → Pearson=RankIC=1.0；`ret=[3,2,
 #### 2.5.2 分位分组 / 分层收益
 
 ```text
-默认 STABLE_SPLIT：按 (value, instrument_id) 升序，bucket = floor(rank * Q / n) + 1
-（KEEP_TIES / PERCENTILE_BOUNDARY 可配）
+固定稳定拆分：按 (value, instrument_id) 升序，bucket = floor(rank * Q / n) + 1
 每 (signal_date, quantile) 输出：实际边界、样本数、mean_return、is_empty
-分层诊断：各组累计净值、单调性、组序号-收益相关、Q−Q1 多空、胜率/年化/Sharpe/最大回撤
+分层诊断：至少三组时计算组序号-收益 Spearman、OLS 斜率、相邻倒序数、终端 spread；
+不计算累计净值、Sharpe 或最大回撤
 ```
 
 #### 2.5.3 多空 / 相关 / 显著性
 
 ```text
 long_short = Q 组均值 − 1 组均值；终端组空/配对不足 → 原因码
-相关矩阵：同日同股票池有效截面 Pearson + Rank，跨日均值
-显著性（5/20 日重叠持有期必做）：Newey-West/HAC 或 block bootstrap，发布 t-stat/CI/p-value
-多因子并检：记 Bonferroni / BH-FDR 校正
+相关矩阵：同日同股票池有效截面 Pearson + Rank
+显著性：Bartlett Newey-West/HAC，lag=min(horizon-1, valid_count-1)，发布标准误/t-stat/CI/p-value
+多因子并检：Rank IC 与毛 spread 两个 family 分别做 Bonferroni / BH-FDR 校正
+换手：每腿 0.5×Σ|w_t-w_(t-1)|；成本代理：gross_spread-total_turnover×bps/10000
 ```
 
 全部内核用向量化 + NumPy；分组用 `over(signal_date)` / `partition_by`，禁止逐行 Python。
@@ -743,11 +743,14 @@ long_short = Q 组均值 − 1 组均值；终端组空/配对不足 → 原因�
 ### 2.6 因子研究产物（FACTOR_STUDY kind）
 
 产物目录（实验层写，见 experiment-layer §）：
-`summary / coverage / ic / quantile_returns / long_short_returns / correlation`（+ 可选 significance/stability）。
-主键见设计文档 `design.md §5.2`（各表 `signal_variant, factor_ref, horizon, signal_date` 组合）。
+`summary / coverage / label_quality / industry_coverage / ic / quantile_returns /
+long_short_returns / monotonicity / turnover / stability / cost_scenarios / correlation`。
+收益相关表的主键包含 `signal_variant, label_kind, factor_ref, horizon`；日度表再包含 `signal_date`。
 
-`signal_variant`：`DIRECTION_ADJUSTED`（方向调整基线）、`INDUSTRY_NEUTRALIZED`（显式启用行业时）。
+`signal_variant`：`DIRECTION_ADJUSTED`（固定发布）、`INDUSTRY_NEUTRALIZED`（配置 `industry` 时发布）。
 行业中性化 = 方向调整后按信号日 as-of `industry_code` 组内等权去均值；单成员组 `SINGLE_MEMBER_INDUSTRY` 失效。
+固定同时发布理论和可执行收益标签；后者以未复权行情和唯一 A 股规则文件判定 T+1 入场可执行性，
+收益仍使用前复权价格。HAC、换手和成本代理公式见 `factor-analysis-design.md`。
 
 ---
 
@@ -1265,7 +1268,7 @@ linear_impact 追加 × 参与率项
 #### 4.4.6 ConstraintSet（YAML 声明）
 
 `max_position_weight / min_positions / max_positions / min_adv_amount / max_turnover /
-industry_neutral | industry_exposure_bound / max_gross / max_net`。构建后 `validate` 二次校验。
+industry_exposure_bound / max_gross / max_net`。构建后 `validate` 二次校验。
 行业约束用信号日 as-of `industry_code`（PIT），单成员组失效。
 
 #### 4.4.7 CrossSectionalStrategy 装配
@@ -1502,7 +1505,8 @@ def run_stage(stage, ctx):
 - **PREPARE_INPUTS**：构建 PIT 股票池；预算本次需要的因子（`FactorEngine.compute`）；装配策略/管线。
 - **STRATEGY_RUN**：`BacktestEngine.run(request, strategy, ...)`，逐日 `on_event`→撮合→账务，仅返回冻结结果与规范化内存表，不发布目录（见 backtest-engine）。
 - **ANALYTICS**：直接消费内存中的 `equity_fen/total_cost_fen` 当前 Schema，计算绩效、风险、执行质量和归因（§5.7）。
-- **ANALYZE_FACTORS**（因子研究）：覆盖率/IC/分位/多空/相关/显著性（因子层 §5.6）。
+- **ANALYZE_FACTORS**（因子研究）：双标签质量、IC/HAC、分位、单调性、毛多空、稳定性、
+  换手和日频成本代理（因子层 §5.6）。
 - **PERSIST**：统一写 staging、生成 Manifest、原子重命名、从最终目录复核并登记有限且已定义的 metrics；因子 Run 也只在此阶段发布。
 
 失败/取消：清理 staging 临时目录，不留半成品；`FAILED` 写 error_json。
@@ -1533,9 +1537,11 @@ STRATEGY_BACKTEST: nav.parquet holdings.parquet fills.parquet costs.parquet
                    monthly_returns.parquet annual_returns.parquet
                    execution_summary.parquet exposure_summary.parquet attribution.parquet
                    config.json metrics.json quality_disclosure.json manifest.json
-FACTOR_STUDY:      summary.parquet coverage.parquet ic.parquet quantile_returns.parquet
-                   long_short_returns.parquet correlation.parquet config.json metrics.json
-                   quality_disclosure.json manifest.json
+FACTOR_STUDY:      summary.parquet coverage.parquet label_quality.parquet
+                   industry_coverage.parquet ic.parquet quantile_returns.parquet
+                   long_short_returns.parquet monotonicity.parquet turnover.parquet
+                   stability.parquet cost_scenarios.parquet correlation.parquet
+                   config.json metrics.json manifest.json
 ```
 
 发布：先写同文件系统 staging → 生成 Manifest → 原子 `os.replace` 到最终目录 → 从最终目录复核路径、

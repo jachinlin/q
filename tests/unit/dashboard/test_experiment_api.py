@@ -252,11 +252,15 @@ def test_artifact_filters_after_integrity_validation_and_before_paging(
     frame = pl.DataFrame(
         {
             "signal_variant": ["RAW", "RAW"],
+            "label_kind": [
+                "THEORETICAL_FORWARD_RETURN",
+                "EXECUTABLE_FORWARD_RETURN",
+            ],
             "factor_ref": ["momentum", "value"],
             "horizon": [5, 5],
             "rank_ic_mean": [0.1, 0.2],
         }
-    ).sort(["signal_variant", "factor_ref", "horizon"])
+    ).sort(["signal_variant", "label_kind", "factor_ref", "horizon"])
     frame.write_parquet(artifact_path)
     content = artifact_path.read_bytes()
     manifest = {
@@ -268,8 +272,18 @@ def test_artifact_filters_after_integrity_validation_and_before_paging(
                 "byte_count": len(content),
                 "row_count": 2,
                 "schema": {name: str(dtype) for name, dtype in frame.schema.items()},
-                "primary_key": ["signal_variant", "factor_ref", "horizon"],
-                "sort_key": ["signal_variant", "factor_ref", "horizon"],
+                "primary_key": [
+                    "signal_variant",
+                    "label_kind",
+                    "factor_ref",
+                    "horizon",
+                ],
+                "sort_key": [
+                    "signal_variant",
+                    "label_kind",
+                    "factor_ref",
+                    "horizon",
+                ],
             }
         ]
     }
@@ -294,12 +308,20 @@ def test_artifact_filters_after_integrity_validation_and_before_paging(
 
     response = client.get(
         "/api/v1/runs/run/artifacts/summary",
-        params={"factor_ref": "value", "horizon": 5},
+        params={
+            "label_kind": "EXECUTABLE_FORWARD_RETURN",
+            "factor_ref": "value",
+            "horizon": 5,
+        },
     )
 
     assert response.status_code == 200
     assert response.json()["total"] == 1
     assert response.json()["items"][0]["factor_ref"] == "value"
+    assert (
+        response.json()["items"][0]["label_kind"]
+        == "EXECUTABLE_FORWARD_RETURN"
+    )
     with pytest.raises(ValueError, match="unsupported filter for signals"):
         service.artifact("run", "signals", 1, 100, factor_ref="value")
 

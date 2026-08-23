@@ -555,8 +555,9 @@ src/quant_research/backtest/
   `task/task_attempt`。
 - **产物目录** `artifacts/experiments/<experiment_id>/<run_id>/`：回测 kind 输出
   `signals/orders/fills/holdings/costs/nav/performance/monthly_returns/annual_returns/execution_summary/exposure_summary/attribution`；
-  因子 kind 输出 `summary/coverage/ic/quantile_returns/long_short_returns/correlation`；两类 Run 均输出
-  `config.json/metrics.json/quality_disclosure.json/manifest.json`。
+  因子 kind 输出 `summary/coverage/label_quality/industry_coverage/ic/quantile_returns/
+  long_short_returns/monotonicity/turnover/stability/cost_scenarios/correlation`；两类 Run 均输出
+  `config.json/metrics.json/manifest.json`，策略 Run 另有 `quality_disclosure.json`。
 - **读侧视图**：排行榜、配置/指标 diff、血缘、结论标记（供 Dashboard/CLI）。
 - 数据版本漂移/阶段失败/取消/状态冲突时抛 `EXPERIMENT_DATA_DRIFT / EXPERIMENT_STAGE_FAILED /
   EXPERIMENT_CANCELLED / EXPERIMENT_STATE_CONFLICT`。
@@ -617,7 +618,8 @@ FACTOR_STUDY:      VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PERSIST
 
 `ANALYTICS` 阶段调用分析层，从回测产物（nav/holdings/fills/costs）计算绩效（累计/年化收益、波动、
 Sharpe/Sortino/Calmar、最大回撤与恢复、IR、beta/alpha）、交易质量、风险与暴露、归因（期间/风格/个股；
-多空分腿与 gross/net 敞口为 P3b-2）。因子研究则计算覆盖率/IC/分层/多空/相关/显著性
+多空分腿与 gross/net 敞口为 P3b-2）。因子研究则计算双标签质量、IC/HAC、分层、单调性、
+毛多空、稳定性、换手、日频成本代理与相关性
 （见[总体设计](design.md) `§5.7-5.8`）。全部统计公式字面量 oracle；首日 0 收益口径明确
 （见[总体设计](design.md) `§8.4`、[实现级细化](implemention.md) `§5.8`）。
 
