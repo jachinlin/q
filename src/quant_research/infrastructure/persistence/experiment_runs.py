@@ -36,9 +36,20 @@ from quant_research.infrastructure.persistence.orm import (
     RunTagORM,
     TaskORM,
 )
-from quant_research.tasks.models import TaskProgress
+from quant_research.tasks.models import TaskProgress, TaskStatus
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_TERMINAL_RUN_STATUSES = frozenset(
+    {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value}
+)
+_TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.SUCCEEDED.value,
+        TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
+        TaskStatus.ORPHANED.value,
+    }
+)
 
 
 class ExperimentRunRegistry:
@@ -462,6 +473,111 @@ class ExperimentRunRegistry:
             session.execute(delete(RunMetricORM).where(RunMetricORM.run_id == run_id))
             session.execute(
                 delete(RunArtifactORM).where(RunArtifactORM.run_id == run_id)
+            )
+
+    def delete_run(self, run_id: str, *, actor: str = "system") -> None:
+        """事务删除一个终态 Run，并保留其独立任务与审计历史。
+
+        入参：run_id：待删除 Run；actor：审计操作者。
+        返回值：Run、标签、指标和产物登记级联删除后无返回。
+        异常：KeyError：Run 不存在；ValueError：Run 尚未进入终态。
+        """
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            row = session.get(RunORM, run_id)
+            if row is None:
+                raise KeyError(f"run does not exist: {run_id}")
+            if row.status not in _TERMINAL_RUN_STATUSES:
+                raise ValueError("active Run cannot be deleted")
+            task = session.get(TaskORM, row.task_id) if row.task_id is not None else None
+            if task is not None and task.status not in _TERMINAL_TASK_STATUSES:
+                raise ValueError("Run task is still active")
+            experiment = self._experiment_row(session, row.experiment_id)
+            if experiment.baseline_run_id == run_id:
+                experiment.baseline_run_id = None
+            self._audit(
+                session,
+                run_id,
+                row.task_id,
+                "RUN_DELETED",
+                actor,
+                {"experiment_id": row.experiment_id, "status": row.status},
+                now,
+            )
+            session.execute(
+                update(TaskORM)
+                .where(
+                    TaskORM.subject_kind == "EXPERIMENT_RUN",
+                    TaskORM.subject_id == run_id,
+                )
+                .values(subject_kind=None, subject_id=None, idempotency_key=None)
+            )
+            session.execute(delete(RunORM).where(RunORM.id == run_id))
+
+    def delete_experiment(
+        self, experiment_id: str, *, actor: str = "system"
+    ) -> None:
+        """事务删除实验及其全部终态 Run，并保留任务与审计历史。
+
+        入参：experiment_id：待删除实验；actor：审计操作者。
+        返回值：实验聚合级联删除后无返回。
+        异常：KeyError：实验不存在；ValueError：任一 Run 尚未进入终态。
+        """
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            self._experiment_row(session, experiment_id)
+            runs = session.scalars(
+                select(RunORM)
+                .where(RunORM.experiment_id == experiment_id)
+                .order_by(RunORM.created_at, RunORM.id)
+            ).all()
+            if any(row.status not in _TERMINAL_RUN_STATUSES for row in runs):
+                raise ValueError("Experiment with active Runs cannot be deleted")
+            run_ids = [row.id for row in runs]
+            active_task = (
+                session.scalar(
+                    select(TaskORM.id)
+                    .where(
+                        TaskORM.subject_kind == "EXPERIMENT_RUN",
+                        TaskORM.subject_id.in_(run_ids),
+                        TaskORM.status.not_in(_TERMINAL_TASK_STATUSES),
+                    )
+                    .limit(1)
+                )
+                if run_ids
+                else None
+            )
+            if active_task is not None:
+                raise ValueError("Experiment has active Run tasks")
+            audit_run_ids: list[JsonValue] = [run_id for run_id in run_ids]
+            session.add(
+                AuditEventORM(
+                    run_id=None,
+                    subject_kind="EXPERIMENT",
+                    subject_id=experiment_id,
+                    task_id=None,
+                    event_type="EXPERIMENT_DELETED",
+                    actor=actor,
+                    details_json=canonical_json_bytes(
+                        {
+                            "experiment_id": experiment_id,
+                            "run_ids": audit_run_ids,
+                        }
+                    ).decode("utf-8"),
+                    created_at=now.isoformat(),
+                )
+            )
+            if run_ids:
+                session.execute(
+                    update(TaskORM)
+                    .where(
+                        TaskORM.subject_kind == "EXPERIMENT_RUN",
+                        TaskORM.subject_id.in_(run_ids),
+                    )
+                    .values(subject_kind=None, subject_id=None, idempotency_key=None)
+                )
+            session.execute(
+                delete(ExperimentORM).where(ExperimentORM.id == experiment_id)
             )
 
     @staticmethod

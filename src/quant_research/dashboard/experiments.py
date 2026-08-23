@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import polars as pl
 from fastapi import FastAPI, Query, Request
@@ -14,7 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from quant_research.application.experiments import ExperimentService
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
-from quant_research.experiments.models import ExperimentAggregate, ResearchMark
+from quant_research.experiments.models import (
+    ExperimentAggregate,
+    ResearchMark,
+    RunRecord,
+)
 from quant_research.strategies.components import StrategyComponentCatalog
 from quant_research.strategies.registry import StrategyRegistry
 
@@ -333,6 +340,10 @@ class ExperimentDashboardService:
                     "latest_run": latest.model_dump(mode="json") if latest else None,
                     "run_count": len(aggregate.runs),
                     "test_uses": sum(item.uses_test_region for item in aggregate.runs),
+                    "has_active_runs": any(
+                        item.status.value not in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                        for item in aggregate.runs
+                    ),
                 }
             )
         return {
@@ -352,6 +363,96 @@ class ExperimentDashboardService:
             KeyError：实验不存在时抛出。
         """
         return self.aggregate(self._experiments.show(experiment_id))
+
+    def delete_run(self, run_id: str, actor: str) -> dict[str, JsonValue]:
+        """删除终态 Run 的聚合记录和可信产物目录。
+
+        入参：run_id：Run 标识；actor：请求审计标识。
+        返回值：被删除的 Run、所属实验和终态标记。
+        异常：Run 不存在、仍活动或产物目录越过可信边界时传播异常。
+        """
+        run = self._experiments.get_run(run_id)
+        staged = self._stage_artifact_deletion((run,))
+        try:
+            self._experiments.delete_run(run_id, actor=actor)
+        except BaseException:
+            self._restore_artifacts(staged)
+            raise
+        self._purge_artifacts(staged)
+        return {
+            "experiment_id": run.experiment_id,
+            "run_id": run.id,
+            "status": "DELETED",
+        }
+
+    def delete_experiment(
+        self, experiment_id: str, actor: str
+    ) -> dict[str, JsonValue]:
+        """删除不存在活动 Run 的实验聚合及全部可信产物目录。
+
+        入参：experiment_id：实验标识；actor：请求审计标识。
+        返回值：被删除的实验、Run 数量和终态标记。
+        异常：实验不存在、含活动 Run 或产物目录越过可信边界时传播异常。
+        """
+        aggregate = self._experiments.show(experiment_id)
+        staged = self._stage_artifact_deletion(aggregate.runs)
+        try:
+            self._experiments.delete_experiment(experiment_id, actor=actor)
+        except BaseException:
+            self._restore_artifacts(staged)
+            raise
+        self._purge_artifacts(staged)
+        return {
+            "experiment_id": experiment_id,
+            "run_count": len(aggregate.runs),
+            "status": "DELETED",
+        }
+
+    def _stage_artifact_deletion(
+        self, runs: tuple[RunRecord, ...]
+    ) -> tuple[tuple[Path, Path], ...]:
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for run in sorted(runs, key=lambda item: item.id):
+                if run.artifact_dir is None:
+                    continue
+                expected = (
+                    self._artifact_root / "experiments" / run.experiment_id / run.id
+                ).resolve()
+                directory = Path(run.artifact_dir).resolve()
+                if directory != expected:
+                    raise ValueError("Run artifact directory does not match trusted identity")
+                if not directory.exists():
+                    continue
+                if not directory.is_dir():
+                    raise ValueError("Run artifact path is not a directory")
+                tombstone = directory.with_name(
+                    f".deleting-{run.id}-{uuid4().hex}"
+                )
+                os.replace(directory, tombstone)
+                staged.append((directory, tombstone))
+        except BaseException:
+            self._restore_artifacts(tuple(staged))
+            raise
+        return tuple(staged)
+
+    @staticmethod
+    def _restore_artifacts(staged: tuple[tuple[Path, Path], ...]) -> None:
+        for directory, tombstone in reversed(staged):
+            if tombstone.exists():
+                os.replace(tombstone, directory)
+
+    @staticmethod
+    def _purge_artifacts(staged: tuple[tuple[Path, Path], ...]) -> None:
+        parents: set[Path] = set()
+        for directory, tombstone in staged:
+            parents.add(directory.parent)
+            shutil.rmtree(tombstone, ignore_errors=True)
+        for parent in sorted(parents, key=lambda item: len(item.parts), reverse=True):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
 
     def add_run(
         self, experiment_id: str, yaml_text: str, actor: str
@@ -571,6 +672,14 @@ class ExperimentRoutes:
         def detail(experiment_id: str) -> dict[str, JsonValue]:
             return service.detail(experiment_id)
 
+        @app.delete("/api/v1/experiments/{experiment_id}")
+        def delete_experiment(
+            experiment_id: str, request: Request
+        ) -> dict[str, JsonValue]:
+            return service.delete_experiment(
+                experiment_id, request.state.request_id
+            )
+
         @app.post("/api/v1/experiments/{experiment_id}/runs", status_code=202)
         def add_run(
             experiment_id: str, body: YamlBody, request: Request
@@ -580,6 +689,10 @@ class ExperimentRoutes:
         @app.post("/api/v1/runs/{run_id}/rerun", status_code=202)
         def rerun(run_id: str, request: Request) -> dict[str, JsonValue]:
             return service.rerun(run_id, request.state.request_id)
+
+        @app.delete("/api/v1/runs/{run_id}")
+        def delete_run(run_id: str, request: Request) -> dict[str, JsonValue]:
+            return service.delete_run(run_id, request.state.request_id)
 
         @app.patch("/api/v1/runs/{run_id}/research")
         def mark(run_id: str, body: MarkBody, request: Request) -> dict[str, JsonValue]:

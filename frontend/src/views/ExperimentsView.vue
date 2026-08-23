@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { useQuery } from '@tanstack/vue-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import { computed } from 'vue'
 
 import { api } from '../api'
@@ -8,6 +11,7 @@ import StatusBadge from '../components/StatusBadge.vue'
 import { formatTime } from '../format'
 import type { ExperimentOverview } from '../types'
 
+const queryClient = useQueryClient()
 const experiments = useQuery({
   queryKey: ['experiments'],
   queryFn: () => api.get<{ items: ExperimentOverview[] }>('/api/v1/experiments?limit=200&offset=0'),
@@ -22,6 +26,27 @@ const counts = computed(() => {
     baseline: items.filter((item) => item.baseline_run_id).length,
   }
 })
+const remove = useMutation({
+  mutationFn: (id: string) => api.delete<{ experiment_id: string; run_count: number; status: 'DELETED' }>(`/api/v1/experiments/${id}`),
+  onSuccess: async (result) => {
+    ElMessage.success(`已删除实验及 ${result.run_count} 个 Run`)
+    queryClient.removeQueries({ queryKey: ['experiment', result.experiment_id] })
+    await queryClient.invalidateQueries({ queryKey: ['experiments'] })
+  },
+})
+
+async function deleteExperiment(experiment: ExperimentOverview) {
+  try {
+    await ElMessageBox.confirm(
+      `将删除实验“${experiment.definition.name}”、${experiment.run_count} 个 Run 及其研究产物。任务和审计历史仍会保留，此操作不可撤销。`,
+      '确认删除实验',
+      { type: 'error', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  remove.mutate(experiment.id)
+}
 </script>
 
 <template>
@@ -46,6 +71,7 @@ const counts = computed(() => {
         <el-table-column label="基线" width="130"><template #default="scope"><span class="hash">{{ scope.row.baseline_run_id?.slice(0, 10) ?? '—' }}</span></template></el-table-column>
         <el-table-column label="状态" width="110"><template #default="scope"><StatusBadge :status="scope.row.latest_run?.status ?? 'CREATED'" /></template></el-table-column>
         <el-table-column label="创建时间" width="170"><template #default="scope">{{ formatTime(scope.row.created_at) }}</template></el-table-column>
+        <el-table-column label="操作" width="100"><template #default="scope"><el-button text type="danger" :disabled="scope.row.has_active_runs" @click="deleteExperiment(scope.row)">删除</el-button></template></el-table-column>
       </el-table>
     </section>
   </div>

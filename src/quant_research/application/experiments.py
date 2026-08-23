@@ -156,6 +156,24 @@ class ExperimentRegistry(Protocol):
         """
         ...
 
+    def delete_run(self, run_id: str, *, actor: str) -> None:
+        """删除一个终态 Run 的聚合记录。
+
+        入参：Run ID 和审计主体。
+        返回值：删除完成后无返回。
+        异常：Run 不存在或仍处于活动状态时抛出对应异常。
+        """
+        ...
+
+    def delete_experiment(self, experiment_id: str, *, actor: str) -> None:
+        """删除一个不存在活动 Run 的实验聚合。
+
+        入参：实验 ID 和审计主体。
+        返回值：实验及其全部终态 Run 删除完成后无返回。
+        异常：实验不存在或包含活动 Run 时抛出对应异常。
+        """
+        ...
+
 
 class StrategyValidator(Protocol):
     """定义实验提交前校验策略标识和参数的消费者侧端口。
@@ -299,6 +317,26 @@ class ExperimentService:
         异常：Run 不存在时抛出对应异常。
         """
         return self._registry.get_run(run_id)
+
+    def delete_run(self, run_id: str, *, actor: str = "user") -> None:
+        """删除一个终态 Run，保留独立任务和审计历史。
+
+        入参：Run ID 和审计主体。
+        返回值：删除完成后无返回。
+        异常：Run 不存在或仍处于活动状态时传播持久化边界异常。
+        """
+        self._registry.delete_run(run_id, actor=actor)
+
+    def delete_experiment(
+        self, experiment_id: str, *, actor: str = "user"
+    ) -> None:
+        """删除一个不存在活动 Run 的实验及其全部 Run。
+
+        入参：实验 ID 和审计主体。
+        返回值：删除完成后无返回。
+        异常：实验不存在或任一 Run 仍活动时传播持久化边界异常。
+        """
+        self._registry.delete_experiment(experiment_id, actor=actor)
 
     def _catalog_hash(self) -> str:
         value = self._catalog.require_validated_catalog().catalog_hash

@@ -1,4 +1,5 @@
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
+import { ElMessageBox } from 'element-plus'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -6,9 +7,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ExperimentDetailView from './views/ExperimentDetailView.vue'
 
 const apiGet = vi.hoisted(() => vi.fn())
+const apiDelete = vi.hoisted(() => vi.fn())
 
 vi.mock('./api', () => ({
-  api: { get: apiGet, post: vi.fn(), patch: vi.fn() },
+  api: { get: apiGet, post: vi.fn(), patch: vi.fn(), delete: apiDelete },
 }))
 vi.mock('vue-echarts', () => ({
   default: { name: 'VChart', props: ['option'], template: '<div class="chart-stub" />' },
@@ -58,7 +60,10 @@ async function clickTab(wrapper: ReturnType<typeof mount>, label: string) {
 }
 
 describe('unified experiment detail', () => {
-  beforeEach(() => apiGet.mockReset())
+  beforeEach(() => {
+    apiGet.mockReset()
+    apiDelete.mockReset()
+  })
 
   it('renders strategy performance as a chart and trusted artifact table', async () => {
     apiGet.mockImplementation((path: string) => {
@@ -152,5 +157,25 @@ describe('unified experiment detail', () => {
     expect(wrapper.findAll('.core-metrics .metric-card')).toHaveLength(8)
     expect(wrapper.text()).toContain('几何超额')
     expect(wrapper.text()).toContain('年化成本拖累')
+    expect(wrapper.text()).not.toContain('Run 核心指标')
+  })
+
+  it('confirms and deletes a terminal Run while keeping the experiment page', async () => {
+    const failedRun = { ...run, status: 'FAILED', manifest_hash: null, metrics: [], artifacts: [] }
+    apiGet.mockImplementation((path: string) => {
+      if (path === '/api/v1/experiments/exp-1') return Promise.resolve(aggregate('STRATEGY_BACKTEST', [failedRun]))
+      return Promise.reject(new Error(`unexpected API path: ${path}`))
+    })
+    apiDelete.mockResolvedValue({ experiment_id: 'exp-1', run_id: run.id, status: 'DELETED' })
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
+    const { wrapper, router } = await mountDetail()
+    await vi.waitFor(() => expect(wrapper.text()).toContain('Run 执行失败'))
+
+    const remove = wrapper.findAll('button').find((button) => button.text() === '删除')
+    if (!remove) throw new Error('missing Run delete button')
+    await remove.trigger('click')
+    await vi.waitFor(() => expect(apiDelete).toHaveBeenCalledWith(`/api/v1/runs/${run.id}`))
+
+    expect(router.currentRoute.value.path).toBe('/experiments/exp-1')
   })
 })

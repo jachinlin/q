@@ -2,10 +2,16 @@
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import inspect
+from sqlalchemy.orm import Session
 
 from quant_research.experiments.config import ExperimentConfigParser
-from quant_research.experiments.models import ResearchMark
+from quant_research.experiments.models import (
+    ResearchMark,
+    RunStage,
+    RunStatus,
+)
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -13,6 +19,7 @@ from quant_research.infrastructure.persistence.database import (
 from quant_research.infrastructure.persistence.experiment_runs import (
     ExperimentRunRegistry,
 )
+from quant_research.infrastructure.persistence.orm import AuditEventORM
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from tests.unit.experiments.test_unified_models import experiment_yaml
 
@@ -85,4 +92,90 @@ def test_failed_run_output_cleanup_is_transactional(tmp_path: Path) -> None:
 
     assert registry.get_run(run_id).metrics == ()
     assert registry.get_run(run_id).artifacts == ()
+    engine.dispose()
+
+
+def test_delete_terminal_run_clears_baseline_and_preserves_task_and_audit(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    registry = ExperimentRunRegistry(engine)
+    definition = ExperimentConfigParser().parse_experiment(experiment_yaml()).definition
+    experiment_id, run_id, task_id = registry.create(
+        definition, "a" * 64, actor="test"
+    )
+    registry.mark(run_id, ResearchMark.BASELINE, actor="test")
+
+    with pytest.raises(ValueError, match="active Run cannot be deleted"):
+        registry.delete_run(run_id, actor="test")
+
+    registry.transition(
+        run_id,
+        RunStatus.QUEUED,
+        RunStatus.CANCELLED,
+        stage=RunStage.VALIDATE,
+    )
+    with pytest.raises(ValueError, match="Run task is still active"):
+        registry.delete_run(run_id, actor="test")
+    queue = TaskQueue(engine, task_log_root=tmp_path / "logs")
+    queue.request_cancel(task_id, actor="test")
+    registry.delete_run(run_id, actor="test")
+
+    aggregate = registry.get_experiment(experiment_id)
+    assert aggregate.experiment.baseline_run_id is None
+    assert aggregate.runs == ()
+    task = queue.get(task_id)
+    assert task.id == task_id
+    assert (task.subject_kind, task.subject_id) == (None, None)
+    with Session(engine) as session:
+        deleted = session.query(AuditEventORM).filter_by(event_type="RUN_DELETED").one()
+        assert deleted.run_id == run_id
+        assert deleted.task_id == task_id
+    with pytest.raises(KeyError, match="run does not exist"):
+        registry.get_run(run_id)
+    engine.dispose()
+
+
+def test_delete_experiment_requires_all_runs_terminal_and_cascades_aggregate(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    registry = ExperimentRunRegistry(engine)
+    definition = ExperimentConfigParser().parse_experiment(experiment_yaml()).definition
+    experiment_id, run_id, task_id = registry.create(
+        definition, "a" * 64, actor="test"
+    )
+
+    with pytest.raises(ValueError, match="Experiment with active Runs"):
+        registry.delete_experiment(experiment_id, actor="test")
+
+    registry.transition(
+        run_id,
+        RunStatus.QUEUED,
+        RunStatus.CANCELLED,
+        stage=RunStage.VALIDATE,
+    )
+    with pytest.raises(ValueError, match="Experiment has active Run tasks"):
+        registry.delete_experiment(experiment_id, actor="test")
+    queue = TaskQueue(engine, task_log_root=tmp_path / "logs")
+    queue.request_cancel(task_id, actor="test")
+    registry.delete_experiment(experiment_id, actor="test")
+
+    with pytest.raises(KeyError, match="experiment does not exist"):
+        registry.get_experiment(experiment_id)
+    task = queue.get(task_id)
+    assert task.id == task_id
+    assert (task.subject_kind, task.subject_id) == (None, None)
+    with Session(engine) as session:
+        deleted = (
+            session.query(AuditEventORM)
+            .filter_by(event_type="EXPERIMENT_DELETED")
+            .one()
+        )
+        assert deleted.subject_kind == "EXPERIMENT"
+        assert deleted.subject_id == experiment_id
     engine.dispose()

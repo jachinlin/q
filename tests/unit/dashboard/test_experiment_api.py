@@ -105,6 +105,79 @@ class _ArtifactExperimentService:
         return self._run
 
 
+class _DeletionExperimentService:
+    """记录删除调用并提供一个已发布终态 Run。"""
+
+    def __init__(self, run: SimpleNamespace) -> None:
+        self.run = run
+        self.deleted_run: tuple[str, str] | None = None
+
+    def get_run(self, run_id: str) -> SimpleNamespace:
+        """返回固定 Run 并校验标识。"""
+        assert run_id == self.run.id
+        return self.run
+
+    def delete_run(self, run_id: str, *, actor: str) -> None:
+        """记录应用服务收到的 Run 删除请求。"""
+        self.deleted_run = (run_id, actor)
+
+
+def test_delete_run_removes_only_identity_bound_artifact_directory(
+    tmp_path: Path,
+) -> None:
+    experiment_id, run_id = "experiment-1", "run-1"
+    artifact_dir = tmp_path / "experiments" / experiment_id / run_id
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    application = _DeletionExperimentService(
+        SimpleNamespace(
+            id=run_id,
+            experiment_id=experiment_id,
+            artifact_dir=str(artifact_dir),
+        )
+    )
+    service = ExperimentDashboardService(
+        cast(Any, application),
+        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
+        tmp_path,
+    )
+
+    result = service.delete_run(run_id, "request-delete")
+
+    assert result == {
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+        "status": "DELETED",
+    }
+    assert application.deleted_run == (run_id, "request-delete")
+    assert not artifact_dir.exists()
+
+
+def test_delete_run_rejects_artifact_directory_outside_run_identity(
+    tmp_path: Path,
+) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    application = _DeletionExperimentService(
+        SimpleNamespace(
+            id="run-1",
+            experiment_id="experiment-1",
+            artifact_dir=str(other),
+        )
+    )
+    service = ExperimentDashboardService(
+        cast(Any, application),
+        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
+        tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="trusted identity"):
+        service.delete_run("run-1", "request-delete")
+
+    assert application.deleted_run is None
+    assert other.exists()
+
+
 def test_artifact_route_serializes_parquet_dates_as_iso_strings(
     tmp_path: Path,
 ) -> None:

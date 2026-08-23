@@ -106,6 +106,7 @@ export type ExperimentOverview = ExperimentSummary & {
   latest_run: ExperimentRun | null
   run_count: number
   test_uses: number
+  has_active_runs: boolean
 }
 
 export type ExperimentRun = {

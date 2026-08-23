@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import VChart from 'vue-echarts'
@@ -28,6 +29,7 @@ const STRATEGY_GROUPS = [
 ] as const
 const LARGE_ARTIFACTS = new Set(['orders', 'fills', 'holdings', 'costs'])
 const FACTOR_FILTERED = new Set(['ic', 'quantile_returns', 'long_short_returns'])
+const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED'])
 
 const route = useRoute()
 const router = useRouter()
@@ -50,6 +52,7 @@ const selectedHorizon = ref(Number(route.query.horizon ?? 0))
 
 const selectedRun = computed<ExperimentRun | undefined>(() => detail.data.value?.runs.find((item) => item.id === selectedRunId.value) ?? detail.data.value?.runs.at(-1))
 const baselineRun = computed(() => detail.data.value?.runs.find((item) => item.id === detail.data.value?.experiment.baseline_run_id))
+const hasActiveRuns = computed(() => detail.data.value?.runs.some((item) => !TERMINAL_RUN_STATUSES.has(item.status)) ?? false)
 const isFactorStudy = computed(() => detail.data.value?.experiment.definition.kind === 'FACTOR_STUDY')
 const selectedRunShortId = computed(() => selectedRun.value?.id.slice(0, 12) ?? '—')
 const testUses = computed(() => detail.data.value?.runs.filter((item) => item.uses_test_region).length ?? 0)
@@ -182,6 +185,58 @@ const rerun = useMutation({ mutationFn: (id: string) => api.post(`/api/v1/runs/$
 const cancel = useMutation({ mutationFn: (taskId: string) => api.post(`/api/v1/tasks/${taskId}/cancel`), onSuccess: async () => { ElMessage.success('已请求取消'); await refresh() } })
 const mark = useMutation({ mutationFn: ({ id, value }: { id: string; value: ResearchMark }) => api.patch(`/api/v1/runs/${id}/research`, { mark: value }), onSuccess: refresh })
 const addRun = useMutation({ mutationFn: () => api.post(`/api/v1/experiments/${experimentId.value}/runs`, { yaml: runYaml.value }), onSuccess: async () => { ElMessage.success('派生 Run 已入队'); runYaml.value = ''; await refresh() } })
+const removeRun = useMutation({
+  mutationFn: (id: string) => api.delete<{ experiment_id: string; run_id: string; status: 'DELETED' }>(`/api/v1/runs/${id}`),
+  onSuccess: async (result) => {
+    selectedRunId.value = ''
+    compareIds.value = compareIds.value.filter((id) => id !== result.run_id)
+    const query = { ...route.query }
+    delete query.run
+    await router.replace({ query })
+    ElMessage.success(`已删除 Run ${result.run_id.slice(0, 12)}`)
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['experiment', experimentId] }),
+      queryClient.invalidateQueries({ queryKey: ['experiments'] }),
+    ])
+  },
+})
+const removeExperiment = useMutation({
+  mutationFn: () => api.delete<{ experiment_id: string; run_count: number; status: 'DELETED' }>(`/api/v1/experiments/${experimentId.value}`),
+  onSuccess: async (result) => {
+    queryClient.removeQueries({ queryKey: ['experiment', result.experiment_id] })
+    await queryClient.invalidateQueries({ queryKey: ['experiments'] })
+    ElMessage.success(`已删除实验及 ${result.run_count} 个 Run`)
+    await router.push('/experiments')
+  },
+})
+
+async function deleteRun(run: ExperimentRun) {
+  try {
+    await ElMessageBox.confirm(
+      `将删除 Run ${run.id.slice(0, 12)} 及其研究产物。任务和审计历史仍会保留，此操作不可撤销。`,
+      '确认删除 Run',
+      { type: 'error', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  removeRun.mutate(run.id)
+}
+
+async function deleteExperiment() {
+  const experiment = detail.data.value?.experiment
+  if (!experiment) return
+  try {
+    await ElMessageBox.confirm(
+      `将删除实验“${experiment.definition.name}”、全部 ${detail.data.value?.runs.length ?? 0} 个 Run 及其研究产物。任务和审计历史仍会保留，此操作不可撤销。`,
+      '确认删除实验',
+      { type: 'error', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  removeExperiment.mutate()
+}
 
 function selectForCompare(rows: ExperimentRun[]) { compareIds.value = rows.map((item) => item.id) }
 function selectRun(run: ExperimentRun) { selectedRunId.value = run.id; if (route.query.run !== run.id) void router.replace({ query: { ...route.query, run: run.id } }) }
@@ -206,15 +261,15 @@ watch(artifactRows, (rows) => { if (isFactorStudy.value && artifactType.value ==
   <div class="page-stack">
     <ErrorState v-if="detail.error.value" :error="detail.error.value" />
     <template v-else-if="detail.data.value">
-      <section class="panel detail-head"><div><span class="eyebrow">{{ detail.data.value.experiment.definition.kind }}</span><h2>{{ detail.data.value.experiment.definition.name }}</h2><p>{{ detail.data.value.experiment.definition.description }}</p></div><div class="head-status"><StatusBadge v-if="selectedRun" :status="selectedRun.status" /><strong>{{ detail.data.value.runs.length }}</strong><small> RUNS</small></div></section>
+      <section class="panel detail-head"><div><span class="eyebrow">{{ detail.data.value.experiment.definition.kind }}</span><h2>{{ detail.data.value.experiment.definition.name }}</h2><p>{{ detail.data.value.experiment.definition.description }}</p></div><div class="head-status"><StatusBadge v-if="selectedRun" :status="selectedRun.status" /><strong>{{ detail.data.value.runs.length }}</strong><small> RUNS</small><el-button type="danger" plain :disabled="hasActiveRuns" :loading="removeExperiment.isPending.value" @click="deleteExperiment">删除实验</el-button></div></section>
       <section class="governance-grid">
         <article class="governance-card"><span>当前 Run</span><strong class="hash">{{ selectedRunShortId }}</strong><small>{{ selectedRun?.research_mark }}</small></article><article class="governance-card"><span>样本区域</span><strong>{{ sampleRegion }}</strong><small>{{ (selectedRun?.config as { start_date?: string })?.start_date ?? '—' }} 至 {{ (selectedRun?.config as { end_date?: string })?.end_date ?? '—' }}</small></article><article class="governance-card"><span>TEST 预算</span><strong>{{ testUses }} / {{ testBudget }}</strong><small>剩余 {{ testRemaining }} 次</small></article><article class="governance-card"><span>运行耗时</span><strong>{{ runDuration }}</strong><small>{{ selectedRun?.stage }}</small></article><article class="governance-card"><span>数据身份</span><strong class="hash identity">{{ selectedRun?.catalog_hash.slice(0, 16) ?? '—' }}</strong><small>catalog_hash</small></article>
       </section>
       <section class="panel">
         <div class="panel-heading"><div><h2>Run 时间线</h2><p>点击 Run 编号切换详情；勾选用于多 Run 比较。默认比较当前 Run 与 baseline。</p></div><el-button :disabled="compareIds.length < 2 && effectiveCompareIds.length < 2" @click="tab = 'compare'">比较 Run</el-button></div>
-        <el-table :data="detail.data.value.runs" :row-class-name="runRowClassName" @selection-change="selectForCompare"><el-table-column type="selection" width="46" /><el-table-column label="Run" width="170"><template #default="scope"><el-button link type="primary" class="run-link" @click.stop="selectRun(scope.row)"><span class="hash">{{ scope.row.id.slice(0, 12) }}</span></el-button></template></el-table-column><el-table-column label="角色" width="150"><template #default="scope"><el-tag v-if="scope.row.id === selectedRun?.id" type="primary" effect="dark" size="small">当前</el-tag><el-tag v-if="scope.row.id === baselineRun?.id" type="success" size="small">Baseline</el-tag></template></el-table-column><el-table-column label="状态" width="115"><template #default="scope"><StatusBadge :status="scope.row.status" /></template></el-table-column><el-table-column prop="stage" label="阶段" width="150" /><el-table-column label="TEST" width="80"><template #default="scope">{{ scope.row.uses_test_region ? '是' : '否' }}</template></el-table-column><el-table-column prop="research_mark" label="标记" width="120" /><el-table-column label="操作" min-width="260"><template #default="scope"><el-button v-if="scope.row.task_id && ['QUEUED', 'RUNNING'].includes(scope.row.status)" size="small" type="danger" plain @click="cancel.mutate(scope.row.task_id)">取消</el-button><el-button size="small" @click="rerun.mutate(scope.row.id)">重跑</el-button><el-dropdown @command="(value: ResearchMark) => mark.mutate({ id: scope.row.id, value })"><el-button size="small">标记</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="value in ['UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED']" :key="value" :command="value">{{ value }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown></template></el-table-column></el-table>
+        <el-table :data="detail.data.value.runs" :row-class-name="runRowClassName" @selection-change="selectForCompare"><el-table-column type="selection" width="46" /><el-table-column label="Run" width="170"><template #default="scope"><el-button link type="primary" class="run-link" @click.stop="selectRun(scope.row)"><span class="hash">{{ scope.row.id.slice(0, 12) }}</span></el-button></template></el-table-column><el-table-column label="角色" width="150"><template #default="scope"><el-tag v-if="scope.row.id === selectedRun?.id" type="primary" effect="dark" size="small">当前</el-tag><el-tag v-if="scope.row.id === baselineRun?.id" type="success" size="small">Baseline</el-tag></template></el-table-column><el-table-column label="状态" width="115"><template #default="scope"><StatusBadge :status="scope.row.status" /></template></el-table-column><el-table-column prop="stage" label="阶段" width="150" /><el-table-column label="TEST" width="80"><template #default="scope">{{ scope.row.uses_test_region ? '是' : '否' }}</template></el-table-column><el-table-column prop="research_mark" label="标记" width="120" /><el-table-column label="操作" min-width="320"><template #default="scope"><el-button v-if="scope.row.task_id && ['QUEUED', 'RUNNING'].includes(scope.row.status)" size="small" type="danger" plain @click="cancel.mutate(scope.row.task_id)">取消</el-button><el-button size="small" @click="rerun.mutate(scope.row.id)">重跑</el-button><el-dropdown @command="(value: ResearchMark) => mark.mutate({ id: scope.row.id, value })"><el-button size="small">标记</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item v-for="value in ['UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED']" :key="value" :command="value">{{ value }}</el-dropdown-item></el-dropdown-menu></template></el-dropdown><el-button v-if="TERMINAL_RUN_STATUSES.has(scope.row.status)" size="small" text type="danger" @click="deleteRun(scope.row)">删除</el-button></template></el-table-column></el-table>
       </section>
-      <section v-if="selectedRun?.status === 'SUCCEEDED'" class="metrics-grid core-metrics"><article v-for="metric in coreMetrics" :key="metric.name" class="metric-card"><span class="metric-top">{{ metric.label }}<i /></span><strong class="metric-value metric-small">{{ formatMetric(metric) }}</strong><p>{{ metric.value == null ? metric.detail : 'Run 核心指标' }}</p></article></section>
+      <section v-if="selectedRun?.status === 'SUCCEEDED'" class="metrics-grid core-metrics"><article v-for="metric in coreMetrics" :key="metric.name" class="metric-card"><span class="metric-top">{{ metric.label }}<i /></span><strong class="metric-value metric-small">{{ formatMetric(metric) }}</strong><p v-if="metric.value == null">{{ metric.detail }}</p></article></section>
       <section v-else class="panel run-state-panel"><h3>{{ selectedRun?.status === 'FAILED' ? 'Run 执行失败' : selectedRun?.status === 'CANCELLED' ? 'Run 已取消' : 'Run 尚未发布指标' }}</h3><p>{{ selectedRun?.error ? JSON.stringify(selectedRun.error) : `当前阶段：${selectedRun?.stage ?? '—'}` }}</p></section>
       <section v-if="!isFactorStudy && selectedRun?.status === 'SUCCEEDED'" class="metric-groups"><article v-for="group in groupedMetrics" :key="group.title" class="panel metric-group"><h3>{{ group.title }}</h3><div v-for="metric in group.metrics" :key="metric.name" class="metric-row"><span>{{ metric.label }}</span><strong>{{ formatMetric(metric) }}</strong><small v-if="metric.value == null">{{ metric.detail }}</small></div></article></section>
       <section v-if="qualityValue?.warnings.length" class="panel quality-warning"><h3>质量披露</h3><el-tag v-for="warning in qualityValue.warnings" :key="warning" type="warning">{{ warning }}</el-tag></section>
