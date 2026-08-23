@@ -149,6 +149,112 @@ export type ExperimentAggregate = {
   tags: string[]
 }
 
+export type ExperimentComparison = {
+  experiment_id: string
+  baseline_run_id: string | null
+  runs: Array<{ id: string; status: RunStatus; research_mark: ResearchMark }>
+  metrics: Array<{
+    name: string
+    unit: string | null
+    values: Array<{
+      run_id: string
+      value: number | null
+      p_value: number | null
+      adjusted_p_value: number | null
+      delta_from_baseline: number | null
+    }>
+  }>
+  configs: Array<{
+    path: string
+    differs: boolean
+    values: Array<{ run_id: string; value: unknown }>
+  }>
+}
+
+export type RunQualityDisclosure = {
+  calculation_mode: string
+  risk_free_rate_annual: number
+  undefined_metrics: Record<string, string>
+  unavailable_dimensions: Record<string, string>
+  attribution_method: string
+  warnings: string[]
+}
+
+export type StrategyPerformanceArtifactRow = {
+  [column: string]: string | number | boolean | null | undefined
+  trade_date: string
+  return: number
+  benchmark_return: number
+  cumulative_return: number
+  benchmark_cumulative_return: number
+  active_return: number
+  nav: number
+  benchmark_nav: number
+  drawdown: number
+  active_drawdown: number
+}
+
+export type PeriodReturnArtifactRow = {
+  [column: string]: string | number | boolean | null | undefined
+  year: number
+  month?: number
+  period_start: string
+  period_end: string
+  portfolio_return: number
+  benchmark_return: number
+  relative_return: number
+}
+
+export type ExecutionSummaryArtifactRow = {
+  [column: string]: string | number | boolean | null | undefined
+  side: string
+  reason_code: string
+  order_count: number
+  requested_quantity: number
+  filled_quantity: number
+  unfilled_quantity: number
+  priced_requested_notional_fen: number
+  priced_filled_notional_fen: number
+  unpriced_order_count: number
+}
+
+export type FactorSummaryArtifactRow = {
+  [column: string]: string | number | boolean | null | undefined
+  signal_variant: string
+  factor_ref: string
+  horizon: number
+  rank_ic_mean: number | null
+  rank_icir_unannualized: number | null
+  adjusted_p_value: number | null
+  long_short_mean: number | null
+}
+
+export type FactorSeriesArtifactRow = {
+  [column: string]: string | number | boolean | null | undefined
+  signal_variant: string
+  factor_ref: string
+  horizon?: number
+  signal_date: string
+  rank_ic?: number | null
+  rank_ic_rolling_mean?: number | null
+  pearson_ic?: number | null
+  coverage?: number | null
+  mean_return?: number | null
+  long_short_return?: number | null
+}
+
+export type RunRawArtifactRow = {
+  [column: string]: string | number | boolean | null
+}
+
+export type RunArtifactRow =
+  | StrategyPerformanceArtifactRow
+  | PeriodReturnArtifactRow
+  | ExecutionSummaryArtifactRow
+  | FactorSummaryArtifactRow
+  | FactorSeriesArtifactRow
+  | RunRawArtifactRow
+
 export type ExperimentValidation = {
   config_hash: string
   normalized: ExperimentDefinitionDto

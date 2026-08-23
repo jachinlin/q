@@ -9,7 +9,7 @@ import time
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import Engine, func, select, update
+from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -446,6 +446,23 @@ class ExperimentRunRegistry:
                         created_at=now,
                     )
                 )
+
+    def discard_outputs(self, run_id: str) -> None:
+        """事务删除失败或取消 Run 的全部输出登记。
+
+        入参：run_id：尚未成功提交的 Run 标识。返回值：删除完成后无返回。
+        异常：Run 不存在或已经成功时抛出 ``ValueError``；数据库错误继续传播。
+        """
+        with Session(self._engine) as session, session.begin():
+            row = session.get(RunORM, run_id)
+            if row is None:
+                raise ValueError("run does not exist")
+            if row.status == RunStatus.SUCCEEDED.value:
+                raise ValueError("cannot discard outputs of a succeeded Run")
+            session.execute(delete(RunMetricORM).where(RunMetricORM.run_id == run_id))
+            session.execute(
+                delete(RunArtifactORM).where(RunArtifactORM.run_id == run_id)
+            )
 
     @staticmethod
     def _insert_run_task(

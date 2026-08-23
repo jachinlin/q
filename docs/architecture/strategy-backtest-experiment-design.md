@@ -554,8 +554,9 @@ src/quant_research/backtest/
   `uses_test_region`、`research_mark`、`artifact_dir`、`error_json`）、`run_metric`、`audit_event`、
   `task/task_attempt`。
 - **产物目录** `artifacts/experiments/<experiment_id>/<run_id>/`：回测 kind 输出
-  `signals/orders/nav/holdings/fills/costs/performance/attribution`；因子 kind 输出
-  `summary/coverage/ic/quantile_returns/long_short_returns/correlation`；+ `config.json/metrics.json/manifest.json`。
+  `signals/orders/fills/holdings/costs/nav/performance/monthly_returns/annual_returns/execution_summary/exposure_summary/attribution`；
+  因子 kind 输出 `summary/coverage/ic/quantile_returns/long_short_returns/correlation`；两类 Run 均输出
+  `config.json/metrics.json/quality_disclosure.json/manifest.json`。
 - **读侧视图**：排行榜、配置/指标 diff、血缘、结论标记（供 Dashboard/CLI）。
 - 数据版本漂移/阶段失败/取消/状态冲突时抛 `EXPERIMENT_DATA_DRIFT / EXPERIMENT_STAGE_FAILED /
   EXPERIMENT_CANCELLED / EXPERIMENT_STATE_CONFLICT`。
@@ -594,7 +595,11 @@ FACTOR_STUDY:      VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PERSIST
 - 截面策略在 `PREPARE_INPUTS` 内先算股票池/因子/管线信号；择时/事件驱动此阶段可能只 warmup。
   差异由 `Strategy.spec` 声明的数据依赖驱动，runner 本身 kind 无关。
 - **STRATEGY\_RUN 与 BACKTEST 交织**：引擎按交易日推进，每个决策时点调 `strategy.on_event(ctx)`
-  取订单；`ctx` 只暴露 PIT 可见信息（防未来函数的物理边界，由回测层保证）。
+  取订单；`ctx` 只暴露 PIT 可见信息（防未来函数的物理边界，由回测层保证）。本阶段只返回
+  冻结回测结果和内存表，不创建最终目录、不登记指标。
+- **ANALYTICS / ANALYZE_FACTORS**：在同一任务会话中完成全部分析计算，仍不发布产物。
+- **PERSIST**：策略和因子 Run 均在此一次性写 staging、生成 Manifest、原子重命名、从最终目录
+  复核后登记产物与有限且已定义的数值指标。
 - 每阶段边界检查协作取消；失败/取消不留半成品目录。
 
 ### 4.6 运行内一致性门（非复现）

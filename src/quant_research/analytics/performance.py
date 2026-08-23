@@ -16,8 +16,11 @@ _NAV_SCHEMA = pl.Schema(
     {
         "trade_date": pl.Date,
         "cash_fen": pl.Int64,
-        "market_value_fen": pl.Int64,
-        "nav_fen": pl.Int64,
+        "long_market_value_fen": pl.Int64,
+        "short_market_value_fen": pl.Int64,
+        "accrued_fees_fen": pl.Int64,
+        "margin_used_fen": pl.Int64,
+        "equity_fen": pl.Int64,
         "benchmark_close": pl.Float64,
     }
 )
@@ -34,29 +37,26 @@ _HOLDINGS_SCHEMA = pl.Schema(
 _FILLS_SCHEMA = pl.Schema(
     {
         "trade_date": pl.Date,
-        "result_index": pl.Int32,
+        "result_index": pl.Int64,
         "instrument_id": pl.String,
         "side": pl.String,
         "requested_quantity": pl.Int64,
-        "reference_price": pl.Float64,
-        "requested_reference_value_fen": pl.Int64,
         "filled_quantity": pl.Int64,
         "unfilled_quantity": pl.Int64,
+        "reference_price": pl.Float64,
         "price": pl.Float64,
         "gross_value_fen": pl.Int64,
         "reason_code": pl.String,
-        "detail": pl.String,
     }
 )
 _COSTS_SCHEMA = pl.Schema(
     {
         "trade_date": pl.Date,
-        "result_index": pl.Int32,
+        "result_index": pl.Int64,
         "instrument_id": pl.String,
-        "commission_fen": pl.Int64,
-        "stamp_tax_fen": pl.Int64,
-        "transfer_fee_fen": pl.Int64,
-        "total_fees_fen": pl.Int64,
+        "rule_fees_fen": pl.Int64,
+        "slippage_fen": pl.Int64,
+        "total_cost_fen": pl.Int64,
     }
 )
 
@@ -162,7 +162,7 @@ def calculate_performance(
     _PerformanceSupport._validate_inputs(nav, holdings, fills, costs, sessions_per_year)
 
     dates = tuple(nav["trade_date"].to_list())
-    nav_values = np.asarray(nav["nav_fen"].to_list(), dtype=np.float64)
+    nav_values = np.asarray(nav["equity_fen"].to_list(), dtype=np.float64)
     benchmark_values = np.asarray(nav["benchmark_close"].to_list(), dtype=np.float64)
     normalized_nav = nav_values / nav_values[0]
     normalized_benchmark = benchmark_values / benchmark_values[0]
@@ -244,7 +244,7 @@ def calculate_performance(
         undefined["annualized_cost_drag"] = "ANNUALIZED_RETURN_NOT_AVAILABLE"
     mean_nav = float(np.mean(nav_values))
     gross_value = sum(abs(value) for value in fills["gross_value_fen"].to_list())
-    total_fees = sum(costs["total_fees_fen"].to_list())
+    total_fees = sum(costs["total_cost_fen"].to_list())
     failed_fills = sum(
         unfilled > 0 or filled == 0
         for unfilled, filled in zip(
@@ -253,6 +253,11 @@ def calculate_performance(
             strict=True,
         )
     )
+    failed_fill_rate: float | None = None
+    if fills.height:
+        failed_fill_rate = float(failed_fills / fills.height)
+    else:
+        undefined["failed_fill_rate"] = "NO_ORDERS"
     annualized_turnover = _PerformanceSupport._annualized_turnover(
         dates, nav_values, fills, sessions_per_year, undefined
     )
@@ -305,9 +310,7 @@ def calculate_performance(
         "gross_annualized_return": gross_annualized_return,
         "cumulative_cost_drag": cumulative_cost_drag,
         "annualized_cost_drag": annualized_cost_drag,
-        "failed_fill_rate": (
-            float(failed_fills / fills.height) if fills.height else 0.0
-        ),
+        "failed_fill_rate": failed_fill_rate,
         "notional_fill_rate": notional_fill_rate,
         "priced_order_coverage_rate": priced_order_coverage_rate,
         "average_cash_weight": average_cash_weight,
@@ -412,22 +415,41 @@ class _PerformanceSupport:
         )
 
         nav_rows = nav.select(
-            "trade_date", "cash_fen", "market_value_fen", "nav_fen", "benchmark_close"
+            "trade_date",
+            "cash_fen",
+            "long_market_value_fen",
+            "short_market_value_fen",
+            "accrued_fees_fen",
+            "margin_used_fen",
+            "equity_fen",
+            "benchmark_close",
         ).iter_rows(named=True)
         nav_dates: set[date] = set()
         market_value_by_date: dict[date, int] = {}
         for row in nav_rows:
             trade_date = row["trade_date"]
             cash = row["cash_fen"]
-            market_value = row["market_value_fen"]
-            nav_fen = row["nav_fen"]
+            market_value = row["long_market_value_fen"]
+            short_market_value = row["short_market_value_fen"]
+            accrued_fees = row["accrued_fees_fen"]
+            margin_used = row["margin_used_fen"]
+            nav_fen = row["equity_fen"]
             benchmark = row["benchmark_close"]
             nav_dates.add(trade_date)
             market_value_by_date[trade_date] = market_value
-            if cash < 0 or market_value < 0:
-                raise ValueError("nav cash and market value must be nonnegative")
-            if nav_fen != cash + market_value:
-                raise ValueError("nav identity must equal cash plus market value")
+            if any(
+                value < 0
+                for value in (
+                    cash,
+                    market_value,
+                    short_market_value,
+                    accrued_fees,
+                    margin_used,
+                )
+            ):
+                raise ValueError("nav monetary values must be nonnegative")
+            if nav_fen != cash + market_value - short_market_value - accrued_fees:
+                raise ValueError("nav equity identity is invalid")
             if nav_fen <= 0:
                 raise ValueError("nav_fen must be positive")
             if not isfinite(benchmark):
@@ -468,20 +490,13 @@ class _PerformanceSupport:
             ):
                 raise ValueError("fill quantity identity is invalid")
             reference_price = row["reference_price"]
-            requested_reference_value = row["requested_reference_value_fen"]
-            if (reference_price is None) != (requested_reference_value is None):
-                raise ValueError("fill reference fields must be jointly available")
             if reference_price is not None:
                 if (
                     not isinstance(reference_price, float)
                     or not isfinite(reference_price)
                     or reference_price <= 0
-                    or requested_reference_value
-                    != _PerformanceSupport._reference_value_fen(
-                        reference_price, row["requested_quantity"]
-                    )
                 ):
-                    raise ValueError("fill reference value is invalid")
+                    raise ValueError("fill reference price is invalid")
             elif row["reason_code"] not in {"SUSPENDED", "NO_MARKET_DATA"}:
                 raise ValueError("only unpriceable rejects may omit reference values")
             price = row["price"]
@@ -492,14 +507,10 @@ class _PerformanceSupport:
         cost_keys: set[tuple[date, int]] = set()
         for row in costs.iter_rows(named=True):
             key = (row["trade_date"], row["result_index"])
-            components = (
-                row["commission_fen"],
-                row["stamp_tax_fen"],
-                row["transfer_fee_fen"],
-            )
-            if any(value < 0 for value in (*components, row["total_fees_fen"])):
+            components = (row["rule_fees_fen"], row["slippage_fen"])
+            if any(value < 0 for value in (*components, row["total_cost_fen"])):
                 raise ValueError("cost fields must be nonnegative")
-            if sum(components) != row["total_fees_fen"]:
+            if sum(components) != row["total_cost_fen"]:
                 raise ValueError("cost component identity is invalid")
             fill = fill_by_key.get(key)
             if fill is None or fill[0] != row["instrument_id"] or fill[1] <= 0:
@@ -547,7 +558,7 @@ class _PerformanceSupport:
     def _fees_by_date(costs: pl.DataFrame) -> dict[date, int]:
         totals: dict[date, int] = {}
         for trade_date, total_fees in costs.select(
-            "trade_date", "total_fees_fen"
+            "trade_date", "total_cost_fen"
         ).iter_rows():
             totals[trade_date] = totals.get(trade_date, 0) + total_fees
         return totals
@@ -599,9 +610,11 @@ class _PerformanceSupport:
             if reference is None:
                 values["unpriced_order_count"] += 1
             else:
-                values["priced_requested_notional_fen"] += row[
-                    "requested_reference_value_fen"
-                ]
+                values["priced_requested_notional_fen"] += (
+                    _PerformanceSupport._reference_value_fen(
+                        reference, row["requested_quantity"]
+                    )
+                )
                 values["priced_filled_notional_fen"] += (
                     _PerformanceSupport._reference_value_fen(
                         reference, row["filled_quantity"]
@@ -628,7 +641,12 @@ class _PerformanceSupport:
         if priced.is_empty():
             undefined["notional_fill_rate"] = "NO_PRICEABLE_ORDERS"
             return None, coverage
-        requested = sum(priced["requested_reference_value_fen"].to_list())
+        requested = sum(
+            _PerformanceSupport._reference_value_fen(reference, quantity)
+            for reference, quantity in priced.select(
+                "reference_price", "requested_quantity"
+            ).iter_rows()
+        )
         filled_value = sum(
             _PerformanceSupport._reference_value_fen(reference, quantity)
             for reference, quantity in priced.select(

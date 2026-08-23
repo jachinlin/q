@@ -3,11 +3,13 @@
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import polars as pl
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +18,13 @@ from quant_research.dashboard.experiments import (
     ExperimentDashboardService,
     ExperimentRoutes,
 )
+from quant_research.experiments.config import ExperimentConfigParser
+from quant_research.experiments.models import (
+    ResearchMark,
+    RunMetricRecord,
+    RunStage,
+    RunStatus,
+)
 from quant_research.strategies.registry import StrategyRegistry
 
 
@@ -23,9 +32,7 @@ def test_strategy_catalog_and_hard_cut_routes() -> None:
     app = FastAPI()
     service = ExperimentDashboardService(
         cast(Any, object()),
-        StrategyRegistry.builtins(
-            commission_bps=3.0, commission_minimum_fen=500
-        ),
+        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
         Path.cwd(),
     )
     ExperimentRoutes.mount(app, service)
@@ -136,10 +143,11 @@ def test_artifact_route_serializes_parquet_dates_as_iso_strings(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     service = ExperimentDashboardService(
-        cast(Any, _ArtifactExperimentService(_ArtifactRun(str(artifact_dir), manifest_hash))),
-        StrategyRegistry.builtins(
-            commission_bps=3.0, commission_minimum_fen=500
+        cast(
+            Any,
+            _ArtifactExperimentService(_ArtifactRun(str(artifact_dir), manifest_hash)),
         ),
+        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
         tmp_path,
     )
     app = FastAPI()
@@ -160,3 +168,176 @@ def test_artifact_route_serializes_parquet_dates_as_iso_strings(
         "page_size": 100,
         "total": 1,
     }
+
+
+def test_artifact_filters_after_integrity_validation_and_before_paging(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "experiment" / "run"
+    artifact_dir.mkdir(parents=True)
+    artifact_path = artifact_dir / "summary.parquet"
+    frame = pl.DataFrame(
+        {
+            "signal_variant": ["RAW", "RAW"],
+            "factor_ref": ["momentum", "value"],
+            "horizon": [5, 5],
+            "rank_ic_mean": [0.1, 0.2],
+        }
+    ).sort(["signal_variant", "factor_ref", "horizon"])
+    frame.write_parquet(artifact_path)
+    content = artifact_path.read_bytes()
+    manifest = {
+        "artifacts": [
+            {
+                "artifact_type": "summary",
+                "relative_path": "summary.parquet",
+                "content_hash": hashlib.sha256(content).hexdigest(),
+                "byte_count": len(content),
+                "row_count": 2,
+                "schema": {name: str(dtype) for name, dtype in frame.schema.items()},
+                "primary_key": ["signal_variant", "factor_ref", "horizon"],
+                "sort_key": ["signal_variant", "factor_ref", "horizon"],
+            }
+        ]
+    }
+    manifest_path = artifact_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    service = ExperimentDashboardService(
+        cast(
+            Any,
+            _ArtifactExperimentService(
+                _ArtifactRun(
+                    str(artifact_dir),
+                    hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                )
+            ),
+        ),
+        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
+        tmp_path,
+    )
+    app = FastAPI()
+    ExperimentRoutes.mount(app, service)
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/v1/runs/run/artifacts/summary",
+        params={"factor_ref": "value", "horizon": 5},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["factor_ref"] == "value"
+    with pytest.raises(ValueError, match="unsupported filter for signals"):
+        service.artifact("run", "signals", 1, 100, factor_ref="value")
+
+
+class _ComparisonExperimentService:
+    """返回同一实验中的两个固定 Run。"""
+
+    def __init__(self, runs: tuple[SimpleNamespace, ...]) -> None:
+        self._runs = {item.id: item for item in runs}
+
+    def get_run(self, run_id: str) -> SimpleNamespace:
+        """按 ID 返回固定 Run。"""
+        return self._runs[run_id]
+
+    def show(self, experiment_id: str) -> SimpleNamespace:
+        """返回含 baseline 指针的聚合。"""
+        assert experiment_id == "experiment-1"
+        return SimpleNamespace(experiment=SimpleNamespace(baseline_run_id="baseline"))
+
+
+def _comparison_runs() -> tuple[SimpleNamespace, SimpleNamespace]:
+    parsed = ExperimentConfigParser().parse_experiment(
+        """name: compare
+kind: STRATEGY_BACKTEST
+sample_windows:
+  train: {start: 2020-01-01, end: 2020-12-31}
+  validation: {start: 2021-01-01, end: 2021-12-31}
+  test: {start: 2022-01-01, end: 2022-12-31}
+governance: {test_budget: 1, correction: BONFERRONI}
+initial_run:
+  kind: STRATEGY_BACKTEST
+  start_date: 2020-01-01
+  end_date: 2021-12-31
+  strategy:
+    strategy_id: dual_ma_trend
+    parameters: {instrument_id: 510300.SH, short_window: 5, long_window: 20}
+  benchmark: 000300.SH
+  initial_cash_fen: 1000000
+  execution: {reference_price: OPEN, slippage_bps: 0.0, max_volume_participation: 0.1, limit_order_policy: REJECT}
+"""
+    )
+    config = parsed.definition.initial_run
+    base_fields = {
+        "experiment_id": "experiment-1",
+        "config": config,
+        "status": RunStatus.SUCCEEDED,
+        "research_mark": ResearchMark.CANDIDATE,
+        "stage": RunStage.PERSIST,
+        "created_at": datetime(2026, 8, 23, tzinfo=UTC),
+    }
+    baseline = SimpleNamespace(
+        id="baseline",
+        metrics=(
+            RunMetricRecord(
+                name="annualized_return",
+                value=0.1,
+                unit="ratio",
+                p_value=None,
+                adjusted_p_value=None,
+            ),
+            RunMetricRecord(
+                name="trade_count",
+                value=10.0,
+                unit="count",
+                p_value=None,
+                adjusted_p_value=None,
+            ),
+        ),
+        **base_fields,
+    )
+    current = SimpleNamespace(
+        id="current",
+        metrics=(
+            RunMetricRecord(
+                name="annualized_return",
+                value=0.13,
+                unit="ratio",
+                p_value=None,
+                adjusted_p_value=None,
+            ),
+            RunMetricRecord(
+                name="trade_count",
+                value=12.0,
+                unit="trades",
+                p_value=None,
+                adjusted_p_value=None,
+            ),
+        ),
+        **base_fields,
+    )
+    return baseline, current
+
+
+def test_compare_aligns_metrics_and_preserves_unit_mismatch() -> None:
+    runs = _comparison_runs()
+    service = ExperimentDashboardService(
+        cast(Any, _ComparisonExperimentService(runs)),
+        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
+        Path.cwd(),
+    )
+
+    result = service.compare(("baseline", "current"))
+
+    assert result["baseline_run_id"] == "baseline"
+    metrics = {
+        item["name"]: item for item in cast(list[dict[str, Any]], result["metrics"])
+    }
+    annualized = metrics["annualized_return"]
+    assert annualized["values"][1]["delta_from_baseline"] == pytest.approx(0.03)
+    assert metrics["trade_count"]["values"][1]["delta_from_baseline"] is None
+    assert any(
+        item["differs"] is False
+        for item in cast(list[dict[str, Any]], result["configs"])
+    )

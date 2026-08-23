@@ -85,7 +85,7 @@ def calculate_attribution(
     _AttributionSupport._validate_holdings(nav, holdings)
 
     nav_by_date = {
-        row["trade_date"]: (row["nav_fen"], row["market_value_fen"])
+        row["trade_date"]: (row["equity_fen"], row["long_market_value_fen"])
         for row in nav.iter_rows(named=True)
     }
     holdings_by_date: dict[date, dict[str, int]] = {
@@ -207,7 +207,7 @@ class _AttributionSupport:
             raise ValueError("holdings rows must be canonically sorted")
 
         nav_market = {
-            row["trade_date"]: row["market_value_fen"]
+            row["trade_date"]: row["long_market_value_fen"]
             for row in nav.iter_rows(named=True)
         }
         holdings_market = {trade_date: 0 for trade_date in nav_market}

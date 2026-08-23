@@ -64,19 +64,27 @@ describe('unified experiment detail', () => {
     apiGet.mockImplementation((path: string) => {
       if (typeof path !== 'string') return Promise.resolve({})
       if (path === '/api/v1/experiments/exp-1') return Promise.resolve(aggregate('STRATEGY_BACKTEST'))
+      if (path.includes('/artifacts/quality_disclosure')) return Promise.resolve({ value: { calculation_mode: 'CASH_EXACT', risk_free_rate_annual: 0, undefined_metrics: {}, unavailable_dimensions: {}, attribution_method: 'CASH_EXACT_SECURITY', warnings: [] } })
       if (path.includes('/artifacts/performance')) return Promise.resolve({ items: [
         { trade_date: '2026-01-02', return: 0, cumulative_return: 0, drawdown: 0 },
         { trade_date: '2026-01-05', return: 0.1, cumulative_return: 0.1, drawdown: -0.02 },
       ], total: 2 })
+      if (path.includes('/artifacts/monthly_returns')) return Promise.resolve({ items: [
+        { year: 2026, month: 1, portfolio_return: 0.1, benchmark_return: 0.08, relative_return: 0.02 },
+      ], total: 1 })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
     const { wrapper } = await mountDetail()
-    await clickTab(wrapper, '绩效')
+    await clickTab(wrapper, '绩效时序')
     await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/performance')))
     await flushPromises()
     expect(wrapper.findComponent({ name: 'VChart' }).exists()).toBe(true)
     expect(wrapper.text()).toContain('cumulative_return')
-    expect(wrapper.text()).toContain('annualized_return')
+    expect(wrapper.text()).toContain('年化收益')
+    const monthly = wrapper.find('input[value="monthly_returns"]')
+    if (!monthly.exists()) throw new Error('missing monthly returns selector')
+    await monthly.setValue(true)
+    await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/monthly_returns')))
   })
 
   it('renders factor summary independently from strategy artifacts', async () => {
@@ -88,13 +96,20 @@ describe('unified experiment detail', () => {
       ], total: 1 })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
-    const { wrapper } = await mountDetail()
-    await clickTab(wrapper, '摘要')
+    const { wrapper, router } = await mountDetail()
+    await clickTab(wrapper, '因子矩阵')
     await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/summary')))
     await flushPromises()
     expect(wrapper.findComponent({ name: 'VChart' }).exists()).toBe(true)
     expect(wrapper.text()).toContain('book_to_price_mrq')
     expect(wrapper.text()).not.toContain('cumulative_return')
+    const matrixRow = wrapper.findAll('.el-table__body-wrapper tbody tr').find((row) => row.text().includes('book_to_price_mrq'))
+    if (!matrixRow) throw new Error('missing factor matrix row')
+    await matrixRow.trigger('click')
+    await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringMatching(/artifacts\/ic.*factor_ref=book_to_price_mrq.*horizon=5/)))
+    await vi.waitFor(() => expect(router.currentRoute.value.query).toMatchObject({
+      signal_variant: 'raw', factor: 'book_to_price_mrq', horizon: '5',
+    }))
   })
 
   it('defaults to the latest Run, marks it clearly, and persists explicit selection in the URL', async () => {
@@ -107,10 +122,10 @@ describe('unified experiment detail', () => {
     })
 
     const { wrapper, router } = await mountDetail()
-    await vi.waitFor(() => expect(wrapper.text()).toContain('当前查看：01JLATEST000'))
+    await vi.waitFor(() => expect(wrapper.text()).toContain('01JLATEST000'))
 
     expect(router.currentRoute.value.query.run).toBe(latestRun.id)
-    expect(wrapper.text()).toContain('左侧勾选框仅用于比较')
+    expect(wrapper.text()).toContain('默认比较当前 Run 与 baseline')
     expect(wrapper.text()).toContain('实验协议')
     expect(wrapper.text()).toContain('当前 Run 配置')
     expect(wrapper.findAll('.viewing-run')).toHaveLength(1)
@@ -123,5 +138,19 @@ describe('unified experiment detail', () => {
 
     expect(router.currentRoute.value.query.run).toBe(failedRun.id)
     expect(wrapper.find('.viewing-run').text()).toContain('01JFAILED000')
+  })
+
+  it('renders a fixed strategy core metric set instead of the first eight API metrics', async () => {
+    apiGet.mockImplementation((path: string) => {
+      if (typeof path !== 'string') return Promise.resolve({})
+      if (path === '/api/v1/experiments/exp-1') return Promise.resolve(aggregate('STRATEGY_BACKTEST'))
+      if (path.includes('/artifacts/quality_disclosure')) return Promise.resolve({ value: { calculation_mode: 'CASH_EXACT', risk_free_rate_annual: 0, undefined_metrics: { sharpe_ratio: 'ZERO_VOLATILITY' }, unavailable_dimensions: {}, attribution_method: 'CASH_EXACT_SECURITY', warnings: [] } })
+      return Promise.reject(new Error(`unexpected API path: ${path}`))
+    })
+    const { wrapper } = await mountDetail()
+    await flushPromises()
+    expect(wrapper.findAll('.core-metrics .metric-card')).toHaveLength(8)
+    expect(wrapper.text()).toContain('几何超额')
+    expect(wrapper.text()).toContain('年化成本拖累')
   })
 })

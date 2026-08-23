@@ -73,43 +73,57 @@ class RunRegistry(Protocol):
         """
         ...
 
+    def discard_outputs(self, run_id: str) -> None:
+        """事务删除未能进入成功终态的指标和产物登记。
 
-class StrategyRunExecutor(Protocol):
-    """执行冻结策略配置并返回发布登记信息。
-
-    入参：Run、进度端口和取消令牌。返回值：产物目录与 Manifest 身份。异常：回测或发布失败时保留原异常。
-    """
-
-    def execute(
-        self,
-        run: RunRecord,
-        progress: ProgressSink,
-        cancellation: CancellationToken,
-    ) -> dict[str, JsonValue]:
-        """执行完整策略回测链。
-
-        入参：冻结 Run、进度端口和取消令牌。返回值：JSON 安全发布结果。异常：输入、撮合或发布失败时抛出对应异常。
+        入参：Run ID。返回值：删除完成后无返回。异常：数据库清理失败时传播。
         """
         ...
 
 
-class FactorRunExecutor(Protocol):
-    """执行冻结因子研究配置并返回发布登记信息。
+class RunExecutionSession(Protocol):
+    """保存一个任务内各阶段共享的短生命周期计算状态。
 
-    入参：Run、进度端口和取消令牌。返回值：因子分析产物登记信息。异常：计算或发布失败时保留原异常。
+    入参：阶段、进度端口和取消令牌。返回值：阶段结果。异常：阶段失败时保留原异常。
     """
 
     def execute(
         self,
-        run: RunRecord,
+        stage: RunStage,
         progress: ProgressSink,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
-        """执行因子计算和统计分析链。
+        """执行当前阶段并保留后续阶段所需的内存状态。
 
-        入参：冻结 Run、进度端口和取消令牌。返回值：JSON 安全发布结果。异常：数据、统计或发布失败时抛出对应异常。
+        入参：阶段、进度端口和取消令牌。返回值：JSON 安全阶段结果。
+        异常：阶段次序、输入、计算或发布失败时抛出对应异常。
         """
         ...
+
+    def abort(self) -> None:
+        """撤销本会话已发布但未成功提交的输出。
+
+        入参：无。返回值：清理完成后无返回。异常：文件或登记清理失败时传播。
+        """
+        ...
+
+
+class RunExecutor(Protocol):
+    """为冻结 Run 创建隔离的阶段执行会话。
+
+    入参：Run。返回值：任务专属执行会话。异常：Run kind 不匹配时抛出类型错误。
+    """
+
+    def create(self, run: RunRecord) -> RunExecutionSession:
+        """创建任务专属会话。
+
+        入参：冻结 Run。返回值：隔离的阶段执行会话。异常：配置类型错误时抛出。
+        """
+        ...
+
+
+StrategyRunExecutor = RunExecutor
+FactorRunExecutor = RunExecutor
 
 
 class ExperimentRunHandler:
@@ -154,10 +168,17 @@ class ExperimentRunHandler:
             else FACTOR_STAGES
         )
         result: dict[str, JsonValue] = {}
+        session: RunExecutionSession | None = None
         try:
+            session = (
+                self._strategy.create(run)
+                if run.config.kind is ExperimentKind.STRATEGY_BACKTEST
+                else self._factor.create(run)
+            )
             for index, stage in enumerate(stages):
                 self._catalog.assert_unchanged(run.catalog_hash)
                 if cancellation.is_cancelled():
+                    session.abort()
                     self._registry.transition(
                         run.id, RunStatus.RUNNING, RunStatus.CANCELLED, stage=stage
                     )
@@ -171,13 +192,20 @@ class ExperimentRunHandler:
                         message=f"{stage.value.lower()} started",
                     )
                 )
-                if stage in {RunStage.STRATEGY_RUN, RunStage.ANALYZE_FACTORS}:
-                    result = (
-                        self._strategy
-                        if stage is RunStage.STRATEGY_RUN
-                        else self._factor
-                    ).execute(run, progress, cancellation)
+                stage_result = session.execute(stage, progress, cancellation)
+                if stage_result:
+                    result = stage_result
+                if cancellation.is_cancelled():
+                    session.abort()
+                    self._registry.transition(
+                        run.id, RunStatus.RUNNING, RunStatus.CANCELLED, stage=stage
+                    )
+                    return TaskOutcome(status=TaskStatus.CANCELLED)
                 self._catalog.assert_unchanged(run.catalog_hash)
+            if not isinstance(result.get("artifact_dir"), str) or not isinstance(
+                result.get("manifest_hash"), str
+            ):
+                raise TypeError("PERSIST did not return verified artifact evidence")
             artifact_dir = str(result.get("artifact_dir"))
             manifest_hash = str(result.get("manifest_hash"))
             self._registry.transition(
@@ -192,6 +220,8 @@ class ExperimentRunHandler:
                 status=TaskStatus.SUCCEEDED, result={"run_id": run.id, **result}
             )
         except Exception as error:
+            if session is not None:
+                session.abort()
             if cancellation.is_cancelled():
                 self._registry.transition(
                     run.id,
@@ -213,4 +243,10 @@ class ExperimentRunHandler:
             raise
 
 
-__all__ = ["ExperimentRunHandler", "FactorRunExecutor", "StrategyRunExecutor"]
+__all__ = [
+    "ExperimentRunHandler",
+    "FactorRunExecutor",
+    "RunExecutionSession",
+    "RunExecutor",
+    "StrategyRunExecutor",
+]

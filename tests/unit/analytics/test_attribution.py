@@ -12,8 +12,11 @@ from quant_research.analytics.attribution import calculate_attribution
 NAV_SCHEMA = {
     "trade_date": pl.Date,
     "cash_fen": pl.Int64,
-    "market_value_fen": pl.Int64,
-    "nav_fen": pl.Int64,
+    "long_market_value_fen": pl.Int64,
+    "short_market_value_fen": pl.Int64,
+    "accrued_fees_fen": pl.Int64,
+    "margin_used_fen": pl.Int64,
+    "equity_fen": pl.Int64,
     "benchmark_close": pl.Float64,
 }
 HOLDINGS_SCHEMA = {
@@ -26,27 +29,24 @@ HOLDINGS_SCHEMA = {
 }
 FILLS_SCHEMA = {
     "trade_date": pl.Date,
-    "result_index": pl.Int32,
+    "result_index": pl.Int64,
     "instrument_id": pl.String,
     "side": pl.String,
     "requested_quantity": pl.Int64,
-    "reference_price": pl.Float64,
-    "requested_reference_value_fen": pl.Int64,
     "filled_quantity": pl.Int64,
     "unfilled_quantity": pl.Int64,
+    "reference_price": pl.Float64,
     "price": pl.Float64,
     "gross_value_fen": pl.Int64,
     "reason_code": pl.String,
-    "detail": pl.String,
 }
 COSTS_SCHEMA = {
     "trade_date": pl.Date,
-    "result_index": pl.Int32,
+    "result_index": pl.Int64,
     "instrument_id": pl.String,
-    "commission_fen": pl.Int64,
-    "stamp_tax_fen": pl.Int64,
-    "transfer_fee_fen": pl.Int64,
-    "total_fees_fen": pl.Int64,
+    "rule_fees_fen": pl.Int64,
+    "slippage_fen": pl.Int64,
+    "total_cost_fen": pl.Int64,
 }
 
 
@@ -60,8 +60,11 @@ def _nav() -> pl.DataFrame:
                 date(2024, 1, 5),
             ],
             "cash_fen": [10_000, 4_000, 4_000, 4_000],
-            "market_value_fen": [0, 6_000, 6_600, 6_600],
-            "nav_fen": [10_000, 10_000, 10_600, 10_600],
+            "long_market_value_fen": [0, 6_000, 6_600, 6_600],
+            "short_market_value_fen": [0, 0, 0, 0],
+            "accrued_fees_fen": [0, 0, 0, 0],
+            "margin_used_fen": [0, 0, 0, 0],
+            "equity_fen": [10_000, 10_000, 10_600, 10_600],
             "benchmark_close": [100.0, 100.0, 100.0, 100.0],
         },
         schema=NAV_SCHEMA,
@@ -91,13 +94,11 @@ def _fills(instrument_id: str = "600001.SH") -> pl.DataFrame:
             "side": ["BUY", "SELL"],
             "requested_quantity": [100, 100],
             "reference_price": [0.6, None],
-            "requested_reference_value_fen": [6_000, None],
             "filled_quantity": [100, 0],
             "unfilled_quantity": [0, 100],
             "price": [0.6, None],
             "gross_value_fen": [6_000, 0],
             "reason_code": ["FILLED", "SUSPENDED"],
-            "detail": [None, "suspended"],
         },
         schema=FILLS_SCHEMA,
     )
@@ -109,10 +110,9 @@ def _costs(instrument_id: str = "600001.SH") -> pl.DataFrame:
             "trade_date": [date(2024, 1, 3)],
             "result_index": [0],
             "instrument_id": [instrument_id],
-            "commission_fen": [0],
-            "stamp_tax_fen": [0],
-            "transfer_fee_fen": [0],
-            "total_fees_fen": [0],
+            "rule_fees_fen": [0],
+            "slippage_fen": [0],
+            "total_cost_fen": [0],
         },
         schema=COSTS_SCHEMA,
     )
@@ -146,7 +146,11 @@ def test_attribution_is_cash_exact_without_industry_dimension() -> None:
     )
 
     nav_values = dict(
-        zip(_nav()["trade_date"].to_list(), _nav()["nav_fen"].to_list(), strict=True)
+        zip(
+            _nav()["trade_date"].to_list(),
+            _nav()["equity_fen"].to_list(),
+            strict=True,
+        )
     )
     previous_nav: int | None = None
     for trade_date, nav_fen in nav_values.items():

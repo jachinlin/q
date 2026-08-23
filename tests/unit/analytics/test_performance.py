@@ -13,8 +13,11 @@ from quant_research.analytics.performance import calculate_performance
 NAV_SCHEMA = {
     "trade_date": pl.Date,
     "cash_fen": pl.Int64,
-    "market_value_fen": pl.Int64,
-    "nav_fen": pl.Int64,
+    "long_market_value_fen": pl.Int64,
+    "short_market_value_fen": pl.Int64,
+    "accrued_fees_fen": pl.Int64,
+    "margin_used_fen": pl.Int64,
+    "equity_fen": pl.Int64,
     "benchmark_close": pl.Float64,
 }
 HOLDINGS_SCHEMA = {
@@ -27,27 +30,24 @@ HOLDINGS_SCHEMA = {
 }
 FILLS_SCHEMA = {
     "trade_date": pl.Date,
-    "result_index": pl.Int32,
+    "result_index": pl.Int64,
     "instrument_id": pl.String,
     "side": pl.String,
     "requested_quantity": pl.Int64,
-    "reference_price": pl.Float64,
-    "requested_reference_value_fen": pl.Int64,
     "filled_quantity": pl.Int64,
     "unfilled_quantity": pl.Int64,
+    "reference_price": pl.Float64,
     "price": pl.Float64,
     "gross_value_fen": pl.Int64,
     "reason_code": pl.String,
-    "detail": pl.String,
 }
 COSTS_SCHEMA = {
     "trade_date": pl.Date,
-    "result_index": pl.Int32,
+    "result_index": pl.Int64,
     "instrument_id": pl.String,
-    "commission_fen": pl.Int64,
-    "stamp_tax_fen": pl.Int64,
-    "transfer_fee_fen": pl.Int64,
-    "total_fees_fen": pl.Int64,
+    "rule_fees_fen": pl.Int64,
+    "slippage_fen": pl.Int64,
+    "total_cost_fen": pl.Int64,
 }
 
 
@@ -61,8 +61,11 @@ def _nav() -> pl.DataFrame:
                 date(2024, 2, 2),
             ],
             "cash_fen": [10_000, 11_000, 9_900, 11_000],
-            "market_value_fen": [0, 0, 0, 0],
-            "nav_fen": [10_000, 11_000, 9_900, 11_000],
+            "long_market_value_fen": [0, 0, 0, 0],
+            "short_market_value_fen": [0, 0, 0, 0],
+            "accrued_fees_fen": [0, 0, 0, 0],
+            "margin_used_fen": [0, 0, 0, 0],
+            "equity_fen": [10_000, 11_000, 9_900, 11_000],
             "benchmark_close": [100.0, 105.0, 100.0, 102.0],
         },
         schema=NAV_SCHEMA,
@@ -78,13 +81,11 @@ def _fills() -> pl.DataFrame:
             "side": ["BUY", "BUY"],
             "requested_quantity": [1, 5],
             "reference_price": [10.0, None],
-            "requested_reference_value_fen": [1_000, None],
             "filled_quantity": [1, 0],
             "unfilled_quantity": [0, 5],
             "price": [10.0, None],
             "gross_value_fen": [1_000, 0],
             "reason_code": ["FILLED", "NO_MARKET_DATA"],
-            "detail": [None, "halted"],
         },
         schema=FILLS_SCHEMA,
     )
@@ -96,10 +97,9 @@ def _costs() -> pl.DataFrame:
             "trade_date": [date(2024, 1, 31)],
             "result_index": [0],
             "instrument_id": ["600001.SH"],
-            "commission_fen": [10],
-            "stamp_tax_fen": [0],
-            "transfer_fee_fen": [0],
-            "total_fees_fen": [10],
+            "rule_fees_fen": [10],
+            "slippage_fen": [0],
+            "total_cost_fen": [10],
         },
         schema=COSTS_SCHEMA,
     )
@@ -124,8 +124,11 @@ def _period_nav(
         {
             "trade_date": dates,
             "cash_fen": nav_values,
-            "market_value_fen": [0] * len(dates),
-            "nav_fen": nav_values,
+            "long_market_value_fen": [0] * len(dates),
+            "short_market_value_fen": [0] * len(dates),
+            "accrued_fees_fen": [0] * len(dates),
+            "margin_used_fen": [0] * len(dates),
+            "equity_fen": nav_values,
             "benchmark_close": benchmark_values,
         },
         schema=NAV_SCHEMA,
@@ -257,7 +260,7 @@ def test_all_unpriced_orders_disclose_null_notional_rate_and_zero_coverage() -> 
     fills = (
         _fills()
         .slice(1, 1)
-        .with_columns(pl.lit(0, dtype=pl.Int32).alias("result_index"))
+        .with_columns(pl.lit(0, dtype=pl.Int64).alias("result_index"))
     )
 
     result = calculate_performance(
@@ -274,7 +277,9 @@ def test_cash_and_position_weights_are_calculated_from_daily_holdings() -> None:
     """现金和最大持仓权重必须来自逐日账户快照而非目标权重。"""
     nav = _nav().with_columns(
         pl.Series("cash_fen", [10_000, 6_000, 4_900, 11_000], dtype=pl.Int64),
-        pl.Series("market_value_fen", [0, 5_000, 5_000, 0], dtype=pl.Int64),
+        pl.Series(
+            "long_market_value_fen", [0, 5_000, 5_000, 0], dtype=pl.Int64
+        ),
     )
     holdings = pl.DataFrame(
         {
@@ -381,8 +386,11 @@ def test_zero_volatility_discloses_undefined_ratios_without_nonfinite_values() -
         {
             "trade_date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
             "cash_fen": [10_000, 10_000, 10_000],
-            "market_value_fen": [0, 0, 0],
-            "nav_fen": [10_000, 10_000, 10_000],
+            "long_market_value_fen": [0, 0, 0],
+            "short_market_value_fen": [0, 0, 0],
+            "accrued_fees_fen": [0, 0, 0],
+            "margin_used_fen": [0, 0, 0],
+            "equity_fen": [10_000, 10_000, 10_000],
             "benchmark_close": [100.0, 100.0, 100.0],
         },
         schema=NAV_SCHEMA,
@@ -397,10 +405,11 @@ def test_zero_volatility_discloses_undefined_ratios_without_nonfinite_values() -
     assert result.metrics["sortino_ratio"] is None
     assert result.metrics["calmar_ratio"] is None
     assert result.metrics["information_ratio"] is None
-    assert result.metrics["failed_fill_rate"] == 0.0
+    assert result.metrics["failed_fill_rate"] is None
     assert result.undefined_metrics == {
         "beta": "ZERO_BENCHMARK_VARIANCE",
         "calmar_ratio": "ZERO_MAX_DRAWDOWN",
+        "failed_fill_rate": "NO_ORDERS",
         "information_ratio": "ZERO_ACTIVE_VOLATILITY",
         "jensen_alpha": "ZERO_BENCHMARK_VARIANCE",
         "notional_fill_rate": "NO_ORDERS",
@@ -416,8 +425,11 @@ def test_all_negative_returns_have_a_finite_sortino_ratio() -> None:
         {
             "trade_date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
             "cash_fen": [10_000, 9_000, 8_100],
-            "market_value_fen": [0, 0, 0],
-            "nav_fen": [10_000, 9_000, 8_100],
+            "long_market_value_fen": [0, 0, 0],
+            "short_market_value_fen": [0, 0, 0],
+            "accrued_fees_fen": [0, 0, 0],
+            "margin_used_fen": [0, 0, 0],
+            "equity_fen": [10_000, 9_000, 8_100],
             "benchmark_close": [100.0, 100.0, 100.0],
         },
         schema=NAV_SCHEMA,
@@ -472,7 +484,7 @@ NavMutation = Callable[[pl.DataFrame], pl.DataFrame]
     ("mutate", "message"),
     [
         pytest.param(
-            lambda frame: frame.with_columns(pl.col("nav_fen").cast(pl.Int32)),
+            lambda frame: frame.with_columns(pl.col("equity_fen").cast(pl.Int32)),
             "nav schema",
             id="wrong-schema",
         ),
@@ -496,8 +508,8 @@ NavMutation = Callable[[pl.DataFrame], pl.DataFrame]
             lambda frame: frame.with_columns(
                 pl.when(pl.col("trade_date") == date(2024, 2, 1))
                 .then(0)
-                .otherwise(pl.col("nav_fen"))
-                .alias("nav_fen"),
+                .otherwise(pl.col("equity_fen"))
+                .alias("equity_fen"),
                 pl.when(pl.col("trade_date") == date(2024, 2, 1))
                 .then(0)
                 .otherwise(pl.col("cash_fen"))
@@ -517,8 +529,8 @@ def test_nav_invariants_fail_closed(mutate: NavMutation, message: str) -> None:
 def test_negative_cost_fails_closed() -> None:
     """Negative fee source fields cannot become an apparently favorable fee rate."""
     costs = _costs().with_columns(
-        pl.lit(-1, dtype=pl.Int64).alias("commission_fen"),
-        pl.lit(-1, dtype=pl.Int64).alias("total_fees_fen"),
+        pl.lit(-1, dtype=pl.Int64).alias("rule_fees_fen"),
+        pl.lit(-1, dtype=pl.Int64).alias("total_cost_fen"),
     )
 
     with pytest.raises(ValueError, match="nonnegative"):
@@ -539,7 +551,7 @@ def test_cross_table_execution_identity_mismatch_fails_closed() -> None:
     ("fills", "costs", "message"),
     [
         pytest.param(
-            _fills().with_columns(pl.col("result_index").cast(pl.Int64)),
+            _fills().with_columns(pl.col("result_index").cast(pl.Int32)),
             _costs(),
             "fills schema",
             id="fills-schema",
@@ -571,7 +583,7 @@ def test_cross_table_execution_identity_mismatch_fails_closed() -> None:
         ),
         pytest.param(
             _fills(),
-            _costs().with_columns(pl.col("result_index").cast(pl.Int64)),
+            _costs().with_columns(pl.col("result_index").cast(pl.Int32)),
             "costs schema",
             id="costs-schema",
         ),

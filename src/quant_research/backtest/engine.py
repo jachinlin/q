@@ -5,8 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
-from typing import Protocol, cast
+from typing import Protocol
 
 import polars as pl
 
@@ -16,7 +15,7 @@ from quant_research.backtest.execution import ExecutionModel
 from quant_research.backtest.models import AccountView as ExecutionAccountView
 from quant_research.backtest.models import ExecutionConfig, FillResult, MarketSlice
 from quant_research.backtest.rulebook import MarketRuleBook
-from quant_research.backtest.run_artifacts import RunArtifactPublisher
+from quant_research.backtest.run_schema import RunTableSchema
 from quant_research.data.contracts import JsonValue
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.strategies.base import (
@@ -70,11 +69,11 @@ class BacktestRequest:
 
 @dataclass(frozen=True, slots=True)
 class BacktestResult:
-    """记录已发布 Run 的产物身份、指标和最终账户状态。
+    """记录尚未发布的规范回测表、冻结输入和最终账户状态。
 
     入参：
-        各字段分别提供实验与运行标识、可信产物路径、Manifest 身份、指标、
-        已处理交易日数和最终账户快照。
+        各字段分别提供实验与运行标识、回测表、配置、输入身份、已处理交易日数和
+        最终账户快照。
     返回值：
         创建不可变的回测结果值对象。
     异常：
@@ -83,11 +82,9 @@ class BacktestResult:
 
     experiment_id: str
     run_id: str
-    artifact_dir: Path
-    manifest_path: Path
-    manifest_hash: str
-    artifacts: tuple[dict[str, JsonValue], ...]
-    metrics: Mapping[str, float]
+    tables: Mapping[str, pl.DataFrame]
+    config: Mapping[str, JsonValue]
+    identities: Mapping[str, JsonValue]
     sessions_completed: int
     final_snapshot: AccountSnapshot
 
@@ -272,14 +269,12 @@ class BacktestEngine:
         rulebook: MarketRuleBook,
         catalog_guard: CatalogGuard,
         *,
-        artifact_root: Path,
         execution_model: ExecutionModel | None = None,
     ) -> None:
         self._market_data = market_data
         self._decision_data = decision_data
         self._rulebook = rulebook
         self._catalog_guard = catalog_guard
-        self._artifact_root = artifact_root
         self._execution = execution_model or ExecutionModel()
 
     def run(
@@ -289,17 +284,17 @@ class BacktestEngine:
         progress: ProgressSink,
         cancellation: CancellationToken,
     ) -> BacktestResult:
-        """执行订单驱动回测并发布完整固定产物集。
+        """执行订单驱动回测并返回供分析和原子发布的内存结果。
 
         入参：
             request：冻结的 Run 请求；strategy：订单策略；progress：进度端口；
             cancellation：取消查询端口。
         返回值：
-            返回可信 Manifest、指标、产物目录和最终账户快照。
+            返回规范回测表、冻结输入身份和最终账户快照。
         异常：
             TypeError：请求类型错误时抛出；ValueError：日历、行情或策略输出
             不合法时抛出；BacktestCancelled：任务被协作取消时抛出；
-            RuntimeError：数据身份漂移、账户或产物发布失败时抛出。
+            RuntimeError：数据身份漂移或账户状态非法时抛出。
         """
         if not isinstance(request, BacktestRequest):
             raise TypeError("request must be BacktestRequest")
@@ -313,8 +308,7 @@ class BacktestEngine:
         account = PortfolioAccount(request.initial_cash_fen, calendar)
         pending: tuple[OrderIntent, ...] = ()
         tables: dict[str, list[dict[str, object]]] = {
-            name: []
-            for name in ("orders", "fills", "holdings", "costs", "nav", "attribution")
+            name: [] for name in ("orders", "fills", "holdings", "costs", "nav")
         }
         snapshots: list[AccountSnapshot] = []
         final: AccountSnapshot | None = None
@@ -373,31 +367,19 @@ class BacktestEngine:
             self._catalog_guard.assert_unchanged(request.catalog_hash)
         if final is None:
             raise RuntimeError("backtest produced no account snapshot")
-        metrics, performance = self._performance(snapshots, request.initial_cash_fen)
         signals = self._signals(strategy)
-        publisher = RunArtifactPublisher(
-            self._artifact_root, request.experiment_id, request.run_id
-        )
-        artifact_dir, manifest_hash, entries = publisher.publish(
-            {**tables, "signals": signals, "performance": performance},
-            config=self._config(request, strategy),
-            metrics=cast(Mapping[str, JsonValue], metrics),
-            identities={
+        return BacktestResult(
+            request.experiment_id,
+            request.run_id,
+            RunTableSchema.canonical_backtest_tables({**tables, "signals": signals}),
+            self._config(request, strategy),
+            {
                 "experiment_id": request.experiment_id,
                 "run_id": request.run_id,
                 "catalog_hash": request.catalog_hash,
                 "rulebook_hash": request.rulebook_hash,
                 "strategy_id": strategy.spec.strategy_id,
             },
-        )
-        return BacktestResult(
-            request.experiment_id,
-            request.run_id,
-            artifact_dir,
-            artifact_dir / "manifest.json",
-            manifest_hash,
-            entries,
-            metrics,
             len(sessions),
             final,
         )
@@ -519,36 +501,6 @@ class BacktestEngine:
                 "benchmark_close": benchmark_close,
             }
         )
-
-    @staticmethod
-    def _performance(
-        snapshots: Sequence[AccountSnapshot], initial_cash_fen: int
-    ) -> tuple[dict[str, float], list[dict[str, object]]]:
-        rows: list[dict[str, object]] = []
-        peak = float(initial_cash_fen)
-        previous = float(initial_cash_fen)
-        max_drawdown = 0.0
-        for item in snapshots:
-            equity = float(item.nav_fen)
-            daily = equity / previous - 1.0
-            cumulative = equity / initial_cash_fen - 1.0
-            peak = max(peak, equity)
-            drawdown = equity / peak - 1.0
-            max_drawdown = min(max_drawdown, drawdown)
-            rows.append(
-                {
-                    "trade_date": item.trade_date,
-                    "return": daily,
-                    "cumulative_return": cumulative,
-                    "drawdown": drawdown,
-                }
-            )
-            previous = equity
-        cumulative_return = cast(float, rows[-1]["cumulative_return"])
-        return {
-            "cumulative_return": cumulative_return,
-            "max_drawdown": max_drawdown,
-        }, rows
 
     @staticmethod
     def _signals(strategy: Strategy) -> pl.DataFrame | list[dict[str, object]]:

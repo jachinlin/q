@@ -13,87 +13,12 @@ from typing import Any, cast
 
 import polars as pl
 
+from quant_research.backtest.run_schema import (
+    RUN_PARQUET_SCHEMAS,
+    RUN_PRIMARY_KEYS,
+    RunTableSchema,
+)
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
-
-_PARQUET_SCHEMAS: dict[str, dict[str, object]] = {
-    "signals": {
-        "signal_date": pl.Date,
-        "instrument_id": pl.String,
-        "signal": pl.String,
-        "value": pl.Float64,
-        "state_changed": pl.Boolean,
-        "invalid_reason": pl.String,
-    },
-    "orders": {
-        "signal_date": pl.Date,
-        "execute_date": pl.Date,
-        "order_index": pl.Int64,
-        "instrument_id": pl.String,
-        "side": pl.String,
-        "quantity": pl.Int64,
-        "reason": pl.String,
-    },
-    "fills": {
-        "trade_date": pl.Date,
-        "result_index": pl.Int64,
-        "instrument_id": pl.String,
-        "side": pl.String,
-        "requested_quantity": pl.Int64,
-        "filled_quantity": pl.Int64,
-        "unfilled_quantity": pl.Int64,
-        "reference_price": pl.Float64,
-        "price": pl.Float64,
-        "gross_value_fen": pl.Int64,
-        "reason_code": pl.String,
-    },
-    "holdings": {
-        "trade_date": pl.Date,
-        "instrument_id": pl.String,
-        "total_quantity": pl.Int64,
-        "sellable_quantity": pl.Int64,
-        "cost_basis_fen": pl.Int64,
-        "market_value_fen": pl.Int64,
-    },
-    "costs": {
-        "trade_date": pl.Date,
-        "result_index": pl.Int64,
-        "instrument_id": pl.String,
-        "rule_fees_fen": pl.Int64,
-        "slippage_fen": pl.Int64,
-        "total_cost_fen": pl.Int64,
-    },
-    "nav": {
-        "trade_date": pl.Date,
-        "cash_fen": pl.Int64,
-        "long_market_value_fen": pl.Int64,
-        "short_market_value_fen": pl.Int64,
-        "accrued_fees_fen": pl.Int64,
-        "margin_used_fen": pl.Int64,
-        "equity_fen": pl.Int64,
-        "benchmark_close": pl.Float64,
-    },
-    "performance": {
-        "trade_date": pl.Date,
-        "return": pl.Float64,
-        "cumulative_return": pl.Float64,
-        "drawdown": pl.Float64,
-    },
-    "attribution": {
-        "trade_date": pl.Date,
-        "component": pl.String,
-        "contribution": pl.Float64,
-    },
-}
-_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
-    "signals": ("signal_date", "instrument_id"),
-    "orders": ("signal_date", "order_index"),
-    "fills": ("trade_date", "result_index"),
-    "holdings": ("trade_date", "instrument_id"),
-    "costs": ("trade_date", "result_index"),
-    "nav": ("trade_date",),
-    "performance": ("trade_date",),
-    "attribution": ("trade_date", "component"),
-}
 
 
 class RunArtifactPublisher:
@@ -128,6 +53,7 @@ class RunArtifactPublisher:
         *,
         config: Mapping[str, JsonValue],
         metrics: Mapping[str, JsonValue],
+        quality_disclosure: Mapping[str, JsonValue],
         identities: Mapping[str, JsonValue],
     ) -> tuple[Path, str, tuple[dict[str, JsonValue], ...]]:
         """写入全部固定产物、生成 Manifest、原子发布并从最终目录复核。
@@ -136,18 +62,22 @@ class RunArtifactPublisher:
         """
         try:
             entries: list[dict[str, JsonValue]] = []
-            for name, schema in _PARQUET_SCHEMAS.items():
+            for name, schema in RUN_PARQUET_SCHEMAS.items():
                 value = tables.get(name, ())
                 frame = (
                     value
                     if isinstance(value, pl.DataFrame)
                     else pl.DataFrame(value, schema=cast(Any, schema))
                 )
-                frame = self._normalize(frame, schema)
+                frame = RunTableSchema.normalize(frame, name)
                 path = self._staging / f"{name}.parquet"
                 frame.write_parquet(path, compression="zstd")
                 entries.append(self._entry(path, name, frame))
-            for name, json_value in (("config", config), ("metrics", metrics)):
+            for name, json_value in (
+                ("config", config),
+                ("metrics", metrics),
+                ("quality_disclosure", quality_disclosure),
+            ):
                 path = self._staging / f"{name}.json"
                 path.write_bytes(canonical_json_bytes(json_value))
                 entries.append(self._entry(path, name, None))
@@ -183,11 +113,10 @@ class RunArtifactPublisher:
                     if actual_schema != expected_schema:
                         raise ValueError("artifact schema changed after publication")
                     artifact_type = cast(str, entry["artifact_type"])
-                    schema = _PARQUET_SCHEMAS[artifact_type]
-                    keys = _PRIMARY_KEYS[artifact_type]
+                    keys = RUN_PRIMARY_KEYS[artifact_type]
                     if frame.select(pl.struct(keys).is_duplicated().any()).item():
                         raise ValueError("artifact primary key is not unique")
-                    if not frame.equals(self._normalize(frame, schema)):
+                    if not frame.equals(RunTableSchema.normalize(frame, artifact_type)):
                         raise ValueError("artifact rows are not canonically sorted")
                 else:
                     canonical_json_bytes(cast(JsonValue, json.loads(path.read_bytes())))
@@ -200,16 +129,15 @@ class RunArtifactPublisher:
             raise
 
     @staticmethod
-    def _normalize(frame: pl.DataFrame, schema: Mapping[str, object]) -> pl.DataFrame:
-        missing = set(schema) - set(frame.columns)
-        if missing:
-            raise ValueError(f"artifact columns missing: {min(missing)}")
-        output = frame.select(tuple(schema)).cast(cast(Any, schema))
-        artifact_type = next(
-            name for name, expected in _PARQUET_SCHEMAS.items() if expected is schema
-        )
-        sort_keys = list(_PRIMARY_KEYS[artifact_type])
-        return output.sort(sort_keys) if sort_keys else output
+    def canonical_tables(
+        tables: Mapping[str, Sequence[Mapping[str, object]] | pl.DataFrame],
+    ) -> dict[str, pl.DataFrame]:
+        """按最终 Run 产物 Schema 规范化全部固定表。
+
+        入参：内存中的回测和分析表。返回值：按产物名稳定排序的规范化表。
+        异常：缺列、类型或唯一键不满足固定契约时抛出 ``ValueError``。
+        """
+        return RunTableSchema.canonical_tables(tables)
 
     @staticmethod
     def _entry(
@@ -226,10 +154,10 @@ class RunArtifactPublisher:
                 if frame is not None
                 else None
             ),
-            "primary_key": list(_PRIMARY_KEYS[artifact_type])
+            "primary_key": list(RUN_PRIMARY_KEYS[artifact_type])
             if frame is not None
             else None,
-            "sort_key": list(_PRIMARY_KEYS[artifact_type])
+            "sort_key": list(RUN_PRIMARY_KEYS[artifact_type])
             if frame is not None
             else None,
         }

@@ -236,7 +236,7 @@ Strategy(Protocol)
 详细设计见[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§2-§4`。
 
 - 追踪实体：`Experiment → Run`（轻量，Run 无 run\_identity 复现哈希，但存 catalog\_version）。Run 记录冻结配置快照、状态、指标、产物指针。
-- 编排：`VALIDATE → PREPARE_INPUTS → STRATEGY_RUN(逐时点产订单) → BACKTEST → ANALYTICS → PERSIST`；kind 无关执行器。
+- 编排：`VALIDATE → PREPARE_INPUTS → STRATEGY_RUN → ANALYTICS → PERSIST`；每个任务使用一个短生命周期执行会话。`STRATEGY_RUN` 只生成内存回测表，`PERSIST` 才一次性发布。
 - **PIT 一致性门（保留、重新定位）**：运行开始记录数据版本，运行中数据被并发改动则失败——作用是"这次运行不混用两批数据"，非复现回放。
 - 成本双角色一致性：事前 CostModel 与回测事后费用共享费率、可对账。
 - 比较：同 Experiment 下排行榜、配置/指标 diff、结论标记（baseline/candidate/discarded）。
@@ -656,18 +656,20 @@ DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
 
 **输入**（回测层产物，见[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§3.10`）：
 
-- `nav`：`trade_date, cash_fen, long_mv_fen, equity_fen, benchmark_close`（\[P3b-2] 增 `short_mv_fen`、`accrued_fees_fen`）。
+- `nav`：`trade_date, cash_fen, long_market_value_fen, short_market_value_fen, accrued_fees_fen, margin_used_fen, equity_fen, benchmark_close`。
 - `holdings`：逐日逐标的头寸/可卖/成本/市值。
 - `fills`：成交与拒绝 + `reason_code`。
-- `costs`：佣金/印花税/过户费（\[P3b-2] 融券费）。
+- `costs`：`rule_fees_fen + slippage_fen = total_cost_fen`；规则内费用的细分留在交易规则审计中。
 - 配置：`sessions_per_year`(默认 252)、基准标识、切片规则（年/月/滚动窗口）。
 
 **输出**（供实验层落盘、Dashboard 展示）：
 
-- `performance.json`：标量绩效指标 + `undefined_metrics`（未定义项显式记录，不填 0/NaN）。
-- `drawdown` / `monthly_returns` / `annual_returns`：时序表。
+- `performance`：逐日组合/基准收益、累计收益、净值与回撤时序表。
+- `monthly_returns` / `annual_returns`：月度和年度收益表。
 - `attribution`：归因表（期间/风格/个股；\[P3b-2] 多空分腿）。
 - `execution_summary`：按方向 × 原因码汇总的成交质量。
+- `exposure_summary`：可用仓位暴露；没有可靠风格输入时保持为空并披露原因。
+- `metrics.json` 保存全部标量、日期、观察数与 `null`；`quality_disclosure.json` 保存未定义原因和统计口径。SQLite 只登记有限且已定义的数值。
 
 **不负责**：信号/因子/撮合/账务；跨运行复现；实盘归因。
 
@@ -681,7 +683,7 @@ DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
    └─► Attribution          期间/风格/个股收益归因
 ```
 
-四个模块都是纯函数：`f(产物表, 配置) -> 结果表`，确定性、稳定排序、可字面量 oracle 校验。
+分析入口都是纯计算：`f(内存回测表, 配置) -> 结果表`，确定性、稳定排序、可字面量 oracle 校验；分析阶段不读写最终产物目录。
 
 ### 8.4 PerformanceMetrics — 绩效
 
@@ -732,19 +734,18 @@ DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
 ### 8.9 依赖方向
 
 ```text
-experiments → analytics → （只消费回测产物表，不反向依赖回测引擎运行态）
+bootstrap 执行会话 → backtest（内存结果）
+                  └→ analytics（只消费规范化 DataFrame）
 ```
 
-分析层只读回测产物文件/DataFrame；不导入接口层、组合根、回测引擎内部状态。被实验层
-`ANALYTICS` 阶段调用，结果并入 Run 产物目录。
+`backtest` 不依赖 `analytics`。分析层不导入接口层、组合根或回测引擎运行态；组合根在
+`ANALYTICS` 阶段把规范化 DataFrame 交给分析层，并在 `PERSIST` 统一发布。
 
 ### 8.10 包结构
 
 ```text
 src/quant_research/analytics/
 ├── performance.py   # PerformanceMetrics：收益/风险标量 + 净值/回撤/年月时序
-├── execution.py     # ExecutionQuality：换手/费用/成交失败汇总
-├── risk.py          # RiskAnalytics：波动/beta/暴露/敞口（[P3b-2] 多空分腿）
 └── attribution.py   # Attribution：期间/风格/个股归因
 ```
 

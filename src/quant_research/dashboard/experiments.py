@@ -13,7 +13,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 
 from quant_research.application.experiments import ExperimentService
-from quant_research.data.contracts import JsonValue
+from quant_research.data.contracts import JsonValue, canonical_json_bytes
 from quant_research.experiments.models import ExperimentAggregate, ResearchMark
 from quant_research.strategies.components import StrategyComponentCatalog
 from quant_research.strategies.registry import StrategyRegistry
@@ -30,15 +30,32 @@ _ARTIFACT_TYPES = frozenset(
         "costs",
         "nav",
         "performance",
+        "monthly_returns",
+        "annual_returns",
+        "execution_summary",
+        "exposure_summary",
         "attribution",
         "config",
         "metrics",
+        "quality_disclosure",
         "manifest",
         "long_short_returns",
         "quantile_returns",
         "summary",
     }
 )
+_ARTIFACT_FILTERS: dict[str, frozenset[str]] = {
+    "summary": frozenset({"signal_variant", "factor_ref", "horizon"}),
+    "coverage": frozenset({"signal_variant", "factor_ref"}),
+    "ic": frozenset({"signal_variant", "factor_ref", "horizon"}),
+    "quantile_returns": frozenset({"signal_variant", "factor_ref", "horizon"}),
+    "long_short_returns": frozenset(
+        {"signal_variant", "factor_ref", "horizon"}
+    ),
+    "correlation": frozenset({"signal_variant"}),
+    "attribution": frozenset({"dimension"}),
+    "exposure_summary": frozenset({"dimension"}),
+}
 
 
 class _StrictBody(BaseModel):
@@ -151,7 +168,16 @@ class ExperimentDashboardService:
         )
 
     def artifact(
-        self, run_id: str, artifact_type: str, page: int, page_size: int
+        self,
+        run_id: str,
+        artifact_type: str,
+        page: int,
+        page_size: int,
+        *,
+        signal_variant: str | None = None,
+        factor_ref: str | None = None,
+        horizon: int | None = None,
+        dimension: str | None = None,
     ) -> dict[str, JsonValue]:
         """只从登记 Run 的可信 Manifest 读取并校验白名单产物。
 
@@ -165,6 +191,22 @@ class ExperimentDashboardService:
         """
         if artifact_type not in _ARTIFACT_TYPES:
             raise ValueError("unsupported artifact type")
+        requested_filters: dict[str, str | int] = {
+            name: value
+            for name, value in {
+                "signal_variant": signal_variant,
+                "factor_ref": factor_ref,
+                "horizon": horizon,
+                "dimension": dimension,
+            }.items()
+            if value is not None
+        }
+        allowed_filters = _ARTIFACT_FILTERS.get(artifact_type, frozenset())
+        unsupported = set(requested_filters) - allowed_filters
+        if unsupported:
+            raise ValueError(
+                f"unsupported filter for {artifact_type}: {min(unsupported)}"
+            )
         run = self._experiments.get_run(run_id)
         if run.artifact_dir is None:
             raise ValueError("Run has no published artifacts")
@@ -213,6 +255,10 @@ class ExperimentDashboardService:
             raise ValueError("artifact primary key is not unique")
         if not frame.equals(frame.sort(sort_key)):
             raise ValueError("artifact rows are not canonically sorted")
+        for name, value in requested_filters.items():
+            if name not in frame.columns:
+                raise ValueError(f"artifact filter column is missing: {name}")
+            frame = frame.filter(pl.col(name) == value)
         return {
             "items": self._json_rows(
                 frame.slice((page - 1) * page_size, page_size)
@@ -357,14 +403,127 @@ class ExperimentDashboardService:
         异常：
             ValueError：标识重复时抛出；KeyError：任一 Run 不存在时抛出。
         """
+        if len(run_ids) < 2:
+            raise ValueError("at least two run_ids are required")
         if len(set(run_ids)) != len(run_ids):
             raise ValueError("run_ids must be unique")
-        return {
-            "runs": [
-                cast(JsonValue, self._experiments.get_run(item).model_dump(mode="json"))
-                for item in run_ids
-            ]
+        runs = tuple(self._experiments.get_run(item) for item in run_ids)
+        experiment_id = runs[0].experiment_id
+        kind = runs[0].config.kind
+        if any(
+            item.experiment_id != experiment_id or item.config.kind is not kind
+            for item in runs[1:]
+        ):
+            raise ValueError("compared Runs must belong to one Experiment and kind")
+        aggregate = self._experiments.show(experiment_id)
+        baseline_id = aggregate.experiment.baseline_run_id
+        metrics_by_run = {
+            item.id: {metric.name: metric for metric in item.metrics} for item in runs
         }
+        baseline_metrics = (
+            metrics_by_run.get(baseline_id, {})
+            if baseline_id is not None
+            else {}
+        )
+        if baseline_id is not None and baseline_id not in metrics_by_run:
+            baseline_run = self._experiments.get_run(baseline_id)
+            baseline_metrics = {
+                metric.name: metric for metric in baseline_run.metrics
+            }
+        metric_names = sorted(
+            {
+                name
+                for values in (*metrics_by_run.values(), baseline_metrics)
+                for name in values
+            }
+        )
+        metric_rows: list[JsonValue] = []
+        for name in metric_names:
+            units = {
+                metric.unit
+                for values in (*metrics_by_run.values(), baseline_metrics)
+                if (metric := values.get(name)) is not None
+            }
+            comparable = len(units) <= 1
+            baseline_metric = baseline_metrics.get(name)
+            values: list[JsonValue] = []
+            for item in runs:
+                metric = metrics_by_run[item.id].get(name)
+                values.append(
+                    {
+                        "run_id": item.id,
+                        "value": metric.value if metric is not None else None,
+                        "p_value": metric.p_value if metric is not None else None,
+                        "adjusted_p_value": (
+                            metric.adjusted_p_value if metric is not None else None
+                        ),
+                        "delta_from_baseline": (
+                            metric.value - baseline_metric.value
+                            if comparable
+                            and metric is not None
+                            and baseline_metric is not None
+                            else None
+                        ),
+                    }
+                )
+            metric_rows.append(
+                {"name": name, "unit": next(iter(units), None), "values": values}
+            )
+        flattened = {
+            item.id: ExperimentDashboardService._flatten_config(
+                cast(JsonValue, item.config.model_dump(mode="json"))
+            )
+            for item in runs
+        }
+        config_paths = sorted(
+            {path for values in flattened.values() for path in values}
+        )
+        config_rows: list[JsonValue] = []
+        for path in config_paths:
+            raw_values = [flattened[item.id].get(path) for item in runs]
+            values = [
+                {"run_id": item.id, "value": value}
+                for item, value in zip(runs, raw_values, strict=True)
+            ]
+            identities = {
+                canonical_json_bytes(value) for value in raw_values
+            }
+            config_rows.append(
+                {"path": path, "differs": len(identities) > 1, "values": values}
+            )
+        return {
+            "experiment_id": experiment_id,
+            "baseline_run_id": baseline_id,
+            "runs": [
+                {
+                    "id": item.id,
+                    "status": item.status.value,
+                    "research_mark": item.research_mark.value,
+                }
+                for item in runs
+            ],
+            "metrics": metric_rows,
+            "configs": config_rows,
+        }
+
+    @staticmethod
+    def _flatten_config(value: JsonValue, prefix: str = "") -> dict[str, JsonValue]:
+        """把嵌套配置按稳定对象路径展开，数组保持原子值。
+
+        入参：value：JSON 配置；prefix：递归对象路径。返回值：路径到 JSON 值映射。
+        异常：无；配置已由冻结 Pydantic 模型保证 JSON 安全。
+        """
+        if not isinstance(value, dict):
+            return {prefix: value}
+        result: dict[str, JsonValue] = {}
+        for key in sorted(value):
+            path = f"{prefix}.{key}" if prefix else key
+            child = cast(JsonValue, value[key])
+            if isinstance(child, dict):
+                result.update(ExperimentDashboardService._flatten_config(child, path))
+            else:
+                result[path] = child
+        return result
 
 
 class ExperimentRoutes:
@@ -436,8 +595,21 @@ class ExperimentRoutes:
             artifact_type: str,
             page: int = Query(1, ge=1),
             page_size: int = Query(100, ge=1, le=1000),
+            signal_variant: str | None = Query(None, min_length=1),
+            factor_ref: str | None = Query(None, min_length=1),
+            horizon: int | None = Query(None, gt=0),
+            dimension: str | None = Query(None, min_length=1),
         ) -> dict[str, JsonValue]:
-            return service.artifact(run_id, artifact_type, page, page_size)
+            return service.artifact(
+                run_id,
+                artifact_type,
+                page,
+                page_size,
+                signal_variant=signal_variant,
+                factor_ref=factor_ref,
+                horizon=horizon,
+                dimension=dimension,
+            )
 
 
 __all__ = ["ExperimentDashboardService", "ExperimentRoutes"]

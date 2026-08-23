@@ -9,21 +9,32 @@ import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import cast
 
 import polars as pl
 from sqlalchemy import Engine
 
+from quant_research.analytics.attribution import (
+    AttributionResult,
+    calculate_attribution,
+)
+from quant_research.analytics.performance import (
+    PerformanceResult,
+    calculate_performance,
+)
 from quant_research.application.worker import Worker
 from quant_research.backtest.calendar import TradingCalendar
 from quant_research.backtest.engine import (
     BacktestEngine,
     BacktestRequest,
+    BacktestResult,
     BoundMarketSlice,
 )
 from quant_research.backtest.models import ExecutionConfig, ExecutionPrice, MarketSlice
 from quant_research.backtest.rulebook import AShareRuleBook
+from quant_research.backtest.run_artifacts import RunArtifactPublisher
 from quant_research.config import Settings
 from quant_research.data.contracts import (
     JsonValue,
@@ -36,6 +47,7 @@ from quant_research.experiments.models import (
     FactorStudyRunConfig,
     MultipleTestingMethod,
     RunRecord,
+    RunStage,
     StrategyBacktestRunConfig,
 )
 from quant_research.experiments.runner import ExperimentRunHandler
@@ -432,7 +444,7 @@ class _BacktestProgress:
 
 
 class StrategyRunExecutor:
-    """构造策略并运行唯一订单驱动回测引擎。
+    """为策略 Run 创建隔离的分阶段执行会话。
 
     入参：
         repository、registry、strategies、rulebook、artifact_root：数据入口、Run
@@ -440,7 +452,7 @@ class StrategyRunExecutor:
     返回值：
         创建策略 Run 执行器。
     异常：
-        构造不执行回测；运行期错误由 execute 方法说明。
+        构造不执行回测；运行期错误由会话方法说明。
     """
 
     def __init__(
@@ -458,38 +470,106 @@ class StrategyRunExecutor:
         )
         self._rulebook, self._artifact_root = rulebook, artifact_root
 
-    def execute(
-        self, run: RunRecord, progress: ProgressSink, cancellation: CancellationToken
-    ) -> dict[str, JsonValue]:
-        """执行策略 Run，验证并登记固定产物。
+    def create(self, run: RunRecord) -> _StrategyRunSession:
+        """创建绑定一个冻结策略 Run 的阶段会话。
 
-        入参：
-            run：冻结策略 Run；progress：任务进度端口；cancellation：取消端口。
-        返回值：
-            返回产物目录、Manifest 哈希和已完成交易日数。
-        异常：
-            TypeError：Run kind 错误时抛出；策略、数据漂移、回测或产物发布错误
-            继续向 ExperimentRunHandler 传播。
+        入参：run：冻结策略 Run。返回值：任务专属会话。
+        异常：Run kind 错误时抛出 ``TypeError``。
         """
-        config = run.config
-        if not isinstance(config, StrategyBacktestRunConfig):
+        if not isinstance(run.config, StrategyBacktestRunConfig):
             raise TypeError("strategy executor requires STRATEGY_BACKTEST config")
+        return _StrategyRunSession(
+            run,
+            self._repository,
+            self._registry,
+            self._strategies,
+            self._rulebook,
+            self._artifact_root,
+        )
+
+
+class _StrategyRunSession:
+    """保存策略 Run 的回测、分析和发布中间状态。"""
+
+    def __init__(
+        self,
+        run: RunRecord,
+        repository: CanonicalResearchRepository,
+        registry: ExperimentRunRegistry,
+        strategies: StrategyRegistry,
+        rulebook: AShareRuleBook,
+        artifact_root: Path,
+    ) -> None:
+        self._run = run
+        self._repository = repository
+        self._registry = registry
+        self._strategies = strategies
+        self._rulebook = rulebook
+        self._artifact_root = artifact_root
+        self._backtest: BacktestResult | None = None
+        self._tables: dict[str, pl.DataFrame] | None = None
+        self._performance: PerformanceResult | None = None
+        self._attribution: AttributionResult | None = None
+        self._published_dir: Path | None = None
+
+    def execute(
+        self,
+        stage: RunStage,
+        progress: ProgressSink,
+        cancellation: CancellationToken,
+    ) -> dict[str, JsonValue]:
+        """按固定阶段计算并在 PERSIST 一次性发布。
+
+        入参：stage、progress、cancellation：当前阶段、进度端口和取消端口。
+        返回值：仅 PERSIST 返回可信发布身份，其余阶段返回空映射。
+        异常：阶段乱序、取消、回测、分析、发布或登记失败时抛出。
+        """
+        if stage in {RunStage.VALIDATE, RunStage.PREPARE_INPUTS}:
+            return {}
+        if stage is RunStage.STRATEGY_RUN:
+            self._run_backtest(progress, cancellation)
+            return {}
+        if stage is RunStage.ANALYTICS:
+            self._analyze()
+            return {}
+        if stage is RunStage.PERSIST:
+            return self._persist(cancellation)
+        raise ValueError(f"unsupported strategy stage: {stage.value}")
+
+    def abort(self) -> None:
+        """撤销未成功提交的策略 Run 输出。
+
+        入参：无。返回值：数据库登记和最终目录清理后无返回。
+        异常：登记清理失败时传播，目录仍会尽力删除。
+        """
+        if self._published_dir is None:
+            return
+        try:
+            self._registry.discard_outputs(self._run.id)
+        finally:
+            if self._published_dir.is_relative_to(self._artifact_root.resolve()):
+                shutil.rmtree(self._published_dir, ignore_errors=True)
+            self._published_dir = None
+
+    def _run_backtest(
+        self, progress: ProgressSink, cancellation: CancellationToken
+    ) -> None:
+        config = cast(StrategyBacktestRunConfig, self._run.config)
         strategy = self._strategies.build(
             config.strategy.strategy_id,
             cast(Mapping[str, JsonValue], config.strategy.parameters),
         )
-        source = CanonicalRunData(self._repository, run.catalog_hash)
-        result = BacktestEngine(
+        source = CanonicalRunData(self._repository, self._run.catalog_hash)
+        self._backtest = BacktestEngine(
             source,
             source,
             self._rulebook,
             CanonicalCatalogGuard(self._repository),
-            artifact_root=self._artifact_root,
         ).run(
             BacktestRequest(
-                run.experiment_id,
-                run.id,
-                run.catalog_hash,
+                self._run.experiment_id,
+                self._run.id,
+                self._run.catalog_hash,
                 config.start_date,
                 config.end_date,
                 InstrumentId.parse(config.benchmark),
@@ -505,16 +585,144 @@ class StrategyRunExecutor:
             _BacktestProgress(progress),
             cancellation,
         )
-        self._registry.register_outputs(
-            run.id,
-            {key: (value, None, None, None) for key, value in result.metrics.items()},
-            result.artifacts,
+
+    def _analyze(self) -> None:
+        if self._backtest is None:
+            raise RuntimeError("strategy analytics requires completed backtest")
+        tables = RunArtifactPublisher.canonical_tables(self._backtest.tables)
+        performance = calculate_performance(
+            tables["nav"], tables["holdings"], tables["fills"], tables["costs"]
         )
+        attribution = calculate_attribution(
+            tables["nav"], tables["holdings"], tables["fills"], tables["costs"]
+        )
+        drawdown = performance.drawdown
+        tables.update(
+            {
+                "performance": drawdown.select(
+                    pl.col("trade_date"),
+                    pl.col("portfolio_daily_return").alias("return"),
+                    pl.col("benchmark_daily_return").alias("benchmark_return"),
+                    (pl.col("nav") - 1.0).alias("cumulative_return"),
+                    (pl.col("benchmark_nav") - 1.0).alias(
+                        "benchmark_cumulative_return"
+                    ),
+                    (
+                        pl.col("portfolio_daily_return")
+                        - pl.col("benchmark_daily_return")
+                    ).alias("active_return"),
+                    pl.col("nav"),
+                    pl.col("benchmark_nav"),
+                    pl.col("drawdown"),
+                    pl.col("active_drawdown"),
+                ),
+                "monthly_returns": performance.monthly_returns,
+                "annual_returns": performance.annual_returns,
+                "execution_summary": performance.execution_summary,
+                "exposure_summary": attribution.exposure_summary,
+                "attribution": attribution.attribution,
+            }
+        )
+        self._tables = RunArtifactPublisher.canonical_tables(tables)
+        self._performance = performance
+        self._attribution = attribution
+
+    def _persist(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
+        if (
+            self._backtest is None
+            or self._tables is None
+            or self._performance is None
+            or self._attribution is None
+        ):
+            raise RuntimeError("strategy persistence requires completed analytics")
+        if cancellation.is_cancelled():
+            raise RuntimeError("strategy persistence cancelled before publication")
+        metrics = dict(self._performance.metrics)
+        quality = cast(
+            Mapping[str, JsonValue],
+            {
+                "calculation_mode": "CASH_EXACT",
+                "risk_free_rate_annual": 0.0,
+                "undefined_metrics": dict(self._performance.undefined_metrics),
+                "unavailable_dimensions": {
+                    "factor": "UNAVAILABLE",
+                    "style": "UNAVAILABLE",
+                },
+                "attribution_method": "CASH_EXACT_SECURITY",
+                "warnings": list(self._attribution.disclosures),
+            },
+        )
+        directory, manifest_hash, artifacts = RunArtifactPublisher(
+            self._artifact_root, self._run.experiment_id, self._run.id
+        ).publish(
+            self._tables,
+            config=self._backtest.config,
+            metrics=cast(Mapping[str, JsonValue], metrics),
+            quality_disclosure=quality,
+            identities=self._backtest.identities,
+        )
+        self._published_dir = directory
+        if cancellation.is_cancelled():
+            self.abort()
+            raise RuntimeError("strategy persistence cancelled after publication")
+        registered_metrics = _StrategyRunSession._registered_metrics(metrics)
+        try:
+            self._registry.register_outputs(
+                self._run.id, registered_metrics, artifacts
+            )
+        except BaseException:
+            if directory.is_relative_to(self._artifact_root.resolve()):
+                shutil.rmtree(directory, ignore_errors=True)
+            self._published_dir = None
+            raise
         return {
-            "artifact_dir": str(result.artifact_dir),
-            "manifest_hash": result.manifest_hash,
-            "sessions_completed": result.sessions_completed,
+            "artifact_dir": str(directory),
+            "manifest_hash": manifest_hash,
+            "sessions_completed": self._backtest.sessions_completed,
         }
+
+    @staticmethod
+    def _registered_metrics(
+        metrics: Mapping[str, int | float | str | None],
+    ) -> dict[str, tuple[float, str | None, float | None, float | None]]:
+        units = {
+            "observations": "count",
+            "max_drawdown_duration_sessions": "sessions",
+        }
+        ratio_names = {
+            name
+            for name in metrics
+            if any(
+                token in name
+                for token in (
+                    "return",
+                    "volatility",
+                    "drawdown",
+                    "turnover",
+                    "rate",
+                    "weight",
+                    "drag",
+                    "alpha",
+                    "error",
+                )
+            )
+        }
+        result: dict[
+            str, tuple[float, str | None, float | None, float | None]
+        ] = {}
+        for name, value in metrics.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            numeric = float(value)
+            if not isfinite(numeric):
+                continue
+            result[name] = (
+                numeric,
+                units.get(name, "ratio" if name in ratio_names else None),
+                None,
+                None,
+            )
+        return result
 
 
 class FactorRunExecutor:
@@ -541,23 +749,80 @@ class FactorRunExecutor:
             artifact_root,
         )
 
-    def execute(
-        self, run: RunRecord, progress: ProgressSink, cancellation: CancellationToken
-    ) -> dict[str, JsonValue]:
-        """计算因子、未来收益和诊断表并原子发布。
+    def create(self, run: RunRecord) -> _FactorRunSession:
+        """创建绑定一个冻结因子 Run 的阶段会话。
 
-        入参：
-            run：冻结因子 Run；progress：任务进度端口；cancellation：取消端口。
-        返回值：
-            返回已发布目录和 Manifest 哈希。
-        异常：
-            TypeError：Run kind 错误时抛出；ValueError：区间无交易日或未来收益
-            覆盖不足时抛出；取消、因子和发布错误继续向任务边界传播。
+        入参：run：冻结因子 Run。返回值：任务专属会话。
+        异常：Run kind 错误时抛出 ``TypeError``。
         """
-        config = run.config
-        if not isinstance(config, FactorStudyRunConfig):
+        if not isinstance(run.config, FactorStudyRunConfig):
             raise TypeError("factor executor requires FACTOR_STUDY config")
-        source = CanonicalRunData(self._repository, run.catalog_hash)
+        return _FactorRunSession(
+            run, self._repository, self._registry, self._artifact_root
+        )
+
+
+class _FactorRunSession:
+    """保存因子 Run 的分析表和待发布指标。"""
+
+    def __init__(
+        self,
+        run: RunRecord,
+        repository: CanonicalResearchRepository,
+        registry: ExperimentRunRegistry,
+        artifact_root: Path,
+    ) -> None:
+        self._run = run
+        self._repository = repository
+        self._registry = registry
+        self._artifact_root = artifact_root
+        self._tables: dict[str, pl.DataFrame] | None = None
+        self._metrics: dict[
+            str, tuple[float, str | None, float | None, float | None]
+        ] | None = None
+        self._published_dir: Path | None = None
+
+    def execute(
+        self,
+        stage: RunStage,
+        progress: ProgressSink,
+        cancellation: CancellationToken,
+    ) -> dict[str, JsonValue]:
+        """在 ANALYZE_FACTORS 计算并在 PERSIST 发布。
+
+        入参：stage、progress、cancellation：当前阶段、进度端口和取消端口。
+        返回值：仅 PERSIST 返回可信发布身份，其余阶段返回空映射。
+        异常：阶段次序、取消、计算、发布或登记失败时抛出。
+        """
+        if stage in {RunStage.VALIDATE, RunStage.PREPARE_INPUTS}:
+            return {}
+        if stage is RunStage.ANALYZE_FACTORS:
+            self._analyze(progress, cancellation)
+            return {}
+        if stage is RunStage.PERSIST:
+            return self._persist(cancellation)
+        raise ValueError(f"unsupported factor stage: {stage.value}")
+
+    def abort(self) -> None:
+        """撤销未成功提交的因子 Run 输出。
+
+        入参：无。返回值：数据库登记和最终目录清理后无返回。
+        异常：登记清理失败时传播，目录仍会尽力删除。
+        """
+        if self._published_dir is None:
+            return
+        try:
+            self._registry.discard_outputs(self._run.id)
+        finally:
+            if self._published_dir.is_relative_to(self._artifact_root.resolve()):
+                shutil.rmtree(self._published_dir, ignore_errors=True)
+            self._published_dir = None
+
+    def _analyze(
+        self, progress: ProgressSink, cancellation: CancellationToken
+    ) -> None:
+        config = cast(FactorStudyRunConfig, self._run.config)
+        source = CanonicalRunData(self._repository, self._run.catalog_hash)
         sessions = source._sessions(config.start_date, config.end_date)
         if not sessions:
             raise ValueError("factor study has no trading sessions")
@@ -589,7 +854,10 @@ class FactorRunExecutor:
         artifacts_by_factor = source._factor_engine.compute(
             config.factor_study.factor_ids,
             FactorContext(
-                run.catalog_hash, universe_hash, config.start_date, config.end_date
+                self._run.catalog_hash,
+                universe_hash,
+                config.start_date,
+                config.end_date,
             ),
         )
         factor_frame = pl.concat(
@@ -610,17 +878,33 @@ class FactorRunExecutor:
         future = build_future_returns(
             bars, all_sessions, eligible, config.factor_study.horizons
         )
-        tables = analyze(
+        self._tables = analyze(
             factor_frame, eligible, future, quantiles=config.factor_study.quantiles
         )
         governance = self._registry.get_experiment(
-            run.experiment_id
+            self._run.experiment_id
         ).experiment.definition.governance
-        metrics = _FactorPublisher.metrics(tables, governance.correction)
+        self._metrics = _FactorPublisher.metrics(self._tables, governance.correction)
+
+    def _persist(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
+        if self._tables is None or self._metrics is None:
+            raise RuntimeError("factor persistence requires completed analysis")
+        if cancellation.is_cancelled():
+            raise RuntimeError("factor persistence cancelled before publication")
         directory, manifest_hash, artifacts = _FactorPublisher(
-            self._artifact_root, run.experiment_id, run.id
-        ).publish(tables, run, metrics)
-        self._registry.register_outputs(run.id, metrics, artifacts)
+            self._artifact_root, self._run.experiment_id, self._run.id
+        ).publish(self._tables, self._run, self._metrics)
+        self._published_dir = directory
+        if cancellation.is_cancelled():
+            self.abort()
+            raise RuntimeError("factor persistence cancelled after publication")
+        try:
+            self._registry.register_outputs(self._run.id, self._metrics, artifacts)
+        except BaseException:
+            if directory.is_relative_to(self._artifact_root.resolve()):
+                shutil.rmtree(directory, ignore_errors=True)
+            self._published_dir = None
+            raise
         return {"artifact_dir": str(directory), "manifest_hash": manifest_hash}
 
 
@@ -759,12 +1043,14 @@ class _FactorPublisher:
             and "coverage" in coverage.columns
         ):
             mean_coverage = cast(float | None, coverage["coverage"].drop_nulls().mean())
-            result["mean_coverage"] = (mean_coverage or 0.0, None, None, None)
+            if mean_coverage is not None:
+                result["mean_coverage"] = (mean_coverage, "ratio", None, None)
         if summary is not None and not summary.is_empty():
             for column in ("rank_ic_mean", "pearson_ic_mean", "long_short_mean"):
                 if column in summary.columns:
                     mean_value = cast(float | None, summary[column].drop_nulls().mean())
-                    result[column] = (mean_value or 0.0, None, None, None)
+                    if mean_value is not None:
+                        result[column] = (mean_value, "ratio", None, None)
             hypotheses: list[tuple[str, float, float]] = []
             for row in summary.sort(
                 "signal_variant", "factor_ref", "horizon"

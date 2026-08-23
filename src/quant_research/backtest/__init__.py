@@ -10,9 +10,6 @@ _EXPORTS = {
     "AccountExecutionView": "accounting",
     "AccountSnapshot": "accounting",
     "AccountView": "models",
-    "ArtifactEntry": "artifacts",
-    "BacktestArtifactRecovery": "artifacts",
-    "BacktestArtifactWriter": "artifacts",
     "BacktestCancelled": "engine",
     "BacktestEngine": "engine",
     "BacktestRequest": "engine",
@@ -28,7 +25,6 @@ _EXPORTS = {
     "InstrumentTradingProfile": "rulebook",
     "LedgerEvent": "accounting",
     "LedgerEventType": "accounting",
-    "ManifestContext": "artifacts",
     "MarketRuleBook": "rulebook",
     "MarketSlice": "models",
     "PortfolioAccount": "accounting",
@@ -39,8 +35,6 @@ _EXPORTS = {
     "Side": "rulebook",
     "SimulatedFill": "rulebook",
     "TradingCalendar": "calendar",
-    "WriterState": "artifacts",
-    "validate_backtest_artifacts": "artifacts",
 }
 
 __all__ = [
@@ -48,9 +42,6 @@ __all__ = [
     "AccountExecutionView",
     "AccountSnapshot",
     "AccountView",
-    "ArtifactEntry",
-    "BacktestArtifactRecovery",
-    "BacktestArtifactWriter",
     "BacktestCancelled",
     "BacktestEngine",
     "BacktestRequest",
@@ -66,7 +57,6 @@ __all__ = [
     "InstrumentTradingProfile",
     "LedgerEvent",
     "LedgerEventType",
-    "ManifestContext",
     "MarketRuleBook",
     "MarketSlice",
     "PortfolioAccount",
@@ -77,8 +67,6 @@ __all__ = [
     "Side",
     "SimulatedFill",
     "TradingCalendar",
-    "WriterState",
-    "validate_backtest_artifacts",
 ]
 
 

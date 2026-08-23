@@ -1058,15 +1058,15 @@ def run(request, strategy, progress, cancellation):
 ```
 
 要点：`on_event` 拿到的 `data` 截断到 `signal_date=d`（≤ d 可见）；订单在 `sessions[i+1]` 撮合，
-天然 T/T+1 分离。失败/取消 `abort_staging()` 清临时目录。
+天然 T/T+1 分离。引擎只返回冻结结果和规范化内存表；发布会话失败或取消时清理 staging。
 
 ---
 
 ### 3.7 产物
 
-逐日写：`nav`（trade_date, cash_fen, long_mv_fen, equity_fen, benchmark_close；
-[P3b-2] 增 short_mv_fen, margin_used_fen；accrued_fees_fen）、`holdings`（逐标的头寸/可卖/成本/市值）、
-`fills`（成交与拒绝，含 reason_code）、`costs`（佣金/印花税/过户费；[P3b-2] 融券费）。
+逐日生成：`nav`（trade_date, cash_fen, long_market_value_fen, short_market_value_fen,
+accrued_fees_fen, margin_used_fen, equity_fen, benchmark_close）、`holdings`（逐标的头寸/可卖/成本/市值）、
+`fills`（成交与拒绝，含 reason_code）、`costs`（rule_fees_fen, slippage_fen, total_cost_fen）。
 统一交给 Run Publisher 写入不可变目录；可信 Manifest 记录并复核逐文件 SHA-256、字节数、行数、
 Schema、主键和排序后，才允许实验 Run 登记成功。
 
@@ -1500,10 +1500,10 @@ def run_stage(stage, ctx):
 各阶段职责：
 - **VALIDATE**：校验配置、数据质量门开启、交易日历覆盖研究区间 + 最长未来窗口、策略/因子能力满足。
 - **PREPARE_INPUTS**：构建 PIT 股票池；预算本次需要的因子（`FactorEngine.compute`）；装配策略/管线。
-- **STRATEGY_RUN + BACKTEST**：`BacktestEngine.run(request, strategy, ...)`，逐日 `on_event`→撮合→账务（见 backtest-engine）。
-- **ANALYTICS**：读回测产物算绩效/风险/归因（§5.7）。
+- **STRATEGY_RUN**：`BacktestEngine.run(request, strategy, ...)`，逐日 `on_event`→撮合→账务，仅返回冻结结果与规范化内存表，不发布目录（见 backtest-engine）。
+- **ANALYTICS**：直接消费内存中的 `equity_fen/total_cost_fen` 当前 Schema，计算绩效、风险、执行质量和归因（§5.7）。
 - **ANALYZE_FACTORS**（因子研究）：覆盖率/IC/分位/多空/相关/显著性（因子层 §5.6）。
-- **PERSIST**：写产物目录 + 记 metrics + 迁移 `SUCCEEDED`。
+- **PERSIST**：统一写 staging、生成 Manifest、原子重命名、从最终目录复核并登记有限且已定义的 metrics；因子 Run 也只在此阶段发布。
 
 失败/取消：清理 staging 临时目录，不留半成品；`FAILED` 写 error_json。
 
@@ -1529,9 +1529,13 @@ def assert_run_internal_consistency(stage):
 
 ```text
 STRATEGY_BACKTEST: nav.parquet holdings.parquet fills.parquet costs.parquet
-                   performance.json attribution.parquet config.json metrics.json
+                   signals.parquet orders.parquet performance.parquet
+                   monthly_returns.parquet annual_returns.parquet
+                   execution_summary.parquet exposure_summary.parquet attribution.parquet
+                   config.json metrics.json quality_disclosure.json manifest.json
 FACTOR_STUDY:      summary.parquet coverage.parquet ic.parquet quantile_returns.parquet
                    long_short_returns.parquet correlation.parquet config.json metrics.json
+                   quality_disclosure.json manifest.json
 ```
 
 发布：先写同文件系统 staging → 生成 Manifest → 原子 `os.replace` 到最终目录 → 从最终目录复核路径、
@@ -1543,8 +1547,9 @@ SHA-256、字节数、行数、Schema、主键、排序和输入身份。`PERSIS
 
 ### 5.7 分析层指标（字面量 oracle）
 
-输入 `nav`（trade_date, cash_fen, long_mv_fen, equity_fen, benchmark_close；[P3b-2] 增 short_mv_fen）。
-下式中 `equity_fen` 为净值序列（P3 = cash + long_mv − accrued_fees；[P3b-2] 再减 short_mv）。
+输入 `nav` 使用 `cash_fen/long_market_value_fen/short_market_value_fen/accrued_fees_fen/equity_fen`，
+并校验 `equity = cash + long_market_value - short_market_value - accrued_fees`。成本输入校验
+`rule_fees_fen + slippage_fen = total_cost_fen`。
 
 ```text
 normalized_nav[t]       = equity_fen[t] / equity_fen[0]

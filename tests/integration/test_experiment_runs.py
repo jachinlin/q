@@ -55,3 +55,34 @@ def test_empty_database_migration_contains_only_unified_research_tables(
         tables
     )
     engine.dispose()
+
+
+def test_failed_run_output_cleanup_is_transactional(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    registry = ExperimentRunRegistry(engine)
+    definition = ExperimentConfigParser().parse_experiment(experiment_yaml()).definition
+    _, run_id, _ = registry.create(definition, "a" * 64, actor="test")
+    registry.register_outputs(
+        run_id,
+        {"annualized_return": (0.1, "ratio", None, None)},
+        (
+            {
+                "artifact_type": "metrics",
+                "relative_path": "metrics.json",
+                "content_hash": "b" * 64,
+                "byte_count": 10,
+                "row_count": None,
+                "schema": None,
+            },
+        ),
+    )
+    assert registry.get_run(run_id).metrics
+    assert registry.get_run(run_id).artifacts
+
+    registry.discard_outputs(run_id)
+
+    assert registry.get_run(run_id).metrics == ()
+    assert registry.get_run(run_id).artifacts == ()
+    engine.dispose()
