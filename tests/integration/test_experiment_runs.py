@@ -1,11 +1,13 @@
 """验证统一 Experiment → Run → Task 的 SQLite 事务和不可覆盖重跑。"""
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from quant_research.bootstrap.worker import _WorkerRecovery
 from quant_research.experiments.config import ExperimentConfigParser
 from quant_research.experiments.models import (
     ResearchMark,
@@ -21,6 +23,7 @@ from quant_research.infrastructure.persistence.experiment_runs import (
 )
 from quant_research.infrastructure.persistence.orm import AuditEventORM
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
+from quant_research.tasks.models import TaskStatus
 from tests.unit.experiments.test_unified_models import experiment_yaml
 
 
@@ -209,4 +212,42 @@ def test_delete_terminal_run_accepts_a_previously_deleted_task(
         deleted = session.query(AuditEventORM).filter_by(event_type="RUN_DELETED").one()
         assert deleted.run_id == run_id
         assert deleted.task_id is None
+    engine.dispose()
+
+
+def test_worker_recovery_orphans_stale_task_and_fails_queued_run(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    registry = ExperimentRunRegistry(engine)
+    definition = ExperimentConfigParser().parse_experiment(experiment_yaml()).definition
+    stale = datetime(2026, 8, 20, tzinfo=UTC)
+    _, run_id, task_id = registry.create(
+        definition, "a" * 64, actor="test", now=stale
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE task SET status = 'CANCEL_REQUESTED', worker_id = 'lost', "
+                "heartbeat_at = :stale, updated_at = :stale WHERE id = :task_id"
+            ),
+            {"stale": stale.isoformat(), "task_id": task_id},
+        )
+    queue = TaskQueue(engine, task_log_root=tmp_path / "logs")
+
+    recovered = _WorkerRecovery(queue, registry, timedelta(seconds=60))(
+        stale + timedelta(minutes=5)
+    )
+
+    assert recovered == 1
+    assert queue.get(task_id).status is TaskStatus.ORPHANED
+    run = registry.get_run(run_id)
+    assert run.status is RunStatus.FAILED
+    assert run.error == {
+        "code": "TASK_ORPHANED",
+        "message": "Run task heartbeat exceeded the stale threshold",
+        "task_id": task_id,
+    }
     engine.dispose()

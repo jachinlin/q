@@ -8,7 +8,7 @@ import logging
 import multiprocessing
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -533,6 +533,36 @@ def test_run_once_claims_only_one_task_and_shutdown_prevents_another_claim(
     assert worker.run_once() is False
     assert len(handler.task_ids) == 1
     assert sorted(_statuses(engine)) == ["QUEUED", "SUCCEEDED"]
+
+
+def test_run_once_recovers_orphans_on_start_and_then_throttles_scans(
+    engine: Engine,
+) -> None:
+    """首次轮询必须恢复，后续轮询只在扫描间隔到期后再次恢复。"""
+    queue = TaskQueue(engine, clock=lambda: NOW)
+    clock = [NOW]
+    recoveries: list[datetime] = []
+
+    def recover(now: datetime) -> int:
+        recoveries.append(now)
+        return 0
+
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(),
+        clock=lambda: clock[0],
+        orphan_recovery=recover,
+        orphan_recovery_interval=30.0,
+    )
+
+    assert worker.run_once() is False
+    clock[0] = NOW + timedelta(seconds=29)
+    assert worker.run_once() is False
+    clock[0] = NOW + timedelta(seconds=30)
+    assert worker.run_once() is False
+
+    assert recoveries == [NOW, NOW + timedelta(seconds=30)]
 
 
 def test_same_worker_serializes_concurrent_run_once_claim_through_finish(

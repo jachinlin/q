@@ -8,7 +8,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import cast
@@ -48,6 +48,7 @@ from quant_research.experiments.models import (
     MultipleTestingMethod,
     RunRecord,
     RunStage,
+    RunStatus,
     StrategyBacktestRunConfig,
 )
 from quant_research.experiments.runner import ExperimentRunHandler
@@ -72,7 +73,7 @@ from quant_research.logging import TaskLogManager
 from quant_research.strategies.base import DecisionData
 from quant_research.strategies.registry import StrategyRegistry
 from quant_research.tasks.handlers import CancellationToken, ProgressSink, TaskHandler
-from quant_research.tasks.models import TaskProgress
+from quant_research.tasks.models import TaskProgress, TaskStatus
 
 _MARKET_SCHEMA = {
     "instrument_id": pl.String,
@@ -106,6 +107,11 @@ _FACTOR_ARTIFACT_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "correlation": ("signal_variant", "factor_x", "factor_y"),
 }
+_ACTIVE_RUN_STATUSES = frozenset(
+    {RunStatus.CREATED, RunStatus.QUEUED, RunStatus.RUNNING}
+)
+_ORPHAN_STALE_AFTER = timedelta(seconds=60)
+_ORPHAN_PAGE_SIZE = 200
 
 
 class CanonicalCatalogGuard:
@@ -1105,6 +1111,62 @@ class _FactorPublisher:
         return result
 
 
+class _WorkerRecovery:
+    """回收失联任务，并将其仍活动的实验 Run 同步终结为失败。"""
+
+    def __init__(
+        self,
+        queue: TaskQueue,
+        registry: ExperimentRunRegistry,
+        stale_after: timedelta = _ORPHAN_STALE_AFTER,
+    ) -> None:
+        self._queue = queue
+        self._registry = registry
+        self._stale_after = stale_after
+
+    def __call__(self, now: datetime) -> int:
+        """回收超时任务并收敛全部 ORPHANED 实验 Run。"""
+        recovered = self._queue.mark_orphans(now, self._stale_after)
+        offset = 0
+        while True:
+            tasks = self._queue.list(
+                status=TaskStatus.ORPHANED,
+                subject_kind="EXPERIMENT_RUN",
+                limit=_ORPHAN_PAGE_SIZE,
+                offset=offset,
+            )
+            for task in tasks:
+                if task.subject_id is None:
+                    continue
+                try:
+                    run = self._registry.get_run(task.subject_id)
+                except KeyError:
+                    continue
+                if run.status not in _ACTIVE_RUN_STATUSES:
+                    continue
+                error: dict[str, JsonValue] = {
+                    "code": "TASK_ORPHANED",
+                    "message": "Run task heartbeat exceeded the stale threshold",
+                    "task_id": task.id,
+                }
+                try:
+                    self._registry.transition(
+                        run.id,
+                        run.status,
+                        RunStatus.FAILED,
+                        stage=run.stage,
+                        error=error,
+                    )
+                except ValueError:
+                    current = self._registry.get_run(run.id)
+                    if current.status in _ACTIVE_RUN_STATUSES:
+                        raise
+            if len(tasks) < _ORPHAN_PAGE_SIZE:
+                break
+            offset += len(tasks)
+        return recovered
+
+
 def build_experiment_worker(
     *,
     engine: Engine,
@@ -1148,7 +1210,11 @@ def build_experiment_worker(
         diagnostic_root=log_root, artifact_root=artifact_root, sensitive_values=()
     )
     return Worker(
-        queue, worker_id=worker_id, handlers=(handler, *extra_handlers), task_logs=logs
+        queue,
+        worker_id=worker_id,
+        handlers=(handler, *extra_handlers),
+        orphan_recovery=_WorkerRecovery(queue, registry),
+        task_logs=logs,
     )
 
 

@@ -826,8 +826,9 @@ payload 是该任务类型的冻结参数（如 DATA\_UPDATE 的固化计划 `pl
 
 ```text
 QUEUED → RUNNING → SUCCEEDED
+              ├→ CANCEL_REQUESTED → CANCELLED
               ├→ FAILED
-              └→ CANCELLED
+              └→ ORPHANED
 ```
 
 - 提交即 `QUEUED`（可带 `available_at` 延迟可见）。
@@ -839,9 +840,15 @@ QUEUED → RUNNING → SUCCEEDED
 
 - **领取**：`SELECT ... WHERE status='QUEUED' AND (available_at IS NULL OR available_at<=now)
   ORDER BY priority DESC, created_at ASC LIMIT 1`，随即 CAS 抢占。
-- **心跳**：RUNNING 期间周期更新 `heartbeat_at`（租约续期）。
-- **陈旧回收**：`heartbeat_at` 超过 `lease_timeout` 的 RUNNING 任务视为 Worker 崩溃，可被重新领取；
-  回收时开新 attempt，旧 attempt 标 `FAILED(lease_expired)`。防止崩溃任务永久占位。
+- **心跳**：RUNNING 或 CANCEL_REQUESTED 期间周期更新 `heartbeat_at`
+  和 `updated_at`（租约续期）。
+- **陈旧回收**：Worker 首次轮询必执行扫描，之后最多每 30 秒扫描一次。
+  RUNNING/CANCEL_REQUESTED 任务超过 60 秒没有任务或活动 attempt 心跳时，
+  任务与所有活动 attempt 一并进入终态 `ORPHANED`。历史异常数据即使缺少
+  attempt 也能收敛，而存在新鲜 attempt 心跳时不会误回收。
+- **Run 联动**：`EXPERIMENT_RUN` 任务进入 `ORPHANED` 后，仍处于
+  CREATED/QUEUED/RUNNING 的 Run 同步进入 `FAILED`，错误码为 `TASK_ORPHANED`。
+  回收不自动重跑；需按任务类型走显式重试契约。
 
 ### 10.5 幂等
 
@@ -880,12 +887,14 @@ Worker 主循环与 `TaskHandler` 分派在 `application`；Worker 不导入接�
 ### 10.10 测试契约
 
 - **CAS 并发**：两 Worker 抢同一 QUEUED，仅一个成功领取；状态迁移冲突失败不覆盖。
-- **租约回收**：心跳超时的 RUNNING 被回收重领；旧 attempt 标 lease\_expired。
+- **租约回收**：无心跳的 RUNNING/CANCEL_REQUESTED 和缺少 attempt 的历史活动任务
+  被置为 ORPHANED；有新鲜 attempt 心跳时不误判；对应活动 Run 置为 FAILED。
 - **幂等**：相同 idempotency\_key 收敛为一 task；handler 重跑不产生重复副产物。
 - **取消**：阶段边界协作退出，不留 staging 半成品目录。
 - **重试**：数据类复用固化计划；实验类建新 Run 不覆盖旧 Run。
 - **run\_id 可空**：DATA\_UPDATE/DATA\_VALIDATION 任务无 Run 也能全生命周期流转。
-- **崩溃恢复**：进程重启识别未完成 RUNNING（超租约）任务，安全重领不重复写。
+- **崩溃恢复**：进程重启首次轮询即识别超时活动任务，终结为 ORPHANED；
+  重跑由显式重试创建，不覆盖原任务或 Run。
 
 ### 10.11 完成定义
 

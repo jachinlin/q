@@ -32,6 +32,7 @@ from quant_research.tasks.models import (
 )
 
 type _Waiter = Callable[[threading.Event, float], bool]
+type _OrphanRecovery = Callable[[datetime], int]
 
 _SAFE_CONTEXT_FIELDS = frozenset(
     {
@@ -296,12 +297,14 @@ class Worker:
         poll_waiter：可注入的空闲等待器，用于测试时避免真实休眠。
         heartbeat_waiter：可注入的心跳等待器，用于可控地唤醒续租线程。
         heartbeat_join_timeout：关闭 Worker 时等待心跳线程退出的最长秒数。
+        orphan_recovery：按当前时点回收失联任务的持久化回调。
+        orphan_recovery_interval：两次失联任务扫描之间的最短秒数。
         logger：接收结构化事件的日志器，类型为 ``logging.Logger | None``。
         task_logs：为任务尝试创建、封存并固化 JSONL 日志的管理器。
     返回值：
         返回完成字段规范化和不变量校验的对象。
     异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``。
+        输入、状态或依赖结果违反契约时抛出 ``TypeError`` 或 ``ValueError``。
     Claim and execute at most one durable task at a time.
     """
 
@@ -317,6 +320,8 @@ class Worker:
         poll_waiter: _Waiter | None = None,
         heartbeat_waiter: _Waiter | None = None,
         heartbeat_join_timeout: float = 5.0,
+        orphan_recovery: _OrphanRecovery | None = None,
+        orphan_recovery_interval: float = 30.0,
         logger: logging.Logger | None = None,
         task_logs: TaskLogManager | None = None,
     ) -> None:
@@ -337,6 +342,14 @@ class Worker:
             heartbeat_join_timeout,
             "heartbeat_join_timeout",
         )
+        if orphan_recovery is not None and not callable(orphan_recovery):
+            raise TypeError("orphan_recovery must be callable or None")
+        self._orphan_recovery = orphan_recovery
+        self._orphan_recovery_interval = _WorkerSupport._positive_seconds(
+            orphan_recovery_interval,
+            "orphan_recovery_interval",
+        )
+        self._last_orphan_recovery_at: datetime | None = None
         self._logger = logger or logging.getLogger(__name__)
         if task_logs is not None and not isinstance(task_logs, TaskLogManager):
             raise TypeError("task_logs must be a TaskLogManager or None")
@@ -412,7 +425,9 @@ class Worker:
         with self._claim_gate:
             if self._shutdown.is_set():
                 return False
-            task = self._queue.claim(self._worker_id, self._clock())
+            now = self._clock()
+            self._recover_orphans(now)
+            task = self._queue.claim(self._worker_id, now)
         if task is None:
             return False
 
@@ -428,6 +443,24 @@ class Worker:
             task_status=final_status,
         )
         return True
+
+    def _recover_orphans(self, now: datetime) -> None:
+        recovery = self._orphan_recovery
+        if recovery is None:
+            return
+        previous = self._last_orphan_recovery_at
+        if previous is not None and now >= previous:
+            elapsed = (now - previous).total_seconds()
+            if elapsed < self._orphan_recovery_interval:
+                return
+        recovered = recovery(now)
+        if type(recovered) is not int:
+            raise TypeError("orphan_recovery must return an integer")
+        if recovered < 0:
+            raise ValueError("orphan_recovery count must be nonnegative")
+        self._last_orphan_recovery_at = now
+        if recovered:
+            self._logger.warning("recovered %d orphaned task(s)", recovered)
 
     def _run_with_task_log(self, task: ClaimedTask) -> tuple[TaskOutcome, TaskProgress]:
         assert self._task_logs is not None

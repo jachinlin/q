@@ -703,7 +703,10 @@ def test_orphan_scan_uses_newer_task_or_attempt_heartbeat(engine: Engine) -> Non
     queue.claim("worker-1", NOW)
     with engine.begin() as connection:
         connection.execute(
-            text("UPDATE task SET heartbeat_at = :old WHERE id = :task_id"),
+            text(
+                "UPDATE task SET heartbeat_at = :old, updated_at = :old "
+                "WHERE id = :task_id"
+            ),
             {"old": (NOW - timedelta(minutes=5)).isoformat(), "task_id": task_id},
         )
         connection.execute(
@@ -715,6 +718,33 @@ def test_orphan_scan_uses_newer_task_or_attempt_heartbeat(engine: Engine) -> Non
 
     assert queue.mark_orphans(NOW + timedelta(seconds=60), timedelta(seconds=60)) == 0
     assert _task_row(engine, task_id)["status"] == "RUNNING"
+
+
+def test_orphan_scan_recovers_stale_active_task_without_attempt(
+    engine: Engine,
+) -> None:
+    """历史活动任务即使缺失 attempt，也必须收敛为 ORPHANED。"""
+    queue = _queue(engine)
+    task_id = queue.enqueue("DATA_UPDATE", {}, 0)
+    stale = NOW - timedelta(minutes=5)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE task SET status = 'CANCEL_REQUESTED', worker_id = 'lost', "
+                "heartbeat_at = :stale, updated_at = :stale WHERE id = :task_id"
+            ),
+            {"stale": stale.isoformat(), "task_id": task_id},
+        )
+
+    assert queue.mark_orphans(NOW, timedelta(seconds=60)) == 1
+
+    task = _task_row(engine, task_id)
+    assert task["status"] == "ORPHANED"
+    assert json.loads(task["error_json"])["code"] == "TASK_ORPHANED"
+    assert _attempt_rows(engine, task_id) == []
+    assert [event["event_type"] for event in _task_audit(engine, task_id)][-1] == (
+        "TASK_ORPHANED"
+    )
 
 
 def test_retry_reuses_task_preserves_history_and_increments_attempt(

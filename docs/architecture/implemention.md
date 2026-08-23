@@ -1786,7 +1786,10 @@ def claim(worker_id, now):
 
 ```python
 def run_once(worker_id, now_fn):
-    task = queue.claim(worker_id, now_fn())
+    now = now_fn()
+    if first_poll or now-last_orphan_scan >= 30s:
+        recover_stale(now)                              # §6.7
+    task = queue.claim(worker_id, now)
     if task is None: return False
     handler = handlers[task.task_type]                   # §6.8 分派表
     progress = _QueueProgressSink(queue, task.id, worker_id, now_fn)   # 内部调 heartbeat
@@ -1805,7 +1808,6 @@ def run_once(worker_id, now_fn):
 def run_loop(worker_id, now_fn, poll_seconds, stop_flag):
     while not stop_flag():
         if not run_once(worker_id, now_fn):
-            recover_stale(now_fn())                       # §6.7
             sleep(poll_seconds)
 ```
 
@@ -1818,19 +1820,35 @@ CLI `quant worker once` 调 `run_once`，`quant worker run` 调 `run_loop`。
 
 ```python
 def heartbeat(task_id, worker_id, progress, now):
-    UPDATE task SET heartbeat_at=? WHERE id=? AND worker_id=? AND status='RUNNING'
-    UPDATE task_attempt SET heartbeat_at=?, progress_json=? WHERE task_id=? AND status='RUNNING'
+    UPDATE task SET heartbeat_at=?, updated_at=? WHERE id=? AND worker_id=?
+           AND status IN ('RUNNING','CANCEL_REQUESTED')
+    UPDATE task_attempt SET heartbeat_at=?, progress_json=? WHERE task_id=?
+           AND status IN ('RUNNING','CANCEL_REQUESTED')
 
-def recover_stale(now, lease_timeout=300s):
+def recover_stale(now, lease_timeout=60s):
     with tx():
-        for row in SELECT * FROM task WHERE status='RUNNING' AND heartbeat_at < now-lease_timeout:
-            UPDATE task_attempt SET status='FAILED', error_json='{"code":"LEASE_EXPIRED"}',
-                   completed_at=? WHERE task_id=row.id AND status='RUNNING'
-            UPDATE task SET status='QUEUED', worker_id=NULL, locked_at=NULL
-                   WHERE id=row.id AND status='RUNNING' AND heartbeat_at<now-lease_timeout   # CAS
+        for row in SELECT * FROM task
+                   WHERE status IN ('RUNNING','CANCEL_REQUESTED')
+                     AND updated_at < now-lease_timeout:
+            attempts = SELECT * FROM task_attempt WHERE task_id=row.id
+                       AND status IN ('RUNNING','CANCEL_REQUESTED')
+            if any(coalesce(a.heartbeat_at, a.started_at) >= now-lease_timeout
+                   for a in attempts):
+                continue
+            UPDATE task_attempt SET status='ORPHANED', error_json='{"code":"TASK_ORPHANED"}',
+                   completed_at=? WHERE id IN attempts
+            UPDATE task SET status='ORPHANED', error_json='{"code":"TASK_ORPHANED"}',
+                   completed_at=?, updated_at=?
+                   WHERE id=row.id AND status IN ('RUNNING','CANCEL_REQUESTED')  # CAS
+
+    for task in list(status='ORPHANED', subject_kind='EXPERIMENT_RUN'):
+        if task.run.status in ('CREATED','QUEUED','RUNNING'):
+            transition_run(task.run, FAILED, error_code='TASK_ORPHANED')
 ```
 
-回收后任务回到 QUEUED 被重新领取（开新 attempt）。进程崩溃恢复即依赖此机制——无需专门"重启扫描"。
+Worker 首次轮询必执行回收，之后按 30 秒间隔节流。任务和活动 attempt
+进入终态 ORPHANED，不自动重领；没有 attempt 的历史活动任务也会收敛。
+若 attempt 仍有新鲜心跳则不回收。关联活动实验 Run 同步进入 FAILED；重跑必须走显式重试。
 
 ---
 
@@ -1865,7 +1883,7 @@ DATA_UPDATE 重试复用原 `plan_hash` 对应的固化计划；水位变化不�
 
 ```text
 TASK_STATE_CONFLICT     CAS 迁移冲突（期望前态不符）
-LEASE_EXPIRED           心跳超时被回收
+TASK_ORPHANED           心跳超时被回收
 TASK_HANDLER_MISSING    task_type 无注册 handler
 TASK_PAYLOAD_INVALID    payload 反序列化/校验失败
 # 业务错误码由 handler 透传（EXPERIMENT_*, DATA_*）
@@ -1878,7 +1896,9 @@ TASK_PAYLOAD_INVALID    payload 反序列化/校验失败
 - **CAS 并发**：模拟两 worker_id 对同一 QUEUED 调 claim，仅一个拿到；另一个得 None。
 - **幂等**：相同 idempotency_key 两次 submit 返回同一 id；handler 重跑无重复副产物。
 - **领取顺序**：priority DESC、同优先级 created_at ASC；`available_at>now` 不被领取。
-- **心跳/回收**：heartbeat 推进；超 lease_timeout 的 RUNNING 被 recover_stale 回收，旧 attempt=LEASE_EXPIRED。
+- **心跳/回收**：heartbeat 推进；超 lease_timeout 的 RUNNING/CANCEL_REQUESTED
+  被 recover_stale 终结为 ORPHANED；缺少 attempt 也可回收，新鲜 attempt 不误回收，
+  关联活动 Run 进入 FAILED。
 - **取消**：request_cancel 后 handler 在边界退出，task=CANCELLED，无 staging 残留。
 - **重试**：数据类复用 plan_hash；实验类新 Run+新 task；attempt_no 递增。
 - **run_id 可空**：DATA_UPDATE 无 run_id 全生命周期流转；删除 Run 时 task.run_id 置 NULL（SET NULL）。
@@ -1892,7 +1912,7 @@ TASK_PAYLOAD_INVALID    payload 反序列化/校验失败
 1. 单队列服务四类任务；`run_id` 可空（数据类无 Run）。
 2. 领取/迁移全用 CAS + 期望前态；影响行数 0 即冲突，不覆盖。
 3. 任务必须幂等；`idempotency_key` UNIQUE 收敛重复提交。
-4. 租约超时回收崩溃任务；崩溃恢复不依赖专门扫描。
+4. Worker 首次轮询必扫描失联任务，之后每 30 秒至多扫描一次；超时任务终结为 ORPHANED。
 5. 取消是协作式、阶段边界检查，不强杀，不留 staging。
 6. 重试：数据类复用固化计划、实验类建新 Run（不覆盖历史）。
 7. 新增任务类型只注册 handler，不改主循环；Worker 不含业务逻辑。

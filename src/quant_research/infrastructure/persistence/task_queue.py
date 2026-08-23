@@ -832,12 +832,9 @@ class TaskQueue:
                 )
                 for row in connection.execute(
                     select(TaskORM.id)
-                    .join(TaskAttemptORM, TaskAttemptORM.task_id == TaskORM.id)
                     .where(
                         TaskORM.status.in_(("RUNNING", "CANCEL_REQUESTED")),
-                        TaskAttemptORM.status.in_(("RUNNING", "CANCEL_REQUESTED")),
-                        TaskORM.heartbeat_at < cutoff,
-                        TaskAttemptORM.heartbeat_at < cutoff,
+                        TaskORM.updated_at < cutoff,
                     )
                     .order_by(TaskORM.id)
                 )
@@ -854,29 +851,44 @@ class TaskQueue:
             def operation(
                 connection: Connection, *, task_id: str = candidate_id
             ) -> bool:
-                pair = (
+                task = (
                     connection.execute(
                         select(
-                            TaskORM.status.label("task_status"),
-                            TaskORM.heartbeat_at.label("task_heartbeat"),
-                            TaskAttemptORM.id.label("attempt_id"),
-                            TaskAttemptORM.status.label("attempt_status"),
-                            TaskAttemptORM.heartbeat_at.label("attempt_heartbeat"),
+                            TaskORM.status,
+                            TaskORM.updated_at,
                         )
                         .select_from(TaskORM)
-                        .join(TaskAttemptORM, TaskAttemptORM.task_id == TaskORM.id)
                         .where(
                             TaskORM.id == task_id,
                             TaskORM.status.in_(("RUNNING", "CANCEL_REQUESTED")),
-                            TaskAttemptORM.status.in_(("RUNNING", "CANCEL_REQUESTED")),
                         )
                     )
                     .mappings()
                     .one_or_none()
                 )
-                if pair is None or not (
-                    cast(str, pair["task_heartbeat"]) < cutoff
-                    and cast(str, pair["attempt_heartbeat"]) < cutoff
+                if task is None or cast(str, task["updated_at"]) >= cutoff:
+                    return False
+                attempts = (
+                    connection.execute(
+                        select(
+                            TaskAttemptORM.id,
+                            func.coalesce(
+                                TaskAttemptORM.heartbeat_at,
+                                TaskAttemptORM.started_at,
+                            ).label("activity_at"),
+                        ).where(
+                            TaskAttemptORM.task_id == task_id,
+                            TaskAttemptORM.status.in_(
+                                ("RUNNING", "CANCEL_REQUESTED")
+                            ),
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                if any(
+                    cast(str, attempt["activity_at"]) >= cutoff
+                    for attempt in attempts
                 ):
                     return False
                 stamp = self._stamp(instant)
@@ -890,13 +902,20 @@ class TaskQueue:
                         error_json=error_json,
                     )
                 )
-                connection.execute(
-                    update(TaskAttemptORM)
-                    .where(TaskAttemptORM.id == pair["attempt_id"])
-                    .values(
-                        status="ORPHANED", completed_at=stamp, error_json=error_json
+                if attempts:
+                    connection.execute(
+                        update(TaskAttemptORM)
+                        .where(
+                            TaskAttemptORM.id.in_(
+                                [cast(str, attempt["id"]) for attempt in attempts]
+                            )
+                        )
+                        .values(
+                            status="ORPHANED",
+                            completed_at=stamp,
+                            error_json=error_json,
+                        )
                     )
-                )
                 self._audit(
                     connection,
                     task_id,
