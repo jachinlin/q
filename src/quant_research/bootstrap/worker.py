@@ -53,7 +53,12 @@ from quant_research.experiments.models import (
 from quant_research.experiments.runner import ExperimentRunHandler
 from quant_research.experiments.statistics import MultipleTestingCorrector
 from quant_research.factor_studies.analysis import analyze, build_future_returns
-from quant_research.factors import FactorContext, FactorEngine, FactorRegistry
+from quant_research.factors import (
+    FactorArtifact,
+    FactorContext,
+    FactorEngine,
+    FactorRegistry,
+)
 from quant_research.factors.builtin import register_stock_factors
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
@@ -818,6 +823,19 @@ class _FactorRunSession:
                 shutil.rmtree(self._published_dir, ignore_errors=True)
             self._published_dir = None
 
+    @staticmethod
+    def _analysis_factor_frame(
+        artifacts: Mapping[str, FactorArtifact], factor_ids: Sequence[str]
+    ) -> pl.DataFrame:
+        """将标准因子产物显式适配为以信号日为主键的研究输入。"""
+        return (
+            pl.concat(
+                [artifacts[factor_id].lazy_frame().collect() for factor_id in factor_ids]
+            )
+            .rename({"trade_date": "signal_date"})
+            .sort("signal_date", "instrument_id", "factor_id")
+        )
+
     def _analyze(
         self, progress: ProgressSink, cancellation: CancellationToken
     ) -> None:
@@ -860,11 +878,8 @@ class _FactorRunSession:
                 config.end_date,
             ),
         )
-        factor_frame = pl.concat(
-            [
-                artifacts_by_factor[item].lazy_frame().collect()
-                for item in config.factor_study.factor_ids
-            ]
+        factor_frame = self._analysis_factor_frame(
+            artifacts_by_factor, config.factor_study.factor_ids
         )
         horizon_tail = max(config.factor_study.horizons)
         later = source._sessions(
