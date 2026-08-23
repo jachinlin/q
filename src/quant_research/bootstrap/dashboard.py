@@ -8,14 +8,14 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from quant_research.application.experiments import ExperimentService
 from quant_research.application.operations import OperationalCommandService
 from quant_research.backtest.rulebook import AShareRuleBook
-from quant_research.bootstrap.research import build_research_platform
 from quant_research.config import Settings
 from quant_research.dashboard.app import create_dashboard_app as create_http_app
+from quant_research.dashboard.experiments import ExperimentDashboardService
 from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.dashboard.notebook import NotebookProbe
-from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.data.pipeline.publish import DataUpdatePlanner
 from quant_research.data.repository import CanonicalResearchRepository
@@ -30,8 +30,12 @@ from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
 )
+from quant_research.infrastructure.persistence.experiment_runs import (
+    ExperimentRunRegistry,
+)
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
+from quant_research.strategies.registry import StrategyRegistry
 
 
 class _LocalNotebookProbe:
@@ -135,13 +139,12 @@ class DashboardBootstrap:
                 MarketReviewService(repository, rulebook),
                 BAOSTOCK_ROUTES,
             )
-            research = build_research_platform(
-                engine=engine,
-                queue=queue,
-                repository=repository,
-                source_root=source_root,
-                artifact_root=settings.artifact_root,
-                rulebook=rulebook,
+            strategies = StrategyRegistry.builtins(
+                commission_bps=rulebook.commission_bps,
+                commission_minimum_fen=rulebook.commission_minimum_fen,
+            )
+            experiments = ExperimentService(
+                ExperimentRunRegistry(engine), repository.catalog(), strategies
             )
             commands = OperationalCommandService(
                 queue,
@@ -150,18 +153,14 @@ class DashboardBootstrap:
                     repository=MetadataRepository(engine),
                     routes=BAOSTOCK_ROUTES,
                 ),
-                research.commands,
+                experiments,
             )
             return create_http_app(
                 service=service,
                 commands=commands,
-                research_service=ResearchDashboardService(
-                    research.registry,
-                    research.components,
-                    config_root / "research" / "examples",
-                    settings.artifact_root,
+                experiment_service=ExperimentDashboardService(
+                    experiments, strategies, settings.artifact_root
                 ),
-                research_commands=research.commands,
                 notebook_probe=notebook_probe or _LocalNotebookProbe(),
                 static_dir=static_dir or source_root / "frontend" / "dist",
                 allowed_hosts=allowed_hosts,

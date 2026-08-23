@@ -34,7 +34,14 @@ def test_data_cli_exposes_validate_gate_without_snapshot_commands() -> None:
 def test_data_commands_do_not_expose_full_and_bootstrap_requires_years() -> None:
     app = create_app(_unexpected_services)
 
-    for command in ("bootstrap", "update", "localize", "localize-all", "curate", "curate-all"):
+    for command in (
+        "bootstrap",
+        "update",
+        "localize",
+        "localize-all",
+        "curate",
+        "curate-all",
+    ):
         result = CliRunner().invoke(app, ["data", command, "--help"])
         assert result.exit_code == 0
         assert "--full" not in result.stdout

@@ -379,7 +379,7 @@ describe('data center core loop', () => {
           retryable: true,
           remediation: 'refresh preview',
           request_id: 'request-1',
-        }))
+        }, 409))
       }
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })

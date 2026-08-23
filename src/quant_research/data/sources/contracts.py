@@ -38,7 +38,6 @@ class SourceClient(Protocol):
         """
 
 
-
 class PipelineSource(Protocol):
     """约束数据流水线编排器使用的细粒度采集接口。
 
@@ -153,9 +152,7 @@ class PipelineSource(Protocol):
         ``ValueError``。
         """
 
-    def fetch_etf_bars(
-        self, request: Mapping[str, JsonValue]
-    ) -> Iterable[RawBatch]:
+    def fetch_etf_bars(self, request: Mapping[str, JsonValue]) -> Iterable[RawBatch]:
         """获取一个 ETF 区间的未复权 Raw 行情。
 
         入参：规范化 ETF 请求。返回值：供应商 Raw 批次。异常：传播供应商边界异常。
@@ -192,9 +189,7 @@ class PipelineSource(Protocol):
         ``ValueError``。
         """
 
-    def fetch_index_bars(
-        self, request: Mapping[str, JsonValue]
-    ) -> Iterable[RawBatch]:
+    def fetch_index_bars(self, request: Mapping[str, JsonValue]) -> Iterable[RawBatch]:
         """获取一个指数区间的未复权 Raw 行情。
 
         入参：规范化指数请求。返回值：供应商 Raw 批次。异常：传播供应商边界异常。

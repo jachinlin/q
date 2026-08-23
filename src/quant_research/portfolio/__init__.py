@@ -13,7 +13,6 @@ from quant_research.portfolio.constructor import (
 from quant_research.portfolio.rebalance import (
     OrderIntent,
     OrderSide,
-    RebalancePlan,
     RebalancePlanner,
 )
 from quant_research.portfolio.research import (
@@ -35,7 +34,6 @@ __all__ = [
     "OrderSide",
     "PortfolioConstraints",
     "PortfolioConstructor",
-    "RebalancePlan",
     "RebalancePlanner",
     "TargetPortfolio",
     "TargetPosition",

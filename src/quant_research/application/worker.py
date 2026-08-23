@@ -94,7 +94,8 @@ class WorkerRunResult:
     """
 
     task_id: str
-    experiment_id: str | None
+    subject_kind: str | None
+    subject_id: str | None
     task_status: TaskStatus
 
 
@@ -135,6 +136,7 @@ class _Queue(Protocol):
         self,
         attempt_id: str,
         worker_id: str,
+        expected_path: str,
     ) -> str: ...
 
     def finish(
@@ -421,33 +423,38 @@ class Worker:
         final_status = self._finish(task, outcome)
         self._last_result = WorkerRunResult(
             task_id=task.id,
-            experiment_id=task.experiment_id,
+            subject_kind=task.subject_kind,
+            subject_id=task.subject_id,
             task_status=final_status,
         )
         return True
 
-    def _run_with_task_log(
-        self, task: ClaimedTask
-    ) -> tuple[TaskOutcome, TaskProgress]:
+    def _run_with_task_log(self, task: ClaimedTask) -> tuple[TaskOutcome, TaskProgress]:
         assert self._task_logs is not None
         context = LogContext(
             request_id=task.attempt_id,
-            experiment_id=task.experiment_id,
+            experiment_id=(
+                task.subject_id if task.subject_kind == "EXPERIMENT_RUN" else None
+            ),
             task_id=task.id,
             attempt_id=task.attempt_id,
             worker_id=task.worker_id,
         )
         try:
             session = self._task_logs.open(context)
-        except StructuredLogWriteError:
+        except (StructuredLogWriteError, TypeError, ValueError):
             return self._run_claimed(task, logger=None)
         with session:
-            bound_path = self._queue.bind_log_path(
-                task.attempt_id,
-                task.worker_id,
-            )
-            if Path(bound_path) != session.path:
-                raise ValueError("task log manager and queue roots do not match")
+            try:
+                bound_path = self._queue.bind_log_path(
+                    task.attempt_id,
+                    task.worker_id,
+                    str(session.path),
+                )
+                if Path(bound_path) != session.path:
+                    raise ValueError("task log manager and queue roots do not match")
+            except (TaskQueueConflict, TypeError, ValueError):
+                return self._run_claimed(task, logger=None)
             session.logger.emit(
                 "INFO",
                 "task.claimed",
@@ -464,9 +471,7 @@ class Worker:
                     },
                 },
             )
-            outcome, final_progress = self._run_claimed(
-                task, logger=session.logger
-            )
+            outcome, final_progress = self._run_claimed(task, logger=session.logger)
             session.logger.emit(
                 "INFO",
                 "task.outcome_ready",

@@ -1,8 +1,3 @@
-"""公开研究平台的 A 股成交执行能力。"""
+"""成交执行统一由 ``quant_research.backtest.execution`` 提供。"""
 
-from quant_research.execution.simulator import (
-    AShareExecutionResult,
-    AShareExecutionSimulator,
-)
-
-__all__ = ["AShareExecutionResult", "AShareExecutionSimulator"]
+__all__: list[str] = []

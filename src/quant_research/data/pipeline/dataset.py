@@ -656,16 +656,22 @@ class DataUpdatePlan:
             sorted(self.skipped_datasets, key=lambda item: item.dataset.value)
         )
         if skipped != self.skipped_datasets:
-            raise ValueError("DATA_UPDATE skipped datasets must use deterministic order")
+            raise ValueError(
+                "DATA_UPDATE skipped datasets must use deterministic order"
+            )
         if len({item.dataset for item in skipped}) != len(skipped):
             raise ValueError("DATA_UPDATE skipped datasets must be unique")
         if {item.dataset for item in ordered} & {item.dataset for item in skipped}:
             raise ValueError("DATA_UPDATE dataset decisions must not overlap")
         if ordered:
             if self.start != min(item.start for item in ordered):
-                raise ValueError("DATA_UPDATE summary start does not match dataset windows")
+                raise ValueError(
+                    "DATA_UPDATE summary start does not match dataset windows"
+                )
             if self.end != max(item.end for item in ordered):
-                raise ValueError("DATA_UPDATE summary end does not match dataset windows")
+                raise ValueError(
+                    "DATA_UPDATE summary end does not match dataset windows"
+                )
         elif self.start != self.end:
             raise ValueError("no-op DATA_UPDATE plan must use a single summary date")
 
@@ -687,9 +693,7 @@ class DataUpdatePlan:
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
             "dataset_windows": [item.to_payload() for item in self.dataset_windows],
-            "skipped_datasets": [
-                item.to_payload() for item in self.skipped_datasets
-            ],
+            "skipped_datasets": [item.to_payload() for item in self.skipped_datasets],
         }
         if self.requested_start is not None and self.requested_end is not None:
             payload["requested_start"] = self.requested_start.isoformat()
@@ -916,8 +920,7 @@ class DataUpdatePlanner:
                     message="data initialization has not completed",
                     context={"frozen_years": initialization.years},
                     remediation=(
-                        "retry quant data bootstrap --years "
-                        f"{initialization.years}"
+                        f"retry quant data bootstrap --years {initialization.years}"
                     ),
                     retryable=False,
                 )
@@ -1399,9 +1402,7 @@ class DataPipeline:
             result: PublishedPartition | None = None
             try:
                 for batch in fetch():
-                    if (
-                        is_financial_cell and len(batch.rows) == 0
-                    ):
+                    if is_financial_cell and len(batch.rows) == 0:
                         validate_batch(batch, endpoint=endpoint, request=request)
                         fetched += 1
                         self._localize_log(
@@ -2012,9 +2013,7 @@ class DataPipeline:
             ordered_records = tuple(
                 record
                 for record in ordered_records
-                if self._mapper.raw_head_is_usable(
-                    dataset, record.request, curate_now
-                )
+                if self._mapper.raw_head_is_usable(dataset, record.request, curate_now)
             )
             records_by_dataset[dataset] = ordered_records
             accepts_raw_schema = getattr(self._mapper, "accepts_raw_schema", None)
@@ -2576,16 +2575,14 @@ class DataPipeline:
                 "DATA_PIPELINE_ARGUMENT",
                 "bootstrap years must be a positive integer",
             )
-        executable = {
-            dataset for dataset in self._catalog if self._routes[dataset]
-        }
+        executable = {dataset for dataset in self._catalog if self._routes[dataset]}
         existing = {
             record.dataset for record in self._repository.list_canonical_datasets()
         }
         initialization = self._repository.find_data_initialization()
-        if (
-            initialization is not None and initialization.status == "COMPLETED"
-        ) or (initialization is None and executable.issubset(existing)):
+        if (initialization is not None and initialization.status == "COMPLETED") or (
+            initialization is None and executable.issubset(existing)
+        ):
             raise QuantError(
                 ErrorDetail(
                     code="DATA_BOOTSTRAP_ALREADY_INITIALIZED",
@@ -2646,9 +2643,7 @@ class DataPipeline:
             quality_run_id=quality,
             completed_at=self._now(),
         )
-        return PipelineResult(
-            run_id, quality, state.catalog_hash
-        )
+        return PipelineResult(run_id, quality, state.catalog_hash)
 
     def update(
         self,

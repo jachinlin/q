@@ -1,8 +1,11 @@
 # A 股量化策略研究工作台
 
-文档状态：设计草案，待用户书面审阅　·　日期：2026-08-20
+文档状态：当前有效设计　·　日期：2026-08-22
 
-本文是 A 股个人量化策略研究工作台的**总体设计入口**，按阅读顺序汇集项目诉求、需求规格、整体架构、各层边界、接口契约与实现计划。数据层的权威详细设计已拆分到[数据层设计](data-layer-design.md)；实现级细化见 `implemention.md`。文中形如 `第 N 章 §M` 的引用指向本文对应章节。
+本文是 A 股个人量化策略研究工作台的**总体设计入口**，按阅读顺序汇集项目诉求、需求规格、
+整体架构、跨层边界与实现计划。数据层的权威详细设计见[数据层设计](data-layer-design.md)，
+策略、回测与实验的权威详细设计见[策略、回测与实验设计](strategy-backtest-experiment-design.md)，
+实现级细化见 `implemention.md`。未附文档链接的 `第 N 章`、`§M` 引用均指向本文。
 
 ## 目录
 
@@ -11,10 +14,10 @@
 3. 整体架构
 4. [数据层设计（独立文档）](data-layer-design.md)
 5. 因子层设计
-6. 策略层设计（A+B 扩展 / 订单驱动）
-7. 回测层设计（订单级引擎 / 多空账务）
+6. [策略层设计（独立文档）](strategy-backtest-experiment-design.md) `§2`
+7. [回测层设计（独立文档）](strategy-backtest-experiment-design.md) `§3`
 8. 分析层设计（绩效 / 风险 / 归因）
-9. 实验层设计（编排 / 追踪 / 比较）
+9. [实验层设计（独立文档）](strategy-backtest-experiment-design.md) `§4`
 10. Worker 与任务队列设计
 11. 接口与 Schema 契约（落地基准）
 12. 分阶段实现计划
@@ -26,7 +29,8 @@
 ### 1.1 一句话定位
 
 个人自有资金的 A 股低频量化**策略研究工作台**：核心价值是**低摩擦地快速迭代、试错、比较各种策略**，
-在保证"结果当下可信"的前提下尽快看到结果。不追求特定收益率，不做实验归档系统。
+在保证"结果当下可信"的前提下尽快看到结果。不追求特定收益率，也不提供历史 Canonical 回放；
+每次 Run 的冻结配置、指标和已发布产物仍保持不可变，便于同一实验内比较。
 
 ### 1.2 诉求优先级（高 → 低）
 
@@ -41,9 +45,9 @@
 放弃的是**跨运行复现回放**，不是所有哈希（哈希用于去重/增量/完整性/运行内一致性仍保留；
 技术边界见 `§3.4.2「哈希边界」`）：
 
-- **跨运行复现回放**：不保留可选择的历史 catalog、不要求旧 run 可完全重放、不做 source/env 指纹链、
-  不做 `run_identity` 内容身份哈希、不做产物 manifest 逐文件 SHA-256 校验、不强制"结果不可覆盖"。
-  重跑允许覆盖。
+- **跨运行复现回放**：不保留可选择的历史 catalog、不承诺旧 Run 可重新读取当时的 Canonical 数据、
+  不做 source/env 指纹链或 `run_identity` 内容身份哈希。Manifest 仍逐文件记录并复核 SHA-256、字节数、
+  行数、Schema、主键和排序，重跑始终创建新 Run、新任务和新目录，禁止覆盖历史产物。
 - **数据层复现**：数据层重性能与去重（"只考虑不重算，不考虑复现"），不为跨运行复现付费。
 - 高频 / Tick / 盘口 / 实盘下单 / 多用户 / 公网 / 分布式 / 参数寻优后直接发布 / 收益承诺。
 
@@ -51,7 +55,7 @@
 
 - **PIT 一致性门**：作用是"防止运行中途数据变了、导致这次结果混用两批数据而错误"，即
   **运行内一致性**，不是跨运行复现回放。
-- **数据版本号（`catalog_version`）轻量化**：只用于运行内一致性判定，不做历史版本存储与回放。
+- **数据版本号（`catalog_hash`）轻量化**：只用于运行内一致性判定，不做历史版本存储与回放。
 - **防过拟合治理（train/valid/test 隔离、多重检验记账）：保留**。它服务于"结论统计可信"，
   不属于复现机制，故在放弃复现的同时仍然保留。
 
@@ -108,7 +112,8 @@
 ### 2.1 定位
 
 个人自有资金的 A 股低频量化**策略研究工作台**。核心价值是**低摩擦地快速迭代、试错、
-比较各种策略**，并在"结果当下可信"的前提下尽快看到结果。不追求特定收益率，不做实验归档系统。
+比较各种策略**，并在"结果当下可信"的前提下尽快看到结果。不追求特定收益率，也不提供历史
+Canonical 回放；已发布 Run 仍不可变并可审计比较。
 
 单用户、Windows 本机、单体、本地 Dashboard。频率以日频为主（接口为日内预留但本期不实现）。
 
@@ -126,13 +131,14 @@
 
 放弃的是**跨运行复现回放**，不是所有哈希（哈希边界见 `§3.4.2「哈希边界」`）：
 
-- **跨运行复现回放**：不保留可选择历史 catalog、不要求旧 run 可完全重放、不做 source/env 指纹链、
-  不做 `run_identity` 内容身份哈希、不做产物 manifest 逐文件 SHA-256 校验、不强制"结果不可覆盖"。重跑允许覆盖。
+- **跨运行复现回放**：不保留可选择历史 catalog、不承诺旧 Run 可重新读取当时的 Canonical 数据、
+  不做 source/env 指纹链或 `run_identity` 内容身份哈希。Run 产物使用可信 Manifest 并不可覆盖；
+  重跑复制冻结配置创建新 Run。
 - **数据层复现**：数据层重性能与去重，不为跨运行复现付费（"只考虑不重算，不考虑复现"）。
 - 高频/Tick、实盘下单、多用户、公网、分布式、参数寻优后自动发布、收益承诺。
 
 > 仍保留完整性/增量/运行内一致性所需的哈希：Raw `request_hash`/`content_hash`、
-> Canonical partition `content_hash`、`schema_fingerprint`、`catalog_version`、curate `input_hash`。
+> Canonical partition `content_hash`、`schema_fingerprint`、`catalog_hash`、curate `input_hash`。
 
 #### 2.3.2 纳入（按业界通用回测框架的合理做法）
 
@@ -225,7 +231,9 @@ Strategy(Protocol)
 - 因子分析：RankIC、滚动 RankIC、分层收益、覆盖率、相关、稳定性；重叠持有期做序列相关修正（HAC/bootstrap），多重检验校正。
 - 全部统计公式字面量 oracle 覆盖。
 
-### 2.10 策略 / 回测 / 实验层需求（详见 `第 6 章`、`第 7 章`、`第 9 章`）
+### 2.10 策略 / 回测 / 实验层需求
+
+详细设计见[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§2-§4`。
 
 - 追踪实体：`Experiment → Run`（轻量，Run 无 run\_identity 复现哈希，但存 catalog\_version）。Run 记录冻结配置快照、状态、指标、产物指针。
 - 编排：`VALIDATE → PREPARE_INPUTS → STRATEGY_RUN(逐时点产订单) → BACKTEST → ANALYTICS → PERSIST`；kind 无关执行器。
@@ -389,7 +397,7 @@ frontend/              # Vue Dashboard 单页应用（独立构建，消费 Fast
 | Raw `content_hash`                 | Raw 内容身份、去重、完整性校验      |
 | Canonical partition `content_hash` | 分区内容身份、完整性校验、增量判定      |
 | `schema_fingerprint`               | 端点/分区契约身份，独立于数据值       |
-| `catalog_version`                  | 当前目录版本号，运行内一致性门（非历史回放） |
+| `catalog_hash`                  | 当前目录版本号，运行内一致性门（非历史回放） |
 | curate `input_hash`                | 增量：输入未变则复用不重算          |
 
 | 不做（跨运行复现回放）                | 理由                |
@@ -397,12 +405,15 @@ frontend/              # Vue Dashboard 单页应用（独立构建，消费 Fast
 | 可选择的历史 catalog / 数据快照版本    | 不回放旧数据            |
 | `run_identity` 内容身份哈希      | 不需按内容身份定位/重放旧 run |
 | source/env 指纹链             | 不锁定代码+环境以复现       |
-| 产物 manifest 逐文件 SHA-256 校验 | 产物普通目录写盘即可        |
-| 强制"结果不可覆盖"                 | 重跑允许覆盖            |
+| 可重放历史 Canonical 的快照 Manifest | 不提供历史数据回放        |
+| source/env 完整复现链               | 不锁定旧代码和旧依赖环境    |
+
+Run 产物的可信 Manifest 属于完整性边界，仍须逐文件复核 SHA-256、字节数、行数、Schema、主键和排序；
+重跑新建 Run，不覆盖既有产物。这不等同于保存历史 Canonical 供回放。
 
 一句话：**内容哈希用于"这一份数据/这一次运行"的正确与高效，不用于"跨时间重放"。**
 
-**运行内一致性门**（`catalog_version` 的唯一用途）：实验运行开始记录当前 `catalog_version`；
+**运行内一致性门**（`catalog_hash` 的唯一用途）：实验运行开始记录当前 `catalog_hash`；
 每阶段边界校验未被并发改动，改动则 `EXPERIMENT_DATA_DRIFT` 失败——作用是"一次运行不混用两批数据"，
 **不用于跨运行回放**（无历史版本存储）。
 
@@ -419,8 +430,8 @@ frontend/              # Vue Dashboard 单页应用（独立构建，消费 Fast
 #### 3.4.5 持久化
 
 - 元数据 SQLite（事务、乐观并发迁移）；大数据 Parquet；本地分析 DuckDB。
-- **实验产物**普通目录写盘（不做逐文件 manifest SHA-256 校验，仅基本完整性 + 孤儿清理）；
-  数据层 Raw/Canonical 仍内容寻址（§3.4.2 保留侧）。
+- **实验产物**按 Run 写入不可变目录，可信 Manifest 逐文件复核 SHA-256、字节数、行数、Schema、
+  主键和排序；数据层 Raw/Canonical 继续内容寻址（§3.4.2 保留侧）。
 
 ### 3.5 数据源可插拔（演进保障）
 
@@ -577,7 +588,8 @@ DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
 ### 5.9 因子研究作为一种实验 kind
 
 - 因子研究（覆盖率/IC/分层/相关/稳定性）由实验层 `FACTOR_STUDY` kind 编排，
-  与策略回测共享同一 `Experiment → Run` 追踪主脊与比较视图（见 `第 9 章`）。
+  与策略回测共享同一 `Experiment → Run` 追踪主脊与比较视图（见
+  [策略、回测与实验设计](strategy-backtest-experiment-design.md) `§4`）。
 - 产物：summary / coverage / ic / quantile\_returns / long\_short\_returns / correlation（+ 可选 significance/stability）。
 
 ### 5.10 与其他层边界
@@ -600,486 +612,30 @@ DELISTED_WITHOUT_EXIT_PRICE / NONFINITE_RETURN
 
 ***
 
-## 6. 策略层设计（A+B 扩展 / 订单驱动）
+## 6. 策略层设计（独立文档）
 
-### 6.1 定位
+策略层详细设计已拆分到[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§2`，
+该文档是 Strategy 协议、A+B 扩展模型、五模块装配、双均线趋势策略和订单意图的权威来源。
 
-策略层是工作台的**生产力核心**：让"加一个新策略"的成本压到最低——只写策略逻辑，
-不改 runner / 回测引擎 / 基础设施。策略只跟稳定公开契约打交道：`DecisionContext`（绑定 signal\_date 的
-只读窄视图 + 账户视图）与 `OrderIntent`（输出，只带整数股数）。
+本总体设计只保留四个跨层边界：
 
-### 6.2 边界
-
-**输入**（每个决策时点，`Strategy.on_event(ctx)` 的 `ctx: DecisionContext`）：
-
-- `signal_date` / `execute_date`（T 决策、T+1 执行）。
-- `data: DecisionData`——**绑定到本 signal\_date 的只读窄视图**：`bars/adjusted_bars/log_returns/
-  daily_basics/factor_values/industry/security_status/stock_universe`，方法签名**均无 as\_of/end 参数**，
-  策略在类型上无法请求 > signal\_date 的数据（PIT 物理边界，非通用 Repository）。
-- `account: AccountView`——`cash_fen`、`positions`（正多；\[P3b-2] 负空）、`sellable`、`available_margin_fen`。
-- 构造期输入：`StrategySpec`（数据/因子依赖声明、参数）。A 底座额外输入五模块配置
-  （AlphaModel/RiskModel/CostModel/ConstructionModel/ConstraintSet 的 `{model_id, params}`）。
-
-**输出**：
-
-- `Sequence[OrderIntent]`（见 `§11.4`）：`instrument_id, side∈{BUY,SELL,SHORT_OPEN,SHORT_COVER},
-  quantity(正整数), reason`。**只带整数股数，无权重字段**。可空（该日不交易）。
-- A 底座（`CrossSectionalStrategy`）内部先产 `TargetWeights`，由 `WeightTargetStrategy` 基类经
-  `RebalancePlanner` 翻译成整数股数 `OrderIntent`；**权重不进入引擎输入**。
-- 缺依赖能力时抛 `STRATEGY_CAPABILITY_UNAVAILABLE`；选型缺前置（如 MVO 要非退化风险模型）抛 `PIPELINE_MODEL_UNAVAILABLE`。
-
-**不负责**：撮合、账务、绩效——那是回测层与实验层的输出。
-
-### 6.3 订单意图是唯一驱动接口
-
-要支持截面选股、择时/CTA、配对、事件驱动四类范式，策略输出必须是**订单意图**层级，而非目标权重：
-
-```text
-策略在每个决策时点产出 OrderIntent（买/卖/开空/平仓 + 整数股数）
-                       ↓
-回测引擎撮合 + 账务（见 backtest-design）
-```
-
-"目标权重"是订单的**特例**：`WeightTargetStrategy` 基类把 `target_weights` 翻译成再平衡订单，
-多因子/ETF 作者仍只声明权重、无感经过基类。反之——用权重表达配对做空、事件驱动离散下单——
-不成立，所以底层必须是订单。这是 backtrader/zipline/vnpy 的共同选择。
-
-### 6.4 策略扩展模型：A + B
-
-#### 6.4.1 B — 策略即插件（底层通用口子）
-
-```python
-class Strategy(Protocol):
-    @property
-    def spec(self) -> StrategySpec: ...          # id / 频率 / 数据依赖声明 / 参数
-    def warmup(self, ctx: DecisionContext) -> None: ...
-    def on_event(self, ctx: DecisionContext) -> Sequence[OrderIntent]: ...
-```
-
-- `on_event` 是唯一必须实现的方法：给定当前决策时点的 PIT 上下文（可见行情、因子、持仓、
-  现金/保证金），返回订单意图。截面、择时、配对、事件驱动都能表达。
-- 通过 `StrategyRegistry`（与 `FactorRegistry` 同一注册表模式）注册；配置按 `{strategy_id, params}` 选择。
-- 数据依赖在 `spec` 声明，preflight 校验；缺能力则 `STRATEGY_CAPABILITY_UNAVAILABLE`。
-
-#### 6.4.2 A — 策略即配置（截面范式的模块化底座）
-
-大多数迭代是"同范式微调"（换因子/换配权/加约束）。为此提供内置 `CrossSectionalStrategy`
-（`WeightTargetStrategy` 子类），由五个可插拔模块组装，配置驱动、无需写代码：
-
-```text
-FactorArtifacts ─► AlphaModel ─► expected_return / score
-returns/history ─► RiskModel  ─► Σ
-holdings/cash   ─► CostModel  ─► 事前成本估计
-                     ▼
-        PortfolioConstructionModel（优化器） + ConstraintSet
-                     ▼
-              target_weights ─►（基类翻译）─► OrderIntent
-```
-
-- **AlphaModel** / **RiskModel** / **TransactionCostModel** / **PortfolioConstructionModel** /
-  **ConstraintSet**——五个可插拔模块，各自设计见 §6.5。
-
-每类模块一个注册表 `model_id → 实现`。ETF 轮动、股票多因子是"底座的两个内置配置"，不是写死特例。
-换任一模块即一个新策略配置，可直接跑、直接与其他 Run 结果并排比较。
-
-#### 6.4.3 A 与 B 的关系
-
-```text
-Strategy (Protocol, B 的口子)
-  └── WeightTargetStrategy (基类：target_weights → OrderIntent)
-        └── CrossSectionalStrategy (A 的底座：五模块组装)
-              ├── 内置配置: etf_rotation
-              └── 内置配置: stock_multifactor
-        └── DualMATrendStrategy (B: 时序状态 → 目标暴露 → OrderIntent)
-  └── PairsStrategy / EventDrivenStrategy … (B: 直接实现 on_event)
-```
-
-A 是 B 之上的便利层，覆盖 \~80% 微调；B 覆盖异构范式。二者同一 `Strategy` 契约、同一回测引擎。
-
-### 6.5 五模块设计（Alpha / Risk / Cost / Construction / Constraint）
-
-A 底座（`CrossSectionalStrategy`）把"截面选股→目标权重"拆成五个**消费者侧 Protocol 端口**，
-每类一个注册表 `model_id → 实现`，配置 `{model_id, params}` 选型。共同约束：
-
-- 只接收 `DecisionContext`（绑定 signal\_date 的窄视图 `DecisionData` + 账户视图）取数，
-  **不得**自取任意日期数据；估计窗口不越 signal\_date（PIT 铁律）。
-- 冻结不可变配置；参数进 `config_hash`（换参即新 Run，可并排比较）。
-- 纯函数、确定性：同输入同输出、稳定排序。
-- 缺前置能力抛 `PIPELINE_MODEL_UNAVAILABLE`（如 MVO 要求非退化风险模型）。
-
-优化目标（组合构建的统一形式，退化项按所选模块置零）：
-
-```text
-maximize_w   αᵀw − λ·wᵀΣw − TC(Δw)      s.t. ConstraintSet(w)
-             └AlphaModel  └RiskModel └CostModel   └ConstraintSet
-```
-
-#### 6.5.1 AlphaModel — 预期收益 / 打分
-
-- **职责**：把因子/信号转成每证券的截面预期收益或可比打分（越大越优）。
-- **契约**：`expected_returns(ctx, universe) -> DataFrame[instrument_id, score, is_valid, reason_code]`。
-  输入 `ctx.data.factor_values(...)`（已绑定 signal\_date）；无效样本保留行 + 原因码，不静默丢。
-- **内置谱系**：
-  - `single_factor`：单因子方向调整后直接作分。
-  - `multi_factor_composite`：固定 `MAD 去极值 → 截面 zscore → 方向调整 → 类别聚合`，**复用因子层
-    `transforms`，禁止另写近似**；有效因子数不足则该证券排除。
-  - （后续）`ml_forecast`：模型打分，输入仍走 PIT 窄视图。
-- **不变量**：只用信号日可见因子；方向与类别权重进 `config_hash`；输出可比、可 rank。
-
-#### 6.5.2 RiskModel — 协方差 / 风险结构
-
-- **职责**：提供组合优化所需的风险度量 Σ（或退化占位）。
-- **契约**：`covariance(ctx, universe) -> CovarianceEstimate`。Σ **只由** **`available_at ≤ signal_date`
-  的** **`ctx.data.log_returns(...)`** **估计**，估计窗口是参数、不得越界。
-- **内置谱系**：
-  - `none`（退化）：返回对角/单位占位，优化目标退化为纯打分（首版默认，配 TopN 用）。
-  - `sample_cov`：样本协方差（窗口可配）。
-  - `shrinkage`：Ledoit-Wolf 收缩，改善病态与小样本。
-  - `factor_risk`：`Σ = BFBᵀ + D`（因子暴露 B、因子协方差 F、特异风险 D）。
-- **不变量**：PIT 估计窗口；非退化模型才允许 MVO/MinVariance/RiskParity，否则 `PIPELINE_MODEL_UNAVAILABLE`。
-
-#### 6.5.3 TransactionCostModel — 事前成本估计
-
-- **职责**：给优化器/权重翻译提供**事前**成交成本估计，用于抑制过度换手、决定交易量。
-- **契约**：`estimate(trades, ctx) -> DataFrame[instrument_id, est_cost_fen]`（整数分）。
-- **内置谱系**：`fixed_bps`（按成交额 bps）/ `linear_impact`（叠加线性冲击 × 参与率）/
-  `sqrt_impact`（Almgren 型 √参与率冲击）。
-- **双角色一致性（硬约束）**：事前 CostModel 与回测撮合的**事后**费用（`MarketRuleBook.fees`）
-  **必须由同一费率配置构造**并可对账，否则优化器对着脱节成本下单——不一致抛
-  `COST_MODEL_INCONSISTENT`（详见 `§7.9`）。
-
-#### 6.5.4 PortfolioConstructionModel — 组合构建 / 优化器
-
-- **职责**：给定 alpha、Σ、成本、约束、当前持仓与现金，求目标权重。
-- **契约**：`construct(alpha, risk, cost, constraints, ctx, account) -> Mapping[InstrumentId, float]`
-  （权重和 ≤ 1，余额为现金）；结果由 `CrossSectionalStrategy` 包成 `TargetWeights`，
-  经 `RebalancePlanner` 翻译为整数股数 `OrderIntent`——**权重不进引擎**。
-- **内置谱系**：
-  - `top_n_equal_weight`（首版默认）：分数前 N 等权 + 上限/换手/流动性约束；Σ/成本退化不参与。
-  - `mean_variance`：最大化 `αᵀw − λ·wᵀΣw − TC`，带约束；要求非退化 RiskModel；先闭式/轻量 QP，
-    不引重型求解器依赖。
-  - （按需）`risk_parity` / `min_variance`。
-- **不变量**：确定性解；持仓数不足抛约束违例；初次建仓豁免换手约束。
-
-#### 6.5.5 ConstraintSet — 声明式约束
-
-- **职责**：声明并强制组合约束，被优化器消费、构建后二次校验（防优化器实现违反）。
-- **契约**：`apply(weights, ctx) -> weights`（裁剪到可行域）+ `validate(weights)`（越界即报错）。
-- **覆盖**：个股权重上限、持仓数区间、换手上限、行业中性/暴露边界（用信号日 as-of `industry_code`，
-  PIT，单成员组失效）、流动性（最小 ADV）、多空/gross/net 敞口（\[P3b-2]）。
-- **不变量**：约束内容进 `config_hash`；行业约束不回填未来状态。
-
-#### 6.5.6 装配（StrategyPipeline）
-
-```text
-StrategyPipeline = AlphaModel + RiskModel + CostModel + ConstructionModel + ConstraintSet
-CrossSectionalStrategy(pipeline).target_weights(ctx):
-    universe = ctx.data.stock_universe().filter(eligible)
-    alpha = pipeline.alpha.expected_returns(ctx, universe)
-    risk  = pipeline.risk.covariance(ctx, universe)
-    w = pipeline.construction.construct(alpha, risk, pipeline.cost, pipeline.constraints, ctx, account)
-    w = pipeline.constraints.apply(w, ctx); pipeline.constraints.validate(w)
-    return TargetWeights(signal_date, execute_date, w)
-```
-
-内置策略即两份装配：`etf_rotation`（composite 动量/趋势/波动 + none + fixed\_bps + top\_n）、
-`stock_multifactor`（七因子 composite + none|shrinkage + fixed\_bps + top\_n|mvo）。换任一模块即新策略配置。
-各模块的精确口径、内置实现与 oracle 见 `implementation.md` §4.5。
-
-### 6.6 必须支持的四类范式
-
-- 截面选股 → 目标权重 → 调仓（多因子、ETF 轮动）：走 A 底座。首版即可跑（多头）。
-- 择时 / CTA（单标的仓位随时间变化）：走 B 插件。首个内置实现是 `dual_ma_trend`；多头择时
-  首版即可，**空头腿随 P3b-2**。
-- 配对交易（成对相对头寸，需做空）：走 B 插件。**纯多空对冲随 P3b-2**（依赖做空账务）。
-- 事件驱动（稀疏、按事件触发的离散订单）：走 B 插件。多头版首版即可。
-
-> 契约层面四范式都可表达；**依赖做空的腿在 P3b 解锁**（见 `§7.5`）。
-> P3 阶段策略产出的 `SHORT_OPEN/SHORT_COVER` 会被引擎拒绝 `SHORT_NOT_SUPPORTED`。
-
-### 6.7 内置双均线趋势策略（`dual_ma_trend`）
-
-#### 6.7.1 定位与组装
-
-双均线是独立的时序方向模型，不进入 `CrossSectionalStrategy` 的 Alpha 五模块。它实现为
-`DualMATrendStrategy(WeightTargetStrategy)`：策略只决定单标的目标暴露，基类继续复用
-`RebalancePlanner` 将目标权重转换为整数股数订单，回测引擎继续统一负责 T+1、涨跌停、停牌、
-费用、滑点、容量和账务。
-
-```text
-fixed instrument
-  → adjusted close history
-  → short/long moving average
-  → LONG|FLAT state
-  → target exposure
-  → RebalancePlanner
-  → BUY|SELL OrderIntent
-  → common execution/account/analytics
-```
-
-首版只支持 LONG/FLAT：`LONG` 映射到 `long_weight`，`FLAT` 映射到 `flat_weight=0`。P3b-2
-完成后可新增 `SHORT` 状态及 `short_weight<0`，不得在首版用负权重绕过做空账务门禁。
-
-#### 6.7.2 信号和时间语义
-
-对交易日 `T`，使用截至 T 日决策截止时点可见的**前复权收盘价**计算：
-
-```text
-MA_n(T) = mean(adjusted_close[T-n+1 : T])
-state(T) = LONG  if MA_short(T) > MA_long(T)
-           FLAT  otherwise
-```
-
-- `short_window_sessions`、`long_window_sessions` 都按交易日计数，且必须满足
-  `2 ≤ short_window_sessions < long_window_sessions`；相等时明确为 FLAT。
-- 必须有连续 `long_window_sessions` 个有效价格才产生首个状态；停牌日是否有有效收盘价由
-  Canonical 行情契约决定，策略不得自行前向填充。窗口不足或价格无效时输出 `INVALID` 原因并且不下单。
-- 信号用 **as-of T 的前复权价**消除拆分、分红等机械跳变：调整因子只能消费截至 T 已可见的
-  公司行为，禁止使用“以回测结束日为基准”的整段前复权序列回写历史。成交与账户估值仍使用
-  T+1 的未复权市场价格。
-- T 日收盘数据形成状态后，最早在 `execute_date=T+1` 撮合，禁止按 T 日收盘价成交。
-- `state_changed` 与上一个**有效决策日状态**比较。首个有效状态为 LONG 时视为变化并建仓；
-  首个有效状态为 FLAT 时不产生空操作。无效日不更新前态。
-
-#### 6.7.3 调仓与失败恢复
-
-正常情况下只在 `state_changed=true` 时建立新的目标暴露，避免每天因价格漂移重复调仓。若订单因
-T+1 可卖、停牌、涨跌停、容量或部分成交未完成，策略保存本次目标状态，并在后续决策日仅对剩余差额
-续单，直到达到 `target_tolerance`、状态再次变化或运行结束。已达到目标后不做日常漂移再平衡。
-该待完成目标属于单次 Run 的确定性状态，可由此前信号和执行结果重建；Worker 重试不得依赖进程内
-未持久化对象而产生不同订单。
-
-状态改变与订单结果是两个不同事实：`state_changed` 只描述信号，拒单、部分成交和续单原因进入执行
-产物，不能回写或篡改均线状态。
-
-#### 6.7.4 严格配置
-
-```yaml
-strategy:
-  strategy_id: dual_ma_trend
-  params:
-    instrument_id: 510300.SH
-    price_field: adjusted_close       # 固定字面量，不允许改为未复权价
-    short_window_sessions: 20
-    long_window_sessions: 120
-    long_weight: 1.0                  # (0, 1]
-    flat_weight: 0.0                  # 首版固定为 0
-    target_tolerance: 0.005           # [0, 0.1]
-    retry_unfilled: true
-```
-
-配置对象拒绝额外字段。`instrument_id` 必须是 Canonical 证券标识；策略依赖声明至少包含
-`adjusted_bars`、`bars`、`security_status` 和 `trading_calendar`。窗口、权重和标的共同进入 Run 的
-冻结配置；参数搜索只能在 TRAIN/VALIDATION 中比较，TEST 不参与均线窗口或权重选择。
-
-#### 6.7.5 产物、分析与验收
-
-运行除通用订单、成交、账户和绩效产物外，还输出按决策日稳定排序的信号明细：
-
-```text
-signal_date, execute_date, instrument_id,
-short_ma, long_ma, state, previous_state, state_changed,
-target_weight, is_valid, invalid_reason
-```
-
-分析至少覆盖：LONG/FLAT 分状态收益、状态持续期、交叉次数、持仓率、换手、未成交恢复、费用拖累、
-参数稳定性和相对基准表现。验收使用字面量价格序列锁定首个有效日、金叉/死叉日、相等为 FLAT、
-无效窗口、T/T+1 分离、首次 LONG 建仓、死叉清仓、部分成交续单，以及 TEST 未参与参数选择。
-
-### 6.8 错误码
-
-```text
-STRATEGY_CAPABILITY_UNAVAILABLE   策略声明的数据依赖不满足
-PIPELINE_MODEL_UNAVAILABLE        选定模型缺依赖（如 MVO 要求非退化风险模型）
-```
-
-（成本一致性错误码 `COST_MODEL_INCONSISTENT` 见 `第 7 章`。）
-
-### 6.9 包结构
-
-```text
-src/quant_research/
-├── strategies/
-│   ├── base.py           # Strategy 协议 + StrategySpec + DecisionContext + OrderIntent
-│   ├── registry.py       # StrategyRegistry
-│   ├── weight_target.py  # WeightTargetStrategy 基类（权重→订单）
-│   ├── cross_sectional.py# CrossSectionalStrategy（A 的五模块底座）
-│   └── builtins/         # etf_rotation / stock_multifactor / dual_ma_trend / pairs / event_driven
-├── alpha/ risk/ costs/   # 五模块能力包之三 + 各自注册表
-└── portfolio/            # ConstructionModel + ConstraintSet + 注册表
-```
-
-### 6.10 依赖方向
-
-```text
-experiments → strategies → {alpha,risk,costs,portfolio} → {data,factors,backtest}
-```
-
-策略与模块只经 `ResearchDataRepository` 等只读端口取数；不导入接口层或组合根。
-
-### 6.11 测试契约
-
-- **扩展性（核心诉求）**：新增一个 `Strategy` 插件无需改 runner/引擎即可跑通（最小 stub 策略测）。
-- **PIT**：`DecisionContext` 物理只暴露 ≤ 决策时点数据；RiskModel/CostModel 估计窗口不越界。
-- **五模块**：MultiFactorComposite 固定 MAD→zscore→方向→类别聚合、复用因子层 transform；oracle。
-- **权重翻译**：差额订单、整手取整、负权重→空头、清仓路径。
-- **双均线**：字面量价格 oracle 锁定窗口、金叉/死叉、相等为 FLAT、`state_changed`、首次有效状态、
-  无效数据不推进状态、T+1 成交和部分成交续单。
-- **回归黄金结果**：etf\_rotation / stock\_multifactor / dual\_ma\_trend 固定小样本锁定输出。
-
-### 6.12 完成定义
-
-> 写一个新策略只需实现 `Strategy.on_event` 并注册（或对截面范式写一份组合五模块的配置），
-> 不改 runner / 回测引擎 / 基础设施即可跑通、出绩效、并排比较；四类范式可表达（依赖做空的腿随 P3b-2）；
-> 事前成本与回测实际成本可对账（见 `第 7 章`）。
+- 策略只能通过绑定决策时点的只读数据视图取数，不能请求未来数据。
+- `OrderIntent` 是回测引擎唯一消费的策略输出；目标权重必须先在策略侧转换为整数股数订单。
+- A（模块化配置）与 B（Strategy 插件）共享同一引擎；双均线趋势属于独立时序策略插件。
+- 策略不负责撮合、账户账务、绩效计算或实验登记。
 
 ***
 
-## 7. 回测层设计（订单级引擎 / 多空账务）
+## 7. 回测层设计（独立文档）
 
-### 7.1 定位
+回测层详细设计已拆分到[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§3`，
+该文档是订单级驱动、A 股撮合规则、账务、估值、成本对账和回测产物的权威来源。
 
-回测层按交易日推进时间轴，消费策略产出的 `OrderIntent`，负责**撮合 + 账务 + A 股规则 + 估值**。
-它不产生信号（策略层）、不算因子（因子层）。设计优先级：回测可信 > 确定性 > 性能。
+本总体设计只保留三个跨层边界：
 
-### 7.2 边界
-
-**输入**：
-
-- `BacktestRequest`：`start_date, end_date, benchmark, initial_cash_fen, execution_config`
-  （`reference_price, slippage_bps, max_volume_participation, limit_fill_policy`）。
-- `Strategy` 实例（引擎逐日回调 `on_event` 取 `OrderIntent`）。
-- `ResearchDataRepository`：逐日 `MarketSlice`（未复权 OHLCV/preclose、is\_suspended、instrument\_type、
-  board、security\_status）、交易日历、`corporate_actions`。
-- `MarketRuleBook`（从 `configs/rules/a_share.yaml` 加载：涨跌幅/费率/融券费/保证金比例）。
-
-**输出**：
-
-- 逐日产物表：`nav`（cash/多头市值/equity\_fen/benchmark\_close；\[P3b-2] 增空头市值/保证金占用列）、
-  `holdings`（逐标的头寸/可卖/成本/市值）、`fills`（成交与拒绝 + reason\_code）、
-  `costs`（佣金/印花税/过户费；\[P3b-2] 增融券费）。
-- `AccountSnapshot` 序列 + ledger 事件流（P3 `OPENING_CASH/BUY/SELL`；\[P3b-1] 增 `DIVIDEND`；
-  \[P3b-2] 增 `SHORT_OPEN/SHORT_COVER/BORROW_FEE/MARGIN_*`）。
-- 撮合失败原因码；账务不变量违背或成本不一致时抛 `COST_MODEL_INCONSISTENT` 等结构化错误。
-
-**不输出**：绩效指标（分析层由本层产物计算）、信号/因子。
-
-### 7.3 订单级驱动
-
-引擎的驱动输入是 `OrderIntent`——**只带整数** **`quantity`，不含权重**（理由见 `§6.3`）。
-目标权重经 `RebalancePlanner` 在策略基类翻译成整数股数订单，权重不进入引擎输入。
-
-### 7.4 时间语义与频率
-
-- **日频驱动**：引擎按交易日推进，T 日决策、T+1 起可成交（T/T+1 严格分离）。使用 T 日收盘信息时，
-  不得默认按 T 日收盘价成交。
-- 订单级接口不绑定日频：未来要日内（分钟/Tick）只需引擎支持 session 内多时点驱动，
-  策略 `on_event` 契约不变。本期日频。
-
-### 7.5 分阶段：首版纯多头，公司行为与做空后置
-
-首版不一次吃下全部复杂度。三段推进（详见 `第 12 章`）：
-
-- **P3 纯多头无公司行为**：BUY/SELL、T+1、涨跌停、停牌、费用、滑点、容量、整手/碎股、未复权撮合、
-  基础 cash/position/equity。空头订单被引擎拒绝（`SHORT_NOT_SUPPORTED`）。
-- **P3b-1 公司行为**：`corporate_action` ledger——现金分红入账、送转调股。
-- **P3b-2 做空**：负头寸、保证金/维持保证金、融券费、空头逐日 mark、多空分腿归因。
-
-接口一次性预留（`OrderSide.SHORT_*`、`AccountView.available_margin_fen`），按阶段补实现，上层契约不变。
-
-### 7.6 账务：ledger 为事实来源，equity 统一公式（无双算）
-
-**统一 equity 公式**（贯穿各阶段，避免"空头负债已 mark 又加浮盈亏"的双算）：
-
-```text
-equity = cash + long_market_value − short_market_value − accrued_fees
-```
-
-- `long_market_value` = Σ 多头数量 × 当日 close。
-- `short_market_value` = Σ |空头数量| × 当日 close（欠券方负债，**\[P3b-2]**；无空头时为 0）。
-- `accrued_fees` = 已计提未结算费用（含 **\[P3b-2]** 融券费）。
-- **保证金是 cash 的占用/约束，不计入 equity**；空头盈亏已隐含在 `cash`（含开仓所得）与
-  `short_market_value`（按现价）的差额中，**不再单列浮盈亏**。
-
-**P3（多头）**：`positions ≥ 0`，`short_market_value = 0`；ledger 只用 `OPENING_CASH / BUY / SELL`；
-多头按 lot（T+1 可卖、FIFO 成本）；整数分；每日 ledger-vs-头寸双向对账。
-
-**\[P3b-1] 公司行为**：`DIVIDEND` ledger 按 `ex_date` 派发现金红利；送转按 `share_ratio` 调整 lot 股数
-（成本不变、摊薄单位成本）。使 NAV 在除权除息日不因未复权价跳水而失真。
-
-**\[P3b-2] 做空**：净头寸可正可负；空头按开仓均价 + 借券成本计提；可用资金/保证金占用/维持保证金；
-开空占用保证金、逐日 mark；ledger 增 `SHORT_OPEN / SHORT_COVER / BORROW_FEE / MARGIN_*`；
-equity 起 `− short_market_value` 项。
-
-### 7.7 A 股撮合约束（配置化）
-
-从 `configs/rules/a_share.yaml` 加载 `MarketRuleBook`，撮合覆盖：
-
-- T+1 可卖；按证券/板块/日期的涨跌幅（主板 ±10%、创业板/科创板 ±20%、ST ±5%、新股无限制）。
-- 停牌不可成交；涨停买入失败、跌停卖出失败（口径见下方决策点）。
-- 整手买入、碎股卖出；成交量参与率容量限制；部分成交与完全无法成交。
-- 上市/退市/风险状态；佣金（含最低佣金）/印花税/过户费；固定或比例滑点。（做空保证金与融券费为 P3b-2。）
-
-**决策点（涨跌停口径）**：`ExecutionConfig.limit_fill_policy ∈ {WHOLE_DAY_SEALED, REFERENCE_AT_LIMIT}`，
-**默认** **`REFERENCE_AT_LIMIT`（保守，符合"回测可信/避免过度乐观"）**；`WHOLE_DAY_SEALED` 更宽松
-（仅全天封死才拒绝）。
-
-### 7.8 撮合价与复权口径
-
-- 撮合用**未复权价**（真实成交价）+ 公司行为事件补偿账务。
-- 因子/信号侧用**前复权序列**。二者口径分离，不可混用。
-
-### 7.9 交易成本双角色一致性（硬约束）
-
-- **事前成本**（策略层 CostModel）：优化器/权重翻译时决定交易量。
-- **事后成本**（本层撮合的费用 + 滑点 + 借券费）：实际扣减账户。
-- 二者**必须共享费率参数**，否则策略对着与实际脱节的成本模型下单。一致性测试：同一笔成交，
-  事前估计与事后实际在同参数下逐项对账；不一致抛 `COST_MODEL_INCONSISTENT`。
-
-### 7.10 输出产物
-
-逐日：`nav`（cash/多头市值/空头负债/保证金占用/nav/benchmark\_close）、`holdings`（逐标的净头寸/
-可卖/成本/市值）、`fills`（成交与拒绝 + reason\_code）、`costs`（佣金/印花税/过户费/融券费）。
-供分析层消费。
-
-### 7.11 包结构
-
-```text
-src/quant_research/backtest/
-├── engine.py       # 逐日主循环
-├── execution.py    # ExecutionModel 撮合
-├── accounting.py   # PortfolioAccount 多空账务 + ledger
-├── rulebook.py     # MarketRuleBook 规则/费率
-├── calendar.py     # 交易日历
-└── models.py       # OrderIntent/AccountView/AccountSnapshot 等 DTO
-```
-
-### 7.12 依赖方向
-
-回测层被 `strategies` 与 `experiments` 依赖；自身只经 `ResearchDataRepository` 取行情/状态/公司行为，
-不导入接口层或组合根。
-
-### 7.13 测试契约
-
-- **账务不变量**：P3 `equity = cash + long_market_value − accrued_fees`；ledger-vs-头寸双向对账。
-  (\[P3b-2] `equity = cash + long_market_value − short_market_value − accrued_fees`，验证无双算、保证金不进 equity。)
-- **A 股约束**：T+1、涨跌停（两种 policy）、停牌、整手/碎股、容量、部分成交、费用，各字面量 oracle。
-- **口径分离**：撮合用未复权价、信号用前复权价。
-- **订单契约**：`OrderIntent` 无权重字段；权重经 `RebalancePlanner` 翻译成整数股数。
-- **做空拒绝（P3b-2 前）**：`SHORT_OPEN/SHORT_COVER` 被拒 `SHORT_NOT_SUPPORTED`。
-- **\[P3b-1]**：现金分红入账、送转调股，除权日 NAV 不跳水，各字面量 oracle。
-- **\[P3b-2]**：做空开平、保证金占用/释放、借券费按天计提、空头逐日 mark、多空分腿 各字面量 oracle。
-- **成本一致性**：事前/事后同参数可对账。
-- **PIT**：策略 `DecisionData` 窄视图物理只暴露 ≤ 决策时点数据（无 as\_of/end 参数）。
-- **确定性**：相同输入相同成交/净值序列。
-
-### 7.14 完成定义
-
-> 首版（P3，纯多头无公司行为）：引擎按 `OrderIntent`（整数股数）驱动，正确处理 T+1、涨跌停、停牌、
-> 费用、滑点、容量、整手/碎股；`equity = cash + long_market_value − accrued_fees` 恒等式与双向对账成立；
-> 撮合用未复权价、信号用前复权价；事前成本与事后成本可对账。
-> P3b-1：分红送转除权除息正确（除权日 NAV 不失真）。
-> P3b-2：做空/保证金/融券费/空头逐日 mark 与多空分腿在负头寸场景成立，equity 增 `− short_market_value` 项且无双算。
+- 引擎消费整数股数的 `OrderIntent`，按交易日推进并产出订单、成交、持仓、成本和净值事实。
+- 策略信号与目标权重不进入撮合内部；分析层只读取已完成的回测产物。
+- T+1、停牌、涨跌停、费用、滑点、容量、公司行为和做空能力按阶段及唯一规则文件实施。
 
 ***
 
@@ -1098,7 +654,7 @@ src/quant_research/backtest/
 
 ### 8.2 边界
 
-**输入**（回测层产物，见 `§7.10`）：
+**输入**（回测层产物，见[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§3.10`）：
 
 - `nav`：`trade_date, cash_fen, long_mv_fen, equity_fen, benchmark_close`（\[P3b-2] 增 `short_mv_fen`、`accrued_fees_fen`）。
 - `holdings`：逐日逐标的头寸/可卖/成本/市值。
@@ -1135,7 +691,7 @@ src/quant_research/backtest/
 - **成本视角**：gross vs net 收益、费用拖累（累计/年化）。
 - **时序表**：逐日净值/回撤、月度收益、年度收益。
 
-**口径铁律**（易错点，实现见 `implementation.md` §5.8）：
+**口径铁律**（易错点，实现见[实现级细化](implemention.md) `§5.8`）：
 
 - 净值序列用 `equity_fen`（P3 = `cash + long_mv − accrued_fees`；\[P3b-2] 再减 `short_mv`）。
 - **首日 0 收益**：波动率/Sharpe/Sortino/IR/beta 用 `daily_return[1:]`（剔首日）；drawdown/水下时长
@@ -1209,167 +765,16 @@ src/quant_research/analytics/
 
 ***
 
-## 9. 实验层设计（编排 / 追踪 / 比较）
+## 9. 实验层设计（独立文档）
 
-### 9.1 定位与范围
+实验层详细设计已拆分到[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§4`，
+该文档是实验配置、Run 状态机、阶段编排、运行内数据身份门、不可变产物和比较追踪的权威来源。
 
-实验层是工作台的**编排核心**：编排"数据只读读取 → 策略产生订单 → 回测撮合账务 → 绩效分析 →
-结果落盘"，并统一追踪、比较、结论标记。它调度策略层与回测层，自身不产订单、不撮合。
+本总体设计只保留三个跨层边界：
 
-**本文明确不做**（对齐 project-intent；此处指**跨运行复现回放**，非去掉所有哈希——
-数据完整性/增量/运行内一致性哈希仍保留，边界见 `§3.4.2`）：
-
-- 不做 `run_identity` 内容身份哈希、source/env 指纹链、产物 manifest 逐文件 SHA-256 校验、
-  可选择历史 catalog——复现回放的重机制一律不建。重跑允许覆盖。
-- 不做分布式 / 多用户 / 远程 registry / model serving。
-
-设计优先级：PIT 正确 > 回测可信 > 策略迭代低摩擦 > 结果可比较 > 性能。
-
-### 9.2 边界
-
-**输入**：
-
-- 实验配置（YAML，Pydantic 严格校验）：`kind∈{STRATEGY_BACKTEST, FACTOR_STUDY}`、`name`、
-  策略/因子配置、`start_date/end_date`、`benchmark`、`initial_cash_fen`、`execution`、`sample_windows`。
-- 装配依赖（组合根注入）：`ResearchDataRepository`、`FactorEngine`、`StrategyRegistry`、
-  `BacktestEngine`、`FactorStudyStore`、`TaskQueue`。
-- 当前 `catalog_version`（运行开始捕获，用于运行内一致性门）。
-
-**输出**：
-
-- **元数据**（SQLite）：`Experiment / Run`（`config_json` 冻结快照、`status`、`catalog_version`、
-  `uses_test_region`、`research_mark`、`artifact_dir`、`error_json`）、`run_metric`、`audit_event`、
-  `task/task_attempt`。
-- **产物目录** `<artifact_root>/<experiment_id>/<run_id>/`：回测 kind 输出
-  `nav/holdings/fills/costs/performance/attribution`；因子 kind 输出
-  `summary/coverage/ic/quantile_returns/long_short_returns/correlation`；+ `config.json/metrics.json`。
-- **读侧视图**：排行榜、配置/指标 diff、血缘、结论标记（供 Dashboard/CLI）。
-- 数据版本漂移/阶段失败/取消/状态冲突时抛 `EXPERIMENT_DATA_DRIFT / EXPERIMENT_STAGE_FAILED /
-  EXPERIMENT_CANCELLED / EXPERIMENT_STATE_CONFLICT`。
-
-### 9.3 追踪实体（轻量版，去复现）
-
-```text
-Experiment（研究命名空间 / 意图 / 标签 / 结论 / baseline 指针）
-   └── Run（一次执行；记录配置快照、状态、指标、产物指针）
-```
-
-- 无 Stage 内容寻址、无 run\_identity。Run 只需 `run_id`(ULID) 作记录键。
-- **Run 记录**：`config_json`(冻结快照，便于比较)、`status`、`catalog_version`(记录提交时数据版本，
-  **用于展示与运行内一致性，不用于复现回放**)、`metrics`、`artifact_dir`、`error_json`。
-- 重跑允许覆盖同一 Run 或生成新 Run（配置项，不强制"结果不可覆盖"）。
-- 统一因子研究（`FACTOR_STUDY`）与策略回测（`STRATEGY_BACKTEST`）到同一追踪主脊与比较视图。
-
-### 9.4 状态机
-
-```text
-CREATED → QUEUED → RUNNING → SUCCEEDED
-                        ├→ FAILED
-                        └→ CANCELLED
-```
-
-乐观并发迁移（携期望前态，CAS）；`SUCCEEDED` 前产物必须已落地；`FAILED` 只存结构化错误码 +
-安全上下文；一个 Run 只绑一个任务，重试建新 Run + 新任务。
-
-### 9.5 编排：kind 无关的阶段执行器
-
-```text
-STRATEGY_BACKTEST: VALIDATE → PREPARE_INPUTS → STRATEGY_RUN(交织 BACKTEST) → ANALYTICS → PERSIST
-FACTOR_STUDY:      VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PERSIST
-```
-
-- 截面策略在 `PREPARE_INPUTS` 内先算股票池/因子/管线信号；择时/事件驱动此阶段可能只 warmup。
-  差异由 `Strategy.spec` 声明的数据依赖驱动，runner 本身 kind 无关。
-- **STRATEGY\_RUN 与 BACKTEST 交织**：引擎按交易日推进，每个决策时点调 `strategy.on_event(ctx)`
-  取订单；`ctx` 只暴露 PIT 可见信息（防未来函数的物理边界，由回测层保证）。
-- 每阶段边界检查协作取消；失败/取消不留半成品目录。
-
-### 9.6 运行内一致性门（非复现）
-
-运行开始记录当前 `catalog_version`；每阶段前后校验未被并发更新，变则 `EXPERIMENT_DATA_DRIFT` 失败。
-作用是"这次运行不混用两批数据"，不是复现回放（不存历史版本、不回放）。
-
-### 9.7 产物与登记
-
-产物目录 `<artifact_root>/<experiment_id>/<run_id>/`，普通目录写盘（无逐文件内容寻址校验）：
-staging 临时目录 → 原子 `rename` 到最终目录。基本完整性检查（存在、可读、行数>0）即可。
-`PERSIST` 成功后才 `RUNNING→SUCCEEDED` 并写 `artifact_dir`。
-
-### 9.8 分析层（详见 `第 8 章`）
-
-`ANALYTICS` 阶段调用分析层，从回测产物（nav/holdings/fills/costs）计算绩效（累计/年化收益、波动、
-Sharpe/Sortino/Calmar、最大回撤与恢复、IR、beta/alpha）、交易质量、风险与暴露、归因（期间/风格/个股；
-多空分腿与 gross/net 敞口为 P3b-2）。因子研究则计算覆盖率/IC/分层/多空/相关/显著性（因子层 §5.7-5.8）。
-全部统计公式字面量 oracle；首日 0 收益口径明确（见 `§8.4`、`implementation.md` §5.8）。
-
-### 9.9 防过拟合治理（保留）
-
-- 样本区间锁定：配置声明 `train/validation/test`；Run 提交计算 `uses_test_region`；
-  Experiment 累计 test 预算消耗并在 Dashboard 显式展示（样本外偷看可见可审计）。
-- 多重检验记账：Experiment 记录尝试 Run 数、参数组合数、校正方法（Bonferroni/BH-FDR）；
-  显著性报告据此校正。
-- 不硬阻断超预算 Run（保留研究灵活性），只做可见可审计。
-
-### 9.10 比较 / 血缘
-
-- 排行榜：同 Experiment 按指定 metric 排序 Run。
-- 配置 diff：两 Run 的 `config_json` 结构化差异。
-- 血缘：Run → `catalog_version`（数据版本，展示用）→ 产物目录，追溯到唯一 Run。
-- 结论标记：`research_mark` = BASELINE/CANDIDATE/DISCARDED；`baseline_run_id` 指精确 Run，不回退所属实验最新 Run。
-
-### 9.11 错误码
-
-```text
-EXPERIMENT_DATA_DRIFT     运行内数据版本被并发改动
-EXPERIMENT_STAGE_FAILED   阶段执行失败（含内层原因码）
-EXPERIMENT_CANCELLED      协作取消
-EXPERIMENT_STATE_CONFLICT 乐观并发状态冲突
-```
-
-### 9.12 包结构
-
-```text
-src/quant_research/experiments/
-├── models.py     # Experiment/Run、状态机
-├── config.py     # 实验+策略 YAML 校验与冻结
-├── runner.py     # kind 无关阶段执行器
-├── graph.py      # 阶段图声明
-├── ports/        # market/factor/universe 只读端口
-├── contracts.py  # Store 端口
-└── query.py      # 比较 / 排行榜 / 结论标记
-```
-
-### 9.13 依赖方向
-
-```text
-bootstrap → application → experiments → strategies → {alpha,risk,costs,portfolio} → {data,factors,backtest}
-```
-
-实验层经只读端口取数与调用引擎；不导入接口层或组合根。
-
-### 9.14 决策记录
-
-| # | 决策                       | 结论                        |
-| - | ------------------------ | ------------------------- |
-| A | 防过拟合护栏（test 预算 + 多重检验记账） | **保留**，服务"结论可信"，非复现       |
-| B | 频率                       | 仅日频，订单接口已为日内预留            |
-| C | 模块建设节奏                   | 渐进：先端口+退化实现打通，再补 MVO/风险模型 |
-| D | 重跑语义                     | 允许覆盖（去复现后无需强制新 Run）       |
-
-### 9.15 测试契约
-
-- **状态机**：合法迁移通过、非法迁移 `EXPERIMENT_STATE_CONFLICT`、并发 CAS 不覆盖。
-- **一致性门**：运行中 catalog\_version 变 → `EXPERIMENT_DATA_DRIFT`；前后双校验。
-- **阶段**：失败/取消不留半成品；`SUCCEEDED` 前产物已落地。
-- **指标 oracle**：Sharpe/Sortino/Calmar/回撤/IR/beta；首日 0 口径；undefined 显式记录。
-- **治理**：`uses_test_region` 标记、test 预算计数、多重检验记账。
-- **kind 复用**：FACTOR\_STUDY 与 STRATEGY\_BACKTEST 共用同一 runner。
-
-### 9.16 完成定义
-
-> 因子研究与策略回测共享同一 `Experiment→Run` 追踪主脊与比较视图；每阶段前后校验数据版本
-> （运行内一致性）；产物原子发布、`SUCCEEDED` 前落地；绩效指标字面量 oracle；样本外使用与
-> 试验次数可审计。
+- 实验层调度策略、回测和分析能力，自身不产订单、不撮合、不重复实现统计公式。
+- 因子研究与策略回测共享追踪主脊，但按实验 kind 生成各自的阶段与产物。
+- 失败、取消和重试不得覆盖既有 Run；每阶段前后检查提交时捕获的数据目录身份。
 
 ***
 
@@ -1409,8 +814,7 @@ Worker 服务全平台后台任务，不只实验。`task_type` 枚举：
 | ------------------- | -------- | ------------------------------------------- | ------- |
 | `DATA_UPDATE`       | 数据中心/CLI | 数据流水线 LOCALIZE→CURATE→VALIDATE（按固化计划）       | NULL    |
 | `DATA_VALIDATION`   | 数据中心/CLI | 质量校验（全目录或单数据集诊断）                            | NULL    |
-| `FACTOR_ANALYSIS`   | 实验中心     | `ExperimentRunner`（FACTOR\_STUDY kind）      | 绑定 Run  |
-| `STRATEGY_BACKTEST` | 实验中心     | `ExperimentRunner`（STRATEGY\_BACKTEST kind） | 绑定 Run  |
+| `EXPERIMENT_RUN`    | 实验中心     | 按 Experiment kind 选择策略或因子阶段图         | 绑定 Run  |
 
 要点：`run_id` **可空**——数据类任务无实验 Run（这修正了"task.run\_id NOT NULL"的过窄约束）。
 payload 是该任务类型的冻结参数（如 DATA\_UPDATE 的固化计划 `plan_hash` + 窗口）。
@@ -1441,7 +845,8 @@ QUEUED → RUNNING → SUCCEEDED
 - `idempotency_key` UNIQUE：相同键的重复提交收敛为同一 task（如 `run-<run_id>`、
   `data-update-<plan_hash>`）。提交竞态由唯一约束兜底。
 - 所有任务**必须幂等**：handler 重跑不产生重复数据或冲突结果（数据层按内容寻址去重、
-  实验重跑覆盖或建新 Run）。这是"进程重启后识别未完成任务、避免重复写入"的前提。
+  实验任务只恢复同一未完成 Run；用户发起的重试始终创建新 Run）。这是"进程重启后识别未完成任务、
+  避免重复写入"的前提。
 
 ### 10.6 取消与重试
 
@@ -1567,7 +972,7 @@ class ResearchDataRepository(Protocol):
     def financials_as_of(self, field_ids, as_of: date, instruments=None) -> pl.LazyFrame: ...
     def financial_history(self, field_ids, as_of: date, instruments=None) -> pl.LazyFrame: ...
     def industry_as_of(self, instruments, as_of: date) -> pl.LazyFrame: ...
-    def catalog_version(self) -> str: ...   # 运行内一致性用，非复现
+    def catalog_hash(self) -> str: ...   # 运行内一致性用，非复现
 ```
 
 铁律：任何返回都物理截断到 `available_at ≤ 截止 & pit_usable`，且只从当前已通过质量门的目录读取。
@@ -1607,224 +1012,13 @@ class FactorEngine:
 列 `return_start, return_end, future_return, is_valid, invalid_reason`；`label_kind ∈
 {THEORETICAL_FORWARD_RETURN, EXECUTABLE_FORWARD_RETURN}`。
 
-### 11.4 策略层（B：统一契约）
+### 11.4 策略、回测与实验契约（独立文档）
 
-> 契约预留做空：`OrderSide` 含 `SHORT_*`、`AccountView` 含 `available_margin_fen`、`LedgerEventType`
-> 含 `SHORT_*/BORROW_FEE/MARGIN_*`。首版（P3）引擎拒绝空头订单（`SHORT_NOT_SUPPORTED`），
-> 做空账务在 **P3b-2** 实现——契约不变，只补实现（见 `第 12 章`）。
+`Strategy`、五模块、`OrderIntent`、回测账务、成本一致性、实验模型及 SQLite 表定义已迁至
+[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§5`。本章不再保留重复契约；
+数据层与因子层分别只依赖自身公开接口，策略、回测和实验按总体依赖方向组装。
 
-```python
-class OrderSide(StrEnum): BUY=...; SELL=...; SHORT_OPEN=...; SHORT_COVER=...   # SHORT_* 首版拒绝，P3b 启用
-
-@dataclass(frozen=True, slots=True)
-class OrderIntent:
-    """回测引擎唯一消费的订单意图——只带整数股数，不含权重。"""
-    instrument_id: InstrumentId; side: OrderSide
-    quantity: int                        # 正整数股数（唯一表达）
-    reason: str = ""
-
-@dataclass(frozen=True, slots=True)
-class TargetWeights:
-    """截面/组合类策略的输出：目标权重（和 ≤ 1，余额为现金）。不是引擎输入。"""
-    signal_date: date; execute_date: date
-    weights: Mapping[InstrumentId, float]     # 正=多；[P3b-2] 负=空
-
-class RebalancePlanner(Protocol):
-    """把 TargetWeights 翻译成整数股数 OrderIntent（差额、整手、负权重→空头[P3b]）。"""
-    def plan(self, targets: TargetWeights, account: "AccountView",
-             ref_prices: Mapping[InstrumentId, float]) -> Sequence[OrderIntent]: ...
-
-class DecisionData(Protocol):
-    """绑定到 signal_date 的只读窄视图：方法签名不含 as_of/end，未来数据在类型上取不到。"""
-    def bars(self, instruments: Sequence[InstrumentId], lookback_sessions: int) -> pl.LazyFrame: ...
-    def adjusted_bars(self, instruments: Sequence[InstrumentId], lookback_sessions: int) -> pl.LazyFrame: ...
-    def log_returns(self, instruments: Sequence[InstrumentId], lookback_sessions: int) -> pl.LazyFrame: ...
-    def daily_basics(self, instruments: Sequence[InstrumentId], lookback_sessions: int) -> pl.LazyFrame: ...
-    def factor_values(self, factor_ids: Sequence[str], instruments: Sequence[InstrumentId]) -> pl.LazyFrame: ...
-    def industry(self, instruments: Sequence[InstrumentId]) -> pl.LazyFrame: ...
-    def security_status(self, instruments: Sequence[InstrumentId]) -> pl.LazyFrame: ...
-    def stock_universe(self) -> pl.LazyFrame: ...
-    # 全部返回截止到本视图 signal_date 且 pit_usable 的数据；签名无任何参数可指定更晚日期。
-
-@dataclass(frozen=True, slots=True)
-class DecisionContext:
-    """物理 PIT 边界：data 是绑定 signal_date 的窄视图，策略无法请求未来数据。"""
-    signal_date: date; execute_date: date
-    data: DecisionData                          # signal_date 绑定的只读窄视图（非通用 Repository）
-    account: "AccountView"                      # 现金/持仓/可用保证金
-
-@dataclass(frozen=True, slots=True)
-class StrategySpec:
-    strategy_id: str; frequency: str
-    data_dependencies: tuple[DatasetKind, ...]
-    factor_dependencies: tuple[str, ...]
-    parameters: Mapping[str, JsonValue]
-
-class Strategy(Protocol):
-    @property
-    def spec(self) -> StrategySpec: ...
-    def warmup(self, ctx: DecisionContext) -> None: ...
-    def on_event(self, ctx: DecisionContext) -> Sequence[OrderIntent]: ...
-
-class WeightTargetStrategy(Strategy):
-    """基类：子类实现 target_weights；基类经 RebalancePlanner 翻译成 OrderIntent。"""
-    def target_weights(self, ctx: DecisionContext) -> TargetWeights: ...   # 子类实现
-    # on_event = planner.plan(target_weights(ctx), ctx.account, ref_prices)
-
-class StrategyRegistry:
-    def register(self, factory: Callable[[Mapping[str, JsonValue]], Strategy], *, strategy_id: str) -> None: ...
-    def build(self, strategy_id: str, params: Mapping[str, JsonValue]) -> Strategy: ...
-```
-
-基类：`WeightTargetStrategy(Strategy)` 的 `on_event` = `target_weights(ctx) -> TargetWeights`
-→ `RebalancePlanner.plan(...)` 翻译成整数股数 `OrderIntent`。子类只实现 `target_weights`；
-**权重不进入引擎输入**（引擎只消费 `OrderIntent.quantity`）。
-
-### 11.5 策略层（A：截面五模块）
-
-```python
-class AlphaModel(Protocol):
-    def expected_returns(self, ctx: DecisionContext, universe: Sequence[InstrumentId]) -> pl.DataFrame: ...
-    # 列: instrument_id, expected_return|score, is_valid, reason_code
-
-class RiskModel(Protocol):
-    def covariance(self, ctx: DecisionContext, universe: Sequence[InstrumentId]) -> "CovarianceEstimate": ...
-    # NoRisk 退化: 返回单位/对角占位，优化器据此退化为纯打分
-
-class TransactionCostModel(Protocol):
-    def estimate(self, trades: pl.DataFrame, ctx: DecisionContext) -> pl.DataFrame: ...
-    # 事前成本; 费率参数必须与回测 rulebook 同源（见 §11.7 一致性）
-
-class ConstraintSet(Protocol):
-    def apply(self, weights: pl.DataFrame, ctx: DecisionContext) -> pl.DataFrame: ...
-    def validate(self, weights: pl.DataFrame) -> None: ...   # 构建后二次校验
-
-class PortfolioConstructionModel(Protocol):
-    def construct(self, alpha, risk, cost, constraints, ctx: DecisionContext,
-                  current: "AccountView") -> Mapping[InstrumentId, float]: ...  # target_weights
-
-@dataclass(frozen=True, slots=True)
-class StrategyPipeline:
-    alpha: AlphaModel; risk: RiskModel; cost: TransactionCostModel
-    construction: PortfolioConstructionModel; constraints: ConstraintSet
-```
-
-每类模块一注册表 `model_id → 实现`。`CrossSectionalStrategy(WeightTargetStrategy)` 持有
-`StrategyPipeline`，`target_weights = construction.construct(...)`。
-
-内置实现（首批）：AlphaModel: `single_factor`/`multi_factor_composite`；RiskModel: `none`/`sample_cov`/`shrinkage`；
-CostModel: `fixed_bps`/`linear_impact`；Construction: `top_n_equal_weight`/`mean_variance`；
-ConstraintSet: 由 YAML 声明的通用约束集合。
-
-### 11.6 回测引擎与账务
-
-> 分阶段（见 `第 12 章`）：
->
-> - **P3 纯多头无公司行为**：`positions` 恒 ≥0；ledger 只用 `OPENING_CASH/BUY/SELL`；
->   `equity = cash + long_market_value − accrued_fees`。
-> - **\[P3b-1] 公司行为**：`DIVIDEND` ledger（现金分红）+ 送转股数调整。
-> - **\[P3b-2] 做空**：负头寸、`available_margin_fen`、`SHORT_*/BORROW_FEE/MARGIN_*`、`borrow_fee`；
->   `equity` 增 `− short_market_value` 项。
->   接口一次性预留全部字段，标注 \[P3b-1]/\[P3b-2] 的按阶段实现，上层契约不变。
-
-```python
-@dataclass(frozen=True, slots=True)
-class AccountView:
-    cash_fen: int
-    positions: Mapping[InstrumentId, int]        # 正=多；[P3b-2] 负=空
-    sellable: Mapping[InstrumentId, int]
-    available_margin_fen: int                     # [P3b-2]
-
-class LedgerEventType(StrEnum):
-    OPENING_CASH=...; BUY=...; SELL=...
-    DIVIDEND=...                                                              # [P3b-1]
-    SHORT_OPEN=...; SHORT_COVER=...; BORROW_FEE=...; MARGIN_POST=...; MARGIN_RELEASE=...  # [P3b-2]
-
-@dataclass(frozen=True, slots=True)
-class AccountSnapshot:
-    trade_date: date; cash_fen: int
-    positions: tuple["PositionSnapshot", ...]
-    long_market_value_fen: int
-    short_market_value_fen: int                   # [P3b-2]，空头按当日 close 计的市值（负债）
-    accrued_fees_fen: int                          # 已计提未结算费用（含 [P3b-2] 融券费）
-    margin_used_fen: int                           # [P3b-2]，保证金占用（约束，不计入 equity）
-    equity_fen: int
-    # 不变量（统一，无双算）：
-    #   P3   : equity_fen == cash_fen + long_market_value_fen − accrued_fees_fen
-    #   P3b-2: equity_fen == cash_fen + long_market_value_fen − short_market_value_fen − accrued_fees_fen
-    # 说明：空头盈亏已隐含在 (cash 含开仓所得) 与 (short_market_value 按现价) 的差额，不再单列浮盈亏；
-    #      保证金是 cash 的占用/约束，不直接增加 equity。
-
-class MarketRuleBook(Protocol):
-    def price_limits(self, profile, trade_date, preclose, status) -> "PriceBand | None": ...
-    def fees(self, fill, profile) -> "FeeBreakdown": ...
-    def borrow_fee(self, short_position, days) -> int: ...      # [P3b-2] 融券成本(分)
-    @property
-    def content_hash(self) -> str: ...
-
-class ExecutionModel(Protocol):
-    def execute(self, intents: Sequence[OrderIntent], market, account: AccountView,
-                rulebook: MarketRuleBook, config) -> "ExecutionBatch": ...
-
-class BacktestEngine:
-    def run(self, request: "BacktestRequest", strategy: Strategy,
-            progress, cancellation) -> "BacktestResult": ...
-    # 内部: 逐交易日 → strategy.on_event(DecisionContext) → execute(只认 OrderIntent.quantity)
-    #      → account.apply → [P3b-1] 按 corporate_action 派发 DIVIDEND/调整股数 → mark_to_market
-```
-
-引擎逐日：先按当日 `corporate_action` 处理持仓公司行为（现金红利入账、送转调股），再撮合当日待执行
-订单，再 mark-to-market。撮合价用未复权价；因子/信号侧用前复权序列。
-
-### 11.7 成本双角色一致性
-
-`TransactionCostModel`（事前）与 `MarketRuleBook.fees/borrow_fee`（事后）**必须由同一费率配置构造**。
-一致性测试：同一笔成交，事前估计与事后实际的费用项在同参数下逐项对账；不一致抛
-`COST_MODEL_INCONSISTENT`。
-
-### 11.8 实验层
-
-```python
-class ExperimentKind(StrEnum): FACTOR_STUDY=...; STRATEGY_BACKTEST=...
-class RunStatus(StrEnum): CREATED=...; QUEUED=...; RUNNING=...; SUCCEEDED=...; FAILED=...; CANCELLED=...
-
-class FactorStudyStore(Protocol):        # 消费者侧持久化端口
-    def create_experiment(self, name: str, kind: ExperimentKind, config: Mapping) -> str: ...
-    def create_run(self, experiment_id: str, config_snapshot: Mapping, catalog_version: str) -> str: ...
-    def transition(self, run_id: str, expected: RunStatus, target: RunStatus, **terminal) -> None: ...
-    def record_metrics(self, run_id: str, metrics: Mapping[str, float]) -> None: ...
-    def get_run(self, run_id: str) -> Mapping[str, object]: ...
-    def list_runs(self, experiment_id: str) -> Sequence[Mapping[str, object]]: ...
-
-class StageGraph(Protocol):
-    def stages(self, kind: ExperimentKind) -> tuple["Stage", ...]: ...
-
-class ExperimentRunner:
-    def run(self, run_id: str, progress, cancellation) -> "RunResult": ...
-    # 阶段: VALIDATE → PREPARE_INPUTS → STRATEGY_RUN → BACKTEST → ANALYTICS → PERSIST
-    # 每阶段前后校验 catalog_version 未变(运行内一致性)，变则 EXPERIMENT_DATA_DRIFT
-```
-
-#### 11.8.1 SQLite 表（Run 无 run\_identity 复现哈希；仍存 catalog\_version）
-
-```text
-experiment(id PK, name, kind, description, baseline_run_id NULL, created_at, updated_at)
-experiment_tag(experiment_id FK, tag)
-run(id PK, experiment_id FK, status, config_json, catalog_version,
-    uses_test_region, research_mark, artifact_dir NULL,
-    created_at, queued_at, started_at, completed_at, error_json NULL)
-run_metric(id PK, run_id FK, name, value, unit, created_at)
-run_tag(run_id FK, tag)
-audit_event(id PK, experiment_id FK NULL, run_id FK NULL, event_type, details_json, created_at)
-task(id PK, run_id FK, task_type, payload_json, status, priority,
-     idempotency_key, worker_id, heartbeat_at, created_at, ...)
-task_attempt(id PK, task_id FK, attempt_no, status, started_at, completed_at, error_json NULL)
-```
-
-产物目录 `<artifact_root>/<experiment_id>/<run_id>/`：普通目录写盘（无逐文件内容寻址校验），
-含 kind 相应 parquet + `config.json` + `metrics.json`。
-
-### 11.9 防过拟合治理
+### 11.5 防过拟合治理
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -1835,7 +1029,7 @@ class SampleWindows:
 # 多重检验记账: Experiment 记录尝试 Run 数/参数组合数/校正方法(Bonferroni|BH_FDR)
 ```
 
-### 11.10 错误码族（进程边界统一）
+### 11.6 错误码族（进程边界统一）
 
 ```text
 DATA_QUALITY_GATE_CLOSED / DATA_SOURCE_CONTRACT
@@ -1845,7 +1039,7 @@ SHORT_NOT_SUPPORTED                         # 首版(P3)引擎拒绝空头订单
 EXPERIMENT_DATA_DRIFT / EXPERIMENT_STAGE_FAILED / EXPERIMENT_CANCELLED / EXPERIMENT_STATE_CONFLICT
 ```
 
-### 11.11 依赖方向（AST 门禁强制）
+### 11.7 依赖方向（AST 门禁强制）
 
 ```text
 bootstrap → application → experiments → strategies → {alpha,risk,costs,portfolio} → {data,factors,backtest}
@@ -1866,8 +1060,9 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 ### 12.2 阶段 P0 — 地基（domain + 存储 + 架构门禁）
 
 **交付**：`domain/`（InstrumentId/Severity/ErrorDetail/QuantError/DatasetKind 枚举）；
-`infrastructure/` SQLite + SQLAlchemy + Alembic 初始迁移（`§11.8.1` 全部表；
-`task`/`task_attempt` 以 `implementation.md` §6.3 为准，`run_id` 可空）；
+`infrastructure/` SQLite + SQLAlchemy + Alembic 初始迁移（
+[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§5.5.1` 全部表；
+`task`/`task_attempt` 以[实现级细化](implemention.md) `§6.3` 为准，`run_id` 可空）；
 `bootstrap/` 骨架 + Engine 生命周期；`cli/` 入口骨架；架构边界 AST 门禁测试。
 
 **验收**：空库建库 + 迁移升级测试通过；AST 门禁能拦住非法 import；`quant --help` 可跑。
@@ -1882,9 +1077,9 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 - **公司行为** **`corporate_action`** **数据集**（含解析与 available\_at 时点化）。
 - 复权：`AdjustmentService`（前复权因子由公司行为推导）。
 - 质量门 VALIDATE（规则 × 数据集，严重/致命关研究门）。
-- `CanonicalResearchRepository`（PIT 物理截断 + `catalog_version`）。
+- `CanonicalResearchRepository`（PIT 物理截断 + `catalog_hash`）。
 - **通用 Worker 队列**（首次落地）：`TaskQueue` + CAS 领取/心跳/租约回收/幂等 + kind 无关主循环 +
-  `DATA_UPDATE`/`DATA_VALIDATION` handler（详见 `第 10 章` / `implementation.md` 第 6 章）。数据更新/校验
+  `DATA_UPDATE`/`DATA_VALIDATION` handler（详见 `第 10 章` / [实现级细化](implemention.md)第 6 章）。数据更新/校验
   作为后台任务运行；后续阶段只注册新 handler、不改主循环。
 
 **验收（PIT 为重）**：
@@ -1989,13 +1184,15 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 
 **交付**：
 
-- `Experiment/Run` 模型 + 状态机 + `FactorStudyStore`（SQLite）。
-- `StageGraph` + kind 无关 `ExperimentRunner`：`VALIDATE→PREPARE_INPUTS→STRATEGY_RUN→BACKTEST→ANALYTICS→PERSIST`。
-- 运行内一致性门（catalog\_version 前后校验，漂移即失败）。
+- `Experiment/Run` 模型 + CAS 状态机 + `ExperimentRunRegistry`（SQLite）。
+- 唯一 `EXPERIMENT_RUN` handler：策略阶段图
+  `VALIDATE→PREPARE_INPUTS→STRATEGY_RUN→ANALYTICS→PERSIST`，因子阶段图
+  `VALIDATE→PREPARE_INPUTS→ANALYZE_FACTORS→PERSIST`。
+- 运行内一致性门（`catalog_hash` 在阶段和长回测交易日边界校验，漂移即失败）。
 - `analytics/`：绩效（Sharpe/Sortino/Calmar/回撤/IR/beta/alpha）、成交质量、归因（多空分腿随 P3b）。
-- Worker：实验任务 handler（`FACTOR_ANALYSIS`/`STRATEGY_BACKTEST`）接入**通用 Worker 队列**——队列本身
+- Worker：唯一实验任务 handler（`EXPERIMENT_RUN`）接入**通用 Worker 队列**——队列本身
   （`task`/`task_attempt` 表、CAS 领取、心跳/租约、幂等、主循环）在 P0/P1 已建（数据类任务先用），
-  P5 只注册实验 handler（详见 `第 10 章` / `implementation.md` 第 6 章）。CLI `quant worker once|run` + 提交实验。
+  P5 只注册实验 handler（详见 `第 10 章` / [实现级细化](implemention.md)第 6 章）。CLI `quant worker once|run` + 提交实验。
 - 防过拟合治理：SampleWindows + test 预算计数 + 多重检验记账。
 
 **验收**：
@@ -2012,7 +1209,8 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 `PairsStrategy`（做空对冲）**依赖 P3b-2**，在 P3b-2 完成后交付。
 
 **验收**：多头范式（截面/双均线择时/事件驱动）各跑通一个示例并在实验层登记；双均线满足
-`§6.7.5` 的信号、时序和续单 oracle；证明订单级接口对异构范式充分；配对纯对冲随 P3b-2
+[策略、回测与实验设计](strategy-backtest-experiment-design.md) `§2.7.5` 的信号、时序和续单 oracle；
+证明订单级接口对异构范式充分；配对纯对冲随 P3b-2
 验收（做空账务正确）。
 
 ### 12.11 阶段 P7 — Dashboard（FastAPI + Vue）

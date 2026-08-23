@@ -44,7 +44,9 @@ class _Repository:
         raise AssertionError((instruments, start, end))
 
 
-def _frame(amounts: list[float], *, future_last_availability: bool = False) -> pl.DataFrame:
+def _frame(
+    amounts: list[float], *, future_last_availability: bool = False
+) -> pl.DataFrame:
     first = date(2026, 1, 1)
     days = [first + timedelta(days=index) for index in range(len(amounts))]
     availability = [
@@ -66,12 +68,8 @@ def _frame(amounts: list[float], *, future_last_availability: bool = False) -> p
 
 def _compute(frame: pl.DataFrame, start: date, end: date) -> tuple[pl.DataFrame, int]:
     repository = _Repository(frame)
-    factor = AvgAmount20dFactor(
-        repository, (InstrumentId.parse("000001.SZ"),)
-    )
-    result = factor.compute(
-        FactorContext("a" * 64, "b" * 64, start, end)
-    ).collect()
+    factor = AvgAmount20dFactor(repository, (InstrumentId.parse("000001.SZ"),))
+    result = factor.compute(FactorContext("a" * 64, "b" * 64, start, end)).collect()
     assert result.schema == FACTOR_OUTPUT_SCHEMA
     return result, repository.calls
 

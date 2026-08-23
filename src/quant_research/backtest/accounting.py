@@ -178,6 +178,54 @@ class AccountSnapshot:
         if self.nav_fen != self.cash_fen + self.total_market_value_fen:
             raise ValueError("nav_fen must equal cash plus market value")
 
+    @property
+    def long_market_value_fen(self) -> int:
+        """返回 P3 多头持仓市值。
+
+        入参：无。返回值：整数分市值。异常：无。
+        """
+        return self.total_market_value_fen
+
+    @property
+    def short_market_value_fen(self) -> int:
+        """返回 P3 尚未启用的空头市值零值。
+
+        入参：无。返回值：恒为零。异常：无。
+        """
+        return 0
+
+    @property
+    def accrued_fees_fen(self) -> int:
+        """返回待扣费用；P3 费用逐笔结算，因此恒为零。
+
+        入参：无。返回值：恒为零。异常：无。
+        """
+        return 0
+
+    @property
+    def margin_used_fen(self) -> int:
+        """返回 P3 尚未启用的保证金占用零值。
+
+        入参：无。返回值：恒为零。异常：无。
+        """
+        return 0
+
+    @property
+    def equity_fen(self) -> int:
+        """返回现金加多头市值减空头负债与待扣费用后的权益。
+
+        入参：无。返回值：整数分权益。异常：与已登记 NAV 不一致时抛出 ``RuntimeError``。
+        """
+        value = (
+            self.cash_fen
+            + self.long_market_value_fen
+            - self.short_market_value_fen
+            - self.accrued_fees_fen
+        )
+        if value != self.nav_fen:
+            raise RuntimeError("account equity identity is inconsistent")
+        return value
+
 
 @dataclass(frozen=True, slots=True)
 class AccountExecutionView:

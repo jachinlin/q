@@ -23,9 +23,9 @@ vi.mock('./api', () => ({
 
 const failedTask = {
   id: 'task-failed-0001',
-  subject_kind: 'RESEARCH_RUN',
+  subject_kind: 'EXPERIMENT_RUN',
   subject_id: 'research-run-0001',
-  task_type: 'RESEARCH_RUN',
+  task_type: 'EXPERIMENT_RUN',
   status: 'FAILED',
   priority: 10,
   progress: { stage: 'VALIDATE', completed: 1, total: 7 },
@@ -45,7 +45,7 @@ const defaultPayload = {
   note: '<img src=x onerror=alert(1)>',
 }
 
-function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType = 'RESEARCH_RUN') {
+function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType = 'EXPERIMENT_RUN') {
   return {
     ...failedTask,
     task_type: taskType,
@@ -85,7 +85,7 @@ function taskLog(available = true) {
 async function mountRuntimeCenter(
   logAvailable = true,
   payload: Record<string, unknown> = defaultPayload,
-  taskType = 'RESEARCH_RUN',
+  taskType = 'EXPERIMENT_RUN',
   initialPath = '/tasks',
 ) {
   apiGet.mockImplementation((path?: string) => {
@@ -107,7 +107,7 @@ async function mountRuntimeCenter(
     history: createMemoryHistory(),
     routes: [
       { path: '/tasks', component: TasksView },
-      { path: '/research/:familyId', name: 'research-detail', component: { template: '<div />' } },
+      { path: '/experiments/:experimentId', name: 'experiment-detail', component: { template: '<div />' } },
     ],
   })
   await router.push(initialPath)
@@ -141,7 +141,7 @@ describe('runtime center', () => {
     expect(headers).not.toContain('任务 / 关联')
     expect(wrapper.find('.task-link').element.closest('td'))
       .not.toBe(wrapper.find('.association-cell').element.closest('td'))
-    expect(wrapper.find('.association-cell').text()).toContain('RESEARCH_RUN · research')
+    expect(wrapper.find('.association-cell').text()).toContain('EXPERIMENT_RUN · research')
     wrapper.unmount()
   })
 
@@ -243,7 +243,7 @@ describe('runtime center', () => {
     const wrapper = await mountRuntimeCenter(true, { run_id: 'research-run-0001' })
     await wrapper.find('.task-link').trigger('click')
     await flushPromises()
-    expect(document.body.textContent).toContain('RESEARCH_RUN · research-run-0001')
+    expect(document.body.textContent).toContain('EXPERIMENT_RUN · research-run-0001')
     wrapper.unmount()
   })
 

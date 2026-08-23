@@ -210,7 +210,7 @@ def test_task_log_manager_binds_diagnostics_to_controlled_artifact_paths(
         "worker_id": "worker-7",
         "stage": "VALIDATE",
     }
-    with pytest.raises(ValueError, match="task_id must be a canonical UUID"):
+    with pytest.raises(ValueError, match="task_id must be a canonical UUID or ULID"):
         manager.open(
             logging_module.LogContext(
                 task_id="../escape",
@@ -218,6 +218,32 @@ def test_task_log_manager_binds_diagnostics_to_controlled_artifact_paths(
             )
         )
     assert not (tmp_path / "escape").exists()
+
+
+def test_task_log_manager_accepts_experiment_task_ulid(tmp_path: Path) -> None:
+    """实验任务的 ULID 必须安全映射到受控诊断路径。"""
+    logging_module = import_module("quant_research.logging")
+    diagnostic_root = tmp_path / "state" / "task-logs"
+    manager = logging_module.TaskLogManager(
+        diagnostic_root=diagnostic_root,
+        artifact_root=tmp_path / "artifacts",
+    )
+    context = logging_module.LogContext(
+        experiment_id="01M0M25S92XABB0B3347ST5KWV",
+        task_id="01M0M25S924HFM59DP2CB9WK70",
+        attempt_id="00000000-0000-0000-0000-000000000703",
+        worker_id="worker-7",
+    )
+
+    with manager.open(context) as session:
+        session.logger.emit("INFO", "task.claimed")
+
+    assert manager.diagnostic_path(context) == (
+        diagnostic_root
+        / "task_id=01M0M25S924HFM59DP2CB9WK70"
+        / "attempt_id=00000000-0000-0000-0000-000000000703"
+        / "run.log"
+    )
 
 
 def test_structured_logger_omits_unused_optional_envelope_fields() -> None:
@@ -598,79 +624,3 @@ def test_materialize_does_not_hide_task_log_correlation_conflicts(
             manager.materialize(context, staging)
 
     assert not (staging / "run.log").exists()
-
-
-def test_experiment_materializer_uses_placeholder_without_a_bound_log(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A successful experiment attempt without a file still gets required run.log."""
-    logging_module = import_module("quant_research.logging")
-    runner_module = import_module("quant_research.experiments.runner")
-    queue_module = import_module(
-        "quant_research.infrastructure.persistence.task_queue"
-    )
-    models_module = import_module("quant_research.tasks.models")
-    experiment_id = "00000000-0000-0000-0000-000000000771"
-    task_id = "00000000-0000-0000-0000-000000000772"
-    attempt_id = "00000000-0000-0000-0000-000000000773"
-    now = datetime.now().astimezone()
-    task = models_module.TaskRecord(
-        id=task_id,
-        experiment_id=experiment_id,
-        task_type="EXPERIMENT_RUN",
-        payload={},
-        status=models_module.TaskStatus.RUNNING,
-        priority=0,
-        progress={},
-        created_at=now,
-        available_at=now,
-        updated_at=now,
-        heartbeat_at=now,
-        completed_at=None,
-        worker_id="worker-7",
-        locked_at=now,
-    )
-    attempt = models_module.TaskAttemptRecord(
-        id=attempt_id,
-        task_id=task_id,
-        attempt_no=1,
-        status=models_module.TaskStatus.RUNNING,
-        worker_id="worker-7",
-        started_at=now,
-        heartbeat_at=now,
-        completed_at=None,
-        log_path=None,
-        progress={},
-        error=None,
-    )
-    queue = object.__new__(queue_module.TaskQueue)
-    monkeypatch.setattr(
-        queue,
-        "list_for_experiment",
-        lambda _experiment_id, *, limit: (task,),
-    )
-    monkeypatch.setattr(
-        queue,
-        "list_attempts",
-        lambda _task_id, *, limit: (attempt,),
-    )
-    artifact_root = tmp_path / "artifacts"
-    manager = logging_module.TaskLogManager(
-        diagnostic_root=tmp_path / "state" / "task-logs",
-        artifact_root=artifact_root,
-    )
-    staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
-    staging.mkdir(parents=True)
-
-    path = runner_module.ExperimentTaskLogMaterializer(queue, manager)(
-        experiment_id,
-        staging,
-    )
-
-    record = json.loads(path.read_text(encoding="utf-8"))
-    assert record["event"] == "task.log_unavailable"
-    assert record["experiment_id"] == experiment_id
-    assert record["task_id"] == task_id
-    assert record["attempt_id"] == attempt_id
-    assert record["stage"] == "ARTIFACT_VERIFY"

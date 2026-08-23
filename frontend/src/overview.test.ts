@@ -12,9 +12,9 @@ vi.mock('./api', () => ({ api: { get: apiGet } }))
 
 const activeTask = {
   id: 'task-active-0001',
-  subject_kind: 'RESEARCH_RUN',
+  subject_kind: 'EXPERIMENT_RUN',
   subject_id: 'run-active',
-  task_type: 'RESEARCH_RUN',
+  task_type: 'EXPERIMENT_RUN',
   status: 'RUNNING',
   priority: 0,
   progress: { stage: 'BACKTEST', completed: 3, total: 7 },
@@ -77,7 +77,7 @@ async function mountOverview(payload: Overview) {
       { path: '/', component: OverviewView },
       { path: '/data', component: { template: '<div />' } },
       { path: '/tasks', component: { template: '<div />' } },
-      { path: '/research', component: { template: '<div />' } },
+      { path: '/experiments', component: { template: '<div />' } },
       { path: '/notebook', component: { template: '<div />' } },
     ],
   })
@@ -102,7 +102,7 @@ describe('research workbench overview', () => {
     expect(wrapper.text()).toContain('当前没有阻断事项')
     expect(wrapper.text()).toContain('当前没有活动任务')
     expect(wrapper.find('a[href="/data"]').exists()).toBe(true)
-    expect(wrapper.find('a[href="/research"]').exists()).toBe(true)
+    expect(wrapper.find('a[href="/experiments"]').exists()).toBe(true)
     const notebook = wrapper.get('a[href="/notebook"]')
     expect(notebook.attributes('target')).toBeUndefined()
     expect(notebook.text()).toBe('打开 Notebook')

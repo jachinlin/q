@@ -7,19 +7,18 @@ from typing import cast
 
 import polars as pl
 
-from quant_research.factor_studies.models import (
-    DIRECTION_ADJUSTED,
-    IC_QUANTILE_PROBABILITIES,
-    IC_ROLLING_MIN_VALID,
-    IC_ROLLING_WINDOW,
-    MIN_CROSS_SECTION,
-)
 from quant_research.factors.analysis import (
     InformationCoefficientAnalyzer,
     factor_rank_correlation_matrix,
     long_short_returns,
     quantile_future_returns,
 )
+
+DIRECTION_ADJUSTED = "DIRECTION_ADJUSTED"
+IC_QUANTILE_PROBABILITIES = (0.05, 0.25, 0.5, 0.75, 0.95)
+IC_ROLLING_MIN_VALID = 10
+IC_ROLLING_WINDOW = 20
+MIN_CROSS_SECTION = 30
 
 
 def build_future_returns(
@@ -45,9 +44,7 @@ def build_future_returns(
     required = {"instrument_id", "trade_date", "open", "close"}
     if not required.issubset(bars.columns):
         raise ValueError("adjusted bars are missing future-return columns")
-    session_frame = pl.DataFrame(
-        {"signal_date": pl.Series(sessions, dtype=pl.Date)}
-    )
+    session_frame = pl.DataFrame({"signal_date": pl.Series(sessions, dtype=pl.Date)})
     eligible_rows = eligible.filter(pl.col("eligible")).select(
         "signal_date", "instrument_id"
     )
@@ -111,20 +108,17 @@ def build_future_returns(
             & raw_return.is_finite()
             & entry_tradable
         ).fill_null(False)
-        output[horizon] = (
-            joined.select(
-                "signal_date",
-                "instrument_id",
-                "return_start",
-                "return_end",
-                pl.when(valid)
-                .then(raw_return)
-                .otherwise(pl.lit(None, dtype=pl.Float64))
-                .cast(pl.Float64)
-                .alias("future_return"),
-            )
-            .sort("signal_date", "instrument_id")
-        )
+        output[horizon] = joined.select(
+            "signal_date",
+            "instrument_id",
+            "return_start",
+            "return_end",
+            pl.when(valid)
+            .then(raw_return)
+            .otherwise(pl.lit(None, dtype=pl.Float64))
+            .cast(pl.Float64)
+            .alias("future_return"),
+        ).sort("signal_date", "instrument_id")
     return output
 
 
@@ -235,9 +229,9 @@ def analyze(
                 quantile = (
                     quantile.join(paired_counts, on="signal_date", how="left")
                     .with_columns(
-                        (
-                            pl.col("is_empty") | (pl.col("paired_count") < minimum)
-                        ).alias("is_empty"),
+                        (pl.col("is_empty") | (pl.col("paired_count") < minimum)).alias(
+                            "is_empty"
+                        ),
                         pl.when(pl.col("paired_count") >= minimum)
                         .then(pl.col("mean_return"))
                         .otherwise(pl.lit(None, dtype=pl.Float64))
@@ -268,9 +262,7 @@ def analyze(
                         "horizon": horizon,
                         **pearson_summary.columns("pearson_ic"),
                         **rank_summary.columns("rank_ic"),
-                        "long_short_mean": mean(
-                            cast(list[float], valid_ls.to_list())
-                        ),
+                        "long_short_mean": mean(cast(list[float], valid_ls.to_list())),
                     }
                 )
         correlation_frames.append(

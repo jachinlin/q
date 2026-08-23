@@ -11,9 +11,7 @@ STANDARD_TASK_TYPES = frozenset(
     {
         "DATA_UPDATE",
         "DATA_VALIDATION",
-        "FACTOR_COMPUTE",
-        "BACKTEST",
-        "REPORT",
+        "EXPERIMENT_RUN",
     }
 )
 

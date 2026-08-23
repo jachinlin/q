@@ -38,10 +38,8 @@ const freshnessLabel = {
 } as const
 const taskTypeLabel: Record<string, string> = {
   DATA_UPDATE: '数据更新',
-  RESEARCH_EXPAND: '展开研究候选',
-  RESEARCH_RUN: '运行研究候选',
-  RESEARCH_SELECT: '锁定验证候选',
-  RESEARCH_REGISTER: '登记研究结论',
+  DATA_VALIDATION: '数据校验',
+  EXPERIMENT_RUN: '实验运行',
 }
 
 const taskCounts = computed(() => data.value?.tasks.status_counts)
@@ -177,7 +175,7 @@ function taskName(task: Task) {
         </div>
         <div class="overview-actions" aria-label="研究工作台快捷入口">
           <RouterLink to="/data"><el-button :type="data.gate.status === 'BLOCKED' ? 'danger' : 'primary'">进入数据中心</el-button></RouterLink>
-          <RouterLink to="/research"><el-button>进入研究中心</el-button></RouterLink>
+          <RouterLink to="/experiments"><el-button>进入实验中心</el-button></RouterLink>
           <RouterLink to="/notebook"><el-button text>打开 Notebook</el-button></RouterLink>
         </div>
       </section>
@@ -258,13 +256,13 @@ function taskName(task: Task) {
       </div>
 
       <section class="panel research-launch-panel">
-        <header class="panel-heading"><div><h2>参考研究模板</h2><p>同一套组件可运行信号研究、组合研究与完整回测</p></div><span class="hash">{{ shortHash(data.gate.catalog_hash) }}</span></header>
+        <header class="panel-heading"><div><h2>参考实验模板</h2><p>策略回测和因子研究共享 Experiment、Run、任务与产物主脊</p></div><span class="hash">{{ shortHash(data.gate.catalog_hash) }}</span></header>
         <div class="three-grid">
           <article class="benchmark-card"><h3>股票多因子</h3><strong>CROSS SECTION</strong><p>动态股票池 · 价值/动量 · Alpha-Risk-Cost 优化</p></article>
           <article class="benchmark-card"><h3>双均线趋势</h3><strong>LONG / FLAT</strong><p>固定标的 · 时序方向信号 · 状态变化调仓</p></article>
           <article class="benchmark-card"><h3>ETF 轮动</h3><strong>ALLOCATION</strong><p>多周期动量 · 趋势过滤 · 月频约束投影</p></article>
         </div>
-        <div class="toolbar launch-action"><span class="spacer" /><RouterLink to="/research/new"><el-button type="primary">使用模板创建研究</el-button></RouterLink></div>
+        <div class="toolbar launch-action"><span class="spacer" /><RouterLink to="/experiments/new"><el-button type="primary">使用模板创建实验</el-button></RouterLink></div>
       </section>
     </template>
 

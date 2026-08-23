@@ -16,11 +16,12 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from quant_research.application.operations import OperationalCommandService
-from quant_research.application.research_platform import ResearchCommandService
+from quant_research.dashboard.experiments import (
+    ExperimentDashboardService,
+    ExperimentRoutes,
+)
 from quant_research.dashboard.notebook import NotebookProbe
-from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.dashboard.routes.api import _DashboardRoutes
-from quant_research.dashboard.routes.research import _ResearchRoutes
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.domain.errors import QuantError
 
@@ -29,8 +30,7 @@ def create_dashboard_app(
     *,
     service: DashboardViewService,
     commands: OperationalCommandService,
-    research_service: ResearchDashboardService,
-    research_commands: ResearchCommandService,
+    experiment_service: ExperimentDashboardService,
     notebook_probe: NotebookProbe,
     static_dir: Path,
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "[::1]"),
@@ -135,17 +135,34 @@ def create_dashboard_app(
             "DASHBOARD_INPUT_INVALID",
             str(error),
             request.state.request_id,
+            remediation="修改实验配置后重新校验；若校验已通过，请刷新页面以避免提交旧配置。",
+        )
+
+    @app.exception_handler(TypeError)
+    async def type_error(request: Request, error: TypeError) -> JSONResponse:
+        return _AppSupport._error_response(
+            422,
+            "DASHBOARD_INPUT_TYPE_INVALID",
+            str(error),
+            request.state.request_id,
+            remediation="按字段 Schema 修正类型后重新校验并提交。",
         )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(
-        request: Request, _: RequestValidationError
+        request: Request, error: RequestValidationError
     ) -> JSONResponse:
+        issues = error.errors()
+        first = issues[0] if issues else {}
+        location = ".".join(str(item) for item in first.get("loc", ()))
+        detail = str(first.get("msg", "请求参数不符合接口约束"))
+        message = f"{location}: {detail}" if location else detail
         return _AppSupport._error_response(
             422,
             "REQUEST_VALIDATION_FAILED",
-            "请求参数不符合接口约束",
+            message,
             request.state.request_id,
+            remediation="刷新页面后重试；若仍失败，请确认请求体只包含非空 yaml 字段。",
         )
 
     @app.exception_handler(HTTPException)
@@ -171,7 +188,7 @@ def create_dashboard_app(
         )
 
     _DashboardRoutes.mount(app, service, commands, notebook_probe)
-    _ResearchRoutes.mount(app, research_service, research_commands)
+    ExperimentRoutes.mount(app, experiment_service)
 
     built = static_dir.resolve()
     index = built / "index.html"

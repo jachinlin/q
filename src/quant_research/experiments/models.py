@@ -1,29 +1,30 @@
-"""提供实验与领域模型相关的公开模型、协议与处理流程。"""
+"""定义统一实验、运行、研究治理和持久化记录。"""
 
 from __future__ import annotations
 
-import hashlib
-import re
-from datetime import UTC, datetime
+from datetime import date, datetime
 from enum import StrEnum
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from quant_research.data.contracts import JsonValue, canonical_json_bytes
-
-_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+from quant_research.data.contracts import JsonValue
 
 
-class ExperimentStatus(StrEnum):
-    """定义 ``ExperimentStatus`` 使用的稳定枚举值。
+class ExperimentKind(StrEnum):
+    """区分策略回测和因子研究两种实验。
 
-    入参：
-        无。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+    入参：实验 kind 字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
+    """
+
+    STRATEGY_BACKTEST = "STRATEGY_BACKTEST"
+    FACTOR_STUDY = "FACTOR_STUDY"
+
+
+class RunStatus(StrEnum):
+    """表示一次 Run 的受控生命周期。
+
+    入参：Run 状态字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
     """
 
     CREATED = "CREATED"
@@ -35,14 +36,9 @@ class ExperimentStatus(StrEnum):
 
 
 class ResearchMark(StrEnum):
-    """定义 ``ResearchMark`` 使用的稳定枚举值。
+    """表示用户对 Run 的研究结论标记。
 
-    入参：
-        无。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+    入参：研究标记字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
     """
 
     UNREVIEWED = "UNREVIEWED"
@@ -51,304 +47,400 @@ class ResearchMark(StrEnum):
     DISCARDED = "DISCARDED"
 
 
-class _ExperimentModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+class MultipleTestingMethod(StrEnum):
+    """定义实验比较采用的多重检验校正方法。
 
-
-class ExperimentSpec(_ExperimentModel):
-    """定义可持久化并参与身份计算的实验不可变规格。
-
-    入参：
-        strategy_id：用于持久化关联和日志追踪的策略标识。
-        config：调用所用的配置对象，类型为 ``dict[str, JsonValue]``。
-        config_hash：确定性序列化后的实验或策略配置身份。
-        data_hash：Canonical 数据内容或本次研究输入的数据身份。
-        source_tree_hash：参与幂等、漂移或完整性校验的数据来源``tree``哈希；使用 SHA-256 十六进制文本。
-        返回完成字段规范化和不变量校验的对象。
-        lockfile_hash：参与幂等、漂移或完整性校验的依赖锁文件哈希；使用 SHA-256 十六进制文本。
-        rulebook_hash：唯一 A 股交易规则文件的内容身份。
-        fingerprint：由策略、数据、源码、依赖锁和交易规则共同形成的研究指纹。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
+    入参：校正方法字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
     """
 
-    strategy_id: str
-    config: dict[str, JsonValue]
-    config_hash: str
-    data_hash: str
-    source_tree_hash: str | None = None
-    git_commit_hash: str | None = None
-    lockfile_hash: str
-    rulebook_hash: str
-    fingerprint: str
-    created_at: datetime
+    BONFERRONI = "BONFERRONI"
+    BH_FDR = "BH_FDR"
 
-    @field_validator(
-        "config_hash",
-        "data_hash",
-        "source_tree_hash",
-        "lockfile_hash",
-        "rulebook_hash",
-        "fingerprint",
+
+class RunStage(StrEnum):
+    """列出两种实验共享编排器可能执行的阶段。
+
+    入参：阶段字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
+    """
+
+    VALIDATE = "VALIDATE"
+    PREPARE_INPUTS = "PREPARE_INPUTS"
+    STRATEGY_RUN = "STRATEGY_RUN"
+    ANALYTICS = "ANALYTICS"
+    ANALYZE_FACTORS = "ANALYZE_FACTORS"
+    PERSIST = "PERSIST"
+
+
+class _FrozenModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        validate_by_alias=True,
+        validate_by_name=True,
+        serialize_by_alias=True,
     )
+
+    @staticmethod
+    def _parse_date(value: object) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError("date must use YYYY-MM-DD") from error
+            if parsed.isoformat() == value:
+                return parsed
+        raise ValueError("date must use YYYY-MM-DD")
+
+
+class DateWindow(_FrozenModel):
+    """表示一个首尾均包含的非空样本窗口。
+
+    入参：ISO 日期格式的起止日。返回值：冻结窗口。异常：日期非法或倒序时抛出值错误。
+    """
+
+    start: date
+    end: date
+
+    @field_validator("start", "end", mode="before")
     @classmethod
-    def validate_hash(cls, value: str | None, info: object) -> str | None:
-        """校验可选文本为小写 SHA-256 十六进制摘要。
-
-        入参：
-            value：待校验或转换的值，类型为 ``str | None``。
-            info：Pydantic 传入的字段元数据，用于在错误中指出具体字段。
-        返回值：
-            返回校验可选文本为小写 SHA-256 十六进制摘要后的哈希（``str | None``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
-        if value is not None and not _SHA256.fullmatch(value):
-            field_name = getattr(info, "field_name", "hash")
-            raise ValueError(f"{field_name} must be a lowercase SHA-256 hex digest")
-        return value
-
-    @field_validator("git_commit_hash")
-    @classmethod
-    def validate_git_oid(cls, value: str | None) -> str | None:
-        """校验 Git 提交标识为 40 或 64 位十六进制文本。
-
-        入参：
-            value：待校验或转换的值，类型为 ``str | None``。
-        返回值：
-            返回校验 Git 提交标识为 40 或 64 位十六进制文本后的Git对象标识（``str | None``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
-        if value is not None and not _GIT_OID.fullmatch(value):
-            raise ValueError("git_commit_hash must be a 40- or 64-character Git OID")
-        return value
-
-    @field_validator("created_at")
-    @classmethod
-    def normalize_created_at(cls, value: datetime) -> datetime:
-        """规范化创建时间``at``。
-
-        入参：
-            value：待校验或转换的值，类型为 ``datetime``。
-        返回值：
-            返回将创建时间规范化为带时区 UTC 时间戳后的创建时间``at``（``datetime``）。
-        异常：
-            无。
-        """
-        return _ModelsSupport._utc(value, "created_at")
-
-    @field_validator("config")
-    @classmethod
-    def validate_config(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        """确认配置可被确定性 JSON 序列化。
-
-        入参：
-            value：待校验或转换的值，类型为 ``dict[str, JsonValue]``。
-        返回值：
-            返回确认配置可被确定性 JSON 序列化后的配置（``dict[str, JsonValue]``）。
-        异常：
-            无。
-        """
-        canonical_json_bytes(value)
-        return value
+    def _date(cls, value: object) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError("date must use YYYY-MM-DD") from error
+            if parsed.isoformat() != value:
+                raise ValueError("date must use YYYY-MM-DD")
+            return parsed
+        raise TypeError("date must use YYYY-MM-DD")
 
     @model_validator(mode="after")
-    def validate_metadata(self) -> ExperimentSpec:
-        """校验实验源码身份完整且配置哈希与规范内容一致。
+    def _ordered(self) -> DateWindow:
+        if self.start > self.end:
+            raise ValueError("window start must not follow end")
+        return self
 
-        入参：
-            无。
-        返回值：
-            返回校验实验源码身份完整且配置哈希与规范内容一致后的元数据（``ExperimentSpec``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
+    def overlaps(self, start: date, end: date) -> bool:
+        """判断给定闭区间是否与本窗口相交。
+
+        入参：待判断闭区间的起止日。返回值：相交时为真。异常：无。
         """
-        if not self.strategy_id:
-            raise ValueError("strategy_id must not be empty")
-        if self.source_tree_hash is None and self.git_commit_hash is None:
-            raise ValueError("source_tree_hash or git_commit_hash is required")
-        canonical_hash = hashlib.sha256(canonical_json_bytes(self.config)).hexdigest()
-        if self.config_hash != canonical_hash:
-            raise ValueError("config_hash must match canonical config")
+        return start <= self.end and end >= self.start
+
+
+class SampleWindows(_FrozenModel):
+    """固定 TRAIN、VALIDATION、TEST 三段互不重叠且有序的协议。
+
+    入参：三个日期窗口。返回值：冻结样本协议。异常：窗口重叠或乱序时抛出值错误。
+    """
+
+    train: DateWindow
+    validation: DateWindow
+    test: DateWindow
+
+    @model_validator(mode="after")
+    def _ordered(self) -> SampleWindows:
+        if not (
+            self.train.end < self.validation.start
+            and self.validation.end < self.test.start
+        ):
+            raise ValueError("sample windows must be ordered and non-overlapping")
+        return self
+
+    @property
+    def start(self) -> date:
+        """返回研究协议首日。
+
+        入参：无。返回值：TRAIN 首日。异常：无。
+        """
+        return self.train.start
+
+    @property
+    def end(self) -> date:
+        """返回研究协议末日。
+
+        入参：无。返回值：TEST 末日。异常：无。
+        """
+        return self.test.end
+
+
+class GovernanceConfig(_FrozenModel):
+    """定义 TEST 使用预算和多重检验校正方法。
+
+    入参：非负测试预算和校正方法。返回值：冻结治理配置。异常：预算非法时抛出校验错误。
+    """
+
+    test_budget: int = Field(ge=0)
+    correction: MultipleTestingMethod
+
+
+class StrategyConfig(_FrozenModel):
+    """保存策略标识及由对应策略工厂严格解释的参数。
+
+    入参：非空策略 ID 和参数映射。返回值：冻结策略配置。异常：字段缺失或额外时抛出校验错误。
+    """
+
+    strategy_id: str = Field(min_length=1)
+    parameters: dict[str, JsonValue]
+
+
+class ExecutionSettings(_FrozenModel):
+    """定义未复权行情上的撮合价格、滑点和容量上限。
+
+    入参：参考价、滑点、成交量参与率和涨跌停策略。返回值：冻结撮合配置。异常：数值越界时抛出校验错误。
+    """
+
+    reference_price: Literal["OPEN", "CLOSE"] = "OPEN"
+    slippage_bps: float = Field(default=0.0, ge=0)
+    max_volume_participation: float = Field(default=0.1, gt=0, le=1)
+    limit_order_policy: Literal["REJECT", "PARTIAL"] = "REJECT"
+
+
+class StrategyBacktestRunConfig(_FrozenModel):
+    """定义策略回测 Run 的冻结业务输入。
+
+    入参：日期、策略、基准、初始资金和撮合配置。返回值：冻结回测 Run。异常：日期或字段非法时抛出校验错误。
+    """
+
+    kind: Literal[ExperimentKind.STRATEGY_BACKTEST]
+    start_date: date
+    end_date: date
+    strategy: StrategyConfig
+    benchmark: str = Field(min_length=1)
+    initial_cash_fen: int = Field(gt=0)
+    execution: ExecutionSettings
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _date(cls, value: object) -> date:
+        return _FrozenModel._parse_date(value)
+
+    @model_validator(mode="after")
+    def _range(self) -> StrategyBacktestRunConfig:
+        if self.start_date > self.end_date:
+            raise ValueError("run start_date must not follow end_date")
         return self
 
 
-class ExperimentRecord(_ExperimentModel):
-    """表示从持久化边界读取的实验记录快照。
+class FactorStudySettings(_FrozenModel):
+    """定义统一 Run 中因子研究所需的分析参数。
 
-    入参：
-        id：用于持久化关联和日志追踪的标识。
-        strategy_id：用于持久化关联和日志追踪的策略标识。
-        config：调用所用的配置对象，类型为 ``dict[str, JsonValue]``。
-        config_hash：确定性序列化后的实验或策略配置身份。
-        data_hash：Canonical 数据内容或本次研究输入的数据身份。
-        source_tree_hash：参与幂等、漂移或完整性校验的数据来源``tree``哈希；使用 SHA-256 十六进制文本。
-        返回完成字段规范化和不变量校验的对象。
-        lockfile_hash：参与幂等、漂移或完整性校验的依赖锁文件哈希；使用 SHA-256 十六进制文本。
-        rulebook_hash：唯一 A 股交易规则文件的内容身份。
-        fingerprint：由策略、数据、源码、依赖锁和交易规则共同形成的研究指纹。
-        status：当前记录所处的受控生命周期状态。
-        research_mark：用户对实验标记的基线、候选或废弃研究结论。
-        created_at：记录创建时的 UTC 时间戳。
-        queued_at：记录入队时间``at``的带时区 UTC 时间戳。
-        started_at：执行实际开始的 UTC 时间戳。
-        completed_at：执行进入终态的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+    入参：因子、股票池、收益期限、分层数和行业中性开关。返回值：冻结分析配置。异常：重复或乱序参数抛出值错误。
+    """
+
+    factor_ids: tuple[str, ...] = Field(min_length=1)
+    universe: dict[str, JsonValue]
+    horizons: tuple[int, ...] = Field(min_length=1)
+    quantiles: int = Field(default=5, ge=2)
+    industry_neutral: bool = False
+
+    @model_validator(mode="after")
+    def _unique(self) -> FactorStudySettings:
+        if len(set(self.factor_ids)) != len(self.factor_ids) or any(
+            not value for value in self.factor_ids
+        ):
+            raise ValueError("factor_ids must be unique and nonempty")
+        if tuple(sorted(set(self.horizons))) != self.horizons or any(
+            value <= 0 for value in self.horizons
+        ):
+            raise ValueError(
+                "horizons must be unique positive values in ascending order"
+            )
+        return self
+
+
+class FactorStudyRunConfig(_FrozenModel):
+    """定义因子研究 Run 的冻结业务输入。
+
+    入参：日期和因子研究配置。返回值：冻结因子 Run。异常：日期倒序或字段非法时抛出校验错误。
+    """
+
+    kind: Literal[ExperimentKind.FACTOR_STUDY]
+    start_date: date
+    end_date: date
+    factor_study: FactorStudySettings
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _date(cls, value: object) -> date:
+        return _FrozenModel._parse_date(value)
+
+    @model_validator(mode="after")
+    def _range(self) -> FactorStudyRunConfig:
+        if self.start_date > self.end_date:
+            raise ValueError("run start_date must not follow end_date")
+        return self
+
+
+RunConfig = Annotated[
+    StrategyBacktestRunConfig | FactorStudyRunConfig,
+    Field(discriminator="kind"),
+]
+
+
+class ExperimentDefinition(_FrozenModel):
+    """定义一个不可变研究问题及提交时立即运行的首个配置。
+
+    入参：名称、描述、kind、标签、样本协议、治理和首个 Run。返回值：冻结实验定义。异常：kind、标签或区间不一致时抛出值错误。
+    """
+
+    name: str = Field(min_length=1, max_length=128)
+    description: str = Field(default="", max_length=4000)
+    kind: ExperimentKind
+    tags: tuple[str, ...] = ()
+    sample_windows: SampleWindows
+    governance: GovernanceConfig
+    initial_run: RunConfig
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ExperimentDefinition:
+        if self.initial_run.kind is not self.kind:
+            raise ValueError("initial_run kind must equal experiment kind")
+        if (
+            len(set(self.tags)) != len(self.tags)
+            or tuple(sorted(self.tags)) != self.tags
+        ):
+            raise ValueError("tags must be unique and sorted")
+        self.validate_run(self.initial_run)
+        return self
+
+    def validate_run(self, config: RunConfig) -> None:
+        """校验派生 Run 与实验 kind 和协议总区间一致。
+
+        入参：待追加的 Run 配置。返回值：无。异常：kind 不同或日期越界时抛出 ``ValueError``。
+        """
+        if config.kind is not self.kind:
+            raise ValueError("run kind must equal experiment kind")
+        if (
+            config.start_date < self.sample_windows.start
+            or config.end_date > self.sample_windows.end
+        ):
+            raise ValueError("run dates must stay inside the experiment protocol")
+
+    def uses_test_region(self, config: RunConfig) -> bool:
+        """返回 Run 是否触及锁定 TEST 区间。
+
+        入参：已归属本实验的 Run 配置。返回值：相交时为真。异常：Run 不符合实验协议时抛出值错误。
+        """
+        self.validate_run(config)
+        return self.sample_windows.test.overlaps(config.start_date, config.end_date)
+
+
+class ExperimentRecord(_FrozenModel):
+    """表示持久化后的实验定义摘要。
+
+    入参：实验 ID、定义、baseline Run 和创建时间。返回值：冻结实验记录。异常：字段类型非法时抛出校验错误。
     """
 
     id: str
-    strategy_id: str
-    config: dict[str, JsonValue]
-    config_hash: str
-    data_hash: str
-    source_tree_hash: str | None
-    git_commit_hash: str | None
-    lockfile_hash: str
-    rulebook_hash: str
-    fingerprint: str
-    status: ExperimentStatus
-    research_mark: ResearchMark
+    definition: ExperimentDefinition
+    baseline_run_id: str | None
     created_at: datetime
-    queued_at: datetime | None
-    started_at: datetime | None
-    completed_at: datetime | None
 
 
-class ExperimentTag(_ExperimentModel):
-    """记录实验上的单个用户标签及创建时间。
+class RunMetricRecord(_FrozenModel):
+    """表示一个已登记的 Run 标量指标和显著性结果。
 
-    入参：
-        experiment_id：目标实验标识，类型为 ``str``。
-        tag：标签。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+    入参：指标名、数值、单位、原始和校正后 p-value。返回值：冻结指标记录。异常：字段类型非法时抛出校验错误。
     """
 
-    experiment_id: str
-    tag: str
-
-
-class ExperimentMetric(_ExperimentModel):
-    """记录实验成功后登记的单个标量指标和单位。
-
-    入参：
-        experiment_id：目标实验标识，类型为 ``str``。
-        name：供用户识别研究、任务或数据对象的非空名称。
-        value：待校验或转换的值，类型为 ``float``。
-        unit：计量单位。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    """
-
-    experiment_id: str
     name: str
     value: float
-    unit: str | None = None
-    created_at: datetime
-
-    @field_validator("created_at")
-    @classmethod
-    def normalize_created_at(cls, value: datetime) -> datetime:
-        """规范化创建时间``at``。
-
-        入参：
-            value：待校验或转换的值，类型为 ``datetime``。
-        返回值：
-            返回将创建时间规范化为带时区 UTC 时间戳后的创建时间``at``（``datetime``）。
-        异常：
-            无。
-        """
-        return _ModelsSupport._utc(value, "created_at")
+    unit: str | None
+    p_value: float | None
+    adjusted_p_value: float | None
 
 
-class ExperimentArtifact(_ExperimentModel):
-    """记录实验产物的类型、路径、哈希和字节数。
+class RunArtifactRecord(_FrozenModel):
+    """表示可信 Manifest 中登记的一个 Run 产物。
 
-    入参：
-        experiment_id：目标实验标识，类型为 ``str``。
-        name：供用户识别研究、任务或数据对象的非空名称。
-        artifact_type：产物类型。
-        path：待处理的文件系统路径，类型为 ``str``。
-        content_hash：按规范字节计算、用于内容寻址和完整性校验的 SHA-256。
-        metadata：元数据。
-        created_at：记录创建时的 UTC 时间戳。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
+    入参：产物类型、相对路径、内容哈希、字节数、行数和 Schema。返回值：冻结产物记录。异常：字段类型非法时抛出校验错误。
     """
 
-    experiment_id: str
-    name: str
     artifact_type: str
-    path: str
+    relative_path: str
     content_hash: str
-    metadata: dict[str, JsonValue]
+    byte_count: int
+    row_count: int | None
+    artifact_schema: dict[str, str] | None = Field(alias="schema")
+
+
+class RunRecord(_FrozenModel):
+    """表示一次不可变配置执行及其生命周期和审计字段。
+
+    入参：Run 身份、配置、状态、产物与时间字段。返回值：冻结 Run 快照。异常：字段不符合严格模型时抛出校验错误。
+    """
+
+    id: str
+    experiment_id: str
+    config: RunConfig
+    config_hash: str
+    catalog_hash: str
+    status: RunStatus
+    stage: RunStage
+    research_mark: ResearchMark
+    uses_test_region: bool
+    task_id: str | None
+    artifact_dir: str | None
+    manifest_hash: str | None
+    error: dict[str, object] | None
     created_at: datetime
-
-    @field_validator("content_hash")
-    @classmethod
-    def validate_content_hash(cls, value: str) -> str:
-        """校验内容哈希。
-
-        入参：
-            value：待校验或转换的值，类型为 ``str``。
-        返回值：
-            返回校验内容哈希后的内容哈希（``str``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
-        if not _SHA256.fullmatch(value):
-            raise ValueError("content_hash must be a lowercase SHA-256 hex digest")
-        return value
-
-    @field_validator("metadata")
-    @classmethod
-    def validate_metadata(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        """校验实验源码身份完整且配置哈希与规范内容一致。
-
-        入参：
-            value：待校验或转换的值，类型为 ``dict[str, JsonValue]``。
-        返回值：
-            返回校验实验源码身份完整且配置哈希与规范内容一致后的元数据（``dict[str, JsonValue]``）。
-        异常：
-            无。
-        """
-        canonical_json_bytes(value)
-        return value
-
-    @field_validator("created_at")
-    @classmethod
-    def normalize_created_at(cls, value: datetime) -> datetime:
-        """规范化创建时间``at``。
-
-        入参：
-            value：待校验或转换的值，类型为 ``datetime``。
-        返回值：
-            返回将创建时间规范化为带时区 UTC 时间戳后的创建时间``at``（``datetime``）。
-        异常：
-            无。
-        """
-        return _ModelsSupport._utc(value, "created_at")
+    started_at: datetime | None
+    completed_at: datetime | None
+    tags: tuple[str, ...] = ()
+    metrics: tuple[RunMetricRecord, ...] = ()
+    artifacts: tuple[RunArtifactRecord, ...] = ()
 
 
-class _ModelsSupport:
-    """集中承载本模块的私有实现逻辑。"""
+class ExperimentAggregate(_FrozenModel):
+    """汇总实验定义、全部 Run 和稳定标签。
 
-    @staticmethod
-    def _utc(value: datetime, field: str) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError(f"{field} must be timezone-aware")
-        return value.astimezone(UTC)
+    入参：实验记录、Run 元组和标签元组。返回值：冻结聚合快照。异常：字段类型非法时抛出校验错误。
+    """
+
+    experiment: ExperimentRecord
+    runs: tuple[RunRecord, ...]
+    tags: tuple[str, ...]
+
+
+STRATEGY_STAGES = (
+    RunStage.VALIDATE,
+    RunStage.PREPARE_INPUTS,
+    RunStage.STRATEGY_RUN,
+    RunStage.ANALYTICS,
+    RunStage.PERSIST,
+)
+FACTOR_STAGES = (
+    RunStage.VALIDATE,
+    RunStage.PREPARE_INPUTS,
+    RunStage.ANALYZE_FACTORS,
+    RunStage.PERSIST,
+)
+
+
+__all__ = [
+    "FACTOR_STAGES",
+    "STRATEGY_STAGES",
+    "ExperimentAggregate",
+    "ExperimentDefinition",
+    "ExperimentKind",
+    "ExperimentRecord",
+    "FactorStudyRunConfig",
+    "FactorStudySettings",
+    "GovernanceConfig",
+    "MultipleTestingMethod",
+    "ResearchMark",
+    "RunArtifactRecord",
+    "RunConfig",
+    "RunMetricRecord",
+    "RunRecord",
+    "RunStage",
+    "RunStatus",
+    "SampleWindows",
+    "StrategyBacktestRunConfig",
+]

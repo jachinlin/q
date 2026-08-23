@@ -1,22 +1,51 @@
-strategy_id: etf_rotation
-start_date: 2026-07-08
-end_date: 2026-08-10
-benchmark: 000300.SH
-initial_cash_fen: 100000000
-strategy_config:
-  etf_pool:
-    - 510050.SH
-    - 510300.SH
-    - 513100.SH
-    - 588000.SH
-  return_factor_weights:
-    return_20d: 0.2
-    return_60d: 0.3
-    return_120d: 0.5
-  trend_factor_ref: trend_120d
-  volatility_factor_ref: volatility_60d
-  volatility_penalty: 0.5
-  top_n: 3
-  frequency: MONTHLY
-  missing_signal_policy: EXCLUDE
-  weighting: EQUAL
+name: ETF 月频动量轮动
+description: 固定 ETF 池按前复权区间收益排序并持有前两名
+kind: STRATEGY_BACKTEST
+tags: [etf, rotation]
+sample_windows:
+  train: {start: 2018-01-01, end: 2020-12-31}
+  validation: {start: 2021-01-01, end: 2022-12-31}
+  test: {start: 2023-01-01, end: 2024-12-31}
+governance:
+  test_budget: 2
+  correction: BONFERRONI
+initial_run:
+  kind: STRATEGY_BACKTEST
+  start_date: 2018-01-01
+  end_date: 2022-12-31
+  strategy:
+    strategy_id: etf_rotation
+    parameters:
+      pipeline:
+        frequency: MONTHLY
+        target_tolerance: 0.001
+        alpha:
+          model_id: multi_factor_composite
+          params:
+            etf_pool: [510050.SH, 510300.SH, 513100.SH, 588000.SH]
+            momentum_windows: [20, 60, 120]
+            momentum_weights: [0.2, 0.3, 0.5]
+            trend_window: 60
+            trend_weight: 0.5
+            volatility_window: 20
+            volatility_weight: 0.5
+        risk: {model_id: none}
+        cost: {model_id: fixed_bps}
+        construction: {model_id: top_n_equal_weight, params: {top_n: 2}}
+        constraints:
+          model_id: long_only
+          params:
+            min_positions: 1
+            max_positions: 2
+            max_position_weight: 0.5
+            max_turnover: 1.0
+            max_industry_weight: 1.0
+            min_adv_amount: 0.0
+            long_exposure: 1.0
+  benchmark: 000300.SH
+  initial_cash_fen: 100000000
+  execution:
+    reference_price: OPEN
+    slippage_bps: 5.0
+    max_volume_participation: 0.1
+    limit_order_policy: REJECT

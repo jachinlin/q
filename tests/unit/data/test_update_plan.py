@@ -82,8 +82,7 @@ def test_auto_plan_freezes_each_dataset_window_without_null_parameters() -> None
         sorted(
             item.value
             for item in DATASET_CATALOG
-            if BAOSTOCK_ROUTES[item]
-            and item is not DatasetKind.FINANCIAL_OBSERVATION
+            if BAOSTOCK_ROUTES[item] and item is not DatasetKind.FINANCIAL_OBSERVATION
         )
     )
     assert tuple(item.dataset.value for item in plan.dataset_windows) == expected

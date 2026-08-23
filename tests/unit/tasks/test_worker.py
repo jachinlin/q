@@ -589,12 +589,14 @@ def test_claim_can_request_shutdown_reentrantly_without_deadlock() -> None:
     )
     process.start()
     try:
-        assert claim_entered.wait(timeout=2)
-        assert shutdown_returned.wait(timeout=0.5)
-        process.join(timeout=2)
+        # Windows ``spawn`` imports the test module in a fresh interpreter;
+        # loaded scientific dependencies can exceed the old two-second budget.
+        assert claim_entered.wait(timeout=10)
+        assert shutdown_returned.wait(timeout=2)
+        process.join(timeout=10)
         assert not process.is_alive()
         assert process.exitcode == 0
-        assert output.get(timeout=0.5) is False
+        assert output.get(timeout=2) is False
     finally:
         if process.is_alive():
             process.terminate()
@@ -1097,9 +1099,7 @@ def test_handler_registry_names_standard_types_and_rejects_duplicate_registratio
     standard = {
         "DATA_UPDATE",
         "DATA_VALIDATION",
-        "FACTOR_COMPUTE",
-        "BACKTEST",
-        "REPORT",
+        "EXPERIMENT_RUN",
     }
     assert getattr(module, "STANDARD_TASK_TYPES", None) == frozenset(standard)
     registry = registry_type()
@@ -1110,7 +1110,7 @@ def test_handler_registry_names_standard_types_and_rejects_duplicate_registratio
 
     assert [registry.get(name) for name in sorted(standard)] == handlers
     with pytest.raises(ValueError, match="already registered"):
-        registry.register(_TypedSuccessHandler("BACKTEST"))
+        registry.register(_TypedSuccessHandler("EXPERIMENT_RUN"))
 
 
 @pytest.mark.parametrize("task_type", ["BACKTEST", "UNKNOWN_TASK"])
@@ -1454,11 +1454,11 @@ def test_task_log_open_failure_does_not_block_the_task(
     assert handler.task_ids == [task_id]
 
 
-def test_task_log_manager_and_queue_roots_must_match(
+def test_task_log_binding_failure_does_not_strand_claimed_task(
     engine: Engine,
     tmp_path: Path,
 ) -> None:
-    """The deterministic queue path must match the active logger path."""
+    """日志根装配错误不得让已认领任务永久停留在 RUNNING。"""
     logging_module = importlib.import_module("quant_research.logging")
     manager = logging_module.TaskLogManager(
         diagnostic_root=tmp_path / "manager-task-logs",
@@ -1479,13 +1479,13 @@ def test_task_log_manager_and_queue_roots_must_match(
         task_logs=manager,
     )
 
-    with pytest.raises(ValueError, match="manager and queue roots do not match"):
-        worker.run_once()
+    assert worker.run_once() is True
 
     task, attempt = _runtime_rows(engine, task_id)
-    assert task["status"] == TaskStatus.RUNNING.value
-    assert attempt["status"] == TaskStatus.RUNNING.value
-    assert handler.task_ids == []
+    assert task["status"] == TaskStatus.SUCCEEDED.value
+    assert attempt["status"] == TaskStatus.SUCCEEDED.value
+    assert attempt["log_path"] is None
+    assert handler.task_ids == [task_id]
 
 
 def test_task_diagnostic_log_keeps_quant_error_action_fields(

@@ -135,6 +135,13 @@ class _ExecutionSupport:
             return _ExecutionSupport._reject(
                 intent, market, ExecutionReason.NO_MARKET_DATA
             ), cash
+        if intent.side in {OrderSide.SHORT_OPEN, OrderSide.SHORT_COVER}:
+            return _ExecutionSupport._reject(
+                intent,
+                market,
+                ExecutionReason.SHORT_NOT_SUPPORTED,
+                _ExecutionSupport._reference_price(row, config),
+            ), cash
         reference_price = _ExecutionSupport._reference_price(row, config)
         profile = rulebook.trading_profile(
             intent.instrument_id,

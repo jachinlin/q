@@ -66,7 +66,6 @@ def test_handler_executes_frozen_plan_without_resolving_dates_again() -> None:
         id="task-1",
         attempt_id="attempt-1",
         attempt_no=1,
-        experiment_id=None,
         task_type="DATA_UPDATE",
         payload=plan.to_payload(),
         priority=0,

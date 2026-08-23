@@ -6,11 +6,6 @@ Revises: initial_schema
 
 from __future__ import annotations
 
-from alembic import op
-from sqlalchemy import Table
-
-from quant_research.infrastructure.persistence.orm import FactorRunORM, FactorStudyORM
-
 revision = "factor_studies"
 down_revision = "initial_schema"
 branch_labels = None
@@ -27,12 +22,7 @@ def upgrade() -> None:
     异常：
         无。
     """
-    study = FactorStudyORM.__table__
-    run = FactorRunORM.__table__
-    assert isinstance(study, Table)
-    assert isinstance(run, Table)
-    study.create(bind=op.get_bind(), checkfirst=True)
-    run.create(bind=op.get_bind(), checkfirst=True)
+    # 该历史 revision 只保留 Alembic 链身份；最终架构不创建独立因子研究表。
 
 
 def downgrade() -> None:
@@ -45,9 +35,4 @@ def downgrade() -> None:
     异常：
         无。
     """
-    run = FactorRunORM.__table__
-    study = FactorStudyORM.__table__
-    assert isinstance(run, Table)
-    assert isinstance(study, Table)
-    run.drop(bind=op.get_bind(), checkfirst=True)
-    study.drop(bind=op.get_bind(), checkfirst=True)
+    # 硬切后没有可恢复的独立因子研究元数据。

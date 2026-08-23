@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
-import polars as pl
 import pytest
 from sqlalchemy import text
 
-from quant_research.application.factor_studies import publish_factor_run
 from quant_research.config import Settings
 from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.dashboard.models import (
@@ -28,14 +26,10 @@ from quant_research.data.quality.models import (
 )
 from quant_research.data.repository import ResearchDataRepository
 from quant_research.domain.enums import DatasetKind, Severity
-from quant_research.factor_studies.models import FactorRunStatus, FactorStudyConfig
 from quant_research.infrastructure.baostock.routing import BAOSTOCK_ROUTES
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
-)
-from quant_research.infrastructure.persistence.factor_studies import (
-    FactorStudyRepository,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
@@ -231,10 +225,10 @@ def test_overview_uses_global_task_counts_without_legacy_research_payloads(
     )
     for index in range(7):
         queue.enqueue(
-            "RESEARCH_RUN",
+            "EXPERIMENT_RUN",
             {},
             0,
-            subject_kind="RESEARCH_RUN",
+            subject_kind="EXPERIMENT_RUN",
             subject_id=f"run-{index}",
         )
 
@@ -252,131 +246,7 @@ def test_overview_uses_global_task_counts_without_legacy_research_payloads(
 
     assert response.tasks.status_counts.QUEUED == 7
     assert len(response.tasks.active) == 5
-    assert all(item.subject_kind == "RESEARCH_RUN" for item in response.tasks.active)
-
-
-def _legacy_factor_series_reads_ic_artifact_and_rejects_tampering(
-    tmp_path: Path,
-) -> None:
-    settings = Settings(
-        timezone=ZoneInfo("Asia/Shanghai"),
-        data_root=tmp_path,
-        max_partition_size=100,
-    )
-    upgrade_database(settings.state_db)
-    engine = create_sqlite_engine(settings.state_db)
-    repository = FactorStudyRepository(engine)
-    config = FactorStudyConfig(
-        factor_refs=("momentum_120_20",),
-        start_date=date(2025, 1, 2),
-        end_date=date(2025, 1, 31),
-    )
-    study_id = repository.create_study("IC artifact", config)
-    run_id = repository.create_run(study_id, "a" * 64, "b" * 64)
-    repository.transition(run_id, FactorRunStatus.CREATED, FactorRunStatus.RUNNING)
-    key = {
-        "signal_variant": ["DIRECTION_ADJUSTED"],
-        "factor_ref": ["momentum_120_20"],
-        "horizon": [20],
-    }
-    outputs = {
-        "summary": pl.DataFrame({**key, "rank_ic_mean": [0.1]}),
-        "coverage": pl.DataFrame(
-            {
-                "signal_variant": ["DIRECTION_ADJUSTED"],
-                "factor_ref": ["momentum_120_20"],
-                "signal_date": [date(2025, 1, 2)],
-            }
-        ),
-        "ic": pl.DataFrame(
-            {
-                **key,
-                "signal_date": [date(2025, 1, 2)],
-                "pearson_ic": [0.2],
-                "rank_ic": [0.1],
-            }
-        ),
-        "quantile_returns": pl.DataFrame(
-            {**key, "signal_date": [date(2025, 1, 2)], "quantile": [5]}
-        ),
-        "long_short_returns": pl.DataFrame(
-            {
-                **key,
-                "signal_date": [date(2025, 1, 2)],
-                "long_short_return": [0.01],
-            }
-        ),
-        "correlation": pl.DataFrame(
-            {
-                "factor_x": ["momentum_120_20"],
-                "factor_y": ["momentum_120_20"],
-                "correlation": [1.0],
-                "signal_variant": ["DIRECTION_ADJUSTED"],
-            }
-        ),
-        "industry_coverage": pl.DataFrame(
-            schema={
-                "signal_date": pl.Date,
-                "taxonomy": pl.String,
-                "unclassified_policy": pl.String,
-                "eligible_count": pl.Int64,
-                "classified_count": pl.Int64,
-                "tombstone_count": pl.Int64,
-                "missing_state_count": pl.Int64,
-                "usable_count": pl.Int64,
-                "classified_coverage": pl.Float64,
-                "usable_coverage": pl.Float64,
-            }
-        ),
-    }
-    manifest_path, manifest_hash = publish_factor_run(
-        artifact_root=settings.artifact_root,
-        study_id=study_id,
-        run_id=run_id,
-        config=config,
-        catalog_hash="a" * 64,
-        source_hash="b" * 64,
-        execution_descriptor={"requested_refs": [], "plan": []},
-        environment={"source_hash": "b" * 64},
-        outputs=outputs,
-    )
-    repository.transition(
-        run_id,
-        FactorRunStatus.RUNNING,
-        FactorRunStatus.SUCCEEDED,
-        manifest_path=manifest_path,
-        manifest_hash=manifest_hash,
-    )
-    service = DashboardViewService(
-        engine,
-        settings,
-        _REPOSITORY,
-        cast(MarketReviewService, object()),
-        BAOSTOCK_ROUTES,
-    )
-    try:
-        payload = service.factor_series(
-            run_id, "momentum_120_20", 20, "DIRECTION_ADJUSTED"
-        )
-        assert payload["ic"] == [
-            {
-                "factor_ref": "momentum_120_20",
-                "horizon": 20,
-                "signal_variant": "DIRECTION_ADJUSTED",
-                "signal_date": date(2025, 1, 2),
-                "pearson_ic": 0.2,
-                "rank_ic": 0.1,
-            }
-        ]
-        assert "rank_ic" not in payload
-
-        (manifest_path.parent / "ic.parquet").write_bytes(b"tampered")
-        with pytest.raises(ValueError, match="size mismatch"):
-            service.factor_series(
-                run_id, "momentum_120_20", 20, "DIRECTION_ADJUSTED"
-            )
-    finally:
-        engine.dispose()
+    assert all(item.subject_kind == "EXPERIMENT_RUN" for item in response.tasks.active)
 
 
 def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
@@ -419,6 +289,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         queue.bind_log_path(
             claimed.attempt_id,
             claimed.worker_id,
+            str(task_log.path),
         )
         task_log.logger.emit("INFO", "unparseable-neighbor")
         task_log.logger.emit(
@@ -444,10 +315,10 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
     )
     research_run_id = "research-run-0001"
     research_task_id = queue.enqueue(
-        "RESEARCH_RUN",
+        "EXPERIMENT_RUN",
         {"run_id": research_run_id, "config_hash": "a" * 64},
         0,
-        subject_kind="RESEARCH_RUN",
+        subject_kind="EXPERIMENT_RUN",
         subject_id=research_run_id,
     )
     service = DashboardViewService(
@@ -477,7 +348,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
 
         all_tasks = service.task_list(status=None, page=1, page_size=10)
         tasks_by_id = {item["id"]: item for item in all_tasks["items"]}
-        assert tasks_by_id[research_task_id]["subject_kind"] == "RESEARCH_RUN"
+        assert tasks_by_id[research_task_id]["subject_kind"] == "EXPERIMENT_RUN"
         assert tasks_by_id[research_task_id]["subject_id"] == research_run_id
         assert tasks_by_id[queued_id]["subject_kind"] is None
         assert all("payload" not in task for task in tasks_by_id.values())
@@ -499,7 +370,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         ]
         assert service.task_detail(queued_id)["payload"] == {}
         research_detail = service.task_detail(research_task_id)
-        assert research_detail["subject_kind"] == "RESEARCH_RUN"
+        assert research_detail["subject_kind"] == "EXPERIMENT_RUN"
         assert research_detail["subject_id"] == research_run_id
         attempt = detail["attempts"][0]
         assert attempt["has_log"] is True
@@ -551,6 +422,7 @@ def test_task_log_degrades_for_missing_file_and_ignores_malformed_jsonl(
         queue.bind_log_path(
             claimed.attempt_id,
             claimed.worker_id,
+            str(task_log.path),
         )
         path = task_log.path
         task_log.logger.emit(
@@ -627,6 +499,7 @@ def test_task_log_keeps_trusted_path_and_file_size_boundaries(tmp_path: Path) ->
         queue.bind_log_path(
             claimed.attempt_id,
             claimed.worker_id,
+            str(task_log.path),
         )
         trusted_path = task_log.path
     queue.finish(

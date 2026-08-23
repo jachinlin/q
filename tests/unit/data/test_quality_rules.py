@@ -113,9 +113,7 @@ def _daily_bar(
 def test_daily_bar_requires_finite_positive_traded_prices(
     column: str, invalid: float
 ) -> None:
-    frame = _daily_bar().with_columns(
-        pl.lit(invalid).cast(pl.Float64).alias(column)
-    )
+    frame = _daily_bar().with_columns(pl.lit(invalid).cast(pl.Float64).alias(column))
 
     issues = daily_bar_value_issues({DatasetKind.DAILY_BAR: (frame,)})
     issue = next(item for item in issues if item.rule_id == "positive_finite_price")

@@ -98,8 +98,7 @@ class FinancialDisclosureBatch:
         if ordered != self.report_periods:
             raise ValueError("financial report periods must use deterministic order")
         if any(
-            financial_disclosure_deadline(year, quarter)
-            != self.disclosure_deadline
+            financial_disclosure_deadline(year, quarter) != self.disclosure_deadline
             for year, quarter in ordered
         ):
             raise ValueError("financial report periods must share one deadline")

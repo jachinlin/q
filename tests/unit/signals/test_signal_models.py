@@ -14,9 +14,23 @@ from quant_research.signals.models import (
 
 def test_signal_rows_accept_their_declared_semantics() -> None:
     available = datetime(2024, 1, 2, 8, tzinfo=UTC)
-    cross = CrossSectionalScoreRow(date(2024, 1, 2), "600000.SH", "alpha", 1.2, 0.8, available, True, None)
-    directional = DirectionalSignalRow(date(2024, 1, 2), "510300.SH", "ma", Direction.LONG, 1.0, True, available, True, None)
-    allocation = AllocationSignalRow(date(2024, 1, 2), "510300.SH", "rotation", 0.5, available, True, None)
+    cross = CrossSectionalScoreRow(
+        date(2024, 1, 2), "600000.SH", "alpha", 1.2, 0.8, available, True, None
+    )
+    directional = DirectionalSignalRow(
+        date(2024, 1, 2),
+        "510300.SH",
+        "ma",
+        Direction.LONG,
+        1.0,
+        True,
+        available,
+        True,
+        None,
+    )
+    allocation = AllocationSignalRow(
+        date(2024, 1, 2), "510300.SH", "rotation", 0.5, available, True, None
+    )
     assert cross.score == 1.2
     assert directional.direction is Direction.LONG
     assert allocation.desired_exposure == 0.5

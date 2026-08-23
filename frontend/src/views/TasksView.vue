@@ -12,7 +12,7 @@ import StatusBadge from '../components/StatusBadge.vue'
 import { formatDuration, formatTime } from '../format'
 import type { DataUpdatePlan, DataUpdateWindow, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
 
-type RetryResult = { task_id: string; family_id?: string; execution_id?: string }
+type RetryResult = { task_id: string; experiment_id?: string; run_id?: string }
 
 const client = useQueryClient()
 const route = useRoute()
@@ -58,8 +58,8 @@ const retry = useMutation({
   mutationFn: ({ id, orphaned }: { id: string; orphaned: boolean }) =>
     api.post<RetryResult>(`/api/v1/tasks/${id}/retry`, { confirm_orphaned: orphaned }),
   onSuccess: async (result) => {
-    const execution = result.execution_id ? `，新 execution ${result.execution_id.slice(0, 8)}` : ''
-    ElMessage.success(`已创建安全重试：任务 ${result.task_id.slice(0, 8)}${execution}`)
+    const run = result.run_id ? `，新 Run ${result.run_id.slice(0, 8)}` : ''
+    ElMessage.success(`已创建安全重试：任务 ${result.task_id.slice(0, 8)}${run}`)
     await Promise.all([
       client.invalidateQueries({ queryKey: ['tasks'] }),
       client.invalidateQueries({ queryKey: ['task'] }),

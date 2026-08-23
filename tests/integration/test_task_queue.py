@@ -170,7 +170,6 @@ def test_claimed_task_normalizes_aware_timestamps_to_utc() -> None:
         id="task-1",
         attempt_id="attempt-1",
         attempt_no=1,
-        experiment_id=None,
         task_type="BACKTEST",
         payload={"window": 20},
         priority=7,
@@ -276,7 +275,7 @@ def test_bind_log_path_derives_one_idempotent_path_from_the_trusted_root(
     assert claimed is not None
 
     with pytest.raises(QuantError) as missing_root:
-        unconfigured.bind_log_path(claimed.attempt_id, claimed.worker_id)
+        unconfigured.bind_log_path(claimed.attempt_id, claimed.worker_id, "unused")
     assert missing_root.value.detail.code == "TASK_LOG_ROOT_UNCONFIGURED"
 
     expected = (
@@ -285,8 +284,12 @@ def test_bind_log_path_derives_one_idempotent_path_from_the_trusted_root(
         / f"attempt_id={claimed.attempt_id}"
         / "run.log"
     )
-    assert queue.bind_log_path(claimed.attempt_id, claimed.worker_id) == str(expected)
-    assert queue.bind_log_path(claimed.attempt_id, claimed.worker_id) == str(expected)
+    assert queue.bind_log_path(
+        claimed.attempt_id, claimed.worker_id, str(expected)
+    ) == str(expected)
+    assert queue.bind_log_path(
+        claimed.attempt_id, claimed.worker_id, str(expected)
+    ) == str(expected)
     assert _attempt_rows(engine, task_id)[0]["log_path"] == str(expected)
     assert [event["event_type"] for event in _task_audit(engine, task_id)].count(
         "TASK_LOG_BOUND"
@@ -298,7 +301,7 @@ def test_bind_log_path_derives_one_idempotent_path_from_the_trusted_root(
             {"path": str(tmp_path / "tampered.log"), "id": claimed.attempt_id},
         )
     with pytest.raises(QuantError) as conflict:
-        queue.bind_log_path(claimed.attempt_id, claimed.worker_id)
+        queue.bind_log_path(claimed.attempt_id, claimed.worker_id, str(expected))
     assert conflict.value.detail.code == "TASK_LOG_PATH_CONFLICT"
 
 
@@ -316,12 +319,13 @@ def test_enqueue_without_key_creates_fresh_canonical_standalone_tasks(
     with engine.connect() as connection:
         rows = connection.execute(
             text(
-                "SELECT experiment_id, payload_json, status, priority, "
+                "SELECT subject_kind, subject_id, payload_json, status, priority, "
                 "progress_json, available_at FROM task ORDER BY id"
             )
         ).all()
     assert rows == [
         (
+            None,
             None,
             '{"a":1,"z":2}',
             "QUEUED",
@@ -330,6 +334,7 @@ def test_enqueue_without_key_creates_fresh_canonical_standalone_tasks(
             NOW_TEXT,
         ),
         (
+            None,
             None,
             '{"a":1,"z":2}',
             "QUEUED",
@@ -373,17 +378,16 @@ def test_subject_identity_is_persisted_without_a_legacy_parent(engine: Engine) -
     queue = _queue(engine)
 
     task_id = queue.enqueue(
-        "RESEARCH_RUN",
+        "EXPERIMENT_RUN",
         {},
         0,
-        subject_kind="RESEARCH_RUN",
+        subject_kind="EXPERIMENT_RUN",
         subject_id="run-1",
     )
 
     row = _task_row(engine, task_id)
-    assert row["subject_kind"] == "RESEARCH_RUN"
+    assert row["subject_kind"] == "EXPERIMENT_RUN"
     assert row["subject_id"] == "run-1"
-    assert row["experiment_id"] is None
 
 
 def test_active_idempotency_returns_same_task_and_audits_canonical_hit(

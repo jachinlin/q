@@ -1,620 +1,611 @@
-"""提供回测与回测引擎相关的公开模型、协议与处理流程。"""
+"""实现策略订单驱动、T 日决策与 T+1 撮合的唯一回测引擎。"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
-from math import isfinite
+from datetime import date
 from pathlib import Path
-from types import MappingProxyType
-from typing import Protocol
-from uuid import UUID
+from typing import Protocol, cast
+
+import polars as pl
 
 from quant_research.backtest.accounting import AccountSnapshot, PortfolioAccount
-from quant_research.backtest.artifacts import BacktestArtifactWriter, ManifestContext
 from quant_research.backtest.calendar import TradingCalendar
 from quant_research.backtest.execution import ExecutionModel
-from quant_research.backtest.models import (
-    AccountView,
-    ExecutionConfig,
-    MarketSlice,
-)
-from quant_research.backtest.rulebook import InstrumentTradingProfile, MarketRuleBook
-from quant_research.data.contracts import JsonValue, canonical_json_bytes
-from quant_research.domain.enums import Board
+from quant_research.backtest.models import AccountView as ExecutionAccountView
+from quant_research.backtest.models import ExecutionConfig, FillResult, MarketSlice
+from quant_research.backtest.rulebook import MarketRuleBook
+from quant_research.backtest.run_artifacts import RunArtifactPublisher
+from quant_research.data.contracts import JsonValue
 from quant_research.domain.identifiers import InstrumentId
-from quant_research.portfolio.constructor import (
-    TargetPortfolio,
-    validate_target_portfolio,
+from quant_research.strategies.base import (
+    AccountView,
+    DecisionContext,
+    DecisionData,
+    OrderIntent,
+    Strategy,
 )
-from quant_research.portfolio.rebalance import RebalancePlanner
-
-_EPSILON = 1e-10
-
-
-@dataclass(frozen=True, slots=True)
-class StrategyRef:
-    """表示回测流程中的策略``ref``及其业务不变量。
-
-    入参：
-        strategy_id：用于持久化关联和日志追踪的策略标识。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-    """
-
-    strategy_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.strategy_id, str) or not self.strategy_id.strip():
-            raise ValueError("strategy_id must be a nonempty string")
 
 
 @dataclass(frozen=True, slots=True)
 class BacktestRequest:
-    """定义一次回测操作在进入用例边界前必须校验的输入。
+    """定义一次 Run 级回测的身份、区间、资金、基准和撮合配置。
 
     入参：
-        experiment_id：目标实验标识，类型为 ``UUID``。
-        data_hash：Canonical 数据内容或本次研究输入的数据身份。
-        strategy：策略。
-        start_date：查询或运行覆盖区间的首日（含）。
-        end_date：查询或运行覆盖区间的末日（含）。
-        benchmark：基准。
-        initial_cash_fen：初始``cash``分币金额。
-        rulebook_hash：唯一 A 股交易规则文件的内容身份。
-        execution_config：成交执行配置。
-        industry_input：显式行业依赖及其可见性语义；未启用时为空。
+        experiment_id、run_id：实验与运行标识；catalog_hash、rulebook_hash：
+        数据目录与交易规则的 SHA-256；其余字段定义区间、基准、资金和撮合参数。
     返回值：
-        返回完成字段规范化和不变量校验的对象。
+        创建经过身份、日期和资金校验的回测请求。
     异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
+        ValueError：标识为空、哈希非法、日期倒置或初始资金非正时抛出。
     """
 
-    experiment_id: UUID
-    data_hash: str
-    strategy: StrategyRef
+    experiment_id: str
+    run_id: str
+    catalog_hash: str
     start_date: date
     end_date: date
     benchmark: InstrumentId
     initial_cash_fen: int
     rulebook_hash: str
     execution_config: ExecutionConfig
-    industry_input: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.experiment_id, UUID):
-            raise TypeError("experiment_id must be a UUID")
-        _EngineSupport._hash(self.data_hash, "data_hash")
-        if not isinstance(self.strategy, StrategyRef):
-            raise TypeError("strategy must be a StrategyRef")
-        _EngineSupport._date(self.start_date, "start_date")
-        _EngineSupport._date(self.end_date, "end_date")
+        if not self.experiment_id or not self.run_id:
+            raise ValueError("experiment_id and run_id must be nonempty")
+        for value, name in (
+            (self.catalog_hash, "catalog_hash"),
+            (self.rulebook_hash, "rulebook_hash"),
+        ):
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(f"{name} must be a SHA-256 digest")
         if self.start_date > self.end_date:
             raise ValueError("start_date must not follow end_date")
-        if not isinstance(self.benchmark, InstrumentId):
-            raise TypeError("benchmark must be an InstrumentId")
-        if type(self.initial_cash_fen) is not int or self.initial_cash_fen <= 0:
-            raise ValueError("initial_cash_fen must be a positive integer")
-        _EngineSupport._hash(self.rulebook_hash, "rulebook_hash")
-        if not isinstance(self.execution_config, ExecutionConfig):
-            raise TypeError("execution_config must be an ExecutionConfig")
-        if self.industry_input is not None:
-            if not isinstance(self.industry_input, Mapping):
-                raise TypeError("industry_input must be a mapping or None")
-            canonical_json_bytes(self.industry_input)
-            object.__setattr__(
-                self, "industry_input", MappingProxyType(dict(self.industry_input))
-            )
+        if self.initial_cash_fen <= 0:
+            raise ValueError("initial_cash_fen must be positive")
 
 
 @dataclass(frozen=True, slots=True)
 class BacktestResult:
-    """记录一次回测操作的结果、业务指标和审计身份。
+    """记录已发布 Run 的产物身份、指标和最终账户状态。
 
     入参：
-        experiment_id：目标实验标识，类型为 ``UUID``。
-        artifact_dir：完成原子发布后的不可变产物目录。
-        manifest_path：记录文件身份、Schema、行数和输入身份的清单路径。
-        sessions_completed：交易会话集合完成。
-        final_snapshot：``final``账户快照。
+        各字段分别提供实验与运行标识、可信产物路径、Manifest 身份、指标、
+        已处理交易日数和最终账户快照。
     返回值：
-        返回完成字段规范化和不变量校验的对象。
+        创建不可变的回测结果值对象。
     异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
+        不执行额外校验；字段类型错误由调用边界的类型校验负责。
     """
 
-    experiment_id: UUID
+    experiment_id: str
+    run_id: str
     artifact_dir: Path
     manifest_path: Path
+    manifest_hash: str
+    artifacts: tuple[dict[str, JsonValue], ...]
+    metrics: Mapping[str, float]
     sessions_completed: int
     final_snapshot: AccountSnapshot
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.experiment_id, UUID):
-            raise TypeError("experiment_id must be a UUID")
-        if not isinstance(self.artifact_dir, Path) or not isinstance(
-            self.manifest_path, Path
-        ):
-            raise TypeError("artifact_dir and manifest_path must be Path values")
-        if self.manifest_path != self.artifact_dir / "manifest.json":
-            raise ValueError("manifest_path must be artifact_dir/manifest.json")
-        if type(self.sessions_completed) is not int or self.sessions_completed <= 0:
-            raise ValueError("sessions_completed must be a positive integer")
-        if not isinstance(self.final_snapshot, AccountSnapshot):
-            raise TypeError("final_snapshot must be an AccountSnapshot")
 
 
 @dataclass(frozen=True, slots=True)
 class BoundMarketSlice:
-    """表示回测流程中的``bound``市场数据``slice``及其业务不变量。
+    """表示已绑定一个交易日的未复权撮合行情。
 
     入参：
-        market：当前交易日经过 Schema 校验的市场切片。
+        market：包含唯一交易日及证券行情的撮合切片。
     返回值：
-        返回完成字段规范化和不变量校验的对象。
+        创建供回测引擎消费的日期绑定行情对象。
     异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``。
-    A validated market slice supplied for one trading date.
+        不执行额外校验；日期一致性由回测引擎检查。
     """
 
     market: MarketSlice
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.market, MarketSlice):
-            raise TypeError("market must be a MarketSlice")
-
 
 class BacktestMarketData(Protocol):
-    """定义 ``BacktestMarketData`` 的依赖端口与实现契约。
+    """定义交易日历和逐日未复权行情读取端口。
 
     入参：
-        无。
+        实现方接收回测日期范围或单个交易日。
     返回值：
-        构造并返回 ``BacktestMarketData`` 实例。
+        实现方返回交易日历和绑定日期的行情切片。
     异常：
-        由具体实现按接口契约定义。
+        数据缺失、PIT 违规或读取失败时由实现方给出明确异常。
     """
 
     def calendar(
-        self,
-        start: date,
-        end: date,
-        *,
-        include_next_session: bool,
+        self, start: date, end: date, *, include_next_session: bool
     ) -> TradingCalendar:
-        """处理回测中的交易日历。
+        """读取指定闭区间的交易日历。
 
         入参：
-            start：处理区间的开始日期，类型为 ``date``。
-            end：处理区间的结束日期，类型为 ``date``。
-            include_next_session：控制是否启用包含范围``next``交易会话规则的布尔开关。
+            start、end：日历边界；include_next_session：是否附加下一交易日。
         返回值：
-            返回交易日历（``TradingCalendar``）。
+            返回稳定排序且无重复日期的交易日历。
         异常：
-            无。
-        Return the range and, when requested, its first later session.
+            ValueError：日期范围无效或权威日历缺失时抛出。
         """
         ...
 
     def market_slice(self, trade_date: date) -> BoundMarketSlice:
-        """处理回测中的市场数据``slice``。
+        """读取单个交易日的未复权撮合行情。
 
         入参：
-            trade_date：目标交易日期，类型为 ``date``。
+            trade_date：待撮合和估值的交易日。
         返回值：
-            返回``slice``（``BoundMarketSlice``）。
+            返回严格绑定该日期的行情切片。
         异常：
-            由具体实现按接口契约定义。
+            ValueError：该日行情不存在或不完整时抛出。
         """
         ...
 
 
-class TargetGenerationPort(Protocol):
-    """定义 ``TargetGenerationPort`` 的依赖端口与实现契约。
+class DecisionDataFactory(Protocol):
+    """为单个信号日创建只允许 PIT 截断读取的决策数据。
 
     入参：
-        无。
+        实现方接收策略当前唯一信号日。
     返回值：
-        构造并返回 ``TargetGenerationPort`` 实例。
+        实现方返回无法越过信号日读取数据的 DecisionData。
     异常：
-        由具体实现按接口契约定义。
+        信号日无权威数据或 PIT 约束失败时由实现方抛出明确异常。
     """
 
-    def generate_target(
-        self,
-        strategy: StrategyRef,
-        signal_date: date,
-        execute_date: date,
-        current: AccountSnapshot,
-    ) -> TargetPortfolio | None:
-        """生成目标组合。
+    def bind(self, signal_date: date) -> DecisionData:
+        """将策略数据读取能力绑定到唯一信号日。
 
         入参：
-            strategy：策略。
-            signal_date：只允许使用当日收盘前已知信息的策略信号日。
-            execute_date：使用上一交易日信号生成委托并撮合的交易日。
-            current：当前值。
+            signal_date：策略可见信息的截止日期。
         返回值：
-            返回生成目标组合后的目标组合（``TargetPortfolio | None``）。
+            返回信号日固定且查询方法不接受额外日期的决策数据。
         异常：
-            由具体实现按接口契约定义。
+            ValueError：信号日不能形成有效 PIT 视图时抛出。
+        """
+        ...
+
+
+class CatalogGuard(Protocol):
+    """在阶段和交易日边界校验提交时捕获的数据目录身份。
+
+    入参：
+        实现方接收 Run 提交时冻结的 catalog_hash。
+    返回值：
+        校验成功时不返回业务数据。
+    异常：
+        RuntimeError：当前目录身份已漂移或目录门禁关闭时抛出。
+    """
+
+    def assert_unchanged(self, catalog_hash: str) -> None:
+        """断言当前数据目录仍等于 Run 捕获的身份。
+
+        入参：
+            catalog_hash：提交时冻结的 SHA-256 目录身份。
+        返回值：
+            身份一致时返回 None。
+        异常：
+            RuntimeError：目录身份变化、不可用或未通过质量门禁时抛出。
         """
         ...
 
 
 class ProgressSink(Protocol):
-    """定义 ``ProgressSink`` 的依赖端口与实现契约。
+    """接收交易日粒度的持久化回测进度。
 
     入参：
-        无。
+        实现方接收已完成数量、总数量和最近完成交易日。
     返回值：
-        构造并返回 ``ProgressSink`` 实例。
+        进度写入成功时不返回业务数据。
     异常：
-        由具体实现按接口契约定义。
+        持久化失败时由实现方保留存储异常语义。
     """
 
     def update(self, completed: int, total: int, trade_date: date) -> None:
-        """更新处理状态或进度。
+        """持久化最近完成的交易日和总体进度。
 
         入参：
-            completed：完成。
-            total：总量。
-            trade_date：目标交易日期，类型为 ``date``。
+            completed、total：已完成数与总数；trade_date：最近完成日期。
         返回值：
-            无。
+            写入成功时返回 None。
         异常：
-            由具体实现按接口契约定义。
+            ValueError：进度越界时可由实现方抛出；存储错误继续向上传播。
         """
         ...
 
 
 class CancellationToken(Protocol):
-    """定义 ``CancellationToken`` 的依赖端口与实现契约。
+    """提供无副作用的协作取消查询。
 
     入参：
-        无。
+        查询不接收参数，状态由任务存储提供。
     返回值：
-        构造并返回 ``CancellationToken`` 实例。
+        返回任务是否已收到取消请求。
     异常：
-        由具体实现按接口契约定义。
+        取消状态无法读取时由实现方抛出存储异常。
     """
 
     def is_cancelled(self) -> bool:
-        """判断``cancelled``。
+        """查询当前 Run 是否应在最近边界取消。
 
         入参：
             无。
         返回值：
-            返回是否``cancelled``。
+            已请求取消返回 True，否则返回 False。
         异常：
-            由具体实现按接口契约定义。
+            任务状态无法可靠读取时抛出实现方定义的异常。
         """
         ...
 
 
 class BacktestCancelled(RuntimeError):
-    """表示 ``BacktestCancelled`` 对应的领域异常。
+    """表示回测在交易日边界响应了取消。
 
     入参：
-        staging_dir：发布前写入文件的同文件系统暂存目录。
-        sessions_completed：交易会话集合完成。
+        message：包含已完成交易日数量的取消说明。
     返回值：
-        返回完成字段规范化和不变量校验的对象。
+        创建供 ExperimentRunner 转换为 CANCELLED 状态的异常。
     异常：
-        无；构造阶段只保存已提供的依赖或值对象。
+        构造过程不主动抛出其他异常。
     """
-
-    def __init__(self, staging_dir: Path, sessions_completed: int) -> None:
-        self.staging_dir = staging_dir
-        self.sessions_completed = sessions_completed
-        super().__init__(f"backtest cancelled after {sessions_completed} sessions")
 
 
 class BacktestEngine:
-    """协调回测计算所需的输入、规则和输出校验。
+    """按交易日先执行前日订单，再估值并调用唯一策略回调。
 
     入参：
-        market_data：市场数据数据。
-        targets：``targets``。
-        rulebook：从 ``configs/rules/a_share.yaml`` 加载的唯一交易规则。
-        rebalance_planner：调仓``planner``。
-        artifact_root：不可变实验产物的可信根目录。
-        execution_model：成交执行``model``。
-        writer_factory：由组合根注入、用于隔离外部副作用的产物写入器``factory``端口。
+        market_data、decision_data、rulebook、catalog_guard：数据与规则端口；
+        artifact_root：不可变产物根；execution_model：可选撮合内核。
     返回值：
-        返回完成字段规范化和不变量校验的对象。
+        创建可执行 T 日决策、T+1 撮合的回测引擎。
     异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``。
-    Coordinate injected data, execution, accounting, and streaming artifacts.
+        依赖构造本身不触发读取；运行期异常由 run 方法说明。
     """
 
     def __init__(
         self,
         market_data: BacktestMarketData,
-        targets: TargetGenerationPort,
+        decision_data: DecisionDataFactory,
         rulebook: MarketRuleBook,
-        rebalance_planner: RebalancePlanner,
+        catalog_guard: CatalogGuard,
         *,
         artifact_root: Path,
         execution_model: ExecutionModel | None = None,
-        writer_factory: Callable[
-            [Path, UUID], BacktestArtifactWriter
-        ] = BacktestArtifactWriter,
     ) -> None:
-        if not isinstance(artifact_root, Path):
-            raise TypeError("artifact_root must be a Path")
-        if not isinstance(rebalance_planner, RebalancePlanner):
-            raise TypeError("rebalance_planner must be a RebalancePlanner")
-        if execution_model is not None and not isinstance(
-            execution_model, ExecutionModel
-        ):
-            raise TypeError("execution_model must be an ExecutionModel")
-        if not callable(writer_factory):
-            raise TypeError("writer_factory must be callable")
         self._market_data = market_data
-        self._targets = targets
+        self._decision_data = decision_data
         self._rulebook = rulebook
-        self._planner = rebalance_planner
-        self._root = artifact_root
+        self._catalog_guard = catalog_guard
+        self._artifact_root = artifact_root
         self._execution = execution_model or ExecutionModel()
-        self._writer_factory = writer_factory
 
     def run(
         self,
         request: BacktestRequest,
+        strategy: Strategy,
         progress: ProgressSink,
         cancellation: CancellationToken,
     ) -> BacktestResult:
-        """执行完整处理流程。
+        """执行订单驱动回测并发布完整固定产物集。
 
         入参：
-            request：请求。
-            progress：当前尝试已完成量、总量和阶段说明。
-            cancellation：Worker 在阶段边界检查的协作取消端口。
+            request：冻结的 Run 请求；strategy：订单策略；progress：进度端口；
+            cancellation：取消查询端口。
         返回值：
-            返回执行回测后的运行（``BacktestResult``）。
+            返回可信 Manifest、指标、产物目录和最终账户快照。
         异常：
-            输入、状态或依赖结果违反契约时抛出 ``BacktestCancelled``、``RuntimeError``、``TypeError``、``ValueError``。
+            TypeError：请求类型错误时抛出；ValueError：日历、行情或策略输出
+            不合法时抛出；BacktestCancelled：任务被协作取消时抛出；
+            RuntimeError：数据身份漂移、账户或产物发布失败时抛出。
         """
         if not isinstance(request, BacktestRequest):
-            raise TypeError("request must be a BacktestRequest")
-        writer = self._writer_factory(self._root, request.experiment_id)
-        completed = 0
-        try:
-            calendar = self._market_data.calendar(
-                request.start_date,
-                request.end_date,
-                include_next_session=True,
-            )
-            sessions = _EngineSupport._validate_calendar(calendar, request)
-            account = PortfolioAccount(request.initial_cash_fen, calendar)
-            pending: TargetPortfolio | None = None
-            final_snapshot: AccountSnapshot | None = None
-            last_closes: dict[InstrumentId, float] = {}
-            for index, trade_date in enumerate(sessions):
-                if cancellation.is_cancelled():
-                    raise BacktestCancelled(writer.staging_dir, completed)
-                bound_market = self._market_data.market_slice(trade_date)
-                market = _EngineSupport._validate_bound_market(
-                    bound_market, request, trade_date
-                )
-                closes, benchmark_close = _EngineSupport._validate_market(
-                    market, request, trade_date
-                )
-                last_closes.update(closes)
-                account.begin_session(trade_date)
-                view = account.execution_view()
-                if pending is None:
-                    execution = self._execution.execute(
-                        (),
-                        market,
-                        AccountView(view.cash_fen, view.sellable_quantities),
-                        self._rulebook,
-                        request.execution_config,
-                    )
-                else:
-                    execution_prices = _EngineSupport._execution_prices(
-                        market,
-                        pending,
-                        view.total_quantities,
-                        request.execution_config,
-                        last_closes,
-                    )
-                    profiles = _EngineSupport._trading_profiles(
-                        market,
-                        execution_prices,
-                        self._rulebook,
-                        trade_date,
-                    )
-                    plan = self._planner.plan(
-                        pending,
-                        view.total_quantities,
-                        view.cash_fen,
-                        execution_prices,
-                        profiles,
-                    )
-                    execution = self._execution.execute(
-                        plan.intents,
-                        market,
-                        AccountView(view.cash_fen, view.sellable_quantities),
-                        self._rulebook,
-                        request.execution_config,
-                    )
-                    pending = None
-                account.apply(execution)
-                final_snapshot = account.mark_to_market(trade_date, closes)
-                writer.append_execution(execution)
-                writer.append_snapshot(final_snapshot, benchmark_close)
-                if index + 1 < len(sessions):
-                    next_session = sessions[index + 1]
-                    generated = self._targets.generate_target(
-                        request.strategy,
-                        trade_date,
-                        next_session,
-                        final_snapshot,
-                    )
-                    if generated is not None:
-                        validate_target_portfolio(generated, trade_date, next_session)
-                        if pending is not None:
-                            raise ValueError("duplicate pending target")
-                        writer.append_target(generated)
-                        pending = generated
-                completed += 1
-                progress.update(completed, len(sessions), trade_date)
-            if final_snapshot is None:
-                raise RuntimeError("no final snapshot was produced")
-            writer.close()
-            context = ManifestContext(
-                request.experiment_id,
-                request.data_hash,
-                request.strategy.strategy_id,
-                request.start_date,
-                request.end_date,
-                request.benchmark,
-                request.initial_cash_fen,
-                request.rulebook_hash,
-                request.execution_config,
-                request.industry_input,
-            )
-            writer.validate(sessions, context)
-            manifest_path = writer.publish()
-            return BacktestResult(
-                request.experiment_id,
-                writer.artifact_dir,
-                manifest_path,
-                completed,
-                final_snapshot,
-            )
-        except BaseException as error:
-            writer.abort(error)
-            raise
-
-
-class _EngineSupport:
-    """集中承载本模块的私有实现逻辑。"""
-
-    @staticmethod
-    def _validate_calendar(
-        calendar: object, request: BacktestRequest
-    ) -> tuple[date, ...]:
-        if not isinstance(calendar, TradingCalendar):
-            raise TypeError("market data calendar must be a TradingCalendar")
-        if calendar.start > request.start_date or calendar.end < request.end_date:
-            raise ValueError("calendar does not cover request range")
-        try:
-            calendar.next_session(request.end_date)
-        except ValueError as error:
-            raise ValueError(
-                "calendar does not cover next trading session after request end"
-            ) from error
+            raise TypeError("request must be BacktestRequest")
+        self._catalog_guard.assert_unchanged(request.catalog_hash)
+        calendar = self._market_data.calendar(
+            request.start_date, request.end_date, include_next_session=True
+        )
         sessions = calendar.sessions(request.start_date, request.end_date)
         if not sessions:
-            raise ValueError("backtest request contains no trading sessions")
-        return sessions
-
-    @staticmethod
-    def _validate_market(
-        market: object, request: BacktestRequest, trade_date: date
-    ) -> tuple[dict[InstrumentId, float], float]:
-        if not isinstance(market, MarketSlice):
-            raise TypeError("market data must return a MarketSlice")
-        if market.trade_date != trade_date:
-            raise ValueError("market slice trade_date does not match session")
-        closes: dict[InstrumentId, float] = {}
-        for row in market.bars.select("instrument_id", "close").iter_rows(named=True):
-            raw = row["instrument_id"]
-            close = row["close"]
-            if not isinstance(raw, str):
-                raise TypeError("market slice has invalid instrument data")
-            if close is None:
-                continue
-            if not isinstance(close, float) or not isfinite(close) or close <= 0:
-                raise TypeError("market slice has invalid close data")
-            closes[InstrumentId.parse(raw)] = close
-        try:
-            benchmark = closes[request.benchmark]
-        except KeyError as error:
-            raise ValueError("market slice is missing benchmark") from error
-        if not isfinite(benchmark) or benchmark <= 0:
-            raise ValueError("benchmark close must be finite and positive")
-        return closes, benchmark
-
-    @staticmethod
-    def _validate_bound_market(
-        bound_market: object, request: BacktestRequest, trade_date: date
-    ) -> MarketSlice:
-        if not isinstance(bound_market, BoundMarketSlice):
-            raise TypeError("market data must return a BoundMarketSlice")
-        if bound_market.market.trade_date != trade_date:
-            raise ValueError("market slice trade_date does not match session")
-        return bound_market.market
-
-    @staticmethod
-    def _execution_prices(
-        market: MarketSlice,
-        target: TargetPortfolio,
-        current: Mapping[InstrumentId, int],
-        config: ExecutionConfig,
-        last_closes: Mapping[InstrumentId, float],
-    ) -> dict[InstrumentId, float]:
-        key = "open" if config.reference_price.value == "OPEN" else "close"
-        rows = {
-            InstrumentId.parse(raw): price
-            for raw, price in market.bars.select("instrument_id", key).iter_rows()
-            if isinstance(price, float)
+            raise ValueError("backtest has no trading sessions")
+        account = PortfolioAccount(request.initial_cash_fen, calendar)
+        pending: tuple[OrderIntent, ...] = ()
+        tables: dict[str, list[dict[str, object]]] = {
+            name: []
+            for name in ("orders", "fills", "holdings", "costs", "nav", "attribution")
         }
-        needed = set(current) | {
-            position.instrument_id for position in target.positions
-        }
-        try:
-            return {
-                instrument: (
-                    rows[instrument] if instrument in rows else last_closes[instrument]
-                )
-                for instrument in needed
-            }
-        except KeyError as error:
-            raise ValueError("market slice is missing execution price") from error
-
-    @staticmethod
-    def _trading_profiles(
-        market: MarketSlice,
-        prices: Mapping[InstrumentId, float],
-        rulebook: MarketRuleBook,
-        trade_date: date,
-    ) -> dict[InstrumentId, InstrumentTradingProfile]:
-        rows = {
-            InstrumentId.parse(raw): (instrument_type, board)
-            for raw, instrument_type, board in market.bars.select(
-                "instrument_id", "instrument_type", "board"
-            ).iter_rows()
-        }
-        profiles: dict[InstrumentId, InstrumentTradingProfile] = {}
-        for instrument in prices:
-            try:
-                instrument_type, raw_board = rows[instrument]
-            except KeyError as error:
-                raise ValueError("market slice is missing trading metadata") from error
-            if not isinstance(instrument_type, str) or not isinstance(raw_board, str):
-                raise TypeError("market slice has invalid trading metadata")
-            profiles[instrument] = rulebook.trading_profile(
-                instrument, instrument_type, Board(raw_board), trade_date
+        snapshots: list[AccountSnapshot] = []
+        final: AccountSnapshot | None = None
+        for index, trade_date in enumerate(sessions):
+            self._catalog_guard.assert_unchanged(request.catalog_hash)
+            if cancellation.is_cancelled():
+                raise BacktestCancelled(f"backtest cancelled after {index} sessions")
+            bound = self._market_data.market_slice(trade_date)
+            if bound.market.trade_date != trade_date:
+                raise ValueError("market slice is bound to a different date")
+            market = bound.market
+            closes, benchmark_close = self._closes(market, request.benchmark)
+            account.begin_session(trade_date)
+            execution_view = account.execution_view()
+            execution = self._execution.execute(
+                pending,
+                market,
+                ExecutionAccountView(
+                    execution_view.cash_fen, execution_view.sellable_quantities
+                ),
+                self._rulebook,
+                request.execution_config,
             )
-        return profiles
+            account.apply(execution)
+            final = account.mark_to_market(trade_date, closes)
+            snapshots.append(final)
+            self._append_execution(
+                tables, execution, request.execution_config.slippage_bps
+            )
+            self._append_snapshot(tables, final, benchmark_close)
+            pending = ()
+            if index + 1 < len(sessions):
+                next_date = sessions[index + 1]
+                data = self._decision_data.bind(trade_date)
+                if data.signal_date != trade_date:
+                    raise ValueError("DecisionData is bound to a different signal_date")
+                account_view = AccountView(
+                    cash_fen=final.cash_fen,
+                    positions={
+                        item.instrument_id: item.total_quantity
+                        for item in final.positions
+                    },
+                    sellable={
+                        item.instrument_id: item.sellable_quantity
+                        for item in final.positions
+                    },
+                    equity_fen=final.nav_fen,
+                    available_margin_fen=0,
+                )
+                context = DecisionContext(trade_date, next_date, data, account_view)
+                if index == 0:
+                    strategy.warmup(context)
+                pending = tuple(strategy.on_event(context))
+                self._append_orders(tables, context, pending)
+            progress.update(index + 1, len(sessions), trade_date)
+            self._catalog_guard.assert_unchanged(request.catalog_hash)
+        if final is None:
+            raise RuntimeError("backtest produced no account snapshot")
+        metrics, performance = self._performance(snapshots, request.initial_cash_fen)
+        signals = self._signals(strategy)
+        publisher = RunArtifactPublisher(
+            self._artifact_root, request.experiment_id, request.run_id
+        )
+        artifact_dir, manifest_hash, entries = publisher.publish(
+            {**tables, "signals": signals, "performance": performance},
+            config=self._config(request, strategy),
+            metrics=cast(Mapping[str, JsonValue], metrics),
+            identities={
+                "experiment_id": request.experiment_id,
+                "run_id": request.run_id,
+                "catalog_hash": request.catalog_hash,
+                "rulebook_hash": request.rulebook_hash,
+                "strategy_id": strategy.spec.strategy_id,
+            },
+        )
+        return BacktestResult(
+            request.experiment_id,
+            request.run_id,
+            artifact_dir,
+            artifact_dir / "manifest.json",
+            manifest_hash,
+            entries,
+            metrics,
+            len(sessions),
+            final,
+        )
 
     @staticmethod
-    def _date(value: object, name: str) -> None:
-        if not isinstance(value, date) or isinstance(value, datetime):
-            raise TypeError(f"{name} must be a date")
+    def _closes(
+        market: MarketSlice, benchmark: InstrumentId
+    ) -> tuple[dict[InstrumentId, float], float]:
+        closes: dict[InstrumentId, float] = {}
+        for identifier, close in market.bars.select(
+            "instrument_id", "close"
+        ).iter_rows():
+            if close is not None and float(close) > 0:
+                closes[InstrumentId.parse(identifier)] = float(close)
+        try:
+            benchmark_close = closes[benchmark]
+        except KeyError as error:
+            raise ValueError("benchmark close is missing from market slice") from error
+        return closes, benchmark_close
 
     @staticmethod
-    def _hash(value: object, name: str) -> None:
-        if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-        ):
-            raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+    def _append_orders(
+        tables: dict[str, list[dict[str, object]]],
+        context: DecisionContext,
+        orders: Sequence[OrderIntent],
+    ) -> None:
+        seen: set[InstrumentId] = set()
+        for order_index, order in enumerate(orders):
+            if order.instrument_id in seen:
+                raise ValueError(
+                    "strategy orders must be unique by instrument per decision"
+                )
+            seen.add(order.instrument_id)
+            tables["orders"].append(
+                {
+                    "signal_date": context.signal_date,
+                    "execute_date": context.execute_date,
+                    "order_index": order_index,
+                    "instrument_id": order.instrument_id.canonical(),
+                    "side": order.side.value,
+                    "quantity": order.quantity,
+                    "reason": order.reason,
+                }
+            )
+
+    @staticmethod
+    def _append_execution(
+        tables: dict[str, list[dict[str, object]]],
+        execution: object,
+        slippage_bps: float,
+    ) -> None:
+        from quant_research.backtest.models import ExecutionBatch
+
+        if not isinstance(execution, ExecutionBatch):
+            raise TypeError("execution must be ExecutionBatch")
+        for result_index, result in enumerate(execution.results):
+            filled = result.filled_quantity if isinstance(result, FillResult) else 0
+            price = result.price if isinstance(result, FillResult) else None
+            gross = result.gross_value_fen if isinstance(result, FillResult) else 0
+            tables["fills"].append(
+                {
+                    "trade_date": execution.trade_date,
+                    "result_index": result_index,
+                    "instrument_id": result.intent.instrument_id.canonical(),
+                    "side": result.intent.side.value,
+                    "requested_quantity": result.requested_quantity,
+                    "filled_quantity": filled,
+                    "unfilled_quantity": result.requested_quantity - filled,
+                    "reference_price": result.reference_price,
+                    "price": price,
+                    "gross_value_fen": gross,
+                    "reason_code": result.reason_code.value,
+                }
+            )
+            if isinstance(result, FillResult):
+                slippage = round(
+                    abs(result.price - result.reference_price)
+                    * result.filled_quantity
+                    * 100
+                )
+                fees = result.fees.total_cents
+                tables["costs"].append(
+                    {
+                        "trade_date": execution.trade_date,
+                        "result_index": result_index,
+                        "instrument_id": result.intent.instrument_id.canonical(),
+                        "rule_fees_fen": fees,
+                        "slippage_fen": slippage,
+                        "total_cost_fen": fees + slippage,
+                    }
+                )
+
+    @staticmethod
+    def _append_snapshot(
+        tables: dict[str, list[dict[str, object]]],
+        snapshot: AccountSnapshot,
+        benchmark_close: float,
+    ) -> None:
+        for position in snapshot.positions:
+            tables["holdings"].append(
+                {
+                    "trade_date": snapshot.trade_date,
+                    "instrument_id": position.instrument_id.canonical(),
+                    "total_quantity": position.total_quantity,
+                    "sellable_quantity": position.sellable_quantity,
+                    "cost_basis_fen": position.cost_basis_fen,
+                    "market_value_fen": position.market_value_fen,
+                }
+            )
+        tables["nav"].append(
+            {
+                "trade_date": snapshot.trade_date,
+                "cash_fen": snapshot.cash_fen,
+                "long_market_value_fen": snapshot.total_market_value_fen,
+                "short_market_value_fen": 0,
+                "accrued_fees_fen": 0,
+                "margin_used_fen": 0,
+                "equity_fen": snapshot.nav_fen,
+                "benchmark_close": benchmark_close,
+            }
+        )
+
+    @staticmethod
+    def _performance(
+        snapshots: Sequence[AccountSnapshot], initial_cash_fen: int
+    ) -> tuple[dict[str, float], list[dict[str, object]]]:
+        rows: list[dict[str, object]] = []
+        peak = float(initial_cash_fen)
+        previous = float(initial_cash_fen)
+        max_drawdown = 0.0
+        for item in snapshots:
+            equity = float(item.nav_fen)
+            daily = equity / previous - 1.0
+            cumulative = equity / initial_cash_fen - 1.0
+            peak = max(peak, equity)
+            drawdown = equity / peak - 1.0
+            max_drawdown = min(max_drawdown, drawdown)
+            rows.append(
+                {
+                    "trade_date": item.trade_date,
+                    "return": daily,
+                    "cumulative_return": cumulative,
+                    "drawdown": drawdown,
+                }
+            )
+            previous = equity
+        cumulative_return = cast(float, rows[-1]["cumulative_return"])
+        return {
+            "cumulative_return": cumulative_return,
+            "max_drawdown": max_drawdown,
+        }, rows
+
+    @staticmethod
+    def _signals(strategy: Strategy) -> pl.DataFrame | list[dict[str, object]]:
+        getter = getattr(strategy, "signal_frame", None)
+        if not callable(getter):
+            return []
+        frame = getter()
+        if not isinstance(frame, pl.DataFrame) or frame.is_empty():
+            return []
+        return pl.DataFrame(
+            {
+                "signal_date": frame["signal_date"],
+                "instrument_id": frame["instrument_id"],
+                "signal": frame["state"]
+                if "state" in frame.columns
+                else pl.Series([strategy.spec.strategy_id] * len(frame)),
+                "value": (frame["short_ma"] - frame["long_ma"])
+                if {"short_ma", "long_ma"}.issubset(frame.columns)
+                else frame["score"]
+                if "score" in frame.columns
+                else pl.Series([None] * len(frame), dtype=pl.Float64),
+                "state_changed": frame["state_changed"]
+                if "state_changed" in frame.columns
+                else pl.Series([False] * len(frame)),
+                "invalid_reason": frame["invalid_reason"]
+                if "invalid_reason" in frame.columns
+                else pl.Series([None] * len(frame), dtype=pl.String),
+            }
+        )
+
+    @staticmethod
+    def _config(request: BacktestRequest, strategy: Strategy) -> dict[str, JsonValue]:
+        return {
+            "start_date": request.start_date.isoformat(),
+            "end_date": request.end_date.isoformat(),
+            "benchmark": request.benchmark.canonical(),
+            "initial_cash_fen": request.initial_cash_fen,
+            "strategy": {
+                "strategy_id": strategy.spec.strategy_id,
+                "parameters": dict(strategy.spec.parameters),
+            },
+            "execution": {
+                "reference_price": request.execution_config.reference_price.value,
+                "slippage_bps": request.execution_config.slippage_bps,
+                "max_volume_participation": request.execution_config.max_volume_participation,
+            },
+        }
+
+
+__all__ = [
+    "BacktestCancelled",
+    "BacktestEngine",
+    "BacktestRequest",
+    "BacktestResult",
+    "BoundMarketSlice",
+    "CancellationToken",
+    "CatalogGuard",
+    "DecisionDataFactory",
+    "ProgressSink",
+]

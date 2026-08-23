@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from quant_research.application.research import ResearchApplicationService
+from quant_research.application.operations import OperationalCommandService
 from quant_research.data.contracts import JsonValue
 from quant_research.data.pipeline.publish import (
     DataUpdatePlan,
@@ -52,14 +51,15 @@ class _Queue:
         task_type: str,
         payload: Mapping[str, JsonValue],
         priority: int,
-        experiment_id: str | None = None,
         *,
         idempotency_key: str | None = None,
         available_at: datetime | None = None,
         actor: str = "system",
         request_id: str | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
     ) -> str:
-        del experiment_id, available_at
+        del available_at, subject_kind, subject_id
         assert task_type == "DATA_UPDATE"
         assert priority == 0
         assert actor == "dashboard"
@@ -87,21 +87,21 @@ class _ValidationQueue:
         task_type: str,
         payload: Mapping[str, JsonValue],
         priority: int,
-        experiment_id: str | None = None,
         *,
         idempotency_key: str | None = None,
         available_at: datetime | None = None,
         actor: str = "system",
         request_id: str | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
     ) -> str:
-        del experiment_id, available_at
+        del available_at, subject_kind, subject_id
         assert priority == 0
         assert actor == "dashboard"
         assert request_id == "request-1"
         self.enqueued = task_type, payload, idempotency_key
         self.task = TaskRecord(
             id="quality-task-1",
-            experiment_id=None,
             task_type=task_type,
             payload=dict(payload),
             status=TaskStatus.QUEUED,
@@ -142,7 +142,6 @@ def _plan() -> DataUpdatePlan:
 def _task(payload: dict[str, JsonValue]) -> TaskRecord:
     return TaskRecord(
         id="task-1",
-        experiment_id=None,
         task_type="DATA_UPDATE",
         payload=payload,
         status=TaskStatus.FAILED,
@@ -156,18 +155,8 @@ def _task(payload: dict[str, JsonValue]) -> TaskRecord:
     )
 
 
-def _service(queue: _Queue, planner: _Planner) -> ResearchApplicationService:
-    return ResearchApplicationService(
-        queue=cast(Any, queue),
-        query=cast(Any, object()),
-        registry=cast(Any, object()),
-        catalog=cast(Any, object()),
-        source_root=Path.cwd(),
-        factor_studies=cast(Any, object()),
-        experiment_submitter=cast(Any, object()),
-        experiment_deletion=cast(Any, object()),
-        data_update_planner=planner,
-    )
+def _service(queue: _Queue, planner: _Planner) -> OperationalCommandService:
+    return OperationalCommandService(cast(Any, queue), planner, cast(Any, object()))
 
 
 def test_preview_and_enqueue_persist_the_same_complete_plan() -> None:

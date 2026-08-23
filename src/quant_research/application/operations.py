@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Protocol
 
-from quant_research.application.research_platform import ResearchCommandService
+from quant_research.application.experiments import ExperimentService
 from quant_research.data.contracts import JsonValue
 from quant_research.data.pipeline.publish import DataUpdatePlan
 from quant_research.domain.enums import DatasetKind, Severity
@@ -17,12 +17,12 @@ from quant_research.tasks.models import TaskRecord, TaskStatus
 class OperationalTaskQueue(Protocol):
     """定义数据任务和运行中心所需的队列端口。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def enqueue(
@@ -30,12 +30,13 @@ class OperationalTaskQueue(Protocol):
         task_type: str,
         payload: Mapping[str, JsonValue],
         priority: int,
-        experiment_id: str | None = None,
         *,
         idempotency_key: str | None = None,
         available_at: datetime | None = None,
         actor: str = "system",
         request_id: str | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
     ) -> str:
         """定义 enqueue 端口操作。
 
@@ -44,7 +45,6 @@ class OperationalTaskQueue(Protocol):
         异常：实现不满足契约时传播对应领域或依赖异常。
         """
         ...
-
 
     def get(self, task_id: str) -> TaskRecord:
         """定义 get 端口操作。
@@ -55,15 +55,14 @@ class OperationalTaskQueue(Protocol):
         """
         ...
 
-
     def request_cancel(
         self,
         task_id: str,
-        actor: str,
+        actor: str = "system",
         *,
         request_id: str | None = None,
         strict: bool = False,
-    ) -> None:
+    ) -> TaskStatus:
         """定义 request_cancel 端口操作。
 
         入参：参数含义由端口签名及类型声明给出。
@@ -72,11 +71,10 @@ class OperationalTaskQueue(Protocol):
         """
         ...
 
-
     def delete(
         self,
         task_id: str,
-        actor: str,
+        actor: str = "system",
         *,
         request_id: str | None = None,
     ) -> None:
@@ -88,11 +86,10 @@ class OperationalTaskQueue(Protocol):
         """
         ...
 
-
     def retry(
         self,
         task_id: str,
-        actor: str,
+        actor: str = "system",
         *,
         available_at: datetime | None = None,
         request_id: str | None = None,
@@ -106,16 +103,15 @@ class OperationalTaskQueue(Protocol):
         ...
 
 
-
 class DataUpdatePlanningPort(Protocol):
     """定义数据更新计划预览与冻结端口。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def plan(
@@ -134,27 +130,26 @@ class DataUpdatePlanningPort(Protocol):
         ...
 
 
-
 class OperationalCommandService:
     """执行数据更新、质量任务和通用任务控制。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def __init__(
         self,
         queue: OperationalTaskQueue,
         planner: DataUpdatePlanningPort,
-        research: ResearchCommandService,
+        experiments: ExperimentService,
     ) -> None:
         self._queue = queue
         self._planner = planner
-        self._research = research
+        self._experiments = experiments
 
     def preview_data_update(
         self,
@@ -165,12 +160,12 @@ class OperationalCommandService:
     ) -> dict[str, JsonValue]:
         """生成无写入的数据更新计划。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         return self._planner.plan(start=start, end=end, datasets=datasets).to_payload()
 
@@ -179,18 +174,18 @@ class OperationalCommandService:
         *,
         start: date | None,
         end: date | None,
-        datasets: tuple[DatasetKind, ...] | None,
+        datasets: tuple[DatasetKind, ...] | None = None,
         expected_plan_hash: str,
         request_id: str,
     ) -> dict[str, JsonValue]:
         """复核计划身份后入队冻结的数据更新任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         plan = self._planner.plan(start=start, end=end, datasets=datasets)
         if plan.plan_hash != expected_plan_hash:
@@ -245,12 +240,12 @@ class OperationalCommandService:
     ) -> dict[str, object]:
         """入队全目录门禁或单数据集诊断。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         scope = "ALL" if dataset is None else "DATASET"
         payload: dict[str, JsonValue] = {"scope": scope}
@@ -280,16 +275,14 @@ class OperationalCommandService:
     def cancel_task(self, task_id: str, *, request_id: str) -> dict[str, object]:
         """严格请求取消目标任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
-        self._queue.request_cancel(
-            task_id, "dashboard", request_id=request_id, strict=True
-        )
+        self._queue.request_cancel(task_id, actor="dashboard", request_id=request_id)
         task = self._queue.get(task_id)
         return {"task_id": task.id, "status": task.status.value}
 
@@ -302,22 +295,24 @@ class OperationalCommandService:
     ) -> dict[str, JsonValue]:
         """数据任务创建新任务；研究任务创建全新 execution。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         task = self._queue.get(task_id)
         if task.status is TaskStatus.ORPHANED and not confirm_orphaned:
             raise ValueError("orphaned task retry requires explicit confirmation")
-        if task.subject_kind is not None and task.subject_id is not None:
-            return self._research.rerun_subject(
-                task.subject_kind,
-                task.subject_id,
-                request_id=request_id,
-            )
+        if task.subject_kind == "EXPERIMENT_RUN" and task.subject_id is not None:
+            aggregate = self._experiments.rerun(task.subject_id, actor="dashboard")
+            newest = aggregate.runs[-1]
+            return {
+                "experiment_id": aggregate.experiment.id,
+                "run_id": newest.id,
+                "task_id": newest.task_id,
+            }
         if task.task_type == "DATA_UPDATE":
             try:
                 DataUpdatePlan.from_payload(task.payload)
@@ -334,20 +329,18 @@ class OperationalCommandService:
                 ) from error
         if task.task_type not in {"DATA_UPDATE", "DATA_VALIDATION"}:
             raise ValueError("task type cannot be retried by the target platform")
-        retried = self._queue.retry(
-            task_id, "dashboard", request_id=request_id
-        )
+        retried = self._queue.retry(task_id, actor="dashboard", request_id=request_id)
         return {"task_id": retried}
 
     def delete_task(self, task_id: str, *, request_id: str) -> dict[str, object]:
         """删除一个终态任务记录。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
-        self._queue.delete(task_id, "dashboard", request_id=request_id)
+        self._queue.delete(task_id, actor="dashboard", request_id=request_id)
         return {"task_id": task_id, "status": "DELETED"}

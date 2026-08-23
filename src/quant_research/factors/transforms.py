@@ -121,8 +121,7 @@ def neutralize_industry(
     value_present = numeric.is_not_null()
     value_finite = numeric.is_finite().fill_null(False)
     industry_present = (
-        pl.col(industry_col).is_not_null()
-        & (pl.col(industry_col).str.len_chars() > 0)
+        pl.col(industry_col).is_not_null() & (pl.col(industry_col).str.len_chars() > 0)
     ).fill_null(False)
     active = source_valid & value_present & value_finite & industry_present
     partition = [*grouping, industry_col]

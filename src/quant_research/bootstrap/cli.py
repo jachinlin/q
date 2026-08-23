@@ -11,23 +11,22 @@ from typing import TextIO
 from sqlalchemy import Engine
 
 from quant_research.application.data import DataUpdateHandler, DataValidationHandler
-from quant_research.application.worker import Worker
+from quant_research.application.experiments import ExperimentService
 from quant_research.backtest.rulebook import AShareRuleBook
-from quant_research.bootstrap.research import build_research_platform
+from quant_research.bootstrap.worker import build_default_experiment_worker
 from quant_research.cli.app import (
     ApplicationServices,
+    LocalExperimentCommands,
+    LocalStrategyCommands,
     LocalTaskCommands,
     LocalWorkerCommands,
     create_app,
     run,
 )
-from quant_research.cli.research import LocalResearchCommands
 from quant_research.config import Settings
-from quant_research.dashboard.research_views import ResearchDashboardService
 from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.pipeline.publish import DataPipeline
 from quant_research.data.quality.runner import QualityRunner
-from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,
@@ -41,6 +40,9 @@ from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
 )
+from quant_research.infrastructure.persistence.experiment_runs import (
+    ExperimentRunRegistry,
+)
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from quant_research.logging import (
@@ -49,6 +51,7 @@ from quant_research.logging import (
     TeeLogStream,
     sensitive_environment_values,
 )
+from quant_research.strategies.registry import StrategyRegistry
 
 
 class CliBootstrap:
@@ -106,28 +109,22 @@ class CliBootstrap:
                 engine,
                 task_log_root=settings.data_root / "state" / "task-logs",
             )
-            research_repository = CanonicalResearchRepository.from_sqlite(
-                engine,
-                trusted_curated_root=settings.curated_root,
-            )
             rulebook = AShareRuleBook.load(
                 source_root / "configs" / "rules" / "a_share.yaml"
             )
-            research = build_research_platform(
-                engine=engine,
-                queue=queue,
-                repository=research_repository,
-                source_root=source_root,
-                artifact_root=settings.artifact_root,
-                rulebook=rulebook,
+            strategies = StrategyRegistry.builtins(
+                commission_bps=rulebook.commission_bps,
+                commission_minimum_fen=rulebook.commission_minimum_fen,
             )
-            worker = Worker(
-                queue,
+            experiments = ExperimentService(
+                ExperimentRunRegistry(engine), repository, strategies
+            )
+            worker = build_default_experiment_worker(
                 worker_id=f"cli-worker-{os.getpid()}",
-                handlers=(
+                engine=engine,
+                extra_handlers=(
                     DataUpdateHandler(pipeline),
                     DataValidationHandler(pipeline),
-                    *research.handlers,
                 ),
             )
             return ApplicationServices(
@@ -137,16 +134,10 @@ class CliBootstrap:
                     worker,
                     queue=queue,
                 ),
-                research_commands=LocalResearchCommands(
-                    research.commands,
-                    ResearchDashboardService(
-                        research.registry,
-                        research.components,
-                        source_root / "configs" / "research" / "examples",
-                        settings.artifact_root,
-                    ),
-                    source_root / "configs",
+                experiment_commands=LocalExperimentCommands(
+                    experiments, source_root / "configs"
                 ),
+                strategy_commands=LocalStrategyCommands(strategies.strategy_ids()),
                 close_callback=lambda: cls._close_resources(
                     pipeline_logger, pipeline_stream, engine
                 ),

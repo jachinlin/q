@@ -31,106 +31,6 @@ export type Task = {
   result: Record<string, unknown> | null
 }
 
-export type ResearchVariantPreview = {
-  variant_id: string
-  composition_hash: string
-  parameters: Record<string, unknown>
-}
-
-export type ResearchValidation = {
-  config_hash: string
-  normalized_yaml: string
-  variant_count: number
-  variants: ResearchVariantPreview[]
-  required_datasets: string[]
-  signal_kind: 'CROSS_SECTIONAL_SCORE' | 'DIRECTIONAL' | 'ALLOCATION'
-}
-
-export type ResearchTemplate = {
-  strategy_id: 'stock_multifactor' | 'dual_ma_trend' | 'etf_rotation'
-  label: string
-  signal_kind: ResearchValidation['signal_kind']
-  yaml: string
-}
-
-export type ResearchExecutionSummary = {
-  id: string
-  status: string
-  catalog_hash: string
-  source_hash: string
-  rulebook_hash: string
-  selected_variant_id: string | null
-  selection_reason: string | null
-  created_at: string
-  started_at: string | null
-  completed_at: string | null
-  error: Record<string, unknown> | null
-}
-
-export type ResearchFamily = {
-  id: string
-  name: string
-  hypothesis: string
-  strategy_id: string
-  research_mode: 'SIGNAL_STUDY' | 'PORTFOLIO_STUDY' | 'BACKTEST_EXPERIMENT'
-  config_hash: string
-  mark: string
-  created_at: string
-  latest_execution: ResearchExecutionSummary | null
-}
-
-export type ResearchMetric = {
-  split: 'TRAIN' | 'VALIDATION' | 'TEST'
-  category: string
-  name: string
-  value: number | null
-  unit: string | null
-  p_value: number | null
-  adjusted_p_value: number | null
-}
-
-export type ResearchVariant = {
-  id: string
-  ordinal: number
-  composition_hash: string
-  parameters: Record<string, unknown>
-  rejection_reasons: string[]
-}
-
-export type ResearchRun = {
-  id: string
-  variant_id: string
-  phase: 'TRAIN_VALIDATION' | 'TEST'
-  status: string
-  stage: string
-  stage_status: Record<string, unknown>
-  manifest_hash: string | null
-  created_at: string
-  completed_at: string | null
-  metrics: ResearchMetric[]
-}
-
-export type ResearchExecution = ResearchExecutionSummary & {
-  variants: ResearchVariant[]
-  runs: ResearchRun[]
-}
-
-export type ResearchFamilyDetail = Omit<ResearchFamily, 'latest_execution'> & {
-  config: Record<string, unknown>
-  note: string | null
-  executions: ResearchExecution[]
-}
-
-export type ResearchArtifactSeries = {
-  run_id: string
-  artifact_type: 'signals' | 'portfolio' | 'execution' | 'performance'
-  manifest_hash: string
-  items: Array<Record<string, unknown>>
-  page: number
-  page_size: number
-  total: number
-}
-
 export type TaskAttempt = {
   id: string
   attempt_no: number
@@ -181,6 +81,86 @@ export type DataUpdateWindow = {
   trigger_date?: string
 }
 
+export type ExperimentKind = 'STRATEGY_BACKTEST' | 'FACTOR_STUDY'
+export type RunStatus = 'CREATED' | 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+export type ResearchMark = 'UNREVIEWED' | 'BASELINE' | 'CANDIDATE' | 'DISCARDED'
+
+export type ExperimentDefinitionDto = {
+  name: string
+  description: string
+  kind: ExperimentKind
+  tags: string[]
+  sample_windows: Record<'train' | 'validation' | 'test', { start: string; end: string }>
+  governance: { test_budget: number; correction: 'BONFERRONI' | 'BH_FDR' }
+  initial_run: Record<string, unknown>
+}
+
+export type ExperimentSummary = {
+  id: string
+  definition: ExperimentDefinitionDto
+  baseline_run_id: string | null
+  created_at: string
+}
+
+export type ExperimentOverview = ExperimentSummary & {
+  latest_run: ExperimentRun | null
+  run_count: number
+  test_uses: number
+}
+
+export type ExperimentRun = {
+  id: string
+  experiment_id: string
+  config: Record<string, unknown>
+  config_hash: string
+  catalog_hash: string
+  status: RunStatus
+  stage: string
+  research_mark: ResearchMark
+  uses_test_region: boolean
+  task_id: string | null
+  artifact_dir: string | null
+  manifest_hash: string | null
+  error: Record<string, unknown> | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  tags: string[]
+  metrics: Array<{
+    name: string
+    value: number
+    unit: string | null
+    p_value: number | null
+    adjusted_p_value: number | null
+  }>
+  artifacts: Array<{
+    artifact_type: string
+    relative_path: string
+    content_hash: string
+    byte_count: number
+    row_count: number | null
+    schema: Record<string, string> | null
+  }>
+}
+
+export type ExperimentAggregate = {
+  experiment: ExperimentSummary
+  runs: ExperimentRun[]
+  tags: string[]
+}
+
+export type ExperimentValidation = {
+  config_hash: string
+  normalized: ExperimentDefinitionDto
+}
+
+export type StrategyCatalog = {
+  strategies: string[]
+  components: Record<string, string[]>
+  component_schemas: Record<string, Array<{ model_id: string; params_schema: Record<string, unknown> }>>
+  capability_rules: Array<Record<string, unknown>>
+}
+
 export type DataUpdateSkip = {
   dataset: string
   reason: 'DISCLOSURE_DEADLINE_PENDING'
@@ -197,34 +177,6 @@ export type DataUpdatePlan = {
   dataset_windows: DataUpdateWindow[]
   skipped_datasets: DataUpdateSkip[]
   plan_hash: string
-}
-
-export type Experiment = {
-  id: string
-  strategy_id: string
-  status: string
-  research_mark: string
-  data_hash: string
-  config_hash: string
-  fingerprint: string
-  created_at: string
-  completed_at: string | null
-  tags: string[]
-  metrics: Record<string, number | null>
-}
-
-export type ExperimentDetail = Omit<Experiment, 'metrics'> & {
-  started_at: string | null
-  source_tree_hash: string | null
-  git_commit_hash: string | null
-  lockfile_hash: string
-  rulebook_hash: string
-  note: string | null
-  latest_task: { id: string; status: string } | null
-  config: Record<string, unknown>
-  metrics: Array<{ name: string; value: number | null; unit: string | null }>
-  artifacts: Array<{ name: string; type: string; content_hash: string; metadata: Record<string, unknown> }>
-  audit: Array<{ event_type: string; actor: string; details: Record<string, unknown>; created_at: string }>
 }
 
 export type Page<T> = { items: T[]; page: number; page_size: number; total: number }

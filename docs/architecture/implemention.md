@@ -2,7 +2,7 @@
 
 文档状态：实现规范，待用户书面审阅　·　日期：2026-08-20
 
-本文是各层**实现级细化**的单文件合并版：深到目录布局、字段映射、类型转换、PIT 计算公式、聚合/去重算法、质量阈值、SQLite DDL、关键伪代码。读者定位：**低级程序员照此即可实现**。设计"为什么"见同目录 `design.md`；本文回答"怎么做"。凡"必须/禁止"为硬约束；伪代码为参考实现，可在不改变输入输出契约与不变量的前提下调整。所有货币金额以**整数分（fen）**表示。文中形如 `第 N 章 §M` 指向本文对应章节，`design.md 第 N 章` 指向设计文档对应章节。
+本文是各层**实现级细化**的单文件合并版：深到目录布局、字段映射、类型转换、PIT 计算公式、聚合/去重算法、质量阈值、SQLite DDL、关键伪代码。读者定位：**低级程序员照此即可实现**。设计“为什么”见同目录[总体设计](design.md)与[策略、回测与实验设计](strategy-backtest-experiment-design.md)；本文回答“怎么做”。凡“必须/禁止”为硬约束；伪代码为参考实现，可在不改变输入输出契约与不变量的前提下调整。所有货币金额以**整数分（fen）**表示。文中形如 `第 N 章 §M` 指向本文对应章节，带文档链接的章节号指向对应设计文档。
 
 ## 目录
 
@@ -343,11 +343,11 @@ CREATE TABLE canonical_partition (
   PRIMARY KEY (dataset, partition_key),
   FOREIGN KEY (dataset) REFERENCES canonical_dataset ON DELETE CASCADE);
 CREATE TABLE data_catalog_state (
-  id INTEGER PRIMARY KEY CHECK(id=1), catalog_version TEXT NOT NULL,
+  id INTEGER PRIMARY KEY CHECK(id=1), catalog_hash TEXT NOT NULL,
   quality_gate_open INTEGER NOT NULL DEFAULT 0, validated_at TEXT);
 ```
 
-`catalog_version` = `SHA256(canonical_json(按 dataset 排序的 {dataset: content_hash}))`；
+`catalog_hash` = `SHA256(canonical_json(按 dataset 排序的 {dataset: content_hash}))`；
 任一数据集 content_hash 变即变。仅供运行内一致性（非复现回放）。
 
 ---
@@ -465,7 +465,7 @@ SELECT <cols> FROM (
 
 - `bars(end)` / `daily_basics(end)`：`pit_usable & available_at<=shanghai_day_end(end) & trade_date∈[start,end]`。
 - 所有接口 `end`/`as_of` 即 PIT 截止，**不接受独立未来 as_of**。
-- `catalog_version()` 返回当前版本供实验层运行内一致性。
+- `catalog_hash()` 返回当前版本供实验层运行内一致性。
 
 ---
 
@@ -1067,7 +1067,8 @@ def run(request, strategy, progress, cancellation):
 逐日写：`nav`（trade_date, cash_fen, long_mv_fen, equity_fen, benchmark_close；
 [P3b-2] 增 short_mv_fen, margin_used_fen；accrued_fees_fen）、`holdings`（逐标的头寸/可卖/成本/市值）、
 `fills`（成交与拒绝，含 reason_code）、`costs`（佣金/印花税/过户费；[P3b-2] 融券费）。
-普通目录写盘（无逐文件内容寻址校验），供分析层消费。
+统一交给 Run Publisher 写入不可变目录；可信 Manifest 记录并复核逐文件 SHA-256、字节数、行数、
+Schema、主键和排序后，才允许实验 Run 登记成功。
 
 ---
 
@@ -1242,8 +1243,8 @@ class PortfolioConstructionModel(Protocol):
 #### 4.4.4 内置 TransactionCostModel：fixed_bps
 
 ```text
-est_cost_fen = round_half_up( |trade_notional| × cost_bps / 10000 )
-cost_bps 由同一费率配置构造（见 §4.6 一致性）
+est_cost_fen = max(规则簿最低佣金, round_half_up( |trade_notional| × cost_bps / 10000 ))
+cost_bps 与最低佣金由 configs/rules/a_share.yaml 的同一规则簿实例注入，Run YAML 不得覆盖
 linear_impact 追加 × 参与率项
 ```
 
@@ -1351,7 +1352,7 @@ frequency: daily
 pipeline:                                # 仅 CrossSectionalStrategy 需要
   alpha:        {model_id: multi_factor_composite, params: {...}}
   risk:         {model_id: none}
-  cost:         {model_id: fixed_bps, params: {cost_bps: 8}}
+  cost:         {model_id: fixed_bps}
   construction: {model_id: top_n_equal_weight, params: {max_positions: 50}}
   constraints:  {max_position_weight: 0.05, min_positions: 20, max_positions: 50,
                  min_adv_amount: 50000000, max_turnover: 0.4}
@@ -1393,7 +1394,9 @@ params: {}                               # 插件策略在此放自身参数
 ### 5.1 职责
 
 实验层编排"一次策略回测或因子研究"：装配管线 → 分阶段执行 → 运行内一致性守卫 → 落盘 → 追踪与比较。
-**不做跨运行复现回放**（无 run_identity 内容身份哈希、source/env 指纹、产物 manifest 逐文件 SHA-256 校验、历史 catalog）；重跑允许覆盖。运行内一致性仍靠 `catalog_version`（见 §5.5）。
+**不做跨运行数据回放**（无历史 catalog、无 source/env 指纹和 run_identity），但每个 Run 的冻结配置与
+产物不可覆盖；可信 Manifest 逐文件记录并复核 SHA-256、字节数、行数、Schema、主键和排序。
+运行内一致性靠 `catalog_hash`（见 §5.5）。
 
 ---
 
@@ -1420,7 +1423,7 @@ transition(run_id, expected, target)：UPDATE ... WHERE id=? AND status=expected
 - `SUCCEEDED` 必须已写 `artifact_dir` 且产物验证通过（§5.6）。
 - `FAILED` 只存 `error_json`（code + 安全上下文），不写 traceback/敏感路径。
 - 一个 Run 只绑一个 task；重试建新 Run + 新 task（不覆盖旧 Run）。
-- 重跑同一配置：允许覆盖同 Run 或建新 Run（配置项，默认建新 Run 更清晰）。
+- 重跑同一配置：只允许复制冻结配置并创建新 Run、新 task 和新产物目录。
 
 ---
 
@@ -1428,32 +1431,40 @@ transition(run_id, expected, target)：UPDATE ... WHERE id=? AND status=expected
 
 ```sql
 CREATE TABLE experiment (
-  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
-  description TEXT, baseline_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, description TEXT NOT NULL,
+  definition_json TEXT NOT NULL, definition_hash TEXT NOT NULL,
+  baseline_run_id TEXT, created_at TEXT NOT NULL);
 CREATE TABLE experiment_tag (experiment_id TEXT NOT NULL, tag TEXT NOT NULL,
   PRIMARY KEY(experiment_id, tag), FOREIGN KEY(experiment_id) REFERENCES experiment ON DELETE CASCADE);
 CREATE TABLE run (
-  id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, status TEXT NOT NULL,
-  config_json TEXT NOT NULL, catalog_version TEXT NOT NULL,
-  uses_test_region INTEGER NOT NULL DEFAULT 0, research_mark TEXT NOT NULL DEFAULT 'NONE',
-  artifact_dir TEXT, created_at TEXT NOT NULL, queued_at TEXT, started_at TEXT,
+  id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  status TEXT NOT NULL, stage TEXT NOT NULL, config_json TEXT NOT NULL,
+  config_hash TEXT NOT NULL, catalog_hash TEXT NOT NULL,
+  uses_test_region INTEGER NOT NULL, research_mark TEXT NOT NULL DEFAULT 'UNREVIEWED',
+  artifact_dir TEXT, manifest_hash TEXT, created_at TEXT NOT NULL, started_at TEXT,
   completed_at TEXT, error_json TEXT,
   FOREIGN KEY(experiment_id) REFERENCES experiment ON DELETE CASCADE);
 CREATE TABLE run_metric (
   id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, name TEXT NOT NULL,
-  value REAL, unit TEXT, created_at TEXT NOT NULL,
+  value REAL NOT NULL, unit TEXT, p_value REAL, adjusted_p_value REAL, created_at TEXT NOT NULL,
   FOREIGN KEY(run_id) REFERENCES run ON DELETE CASCADE);
 CREATE TABLE run_tag (run_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(run_id, tag));
+CREATE TABLE run_artifact (
+  id INTEGER PRIMARY KEY, run_id TEXT NOT NULL, artifact_type TEXT NOT NULL,
+  relative_path TEXT NOT NULL, content_hash TEXT NOT NULL, byte_count INTEGER NOT NULL,
+  row_count INTEGER, schema_json TEXT, created_at TEXT NOT NULL,
+  UNIQUE(run_id, artifact_type), FOREIGN KEY(run_id) REFERENCES run ON DELETE CASCADE);
 CREATE TABLE audit_event (
-  id INTEGER PRIMARY KEY, experiment_id TEXT, run_id TEXT,
-  event_type TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL);   -- append-only
+  id INTEGER PRIMARY KEY, run_id TEXT, subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL,
+  task_id TEXT, event_type TEXT NOT NULL, actor TEXT NOT NULL,
+  details_json TEXT NOT NULL, created_at TEXT NOT NULL);   -- append-only
 CREATE TABLE task (
-  id TEXT PRIMARY KEY, run_id TEXT, task_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+  id TEXT PRIMARY KEY, subject_kind TEXT, subject_id TEXT, task_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
   status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT UNIQUE,
   worker_id TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
   heartbeat_at TEXT, created_at TEXT NOT NULL, available_at TEXT,
-  locked_at TEXT, completed_at TEXT, error_json TEXT,
-  FOREIGN KEY(run_id) REFERENCES run ON DELETE SET NULL);   -- run_id 可空：数据类任务无 Run，见§6.2
+  locked_at TEXT, completed_at TEXT, error_json TEXT);
 CREATE TABLE task_attempt (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_no INTEGER NOT NULL, status TEXT NOT NULL,
   started_at TEXT, heartbeat_at TEXT, completed_at TEXT, error_json TEXT,
@@ -1463,7 +1474,7 @@ CREATE TABLE task_attempt (
 > `task`/`task_attempt` 是全平台通用任务队列（不止实验），完整 DDL 与语义以 `§6.2` 为准；
 > 此处为实验相关字段的摘要。
 
-`config_json` 是冻结配置快照（canonical_json）。`catalog_version` 记录提交时的数据版本（§5.5）。
+`config_json` 是冻结配置快照（canonical_json）。`catalog_hash` 记录提交时的数据版本（§5.5）。
 
 ---
 
@@ -1502,9 +1513,9 @@ def run_stage(stage, ctx):
 
 ```python
 def assert_run_internal_consistency(stage):
-    current = repository.catalog_version()
-    if current != run.catalog_version:
-        raise QuantError(EXPERIMENT_DATA_DRIFT, {stage, expected: run.catalog_version, actual: current})
+    current = repository.catalog_hash()
+    if current != run.catalog_hash:
+        raise QuantError(EXPERIMENT_DATA_DRIFT, {stage, expected: run.catalog_hash, actual: current})
 ```
 
 作用：运行中数据被并发更新（另一个 update 任务改了 Canonical）时，本次运行立即失败，
@@ -1514,7 +1525,7 @@ def assert_run_internal_consistency(stage):
 
 ### 5.6 产物与登记
 
-产物目录 `<artifact_root>/<experiment_id>/<run_id>/`，普通目录写盘（无逐文件内容寻址校验）：
+产物目录 `artifacts/experiments/<experiment_id>/<run_id>/`，使用可信 Manifest：
 
 ```text
 STRATEGY_BACKTEST: nav.parquet holdings.parquet fills.parquet costs.parquet
@@ -1523,9 +1534,10 @@ FACTOR_STUDY:      summary.parquet coverage.parquet ic.parquet quantile_returns.
                    long_short_returns.parquet correlation.parquet config.json metrics.json
 ```
 
-发布：先写 staging 临时目录 → 完成后 `os.replace` 到最终目录（原子）。基本完整性检查（文件存在、
-可读、行数>0）即可，不做 SHA-256 逐文件校验。`PERSIST` 成功后才 `RUNNING→SUCCEEDED` 并写 `artifact_dir`。
-恢复：若 `artifact_dir` 存在但 Run 非 SUCCEEDED，重跑覆盖（去复现后无需重验旧产物）。
+发布：先写同文件系统 staging → 生成 Manifest → 原子 `os.replace` 到最终目录 → 从最终目录复核路径、
+SHA-256、字节数、行数、Schema、主键、排序和输入身份。`PERSIST` 成功后才
+`RUNNING→SUCCEEDED` 并写 `artifact_dir/manifest_hash`。最终目录已存在立即失败；重试创建新 Run，
+绝不接管或覆盖旧目录。
 
 ---
 
@@ -1577,11 +1589,11 @@ class SampleWindows:
 
 ### 5.9 Worker（详见 `design.md` 第 10 章 / `第 6 章`）
 
-实验任务（`FACTOR_ANALYSIS` / `STRATEGY_BACKTEST`）由通用 Worker 队列驱动，与数据类任务共用同一
+实验任务统一为 `EXPERIMENT_RUN`，由通用 Worker 队列驱动，与数据类任务共用同一
 `task`/`task_attempt` 表和生命周期。实验侧只需知道：
 
-- 提交：`TaskQueue.submit(FACTOR_ANALYSIS|STRATEGY_BACKTEST, {run_id, config_hash},
-  idempotency_key="run-<run_id>", run_id=<run_id>)`；重复提交按 key 收敛。
+- 提交：`TaskQueue.submit(EXPERIMENT_RUN, {run_id}, subject_kind="EXPERIMENT_RUN",
+  subject_id=<run_id>, idempotency_key="experiment-run:<run_id>")`；重复提交按 key 收敛。
 - 执行：`ExperimentHandler` 委派 `ExperimentRunner.run(run_id, progress, cancellation)`；
   阶段边界响应心跳与协作取消。
 - 取消/重试：协作取消在阶段边界退出、清 staging；重试建**新 Run + 新 task**，不覆盖旧 Run。
@@ -1594,7 +1606,7 @@ class SampleWindows:
 
 - **排行榜**：`SELECT run.id, run_metric.value FROM ... WHERE experiment_id=? AND name=? ORDER BY value`。
 - **配置 diff**：两 Run 的 `config_json` 结构化差异。
-- **血缘**：Run → `catalog_version`（数据版本，展示用）→ 产物目录，追溯到唯一 Run。
+- **血缘**：Run → `catalog_hash`（数据版本，展示用）→ 产物目录，追溯到唯一 Run。
 - **结论标记**：`research_mark` = BASELINE/CANDIDATE/DISCARDED；`baseline_run_id` 指精确 Run，
   不回退"所属实验最新 Run"。
 
@@ -1623,7 +1635,7 @@ sample_windows: {train: [2015-01-01, 2019-12-31], validation: [2020-01-01, 2021-
 ### 5.12 测试清单（TDD）
 
 - **状态机**：合法迁移通过、非法迁移 `EXPERIMENT_STATE_CONFLICT`、并发 CAS 冲突不覆盖。
-- **一致性门**：运行中 catalog_version 变 → `EXPERIMENT_DATA_DRIFT`；前后双校验。
+- **一致性门**：运行中 catalog_hash 变 → `EXPERIMENT_DATA_DRIFT`；前后双校验。
 - **阶段**：失败/取消不留半成品目录；`SUCCEEDED` 前产物已落地。
 - **指标 oracle**：Sharpe/Sortino/Calmar/回撤/IR/beta；首日 0 口径；undefined 记录不填 0。
 - **治理**：`uses_test_region` 正确标记；test 预算计数累加；多重检验记账。
@@ -1634,10 +1646,10 @@ sample_windows: {train: [2015-01-01, 2019-12-31], validation: [2020-01-01, 2021-
 
 ### 5.13 关键不变量
 
-1. `Experiment → Run` 轻量追踪；无 run_identity 复现哈希（但存 catalog_version）；重跑允许覆盖。
+1. `Experiment → Run` 轻量追踪；无历史 catalog 回放（但存 `catalog_hash`）；重跑不可覆盖。
 2. 状态迁移乐观并发 CAS，携期望前态；一 Run 一 task，重试建新 Run。
-3. 每阶段前后校验 `catalog_version`（运行内一致性，非复现回放）。
-4. 产物普通目录原子发布；`SUCCEEDED` 前落地成功。
+3. 每阶段前后校验 `catalog_hash`（运行内一致性，非复现回放）。
+4. 产物经 staging、可信 Manifest 和最终目录复核后原子发布；`SUCCEEDED` 前落地成功。
 5. 绩效指标字面量 oracle；首日 0 收益口径明确；undefined 显式记录。
 6. 防过拟合护栏保留（test 预算 + 多重检验记账），不硬阻断。
 7. runner kind 无关；因子研究与策略回测共享同一执行器与比较视图。
@@ -1659,8 +1671,8 @@ Worker = 后台长任务执行器：领取 SQLite 队列中的任务 → 按 `ta
 ```sql
 CREATE TABLE task (
   id TEXT PRIMARY KEY,                       -- ULID
-  task_type TEXT NOT NULL,                   -- DATA_UPDATE|DATA_VALIDATION|FACTOR_ANALYSIS|STRATEGY_BACKTEST
-  run_id TEXT,                               -- 可空：数据类任务无实验 Run；实验类绑定 Run
+  task_type TEXT NOT NULL,                   -- DATA_UPDATE|DATA_VALIDATION|EXPERIMENT_RUN
+  subject_kind TEXT, subject_id TEXT,         -- 实验任务绑定 EXPERIMENT_RUN/run_id
   payload_json TEXT NOT NULL,                -- 冻结参数（canonical_json）
   status TEXT NOT NULL,                       -- QUEUED|RUNNING|SUCCEEDED|FAILED|CANCELLED
   priority INTEGER NOT NULL DEFAULT 0,
@@ -1692,7 +1704,7 @@ CREATE TABLE task_attempt (
 
 ```python
 class TaskType(StrEnum):
-    DATA_UPDATE; DATA_VALIDATION; FACTOR_ANALYSIS; STRATEGY_BACKTEST
+    DATA_UPDATE; DATA_VALIDATION; EXPERIMENT_RUN
 class TaskStatus(StrEnum):
     QUEUED; RUNNING; SUCCEEDED; FAILED; CANCELLED
 
@@ -1823,8 +1835,7 @@ def recover_stale(now, lease_timeout=300s):
 handlers: dict[TaskType, TaskHandler] = {
     DATA_UPDATE:       DataUpdateHandler(pipeline),           # 按 payload 固化计划跑 LOCALIZE→CURATE→VALIDATE
     DATA_VALIDATION:   DataValidationHandler(pipeline),       # 全目录/单数据集诊断
-    FACTOR_ANALYSIS:   ExperimentHandler(runner, FACTOR_STUDY),
-    STRATEGY_BACKTEST: ExperimentHandler(runner, STRATEGY_BACKTEST),
+    EXPERIMENT_RUN:    ExperimentRunHandler(registry, guard, strategy, factor),
 }
 ```
 
@@ -1839,8 +1850,7 @@ handlers: dict[TaskType, TaskHandler] = {
 |---|---|---|
 | DATA_UPDATE | `plan_hash, window_mode, dataset_windows[]`（固化计划，Worker 不重解析） | `data-update-<plan_hash>` |
 | DATA_VALIDATION | `scope: ALL|DATASET, dataset?` | `data-validate-<scope>-<dataset?>` |
-| FACTOR_ANALYSIS | `run_id, config_hash` | `run-<run_id>` |
-| STRATEGY_BACKTEST | `run_id, config_hash` | `run-<run_id>` |
+| EXPERIMENT_RUN | `run_id` + `subject_kind/subject_id` | `experiment-run:<run_id>` |
 
 DATA_UPDATE 重试复用原 `plan_hash` 对应的固化计划；水位变化不重解析（预览时若水位变则拒绝旧计划要求刷新，属提交侧）。
 

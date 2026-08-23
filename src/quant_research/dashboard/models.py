@@ -8,11 +8,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from quant_research.domain.enums import DatasetKind
-from quant_research.experiments.models import ResearchMark
-from quant_research.factor_studies.models import (
-    FactorStudyConfig,
-    FactorStudyIndustryConfig,
-)
 
 
 class DashboardModel(BaseModel):
@@ -661,50 +656,6 @@ class TaskStatusCountsResponse(DashboardModel):
     ORPHANED: int
 
 
-class ExperimentStatusCountsResponse(DashboardModel):
-    """返回所有实验状态的全局计数。
-
-    入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
-    """
-
-    CREATED: int
-    QUEUED: int
-    RUNNING: int
-    SUCCEEDED: int
-    FAILED: int
-    CANCELLED: int
-
-
-class ExperimentSummaryResponse(DashboardModel):
-    """返回总览与登记册共用的实验摘要。
-
-    入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
-    """
-
-    id: str
-    strategy_id: str
-    status: str
-    research_mark: str
-    data_hash: str
-    config_hash: str
-    fingerprint: str
-    created_at: str
-    started_at: str | None
-    completed_at: str | None
-    tags: tuple[str, ...]
-    metrics: dict[str, float | None]
-
-
-class BenchmarkSummaryResponse(DashboardModel):
-    """返回单个内置基准策略最近成功实验。
-
-    入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
-    """
-
-    strategy_id: Literal["etf_rotation", "stock_multifactor"]
-    experiment: ExperimentSummaryResponse | None
-
-
 class OverviewTasksResponse(DashboardModel):
     """返回研究工作台所需的全局任务状态与活动任务。
 
@@ -713,17 +664,6 @@ class OverviewTasksResponse(DashboardModel):
 
     status_counts: TaskStatusCountsResponse
     active: tuple[TaskSummaryResponse, ...]
-
-
-class OverviewExperimentsResponse(DashboardModel):
-    """返回研究工作台所需的实验状态、近期记录与基准结果。
-
-    入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
-    """
-
-    status_counts: ExperimentStatusCountsResponse
-    recent: tuple[ExperimentSummaryResponse, ...]
-    benchmarks: tuple[BenchmarkSummaryResponse, ...]
 
 
 class OverviewResponse(DashboardModel):
@@ -743,70 +683,6 @@ class OverviewResponse(DashboardModel):
     tasks: OverviewTasksResponse
 
 
-class ResearchUpdateRequest(DashboardModel):
-    """定义一次研究工作台操作在进入用例边界前必须校验的输入。
-
-    入参：
-        mark：需要写入实验记录的研究标记。
-        tags：参与本次处理的标签集合；调用方不得依赖未声明的顺序。
-        note：不参与研究身份计算的可选人工备注。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    """
-
-    mark: ResearchMark
-    tags: tuple[str, ...] = ()
-    note: str = Field(max_length=16_384)
-
-
-class ExperimentCloneRequest(DashboardModel):
-    """定义一次研究工作台操作在进入用例边界前必须校验的输入。
-
-    入参：
-        submit：控制是否启用``submit``规则的布尔开关。
-        priority：任务在同一可运行集合中的调度优先级。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    """
-
-    submit: bool = True
-    priority: int = Field(default=0, ge=-100, le=100)
-
-
-class ExperimentSubmitRequest(DashboardModel):
-    """校验 Dashboard 从 YAML 文本提交新实验的请求。
-
-    入参：
-        config_yaml：用户提交的实验 YAML 原文；仅从受信配置根或内存文本解析。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-    """
-
-    config_yaml: str = Field(min_length=1, max_length=1_048_576)
-
-    @field_validator("config_yaml")
-    @classmethod
-    def validate_encoded_size(cls, value: str) -> str:
-        """限制 UTF-8 实际负载不超过 1 MiB。
-
-        入参：
-            value：值。
-        返回值：
-            返回校验``encoded``字节数后的``encoded``字节数（``str``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
-        if len(value.encode("utf-8")) > 1_048_576:
-            raise ValueError("config_yaml exceeds the 1 MiB UTF-8 limit")
-        return value
-
-
 class RetryRequest(DashboardModel):
     """定义一次研究工作台操作在进入用例边界前必须校验的输入。
 
@@ -819,101 +695,3 @@ class RetryRequest(DashboardModel):
     """
 
     confirm_orphaned: bool = False
-
-
-class CompareRequest(DashboardModel):
-    """定义一次研究工作台操作在进入用例边界前必须校验的输入。
-
-    入参：
-        experiment_ids：参与本次处理的实验``ids``；调用方不得依赖未声明的顺序。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    """
-
-    experiment_ids: tuple[str, ...] = Field(min_length=2, max_length=5)
-
-
-class PanelAvailability(DashboardModel):
-    """说明 Dashboard 面板是否可用以及不可用时的安全原因。
-
-    入参：
-        status：当前记录所处的受控生命周期状态。
-        reason：原因。
-        data：待处理的数据，类型为 ``list[dict[str, object]]``。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    """
-
-    status: Literal["AVAILABLE", "UNAVAILABLE"]
-    reason: str | None = None
-    data: list[dict[str, object]] = Field(default_factory=list)
-
-
-class FactorStudyCreateRequest(DashboardModel):
-    """校验 Dashboard 创建独立因子研究的 JSON 请求。
-
-    入参：
-        name：供用户识别研究、任务或数据对象的非空名称。
-        factor_refs：按规范 ``factor_id`` 指定的因子引用集合。
-        start_date：查询或运行覆盖区间的首日（含）。
-        end_date：查询或运行覆盖区间的末日（含）。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        无；构造阶段只保存已提供的依赖或值对象。
-    """
-
-    name: str = Field(min_length=1, max_length=128)
-    factor_refs: tuple[str, ...] = Field(min_length=1, max_length=7)
-    start_date: date
-    end_date: date
-    industry: FactorStudyIndustryConfig | None = None
-
-    @field_validator("factor_refs", mode="before")
-    @classmethod
-    def parse_factor_refs(cls, value: object) -> object:
-        """将 JSON 因子数组转换为不可变元组。
-
-        入参：
-            value：待校验或转换的值，类型为 ``object``。
-        返回值：
-            返回解析并校验因子``refs``后的因子``refs``（``object``）。
-        异常：
-            无。
-        """
-        return tuple(value) if isinstance(value, list) else value
-
-    @field_validator("start_date", "end_date", mode="before")
-    @classmethod
-    def parse_dates(cls, value: object) -> object:
-        """将 ISO 日期文本转换为日期对象。
-
-        入参：
-            value：待校验或转换的值，类型为 ``object``。
-        返回值：
-            返回解析并校验``dates``后的``dates``（``object``）。
-        异常：
-            无。
-        """
-        return date.fromisoformat(value) if isinstance(value, str) else value
-
-    def config(self) -> FactorStudyConfig:
-        """返回经过固定 MVP 契约校验的研究配置。
-
-        入参：
-            无。
-        返回值：
-            返回配置（``FactorStudyConfig``）。
-        异常：
-            无。
-        """
-        return FactorStudyConfig(
-            factor_refs=self.factor_refs,
-            start_date=self.start_date,
-            end_date=self.end_date,
-            industry=self.industry,
-        )

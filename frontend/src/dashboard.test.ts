@@ -3,20 +3,22 @@ import { describe, expect, it } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
 import App from './App.vue'
+import { DashboardApiError } from './api'
+import ErrorState from './components/ErrorState.vue'
 import MetricCard from './components/MetricCard.vue'
 import { formatDuration, formatPercent, shortHash, statusType } from './format'
 import router from './router'
 
 describe('dashboard shell contract', () => {
-  it('keeps one unified research center and no legacy research routes', () => {
+  it('keeps one unified experiment center and no legacy research routes', () => {
     expect(router.getRoutes().map((route) => route.path).sort()).toEqual([
       '/',
       '/data',
       '/market',
       '/notebook',
-      '/research',
-      '/research/:familyId',
-      '/research/new',
+      '/experiments',
+      '/experiments/:experimentId',
+      '/experiments/new',
       '/tasks',
     ].sort())
     expect(router.hasRoute('backtest')).toBe(false)
@@ -36,7 +38,7 @@ describe('dashboard shell contract', () => {
     const shellView = { template: '<div />' }
     const shellRouter = createRouter({
       history: createMemoryHistory(),
-      routes: ['/', '/market', '/data', '/research', '/tasks', '/notebook'].map(
+      routes: ['/', '/market', '/data', '/experiments', '/tasks', '/notebook'].map(
         (path) => ({ path, component: shellView }),
       ),
     })
@@ -57,5 +59,21 @@ describe('dashboard shell contract', () => {
     expect(shortHash(null)).toBe('—')
     expect(statusType('UNKNOWN')).toBe('info')
     expect(formatDuration('2026-08-15T00:00:00Z', null, Date.parse('2026-08-15T01:02:03Z'))).toBe('1小时 2分')
+  })
+
+  it('shows the structured API reason instead of a generic unavailable state', () => {
+    const error = new DashboardApiError({
+      code: 'DASHBOARD_INPUT_INVALID',
+      message: 'max_positions must be positive',
+      severity: 'SEVERE',
+      retryable: false,
+      remediation: '修改实验参数后重新校验。',
+      request_id: 'request-1',
+    }, 422)
+    const wrapper = mount(ErrorState, { props: { error } })
+    expect(wrapper.text()).toContain('DASHBOARD_INPUT_INVALID')
+    expect(wrapper.text()).toContain('max_positions must be positive')
+    expect(wrapper.text()).toContain('修改实验参数后重新校验。')
+    expect(wrapper.text()).not.toContain('请检查本地服务状态后重试')
   })
 })

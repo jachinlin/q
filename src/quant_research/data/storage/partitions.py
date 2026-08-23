@@ -142,9 +142,12 @@ class RawPartitionStore:
                     entry = self._entry_for(manifest, content_hash)
                     if (
                         str(entry["schema_fingerprint"]) != schema_fingerprint
-                        or _RawManifestSupport.entry_int(entry, "row_count") != row_count
+                        or _RawManifestSupport.entry_int(entry, "row_count")
+                        != row_count
                     ):
-                        raise ValueError("raw manifest entry does not match its content")
+                        raise ValueError(
+                            "raw manifest entry does not match its content"
+                        )
         except ValueError as error:
             self._raise_conflict(
                 manifest_path, request_hash, "manifest is invalid", error

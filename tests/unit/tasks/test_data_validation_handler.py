@@ -62,7 +62,6 @@ def _task(payload: dict[str, str]) -> ClaimedTask:
         id="task-1",
         attempt_id="attempt-1",
         attempt_no=1,
-        experiment_id=None,
         task_type="DATA_VALIDATION",
         payload=payload,
         priority=0,

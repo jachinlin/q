@@ -140,9 +140,7 @@ def test_financial_freshness_turns_stale_only_after_disclosure_deadline() -> Non
         timezone=ZoneInfo("Asia/Shanghai"),
     )
     result = evaluator.evaluate(
-        canonical=(
-            _canonical(DatasetKind.FINANCIAL_OBSERVATION, date(2026, 6, 30)),
-        ),
+        canonical=(_canonical(DatasetKind.FINANCIAL_OBSERVATION, date(2026, 6, 30)),),
         operational=(
             _operational(
                 DatasetKind.FINANCIAL_OBSERVATION,
@@ -153,9 +151,7 @@ def test_financial_freshness_turns_stale_only_after_disclosure_deadline() -> Non
         latest_complete_session=date(2026, 8, 31),
     )
     financial = next(
-        item
-        for item in result
-        if item.dataset is DatasetKind.FINANCIAL_OBSERVATION
+        item for item in result if item.dataset is DatasetKind.FINANCIAL_OBSERVATION
     )
 
     assert financial.status is FreshnessStatus.STALE

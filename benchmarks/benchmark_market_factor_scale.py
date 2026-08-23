@@ -14,8 +14,8 @@ from collections.abc import Sequence
 from datetime import date, timedelta
 
 import polars as pl
-
 from quant_research.data.adjustments import FORWARD_LOG_RETURN_COLUMN
+
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors import (
     FactorContext,
@@ -135,6 +135,7 @@ def run(
     )
     statistics = {"market_bar_reads": 0, "max_partition_input_rows": 0}
     with tempfile.TemporaryDirectory(prefix="quant-i3-benchmark-"):
+
         def engine_factory(scope: tuple[InstrumentId, ...]) -> FactorEngine:
             frame = _bars(scope, sessions)
             statistics["max_partition_input_rows"] = max(

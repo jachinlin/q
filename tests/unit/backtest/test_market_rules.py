@@ -28,6 +28,13 @@ from quant_research.domain.identifiers import InstrumentId
 from quant_research.portfolio import OrderIntent, OrderSide
 
 _RULES = Path(__file__).resolve().parents[3] / "configs" / "rules" / "a_share.yaml"
+
+
+def test_rulebook_exposes_pretrade_commission_from_single_source() -> None:
+    """确认事前成本与事后成交共享规则文件中的佣金配置。"""
+    rulebook = AShareRuleBook.load(_RULES)
+    assert rulebook.commission_bps == 3.0
+    assert rulebook.commission_minimum_fen == 500
 _ETF_T1 = InstrumentId.parse("510050.SH")
 _ETF_T0 = InstrumentId.parse("513100.SH")
 _STAR_ETF = InstrumentId.parse("588000.SH")
@@ -110,6 +117,26 @@ def test_suspended_market_slice_accepts_null_prices_and_rejects_before_price_rea
     assert result.results[0].reference_price is None
     assert result.results[0].requested_reference_value_fen is None
     assert result.ending_cash_fen == 1_000_000
+
+
+def test_suspended_market_slice_accepts_valuation_price_with_null_volume() -> None:
+    """停牌日可保留估值价格和空成交量，执行仍须在读取容量前拒绝。"""
+    priced = _market(_ETF_T1, suspended=True, price=3.527)
+    market = MarketSlice(
+        _DAY_ONE,
+        priced.bars.with_columns(pl.lit(None, dtype=pl.Int64).alias("volume")),
+    )
+    intent = OrderIntent(_ETF_T1, OrderSide.BUY, 100, "TEST")
+
+    result = ExecutionModel().execute(
+        [intent],
+        market,
+        AccountView(1_000_000, {}),
+        AShareRuleBook.load(_RULES),
+        ExecutionConfig(ExecutionPrice.OPEN, 0.0, 1.0),
+    )
+
+    assert result.results[0].reason_code is ExecutionReason.SUSPENDED
 
 
 def test_etf_execution_retains_mill_price_and_waives_stock_taxes() -> None:

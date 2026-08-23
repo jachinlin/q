@@ -1,9 +1,1 @@
-"""提供python-module-conventions与因子研究相关的公开模型、协议与处理流程。"""
-
-from quant_research.factor_studies.models import (
-    FactorRunStatus,
-    FactorStudyConfig,
-    FactorStudyIndustryConfig,
-)
-
-__all__ = ["FactorRunStatus", "FactorStudyConfig", "FactorStudyIndustryConfig"]
+"""提供统一 Experiment Run 复用的因子统计分析内核。"""

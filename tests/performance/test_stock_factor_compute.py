@@ -84,9 +84,13 @@ class _SyntheticInputs:
     ) -> pl.LazyFrame:
         del instruments
         self.bar_reads += 1
-        return self._market.filter(
-            pl.col("trade_date").is_between(start, end, closed="both")
-        ).select("instrument_id", "trade_date", "amount", "available_at").lazy()
+        return (
+            self._market.filter(
+                pl.col("trade_date").is_between(start, end, closed="both")
+            )
+            .select("instrument_id", "trade_date", "amount", "available_at")
+            .lazy()
+        )
 
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
         self.calendar_reads += 1

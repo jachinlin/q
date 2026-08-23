@@ -367,10 +367,7 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
     )
     invalid_price = _QualityRuleSupport._count(
         traded.filter(
-            close.is_null()
-            | ~close.is_finite()
-            | (close <= 0)
-            | optional_price_invalid
+            close.is_null() | ~close.is_finite() | (close <= 0) | optional_price_invalid
         )
     )
     if invalid_price:

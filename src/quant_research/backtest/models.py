@@ -14,7 +14,7 @@ import polars as pl
 
 from quant_research.backtest.rulebook import FeeBreakdown
 from quant_research.domain.identifiers import InstrumentId
-from quant_research.portfolio.rebalance import OrderIntent, OrderSide
+from quant_research.strategies.base import OrderIntent, OrderSide
 
 
 class ExecutionReason(StrEnum):
@@ -37,6 +37,7 @@ class ExecutionReason(StrEnum):
     VOLUME_CAP = "VOLUME_CAP"
     ODD_LOT = "ODD_LOT"
     NO_MARKET_DATA = "NO_MARKET_DATA"
+    SHORT_NOT_SUPPORTED = "SHORT_NOT_SUPPORTED"
 
 
 class ExecutionPrice(StrEnum):
@@ -377,6 +378,8 @@ class _ModelsSupport:
                 raise ValueError("market bars low invariant is invalid")
             if row["open"] > row["high"] or row["close"] > row["high"]:
                 raise ValueError("market bars high invariant is invalid")
+            if row["volume"] is None and row["is_suspended"] is True:
+                continue
             if not isinstance(row["volume"], int) or row["volume"] < 0:
                 raise ValueError("market bars volume must be nonnegative")
 
@@ -389,8 +392,8 @@ class _ModelsSupport:
         if not isinstance(value.side, OrderSide):
             raise TypeError("intent side must be an OrderSide")
         _ModelsSupport._positive_int(value.quantity, "intent quantity")
-        if not isinstance(value.reason_code, str):
-            raise TypeError("intent reason_code must be a string")
+        if not isinstance(value.reason, str):
+            raise TypeError("intent reason must be a string")
 
     @staticmethod
     def _fees(value: FeeBreakdown) -> None:

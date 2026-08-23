@@ -133,9 +133,7 @@ class _DailyMarketPlan:
             context.publish_or_reuse(
                 cls._CALENDAR_ENDPOINT,
                 calendar_request,
-                lambda: context.source.fetch_trade_calendar(
-                    context.start, context.end
-                ),
+                lambda: context.source.fetch_trade_calendar(context.start, context.end),
                 False,
             ),
             "trade calendar returned no batch",
@@ -205,9 +203,7 @@ class _IndustryAsOfPlan:
             context.publish_or_reuse(
                 cls._CALENDAR_ENDPOINT,
                 calendar_request,
-                lambda: context.source.fetch_trade_calendar(
-                    context.start, context.end
-                ),
+                lambda: context.source.fetch_trade_calendar(context.start, context.end),
                 False,
             ),
             "trade calendar returned no batch",

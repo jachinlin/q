@@ -49,6 +49,7 @@ _MAX_DEPTH = 8
 _MAX_NODES = 512
 _MIN_GLOBAL_SECRET_LENGTH = 8
 MAX_TASK_LOG_BYTES = 16 * 1024 * 1024
+_CANONICAL_ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 
 
 class _TaskLogContentUnavailable(ValueError):
@@ -463,7 +464,7 @@ class TaskLogManager:
         返回完成字段规范化和不变量校验的对象。
     异常：
         输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
-    Derive diagnostic and success-log paths from trusted roots and UUIDs.
+    Derive diagnostic and success-log paths from trusted roots and stable IDs.
     """
 
     def __init__(
@@ -778,9 +779,18 @@ class _LoggingSupport:
         if not isinstance(context, LogContext):
             raise TypeError("context must be a LogContext")
         return (
-            _LoggingSupport._canonical_uuid(context.task_id, "task_id"),
+            _LoggingSupport._canonical_task_id(context.task_id),
             _LoggingSupport._canonical_uuid(context.attempt_id, "attempt_id"),
         )
+
+    @staticmethod
+    def _canonical_task_id(value: str | None) -> str:
+        if isinstance(value, str) and _CANONICAL_ULID.fullmatch(value) is not None:
+            return value
+        try:
+            return _LoggingSupport._canonical_uuid(value, "task_id")
+        except (TypeError, ValueError) as error:
+            raise ValueError("task_id must be a canonical UUID or ULID") from error
 
     @staticmethod
     def _canonical_uuid(value: str | None, label: str) -> str:
@@ -1002,9 +1012,7 @@ class _LoggingSupport:
             ) from error
         lines = text.splitlines()
         if not lines or any(not line for line in lines):
-            raise _TaskLogContentUnavailable(
-                "run.log must contain nonempty JSON Lines"
-            )
+            raise _TaskLogContentUnavailable("run.log must contain nonempty JSON Lines")
         for line in lines:
             try:
                 record = json.loads(line)

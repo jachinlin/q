@@ -5,12 +5,16 @@ const REQUEST_TIMEOUT = 15_000
 export class DashboardApiError extends Error {
   code: string
   remediation: string | null
+  requestId: string | null
+  status: number
 
-  constructor(payload: ApiError['error']) {
+  constructor(payload: ApiError['error'], status: number) {
     super(payload.message)
     this.name = 'DashboardApiError'
     this.code = payload.code
     this.remediation = payload.remediation
+    this.requestId = payload.request_id ?? null
+    this.status = status
   }
 }
 
@@ -27,7 +31,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(path, { ...init, headers, signal: controller.signal })
     const payload = (await response.json()) as T | ApiError
     if (!response.ok) {
-      throw new DashboardApiError((payload as ApiError).error)
+      const detail = (payload as Partial<ApiError>).error
+      if (detail && typeof detail.code === 'string' && typeof detail.message === 'string') {
+        throw new DashboardApiError(detail, response.status)
+      }
+      throw new DashboardApiError({
+        code: `HTTP_${response.status}`,
+        message: `请求失败（HTTP ${response.status}）`,
+        severity: 'SEVERE',
+        retryable: response.status >= 500,
+        remediation: '请刷新页面后重试；若问题持续，请查看 Dashboard 服务日志。',
+        request_id: response.headers.get('X-Request-ID') ?? '',
+      }, response.status)
     }
     return payload as T
   } finally {

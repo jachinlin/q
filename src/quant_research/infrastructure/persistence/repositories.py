@@ -11,7 +11,6 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Never, cast
-from uuid import uuid4
 
 from sqlalchemy import Engine, delete, func, select
 from sqlalchemy.orm import Session
@@ -28,12 +27,6 @@ from quant_research.data.quality.models import (
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
 from quant_research.domain.identifiers import QualityRunId
-from quant_research.experiments.models import (
-    ExperimentRecord,
-    ExperimentSpec,
-    ExperimentStatus,
-    ResearchMark,
-)
 from quant_research.infrastructure.persistence.orm import (
     CanonicalDatasetORM,
     CanonicalPartitionORM,
@@ -49,7 +42,6 @@ from quant_research.infrastructure.persistence.orm import (
     RawRequestORM,
     TaskORM,
 )
-from quant_research.tasks.models import TaskRecord, TaskSpec, TaskStatus
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -1255,7 +1247,7 @@ class MetadataRepository:
             )
             return tuple(self._quality_record(session, item) for item in identifiers)
 
-    def register_experiment(self, spec: ExperimentSpec) -> ExperimentRecord:
+    def _removed_register_experiment(self, spec: object) -> object:
         """注册一个初始状态为 ``CREATED`` 的研究实验。
 
         入参：
@@ -1265,34 +1257,10 @@ class MetadataRepository:
         异常：
             ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
         """
-        config_bytes = canonical_json_bytes(spec.config)
-        if hashlib.sha256(config_bytes).hexdigest() != spec.config_hash:
-            raise ValueError("config_hash must match canonical config")
-        identifier = str(uuid4())
-        with Session(self._engine) as session, session.begin():
-            row = ExperimentORM(
-                id=identifier,
-                strategy_id=spec.strategy_id,
-                config_json=config_bytes.decode("utf-8"),
-                config_hash=spec.config_hash,
-                data_hash=spec.data_hash,
-                source_tree_hash=spec.source_tree_hash,
-                git_commit_hash=spec.git_commit_hash,
-                lockfile_hash=spec.lockfile_hash,
-                rulebook_hash=spec.rulebook_hash,
-                fingerprint=spec.fingerprint,
-                status=ExperimentStatus.CREATED.value,
-                research_mark=ResearchMark.UNREVIEWED.value,
-                created_at=_RepositoriesSupport._timestamp(spec.created_at),
-                queued_at=None,
-                started_at=None,
-                completed_at=None,
-            )
-            session.add(row)
-            session.flush()
-            return self._experiment_record(row)
+        del spec
+        raise RuntimeError("legacy experiment registry was removed")
 
-    def count_experiments_by_fingerprint(self, fingerprint: str) -> int:
+    def _removed_count_experiments_by_fingerprint(self, fingerprint: str) -> int:
         """统计具有指定研究指纹的实验数量。
 
         入参：
@@ -1302,18 +1270,10 @@ class MetadataRepository:
         异常：
             无。
         """
-        _RepositoriesSupport._validate_hash(fingerprint, "fingerprint")
-        with Session(self._engine) as session:
-            return int(
-                session.scalar(
-                    select(func.count())
-                    .select_from(ExperimentORM)
-                    .where(ExperimentORM.fingerprint == fingerprint)
-                )
-                or 0
-            )
+        del fingerprint
+        raise RuntimeError("legacy experiment fingerprint query was removed")
 
-    def create_task(self, spec: TaskSpec) -> TaskRecord:
+    def _removed_create_task(self, spec: object) -> object:
         """为已存在的实验创建一个初始状态为 ``QUEUED`` 的任务。
 
         入参：
@@ -1323,28 +1283,8 @@ class MetadataRepository:
         异常：
             输入、状态或依赖结果违反契约时抛出 ``KeyError``。
         """
-        identifier = str(uuid4())
-        with Session(self._engine) as session, session.begin():
-            if session.get(ExperimentORM, spec.experiment_id) is None:
-                raise KeyError(f"experiment does not exist: {spec.experiment_id}")
-            row = TaskORM(
-                id=identifier,
-                experiment_id=spec.experiment_id,
-                task_type=spec.task_type,
-                payload_json=_RepositoriesSupport._json_text(spec.payload),
-                status=TaskStatus.QUEUED.value,
-                priority=spec.priority,
-                progress_json="{}",
-                created_at=_RepositoriesSupport._timestamp(spec.created_at),
-                available_at=_RepositoriesSupport._timestamp(spec.available_at),
-                updated_at=_RepositoriesSupport._timestamp(spec.created_at),
-                heartbeat_at=None,
-                completed_at=None,
-                result_json=None,
-            )
-            session.add(row)
-            session.flush()
-            return self._task_record(row)
+        del spec
+        raise RuntimeError("legacy task creation was removed")
 
     @staticmethod
     def _raw_partition_record(
@@ -1558,51 +1498,14 @@ class MetadataRepository:
         )
 
     @staticmethod
-    def _experiment_record(row: ExperimentORM) -> ExperimentRecord:
-        return ExperimentRecord(
-            id=row.id,
-            strategy_id=row.strategy_id,
-            config=json.loads(row.config_json),
-            config_hash=row.config_hash,
-            data_hash=row.data_hash,
-            source_tree_hash=row.source_tree_hash,
-            git_commit_hash=row.git_commit_hash,
-            lockfile_hash=row.lockfile_hash,
-            rulebook_hash=row.rulebook_hash,
-            fingerprint=row.fingerprint,
-            status=ExperimentStatus(row.status),
-            research_mark=ResearchMark(row.research_mark),
-            created_at=_RepositoriesSupport._parse_timestamp(row.created_at),
-            queued_at=_RepositoriesSupport._parse_optional_timestamp(row.queued_at),
-            started_at=_RepositoriesSupport._parse_optional_timestamp(row.started_at),
-            completed_at=_RepositoriesSupport._parse_optional_timestamp(
-                row.completed_at
-            ),
-        )
+    def _removed_experiment_record(row: ExperimentORM) -> object:
+        del row
+        raise RuntimeError("legacy experiment records were removed")
 
     @staticmethod
-    def _task_record(row: TaskORM) -> TaskRecord:
-        return TaskRecord(
-            id=row.id,
-            experiment_id=row.experiment_id,
-            task_type=row.task_type,
-            payload=json.loads(row.payload_json),
-            status=TaskStatus(row.status),
-            priority=row.priority,
-            progress=json.loads(row.progress_json),
-            created_at=_RepositoriesSupport._parse_timestamp(row.created_at),
-            available_at=_RepositoriesSupport._parse_timestamp(row.available_at),
-            updated_at=_RepositoriesSupport._parse_timestamp(row.updated_at),
-            heartbeat_at=_RepositoriesSupport._parse_optional_timestamp(
-                row.heartbeat_at
-            ),
-            completed_at=_RepositoriesSupport._parse_optional_timestamp(
-                row.completed_at
-            ),
-            result=(
-                json.loads(row.result_json) if row.result_json is not None else None
-            ),
-        )
+    def _removed_task_record(row: TaskORM) -> object:
+        del row
+        raise RuntimeError("legacy repository task records were removed")
 
 
 def canonical_dataset_hash(spec: CanonicalDatasetSpec) -> str:

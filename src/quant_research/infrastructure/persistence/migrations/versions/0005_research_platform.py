@@ -14,19 +14,6 @@ from sqlalchemy.engine import Connection
 
 from quant_research.infrastructure.persistence.orm import (
     AuditEventORM,
-    ExperimentArtifactORM,
-    ExperimentMetricORM,
-    ExperimentORM,
-    ExperimentTagORM,
-    FactorRunORM,
-    FactorStudyORM,
-    ResearchArtifactORM,
-    ResearchFamilyExecutionORM,
-    ResearchFamilyORM,
-    ResearchMetricORM,
-    ResearchRunORM,
-    ResearchTagORM,
-    ResearchVariantORM,
     TaskAttemptORM,
     TaskORM,
 )
@@ -36,40 +23,27 @@ down_revision = "quality_rule_results"
 branch_labels = None
 depends_on = None
 
-_TABLES = (
-    ResearchFamilyORM.__table__,
-    ResearchFamilyExecutionORM.__table__,
-    ResearchVariantORM.__table__,
-    ResearchRunORM.__table__,
-    ResearchMetricORM.__table__,
-    ResearchArtifactORM.__table__,
-    ResearchTagORM.__table__,
-)
-_LEGACY_TABLES = (
-    FactorRunORM.__table__,
-    FactorStudyORM.__table__,
-    ExperimentArtifactORM.__table__,
-    ExperimentMetricORM.__table__,
-    ExperimentTagORM.__table__,
-    ExperimentORM.__table__,
+_LEGACY_TABLE_NAMES = (
+    "factor_run",
+    "factor_study",
+    "experiment_tag",
+    "experiment",
 )
 
 
 def upgrade() -> None:
     """按外键依赖顺序创建目标研究平台表。
 
-该函数作为模块级确定性辅助或框架入口保留。
+    该函数作为模块级确定性辅助或框架入口保留。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
     bind = op.get_bind()
-    for table in _TABLES:
-        cast(Table, table).create(bind=bind, checkfirst=True)
     inspector = inspect(bind)
     if not inspector.has_table("task"):
         return
@@ -79,27 +53,24 @@ def upgrade() -> None:
     if "subject_id" not in task_columns:
         op.add_column("task", Column("subject_id", String(64), nullable=True))
     _MigrationSupport.remove_legacy_research_foreign_keys(bind)
-    for table in _LEGACY_TABLES:
-        cast(Table, table).drop(bind=bind, checkfirst=True)
+    for table_name in _LEGACY_TABLE_NAMES:
+        if inspect(bind).has_table(table_name):
+            op.drop_table(table_name)
 
 
 def downgrade() -> None:
     """按外键逆序删除目标研究平台表。
 
-该函数作为模块级确定性辅助或框架入口保留。
+    该函数作为模块级确定性辅助或框架入口保留。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
     bind = op.get_bind()
-    for table in reversed(_TABLES):
-        cast(Table, table).drop(bind=bind, checkfirst=True)
-    for table in reversed(_LEGACY_TABLES):
-        cast(Table, table).create(bind=bind, checkfirst=True)
     inspector = inspect(bind)
     if not inspector.has_table("task"):
         return
@@ -119,7 +90,10 @@ class _MigrationSupport:
         inspector = inspect(bind)
         task_fks = inspector.get_foreign_keys("task")
         audit_fks = inspector.get_foreign_keys("audit_event")
-        if not any(item.get("referred_table") == "experiment" for item in (*task_fks, *audit_fks)):
+        if not any(
+            item.get("referred_table") == "experiment"
+            for item in (*task_fks, *audit_fks)
+        ):
             return
         connection = op.get_bind()
         connection.exec_driver_sql(

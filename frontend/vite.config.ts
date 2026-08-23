@@ -8,7 +8,10 @@ export default defineConfig({
   plugins: [
     vue(),
     AutoImport({ resolvers: [ElementPlusResolver({ importStyle: 'css' })] }),
-    Components({ resolvers: [ElementPlusResolver({ importStyle: 'css' })] }),
+    Components({
+      dts: false,
+      resolvers: [ElementPlusResolver({ importStyle: 'css' })],
+    }),
   ],
   server: {
     host: '127.0.0.1',

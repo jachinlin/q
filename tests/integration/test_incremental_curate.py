@@ -442,6 +442,7 @@ def test_transform_change_and_missing_file_force_selected_rebuilds(
     assert len(mapper.normalized_requests) == 1
     assert year_2025.path.is_file()
 
+
 def test_localize_refetches_a_schema_incompatible_financial_checkpoint(
     tmp_path: Path,
 ) -> None:

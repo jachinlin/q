@@ -429,6 +429,26 @@ class AShareRuleBook:
 
         return self._content_hash
 
+    @property
+    def commission_bps(self) -> float:
+        """返回事前成本模型复用的佣金比例，单位为基点。
+
+        入参：无。
+        返回值：唯一规则文件中的佣金率乘以一万。
+        异常：规则簿构造时已校验，本属性不主动抛出异常。
+        """
+        return float(self._commission_rate * Decimal(10_000))
+
+    @property
+    def commission_minimum_fen(self) -> int:
+        """返回事前成本模型复用的单笔最低佣金，单位为分。
+
+        入参：无。
+        返回值：唯一规则文件中的最低佣金整数分值。
+        异常：无。
+        """
+        return self._commission_minimum_cents
+
     @classmethod
     def load(cls, config_path: Path) -> AShareRuleBook:
         """读取并严格校验唯一交易规则文件。

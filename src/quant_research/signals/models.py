@@ -15,12 +15,12 @@ from quant_research.domain.identifiers import InstrumentId
 class Direction(StrEnum):
     """定义时序方向信号。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     LONG = "LONG"
@@ -32,12 +32,12 @@ class Direction(StrEnum):
 class ArtifactIdentity:
     """绑定信号产物的运行、组件、数据和研究区间身份。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     run_id: str
@@ -51,7 +51,10 @@ class ArtifactIdentity:
     def __post_init__(self) -> None:
         if not self.run_id or not self.component_id:
             raise ValueError("artifact run and component IDs must not be empty")
-        for name, value in (("component_hash", self.component_hash), ("catalog_hash", self.catalog_hash)):
+        for name, value in (
+            ("component_hash", self.component_hash),
+            ("catalog_hash", self.catalog_hash),
+        ):
             if len(value) != 64:
                 raise ValueError(f"{name} must be a SHA-256 digest")
         if self.start_date > self.end_date:
@@ -62,12 +65,12 @@ class ArtifactIdentity:
 class CrossSectionalScoreRow:
     """表示一个证券在一个决策日的横截面评分。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     signal_date: date
@@ -95,12 +98,12 @@ class CrossSectionalScoreRow:
 class DirectionalSignalRow:
     """表示一个证券在一个决策日的方向和状态变化。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     signal_date: date
@@ -127,12 +130,12 @@ class DirectionalSignalRow:
 class AllocationSignalRow:
     """表示一个证券在一个决策日的目标暴露意图。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     signal_date: date
@@ -157,12 +160,12 @@ class AllocationSignalRow:
 class CrossSectionalScoreArtifact:
     """保存按稳定主键排序的横截面评分产物。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     identity: ArtifactIdentity
@@ -176,12 +179,12 @@ class CrossSectionalScoreArtifact:
 class DirectionalSignalArtifact:
     """保存按稳定主键排序的方向信号产物。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     identity: ArtifactIdentity
@@ -195,12 +198,12 @@ class DirectionalSignalArtifact:
 class AllocationSignalArtifact:
     """保存按稳定主键排序的配置暴露产物。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     identity: ArtifactIdentity
@@ -222,9 +225,8 @@ class _SignalKey(Protocol):
 
 
 def _validate_rows(rows: Sequence[_SignalKey]) -> None:
-    keys = tuple(
-        (row.signal_date, row.instrument_id, row.signal_id)
-        for row in rows
-    )
+    keys = tuple((row.signal_date, row.instrument_id, row.signal_id) for row in rows)
     if keys != tuple(sorted(keys)) or len(set(keys)) != len(keys):
-        raise ValueError("signal rows must have unique, deterministic primary-key order")
+        raise ValueError(
+            "signal rows must have unique, deterministic primary-key order"
+        )

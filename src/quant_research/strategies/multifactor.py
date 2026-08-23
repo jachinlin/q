@@ -1,544 +1,290 @@
-"""提供策略与multifactor相关的公开模型、协议与处理流程。"""
+"""实现由五模块流水线装配的股票截面策略预设。"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from datetime import date
+from collections.abc import Mapping
+from dataclasses import dataclass
 from math import isfinite
-from types import MappingProxyType
 from typing import cast
 
 import polars as pl
 
-from quant_research.backtest.engine import StrategyRef
+from quant_research.data.contracts import JsonValue
+from quant_research.domain.enums import DatasetKind
 from quant_research.domain.identifiers import InstrumentId
-from quant_research.factors.base import canonical_factor_ref, is_available_on_signal_day
 from quant_research.factors.transforms import winsorize_mad, zscore
-from quant_research.portfolio.constraints import PortfolioConstraints
-from quant_research.portfolio.constructor import TargetPortfolio
 from quant_research.strategies.base import (
-    PortfolioState,
-    RebalanceFrequency,
-    StrategyContext,
-    ValidationIssue,
-    is_rebalance_boundary,
-    validated_factor_values,
-    validated_stock_universe,
+    DecisionContext,
+    RebalancePlanner,
+    StrategySpec,
+    TargetWeights,
+    WeightTargetStrategy,
 )
-
-_FACTOR_DEFINITIONS = {
-    "earnings_yield_ttm": ("VALUE", 1),
-    "book_to_price_mrq": ("VALUE", 1),
-    "roe_pit": ("QUALITY", 1),
-    "momentum_120_20": ("MOMENTUM", 1),
-    "volatility_60d": ("RISK", -1),
-    "downside_volatility_60d": ("RISK", -1),
-    "max_drawdown_120d": ("RISK", -1),
-}
-_CATEGORY_WEIGHTS = {"VALUE": 0.25, "QUALITY": 0.25, "MOMENTUM": 0.30, "RISK": 0.20}
-_EPSILON = 1e-10
-
-
-@dataclass(frozen=True, slots=True)
-class MultifactorDecision:
-    """记录单只股票的多因子综合得分或被排除的证据。
-
-    入参：
-        instrument_id：目标证券标识，类型为 ``InstrumentId``。
-        score：综合得分。
-        reason_code：说明成交、拒绝或排除原因的稳定机器码。
-        factor_reasons：参与本次处理的因子``reasons``；调用方不得依赖未声明的顺序。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
-    Immutable per-instrument score or exclusion evidence.
-    """
-
-    instrument_id: InstrumentId
-    score: float | None
-    reason_code: str
-    factor_reasons: Mapping[str, str]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.instrument_id, InstrumentId):
-            raise TypeError("instrument_id must be an InstrumentId")
-        if self.score is not None and (
-            not isinstance(self.score, float) or not isfinite(self.score)
-        ):
-            raise ValueError("score must be finite or None")
-        if not isinstance(self.reason_code, str) or not self.reason_code.strip():
-            raise ValueError("reason_code must be a nonempty string")
-        if not isinstance(self.factor_reasons, Mapping) or any(
-            not isinstance(reference, str)
-            or not isinstance(reason, str)
-            or not reason.strip()
-            for reference, reason in self.factor_reasons.items()
-        ):
-            raise ValueError("factor_reasons must map factor refs to nonempty reasons")
-        object.__setattr__(
-            self,
-            "factor_reasons",
-            MappingProxyType(dict(sorted(self.factor_reasons.items()))),
-        )
-
-
-class _MultifactorSupport:
-    """集中承载本模块的私有实现逻辑。"""
-
-    @staticmethod
-    def _default_factor_definitions() -> Mapping[str, tuple[str, int]]:
-        return MappingProxyType(dict(_FACTOR_DEFINITIONS))
-
-    @staticmethod
-    def _default_category_weights() -> Mapping[str, float]:
-        return MappingProxyType(dict(_CATEGORY_WEIGHTS))
-
-    @staticmethod
-    def _constraints_from_mapping(
-        mapping: Mapping[str, object],
-    ) -> PortfolioConstraints:
-        names = {
-            "max_position_weight",
-            "min_positions",
-            "max_positions",
-            "min_adv_amount",
-            "max_turnover",
-        }
-        unknown = set(mapping) - names
-        if unknown:
-            raise ValueError(f"unknown constraint key: {min(unknown)}")
-        missing = names - set(mapping)
-        if missing:
-            raise ValueError(f"missing constraint key: {min(missing)}")
-        return PortfolioConstraints(
-            max_position_weight=cast(float, mapping["max_position_weight"]),
-            min_positions=cast(int, mapping["min_positions"]),
-            max_positions=cast(int, mapping["max_positions"]),
-            min_adv_amount=cast(float, mapping["min_adv_amount"]),
-            max_turnover=cast(float, mapping["max_turnover"]),
-        )
+from quant_research.strategies.components import StrategyPipelineConfig
+from quant_research.strategies.cross_sectional import (
+    CrossSectionalPortfolioAssembler,
+    ScoredInstrument,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class MultifactorConfig:
-    """定义策略信号流程使用的不可变配置及取值约束。
+    """定义股票多因子策略的完整五模块流水线。
 
-    入参：
-        constraints：组合约束。
-        factor_definitions：参与本次处理的因子``definitions``；调用方不得依赖未声明的顺序。
-        category_weights：参与本次处理的因子类别``weights``；调用方不得依赖未声明的顺序。
-        min_valid_factors：判定输入或结果有效所需达到的下限``valid``因子集合。
-        mad_multiplier：MAD倍数。
-        frequency：调仓频率。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
+    入参：通过组件目录校验的不可变流水线配置。
+    返回值：股票多因子预设配置。
+    异常：频率或 Alpha 参数不适用于股票截面时抛出值错误。
     """
 
-    constraints: PortfolioConstraints
-    factor_definitions: Mapping[str, tuple[str, int]] = field(
-        default_factory=_MultifactorSupport._default_factor_definitions
-    )
-    category_weights: Mapping[str, float] = field(
-        default_factory=_MultifactorSupport._default_category_weights
-    )
-    min_valid_factors: int = 5
-    mad_multiplier: float = 3.0
-    frequency: RebalanceFrequency = RebalanceFrequency.WEEKLY
+    pipeline: StrategyPipelineConfig
 
     def __post_init__(self) -> None:
-        if not isinstance(self.constraints, PortfolioConstraints):
-            raise TypeError("constraints must be PortfolioConstraints")
-        if not isinstance(self.factor_definitions, Mapping):
-            raise TypeError("factor_definitions must be a mapping")
-        definitions: dict[str, tuple[str, int]] = {}
-        for reference, definition in self.factor_definitions.items():
-            factor_ref = canonical_factor_ref(reference)
-            if not isinstance(definition, tuple) or len(definition) != 2:
-                raise ValueError("factor definitions must be (category, direction)")
-            category, direction = definition
-            if (
-                category not in _CATEGORY_WEIGHTS
-                or type(direction) is not int
-                or direction not in {-1, 1}
-            ):
-                raise ValueError(
-                    "factor definitions have invalid category or direction"
-                )
-            definitions[factor_ref] = (category, direction)
-        if definitions != _FACTOR_DEFINITIONS:
-            raise ValueError("factor_definitions must be the fixed seven alpha refs")
-        if not isinstance(self.category_weights, Mapping):
-            raise TypeError("category_weights must be a mapping")
-        weights = dict(self.category_weights)
-        if set(weights) != set(_CATEGORY_WEIGHTS):
-            raise ValueError("category_weights must include each alpha category")
-        if any(
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not isfinite(value)
-            or value < 0
-            for value in weights.values()
-        ):
-            raise ValueError("category weights must be finite and nonnegative")
-        if abs(sum(weights.values()) - 1.0) > _EPSILON:
-            raise ValueError("category weights must sum to one")
-        if type(self.min_valid_factors) is not int or self.min_valid_factors != 5:
-            raise ValueError("min_valid_factors must be the value 5")
-        if (
-            not isinstance(self.mad_multiplier, (int, float))
-            or isinstance(self.mad_multiplier, bool)
-            or not isfinite(self.mad_multiplier)
-            or self.mad_multiplier <= 0
-        ):
-            raise ValueError("mad_multiplier must be finite and positive")
-        if self.frequency is not RebalanceFrequency.WEEKLY:
-            raise ValueError("multifactor frequency must be WEEKLY")
-        object.__setattr__(
-            self,
-            "factor_definitions",
-            MappingProxyType(dict(sorted(definitions.items()))),
-        )
-        object.__setattr__(
-            self, "category_weights", MappingProxyType(dict(sorted(weights.items())))
-        )
+        if self.pipeline.frequency != "WEEKLY":
+            raise ValueError("stock_multifactor frequency must be WEEKLY")
+        params = self.pipeline.alpha.params
+        if self.pipeline.alpha.model_id == "single_factor":
+            unknown = set(params) - {"factor_id", "direction"}
+            factor_id = params.get("factor_id")
+            direction = params.get("direction", 1.0)
+            if unknown:
+                raise ValueError(f"unknown single_factor parameter: {min(unknown)}")
+            if not isinstance(factor_id, str) or not factor_id:
+                raise TypeError("single_factor factor_id must be a nonempty string")
+            self._finite(direction, "single_factor direction")
+            return
+        unknown = set(params) - {"factor_weights", "min_valid_factors"}
+        if unknown:
+            raise ValueError(
+                f"unknown multi_factor_composite parameter: {min(unknown)}"
+            )
+        weights = params.get("factor_weights")
+        if not isinstance(weights, Mapping) or not weights:
+            raise TypeError("factor_weights must be a nonempty mapping")
+        for factor_id, weight in weights.items():
+            if not isinstance(factor_id, str) or not factor_id:
+                raise TypeError("factor IDs must be nonempty strings")
+            self._finite(weight, f"factor weight {factor_id}")
+        minimum = params.get("min_valid_factors", len(weights))
+        if type(minimum) is not int or not 1 <= minimum <= len(weights):
+            raise ValueError("min_valid_factors must be within factor count")
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, object]) -> MultifactorConfig:
-        """从输入解析配置映射。
+    def from_mapping(cls, value: Mapping[str, JsonValue]) -> MultifactorConfig:
+        """从策略参数解析并校验股票五模块配置。
 
-        入参：
-            mapping：参与本次处理的配置映射；调用方不得依赖未声明的顺序。
-        返回值：
-            返回配置映射（``MultifactorConfig``）。
-        异常：
-            输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
+        入参：严格 YAML 中 ``strategy.parameters`` 的映射。
+        返回值：规范化多因子配置。
+        异常：未知字段、组件冲突或 Alpha 参数非法时抛出错误。
         """
-        if not isinstance(mapping, Mapping):
-            raise TypeError("multifactor config must be a mapping")
-        allowed = {
-            "constraints",
-            "factor_definitions",
-            "category_weights",
-            "min_valid_factors",
-            "mad_multiplier",
-            "frequency",
-        }
-        unknown = set(mapping) - allowed
-        if unknown:
-            raise ValueError(f"unknown multifactor config key: {min(unknown)}")
-        if "constraints" not in mapping:
-            raise ValueError("missing multifactor config key: constraints")
-        raw_constraints = mapping["constraints"]
-        if not isinstance(raw_constraints, Mapping):
-            raise TypeError("constraints must be a mapping")
-        constraints = _MultifactorSupport._constraints_from_mapping(raw_constraints)
-        raw_definitions = mapping.get("factor_definitions", _FACTOR_DEFINITIONS)
-        if not isinstance(raw_definitions, Mapping):
-            raise TypeError("factor_definitions must be a mapping")
-        definitions: dict[str, tuple[str, int]] = {}
-        for reference, value in raw_definitions.items():
-            if not isinstance(reference, str):
-                raise TypeError("factor definition reference must be a string")
-            if not isinstance(value, Mapping):
-                raise TypeError("factor definition must be a mapping")
-            if set(value) != {"category", "direction"}:
-                raise ValueError(
-                    "factor definition keys must be category and direction"
+        return cls(StrategyPipelineConfig.from_parameters(value))
+
+    @property
+    def factor_weights(self) -> dict[str, float]:
+        """返回 Alpha 模块展开后的因子方向和权重。
+
+        入参：无。
+        返回值：按因子 ID 排序的浮点权重映射。
+        异常：配置构造已完成校验，本属性不抛出主动异常。
+        """
+        params = self.pipeline.alpha.params
+        if self.pipeline.alpha.model_id == "single_factor":
+            return {
+                cast(str, params["factor_id"]): self._finite(
+                    params.get("direction", 1.0), "single_factor direction"
                 )
-            category, direction = value["category"], value["direction"]
-            if not isinstance(category, str):
-                raise TypeError("factor definition category must be a string")
-            if type(direction) is not int:
-                raise TypeError("factor definition direction must be an integer")
-            definitions[reference] = (category, direction)
-        raw_weights = mapping.get("category_weights", _CATEGORY_WEIGHTS)
-        if not isinstance(raw_weights, Mapping):
-            raise TypeError("category_weights must be a mapping")
-        return cls(
-            constraints,
-            definitions,
-            cast(Mapping[str, float], raw_weights),
-            cast(int, mapping.get("min_valid_factors", 5)),
-            cast(float, mapping.get("mad_multiplier", 3.0)),
-            RebalanceFrequency(cast(str, mapping.get("frequency", "WEEKLY"))),
+            }
+        weights = cast(Mapping[str, JsonValue], params["factor_weights"])
+        return {
+            key: self._finite(weights[key], f"factor weight {key}")
+            for key in sorted(weights)
+        }
+
+    @property
+    def min_valid_factors(self) -> int:
+        """返回复合 Alpha 要求的最少有效因子数。
+
+        入参：无。
+        返回值：正整数有效因子门槛；单因子模型固定为一。
+        异常：无。
+        """
+        if self.pipeline.alpha.model_id == "single_factor":
+            return 1
+        return cast(
+            int,
+            self.pipeline.alpha.params.get(
+                "min_valid_factors", len(self.factor_weights)
+            ),
         )
 
+    @staticmethod
+    def _finite(value: object, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{field} must be numeric")
+        number = float(value)
+        if not isfinite(number):
+            raise ValueError(f"{field} must be finite")
+        return number
 
-class MultifactorStrategy:
-    """表示策略信号流程中的``multifactor``策略及其业务不变量。
 
-    入参：
-        config：调用所用的配置对象，类型为 ``MultifactorConfig``。
-        audit_sink：由组合根注入、用于隔离外部副作用的审计事件``sink``端口。
-    返回值：
-        返回完成字段规范化和不变量校验的对象。
-    异常：
-        输入、状态或依赖结果违反契约时抛出 ``TypeError``。
+class MultifactorStrategy(WeightTargetStrategy):
+    """按周运行 Alpha→Risk→Cost→Construction→Constraint 流水线。
+
+    入参：股票多因子配置和目标权重转订单规划器。
+    返回值：周边界整数订单及可审计横截面信号。
+    异常：PIT 数据、因子变换或组合约束失败时传播对应错误。
     """
-
-    strategy_id = "stock_multifactor"
 
     def __init__(
         self,
         config: MultifactorConfig,
+        planner: RebalancePlanner,
         *,
-        audit_sink: Callable[[tuple[MultifactorDecision, ...]], None] | None = None,
+        commission_bps: float,
+        commission_minimum_fen: int,
     ) -> None:
-        if not isinstance(config, MultifactorConfig):
-            raise TypeError("config must be a MultifactorConfig")
-        if audit_sink is not None and not callable(audit_sink):
-            raise TypeError("audit_sink must be callable or None")
+        super().__init__(planner, target_tolerance=config.pipeline.target_tolerance)
         self.config = config
-        self._audit_sink = audit_sink
+        self._assembler = CrossSectionalPortfolioAssembler(
+            config.pipeline,
+            commission_bps=commission_bps,
+            commission_minimum_fen=commission_minimum_fen,
+        )
+        self._signals: list[dict[str, object]] = []
 
     @property
-    def ref(self) -> StrategyRef:
-        """处理策略信号中的``ref``。
+    def spec(self) -> StrategySpec:
+        """返回股票策略依赖和完整五模块参数。
 
-        入参：
-            无。
-        返回值：
-            返回``ref``（``StrategyRef``）。
-        异常：
-            无。
+        入参：无。
+        返回值：``stock_multifactor`` 策略规格。
+        异常：无。
         """
-        return StrategyRef(self.strategy_id)
-
-    def validate(self, ctx: StrategyContext) -> list[ValidationIssue]:
-        """校验策略信号。
-
-        入参：
-            ctx：本次计算的上下文，类型为 ``StrategyContext``。
-        返回值：
-            返回校验策略信号后的``validate``（``list[ValidationIssue]``）。
-        异常：
-            无。
-        """
-        if not isinstance(ctx, StrategyContext):
-            return [ValidationIssue("INVALID_CONTEXT", "strategy context is invalid")]
-        return []
-
-    def should_rebalance(self, ctx: StrategyContext, rebalance_date: date) -> bool:
-        """判断是否需要调仓。
-
-        入参：
-            ctx：本次计算的上下文，类型为 ``StrategyContext``。
-            rebalance_date：限定本次业务操作覆盖范围的调仓日期（含边界）。
-        返回值：
-            返回是否是否需要调仓。
-        异常：
-            无。
-        """
-        return rebalance_date == ctx.signal_date and is_rebalance_boundary(
-            ctx, self.config.frequency
+        return StrategySpec(
+            "stock_multifactor",
+            self.config.pipeline.frequency,
+            (
+                DatasetKind.DAILY_BAR,
+                DatasetKind.SECURITY_STATUS,
+                DatasetKind.DAILY_BASIC,
+                DatasetKind.INDUSTRY_CLASSIFICATION,
+            ),
+            tuple(self.config.factor_weights),
+            {"pipeline": self.config.pipeline.as_json()},
         )
 
-    def generate_targets(
-        self, ctx: StrategyContext, rebalance_date: date, current: PortfolioState
-    ) -> TargetPortfolio:
-        """生成``targets``。
+    def target_weights(self, ctx: DecisionContext) -> TargetWeights | None:
+        """仅在周边界计算完整截面评分并构建目标组合。
 
-        入参：
-            ctx：本次计算的上下文，类型为 ``StrategyContext``。
-            rebalance_date：限定本次业务操作覆盖范围的调仓日期（含边界）。
-            current：当前值。
-        返回值：
-            返回生成``targets``后的``targets``（``TargetPortfolio``）。
-        异常：
-            输入、状态或依赖结果违反契约时抛出 ``TypeError``、``ValueError``。
+        入参：绑定信号日、下一执行日和账户的决策上下文。
+        返回值：新目标权重；非周边界或没有有效候选时为空。
+        异常：PIT 数据读取、因子变换或组合约束失败时传播对应错误。
         """
-        if rebalance_date != ctx.signal_date:
-            raise ValueError("rebalance_date must equal signal_date")
-        if not isinstance(current, PortfolioState):
-            raise TypeError("current must be a PortfolioState")
-        if current.trade_date != rebalance_date:
-            raise ValueError("current portfolio state must match rebalance_date")
-        universe = validated_stock_universe(
-            ctx.data.stock_universe(ctx.signal_date),
-            signal_date=ctx.signal_date,
-        ).filter(pl.col("eligible"))
-        eligible_ids = tuple(
+        if ctx.signal_date.isocalendar()[:2] == ctx.execute_date.isocalendar()[:2]:
+            return None
+        universe = ctx.data.stock_universe().collect().sort("instrument_id")
+        if "eligible" in universe.columns:
+            universe = universe.filter(pl.col("eligible"))
+        identifiers = tuple(
             InstrumentId.parse(value) for value in universe["instrument_id"].to_list()
         )
-        factors = validated_factor_values(
-            ctx.data.factor_values(
-                ctx.signal_date,
-                eligible_ids,
-                tuple(_FACTOR_DEFINITIONS),
-            ),
-            signal_date=ctx.signal_date,
-            instruments=eligible_ids,
-            factor_refs=tuple(_FACTOR_DEFINITIONS),
-        )
-        scores, decisions = self._scores(universe, factors, ctx.signal_date)
-        if self._audit_sink is not None:
-            self._audit_sink(decisions)
-        current_weights = {
-            item.instrument_id.canonical(): item.current_weight
-            for item in current.positions
+        if not identifiers:
+            return None
+        scored = self._scores(ctx, identifiers)
+        self._record(ctx, scored)
+        return self._assembler.construct(ctx, scored)
+
+    def signal_frame(self) -> pl.DataFrame:
+        """返回按信号日和证券稳定排序的评分审计表。
+
+        入参：无。
+        返回值：包含 score、有效性和原因码的 Polars DataFrame。
+        异常：无。
+        """
+        schema = {
+            "signal_date": pl.Date,
+            "instrument_id": pl.String,
+            "state": pl.String,
+            "score": pl.Float64,
+            "state_changed": pl.Boolean,
+            "invalid_reason": pl.String,
         }
-        candidates: list[dict[str, object]] = []
-        for row in universe.iter_rows(named=True):
-            instrument_id = cast(str, row["instrument_id"])
-            candidates.append(
-                {
-                    "instrument_id": instrument_id,
-                    "score": scores.get(instrument_id),
-                    "adv_amount": row["adv_amount"],
-                    "current_weight": current_weights.pop(instrument_id, 0.0),
-                }
-            )
-        for instrument_id, weight in current_weights.items():
-            candidates.append(
-                {
-                    "instrument_id": instrument_id,
-                    "score": None,
-                    "adv_amount": 0.0,
-                    "current_weight": weight,
-                }
-            )
-        candidates.sort(key=lambda row: cast(str, row["instrument_id"]))
-        frame = pl.DataFrame(
-            candidates,
-            schema={
-                "instrument_id": pl.String,
-                "score": pl.Float64,
-                "adv_amount": pl.Float64,
-                "current_weight": pl.Float64,
-            },
-        )
-        return ctx.portfolio_constructor.construct(
-            frame, self.config.constraints, ctx.signal_date, ctx.execute_date
+        if not self._signals:
+            return pl.DataFrame(schema=schema)
+        return pl.DataFrame(self._signals, schema=schema, strict=False).sort(
+            "signal_date", "instrument_id"
         )
 
     def _scores(
-        self, universe: pl.DataFrame, factors: pl.DataFrame, signal_date: date
-    ) -> tuple[dict[str, float], tuple[MultifactorDecision, ...]]:
-        base_rows = list(universe.iter_rows(named=True))
-        transformed: dict[str, dict[str, float]] = {
-            cast(str, row["instrument_id"]): {} for row in base_rows
-        }
-        audit_reasons: dict[str, dict[str, str]] = {
-            cast(str, row["instrument_id"]): {} for row in base_rows
-        }
-        source = {
-            (cast(str, row["instrument_id"]), cast(str, row["factor_ref"])): row
-            for row in factors.iter_rows(named=True)
-        }
-        for factor_ref in _FACTOR_DEFINITIONS:
-            _, direction = self.config.factor_definitions[factor_ref]
-            rows: list[dict[str, object]] = []
-            for item in base_rows:
-                identifier = cast(str, item["instrument_id"])
-                observed = source.get((identifier, factor_ref))
-                source_reason: str | None = None
-                if observed is None:
-                    source_reason = "MISSING_FACTOR_ROW"
-                elif observed["is_valid"] is not True:
-                    raw_reason = (
-                        observed.get("invalid_reason")
-                        if "invalid_reason" in factors.columns
-                        else None
-                    )
-                    source_reason = (
-                        raw_reason
-                        if isinstance(raw_reason, str) and raw_reason.strip()
-                        else "INPUT_INVALID"
-                    )
-                elif not is_available_on_signal_day(
-                    observed["available_at"], signal_date
-                ):
-                    source_reason = "FUTURE_AVAILABLE_AT"
-                valid = observed is not None and source_reason is None
-                value = observed["value"] if observed is not None and valid else None
-                rows.append(
-                    {
-                        "trade_date": signal_date,
-                        "instrument_id": identifier,
-                        "value": value,
-                        "is_valid": valid,
-                        "invalid_reason": source_reason,
-                    }
-                )
-            frame = pl.DataFrame(
-                rows,
-                schema={
-                    "trade_date": pl.Date,
-                    "instrument_id": pl.String,
-                    "value": pl.Float64,
-                    "is_valid": pl.Boolean,
-                    "invalid_reason": pl.String,
-                },
+        self, ctx: DecisionContext, identifiers: tuple[InstrumentId, ...]
+    ) -> tuple[ScoredInstrument, ...]:
+        weights = self.config.factor_weights
+        raw = ctx.data.factor_values(tuple(weights), identifiers).collect()
+        factor_column = "factor_id" if "factor_id" in raw.columns else "factor_ref"
+        reason_column = (
+            "invalid_reason" if "invalid_reason" in raw.columns else "reason_code"
+        )
+        frame = raw.select(
+            "trade_date",
+            "instrument_id",
+            pl.col(factor_column).alias("factor_id"),
+            pl.col("value").cast(pl.Float64),
+            pl.col("is_valid").cast(pl.Boolean),
+            (
+                pl.col(reason_column).cast(pl.String)
+                if reason_column in raw.columns
+                else pl.lit(None, dtype=pl.String)
+            ).alias("invalid_reason"),
+        )
+        transformed = zscore(
+            winsorize_mad(frame, "value", ["trade_date", "factor_id"]),
+            "value",
+            ["trade_date", "factor_id"],
+        ).with_columns(
+            pl.col("factor_id")
+            .replace(weights, default=0.0)
+            .cast(pl.Float64)
+            .alias("_weight")
+        )
+        aggregated = (
+            transformed.group_by("instrument_id")
+            .agg(
+                (pl.col("value") * pl.col("_weight"))
+                .filter(pl.col("is_valid"))
+                .sum()
+                .alias("score"),
+                pl.col("is_valid").sum().alias("valid_count"),
             )
-            result = zscore(
-                winsorize_mad(
-                    frame, "value", ("trade_date",), self.config.mad_multiplier
-                ),
-                "value",
-                ("trade_date",),
+            .sort("instrument_id")
+        )
+        values = {str(row["instrument_id"]): row for row in aggregated.to_dicts()}
+        result: list[ScoredInstrument] = []
+        for identifier in identifiers:
+            row = values.get(identifier.canonical())
+            if (
+                row is None
+                or int(row["valid_count"] or 0) < self.config.min_valid_factors
+            ):
+                result.append(
+                    ScoredInstrument(identifier, None, "INSUFFICIENT_VALID_FACTORS")
+                )
+            else:
+                result.append(ScoredInstrument(identifier, float(row["score"])))
+        return tuple(result)
+
+    def _record(
+        self, ctx: DecisionContext, scored: tuple[ScoredInstrument, ...]
+    ) -> None:
+        for item in scored:
+            self._signals.append(
+                {
+                    "signal_date": ctx.signal_date,
+                    "instrument_id": item.instrument_id.canonical(),
+                    "state": "SCORE" if item.score is not None else "INVALID",
+                    "score": item.score,
+                    "state_changed": False,
+                    "invalid_reason": item.invalid_reason,
+                }
             )
-            for row in result.iter_rows(named=True):
-                value = row["value"]
-                if (
-                    row["is_valid"] is True
-                    and isinstance(value, float)
-                    and isfinite(value)
-                ):
-                    transformed[cast(str, row["instrument_id"])][factor_ref] = (
-                        direction * value
-                    )
-                else:
-                    reason = row["invalid_reason"]
-                    if isinstance(reason, str) and reason.strip():
-                        audit_reasons[cast(str, row["instrument_id"])][factor_ref] = (
-                            reason
-                        )
-        result_scores: dict[str, float] = {}
-        decisions: list[MultifactorDecision] = []
-        for identifier, values in transformed.items():
-            if len(values) < self.config.min_valid_factors:
-                decisions.append(
-                    MultifactorDecision(
-                        InstrumentId.parse(identifier),
-                        None,
-                        "INSUFFICIENT_FACTOR_COVERAGE",
-                        audit_reasons[identifier],
-                    )
-                )
-                continue
-            category_scores: dict[str, list[float]] = {
-                category: [] for category in _CATEGORY_WEIGHTS
-            }
-            for factor_ref in sorted(values):
-                value = values[factor_ref]
-                category_scores[self.config.factor_definitions[factor_ref][0]].append(
-                    value
-                )
-            if any(not values for values in category_scores.values()):
-                decisions.append(
-                    MultifactorDecision(
-                        InstrumentId.parse(identifier),
-                        None,
-                        "INSUFFICIENT_FACTOR_COVERAGE",
-                        audit_reasons[identifier],
-                    )
-                )
-                continue
-            score = sum(
-                self.config.category_weights[category] * (sum(items) / len(items))
-                for category, items in category_scores.items()
-            )
-            result_scores[identifier] = score
-            decisions.append(
-                MultifactorDecision(
-                    InstrumentId.parse(identifier),
-                    score,
-                    "MULTIFACTOR_SELECTED",
-                    audit_reasons[identifier],
-                )
-            )
-        return result_scores, tuple(decisions)
+
+
+__all__ = ["MultifactorConfig", "MultifactorStrategy"]

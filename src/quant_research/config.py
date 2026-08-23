@@ -135,16 +135,24 @@ class Settings(BaseSettings):
         """
         resolved_source_tree = Path(__file__).resolve().parents[2]
         configured_path = os.environ.get("QUANT_CONFIG")
-        effective_config_path = config_path if config_path is not None else (
-            Path(configured_path)
-            if configured_path
-            else resolved_source_tree / "configs" / "base.yaml"
+        effective_config_path = (
+            config_path
+            if config_path is not None
+            else (
+                Path(configured_path)
+                if configured_path
+                else resolved_source_tree / "configs" / "base.yaml"
+            )
         )
         configured_data_root = os.environ.get("QUANT_DATA_ROOT")
-        effective_data_root = data_root if data_root is not None else (
-            Path(configured_data_root)
-            if configured_data_root
-            else Path.home() / ".q-data"
+        effective_data_root = (
+            data_root
+            if data_root is not None
+            else (
+                Path(configured_data_root)
+                if configured_data_root
+                else Path.home() / ".q-data"
+            )
         )
         resolved_data_root = effective_data_root.resolve()
         if resolved_data_root.is_relative_to(resolved_source_tree):

@@ -8,4 +8,10 @@ from quant_research.costs.models import (
     RealizedCostModel,
 )
 
-__all__ = ["CostEstimate", "LiquidityImpactCostModel", "PreTradeCostSlice", "RealizedCost", "RealizedCostModel"]
+__all__ = [
+    "CostEstimate",
+    "LiquidityImpactCostModel",
+    "PreTradeCostSlice",
+    "RealizedCost",
+    "RealizedCostModel",
+]

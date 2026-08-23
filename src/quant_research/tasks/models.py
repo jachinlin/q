@@ -50,7 +50,6 @@ class TaskSpec(_TaskModel):
         ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
     """
 
-    experiment_id: str | None = None
     task_type: str
     payload: dict[str, JsonValue]
     priority: int = 0
@@ -100,8 +99,6 @@ class TaskSpec(_TaskModel):
         异常：
             ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
         """
-        if self.experiment_id is not None and not self.experiment_id:
-            raise ValueError("experiment_id must not be empty")
         if not self.task_type:
             raise ValueError("task_type must not be empty")
         if (self.subject_kind is None) != (self.subject_id is None):
@@ -136,7 +133,6 @@ class TaskRecord(_TaskModel):
     """
 
     id: str
-    experiment_id: str | None
     task_type: str
     payload: dict[str, JsonValue]
     status: TaskStatus
@@ -210,9 +206,23 @@ class AuditEventSpec(_TaskModel):
     event_type: str
     details: dict[str, JsonValue]
     created_at: datetime
-    experiment_id: str | None = None
+    run_id: str | None = None
+    subject_kind: str | None = None
+    subject_id: str | None = None
     task_id: str | None = None
     actor: str | None = None
+
+    @model_validator(mode="after")
+    def validate_subject(self) -> AuditEventSpec:
+        """要求通用审计主体的 kind 和 id 同时存在或同时缺失。
+
+        入参：已解析的审计事件自身。返回值：校验后的事件。异常：主体字段只出现一个时抛出 ``ValueError``。
+        """
+        if (self.subject_kind is None) != (self.subject_id is None):
+            raise ValueError(
+                "audit subject_kind and subject_id must be jointly present"
+            )
+        return self
 
     @field_validator("details")
     @classmethod
@@ -400,7 +410,6 @@ class ClaimedTask(_TaskModel):
     id: str
     attempt_id: str
     attempt_no: int
-    experiment_id: str | None
     task_type: str
     payload: dict[str, JsonValue]
     priority: int
@@ -463,8 +472,8 @@ class ClaimedTask(_TaskModel):
             raise ValueError("claim identity fields must not be empty")
         if self.attempt_no <= 0:
             raise ValueError("attempt_no must be positive")
-        if self.experiment_id is not None and not self.experiment_id:
-            raise ValueError("experiment_id must not be empty")
+        if (self.subject_kind is None) != (self.subject_id is None):
+            raise ValueError("subject_kind and subject_id must be jointly present")
         return self
 
 

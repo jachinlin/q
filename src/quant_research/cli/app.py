@@ -8,15 +8,13 @@ import signal
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Never, Protocol
+from pathlib import Path
+from typing import Any, Never, Protocol
 
 import typer
 from typer import _click
 
-from quant_research.application.experiments import (
-    ExperimentClient,
-    ExperimentInspection,
-)
+from quant_research.application.experiments import ExperimentService
 from quant_research.application.worker import WorkerRunResult
 from quant_research.data.pipeline.dataset import DatasetCurateResult, LocalizeResult
 from quant_research.data.pipeline.publish import DataPipeline, PipelineResult
@@ -29,154 +27,155 @@ from quant_research.tasks.models import TaskAttemptRecord, TaskRecord, TaskStatu
 class TaskCommands(Protocol):
     """定义 ``TaskCommands`` 的依赖端口与实现契约。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def list(self, *, status: str | None, limit: int, offset: int) -> object:
         """列出符合条件的记录。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
     def cancel(self, task_id: str) -> object:
         """请求取消目标任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
     def retry(self, task_id: str) -> object:
         """重新提交可重试任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
 
 class ExperimentCommands(Protocol):
-    """定义 ``ExperimentCommands`` 的依赖端口与实现契约。
+    """定义实验命令组需要的应用服务端口。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        实现方接收受信配置文件名、Experiment 标识或 Run 标识。
+    返回值：
+        实现方返回可安全 JSON 序列化的实验、Run 或校验结果。
+    异常：
+        配置非法、对象不存在或持久化失败时由实现方给出受控异常。
     """
+
+    def validate(self, config: str) -> object:
+        """校验实验 YAML，且不创建持久化记录。
+
+        入参：
+            config：位于受信配置根内的 YAML 文件名。
+        返回值：
+            返回规范化实验定义和配置哈希。
+        异常：
+            ValueError：路径不受信或 YAML 不符合严格 Schema 时抛出。
+        """
+        ...
 
     def submit(self, config: str) -> object:
         """提交并登记约定任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
     def show(self, experiment_id: str) -> object:
         """读取旧实验详情；仅供待移除实现内部完成切换。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
+    def run(self, experiment_id: str, config: str) -> object:
+        """在实验下创建一个显式 Run。
 
-class ResearchCommands(Protocol):
-    """定义目标研究中心 CLI 的读写契约。
-
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
-    """
-
-    def validate(self, config: str) -> object:
-        """定义 validate 端口操作。
-
-        入参：参数含义由端口签名及类型声明给出。
-        返回值：返回端口声明的不可变领域结果。
-        异常：实现不满足契约时传播对应领域或依赖异常。
+        入参：
+            experiment_id：实验标识；config：受信 Run YAML 文件名。
+        返回值：
+            返回包含新 Run 的实验聚合。
+        异常：
+            KeyError：实验不存在时抛出；ValueError：配置不符合协议时抛出。
         """
         ...
 
+    def rerun(self, run_id: str) -> object:
+        """复制冻结配置并创建新 Run。
 
-    def submit(self, config: str) -> object:
-        """定义 submit 端口操作。
-
-        入参：参数含义由端口签名及类型声明给出。
-        返回值：返回端口声明的不可变领域结果。
-        异常：实现不满足契约时传播对应领域或依赖异常。
+        入参：
+            run_id：源 Run 标识。
+        返回值：
+            返回包含新 Run 的实验聚合。
+        异常：
+            KeyError：源 Run 不存在时抛出。
         """
         ...
-
 
     def list(self) -> object:
-        """定义 list 端口操作。
+        """列出最近创建的实验。
 
-        入参：参数含义由端口签名及类型声明给出。
-        返回值：返回端口声明的不可变领域结果。
-        异常：实现不满足契约时传播对应领域或依赖异常。
+        入参：
+            无。
+        返回值：
+            返回稳定排序的实验摘要。
+        异常：
+            实验存储不可读时传播受控持久化异常。
         """
         ...
 
 
-    def show(self, family_id: str) -> object:
-        """定义 show 端口操作。
+class StrategyCommands(Protocol):
+    """定义策略目录 CLI 的只读契约。
 
-        入参：参数含义由端口签名及类型声明给出。
-        返回值：返回端口声明的不可变领域结果。
-        异常：实现不满足契约时传播对应领域或依赖异常。
-        """
-        ...
+    入参：
+        目录查询不接收用户配置。
+    返回值：
+        实现方返回稳定排序的策略描述。
+    异常：
+        策略注册存在重复标识时由组合根在构建阶段抛出。
+    """
 
+    def list(self) -> object:
+        """列出稳定排序的已注册策略。
 
-    def rerun(self, family_id: str) -> object:
-        """定义 rerun 端口操作。
-
-        入参：参数含义由端口签名及类型声明给出。
-        返回值：返回端口声明的不可变领域结果。
-        异常：实现不满足契约时传播对应领域或依赖异常。
-        """
-        ...
-
-
-    def components(self) -> object:
-        """定义 components 端口操作。
-
-        入参：参数含义由端口签名及类型声明给出。
-        返回值：返回端口声明的不可变领域结果。
-        异常：实现不满足契约时传播对应领域或依赖异常。
+        入参：
+            无。
+        返回值：
+            返回可 JSON 序列化的策略目录。
+        异常：
+            目录不可用时由实现方抛出受控异常。
         """
         ...
 
@@ -184,35 +183,35 @@ class ResearchCommands(Protocol):
 class WorkerCommands(Protocol):
     """定义 ``WorkerCommands`` 的依赖端口与实现契约。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def once(self) -> object:
         """处理命令行中的``once``。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
     def run(self) -> object:
         """执行完整处理流程。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         ...
 
@@ -236,7 +235,6 @@ class _TaskQueuePort(Protocol):
         """
         ...
 
-
     def get(self, task_id: str) -> TaskRecord:
         """定义 get 端口操作。
 
@@ -246,15 +244,13 @@ class _TaskQueuePort(Protocol):
         """
         ...
 
-
     def request_cancel(
         self,
         task_id: str,
-        actor: str,
         *,
+        actor: str = "system",
         request_id: str | None = None,
-        strict: bool = False,
-    ) -> None:
+    ) -> TaskStatus:
         """定义 request_cancel 端口操作。
 
         入参：参数含义由端口签名及类型声明给出。
@@ -263,22 +259,20 @@ class _TaskQueuePort(Protocol):
         """
         ...
 
-
-    def clone_for_retry(
+    def retry(
         self,
         task_id: str,
-        actor: str,
         *,
+        actor: str = "system",
         request_id: str | None = None,
-    ) -> tuple[str | None, str]:
-        """定义 clone_for_retry 端口操作。
+    ) -> str:
+        """定义非实验任务 retry 端口操作。
 
         入参：参数含义由端口签名及类型声明给出。
         返回值：返回端口声明的不可变领域结果。
         异常：实现不满足契约时传播对应领域或依赖异常。
         """
         ...
-
 
 
 class _WorkerPort(Protocol):
@@ -294,7 +288,6 @@ class _WorkerPort(Protocol):
         """
         ...
 
-
     def run_once(self) -> bool:
         """定义 run_once 端口操作。
 
@@ -304,7 +297,6 @@ class _WorkerPort(Protocol):
         """
         ...
 
-
     def run_forever(self) -> None:
         """定义 run_forever 端口操作。
 
@@ -313,7 +305,6 @@ class _WorkerPort(Protocol):
         异常：实现不满足契约时传播对应领域或依赖异常。
         """
         ...
-
 
     def request_shutdown(self) -> None:
         """定义 request_shutdown 端口操作。
@@ -325,16 +316,15 @@ class _WorkerPort(Protocol):
         ...
 
 
-
 class LocalTaskCommands:
     """表示命令行流程中的``local``任务``commands``及其业务不变量。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def __init__(self, queue: _TaskQueuePort) -> None:
@@ -351,12 +341,12 @@ class LocalTaskCommands:
     ) -> Mapping[str, object]:
         """列出符合条件的记录。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         parsed_status: TaskStatus | None = None
         if status is not None:
@@ -396,14 +386,14 @@ class LocalTaskCommands:
     def cancel(self, task_id: str) -> Mapping[str, object]:
         """请求取消目标任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
-        self._queue.request_cancel(task_id, "cli", strict=True)
+        self._queue.request_cancel(task_id, actor="cli")
         record = self._queue.get(task_id)
         return {
             "task_id": record.id,
@@ -413,85 +403,172 @@ class LocalTaskCommands:
     def retry(self, task_id: str) -> Mapping[str, object]:
         """重新提交可重试任务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         original = self._queue.get(task_id)
-        new_experiment_id, new_task_id = self._queue.clone_for_retry(
-            original.id,
-            actor="cli",
-        )
+        new_task_id = self._queue.retry(original.id, actor="cli")
         return {
             "task_id": original.id,
-            "experiment_id": original.experiment_id,
             "new_task_id": new_task_id,
-            "new_experiment_id": new_experiment_id,
         }
 
 
 class LocalExperimentCommands:
-    """表示命令行流程中的``local``实验``commands``及其业务不变量。
+    """从受信配置目录调用统一实验应用服务。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        service：实验应用服务；config_root：允许读取 YAML 的配置根目录。
+    返回值：
+        创建不接受任意文件路径的本地实验命令适配器。
+    异常：
+        构造不读取文件；命令执行时的路径和领域错误由各方法说明。
     """
 
-    def __init__(self, client: ExperimentClient) -> None:
-        if not isinstance(client, ExperimentClient):
-            raise TypeError("client must be an ExperimentClient")
-        self._client = client
+    def __init__(self, service: ExperimentService, config_root: Path) -> None:
+        self._service = service
+        self._config_root = config_root.resolve()
 
-    def submit(self, config: str) -> Mapping[str, object]:
-        """提交并登记约定任务。
+    def validate(self, config: str) -> Mapping[str, object]:
+        """校验实验定义并返回规范化配置。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            config：受信配置根内的 YAML 文件名。
+        返回值：
+            返回规范化定义和确定性配置哈希。
+        异常：
+            ValueError：路径越界、文件不存在或严格 Schema 校验失败时抛出。
         """
-        experiment, task = self._client.create_and_submit_from_yaml(
-            config,
-            actor="cli",
-        )
+        resolved = self._service.validate_experiment(self._read(config))
         return {
-            "experiment_id": experiment.id,
-            "experiment_status": experiment.status.value,
-            "task_id": task.id,
-            "task_status": task.status.value,
+            "definition": resolved.definition.model_dump(mode="json"),
+            "config_hash": resolved.config_hash,
         }
 
-    def show(self, experiment_id: str) -> Mapping[str, object]:
-        """读取并展示命令行。
+    def submit(self, config: str) -> Mapping[str, object]:
+        """创建实验及首个已入队 Run。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            config：受信实验 YAML 文件名。
+        返回值：
+            返回新实验、首个 Run 和标签。
+        异常：
+            ValueError：配置非法时抛出；持久化失败时事务回滚并传播异常。
         """
-        return _CliSupport._experiment_inspection(self._client.inspect(experiment_id))
+        return self._aggregate(self._service.submit(self._read(config), actor="cli"))
+
+    def show(self, experiment_id: str) -> Mapping[str, object]:
+        """读取实验定义及其全部 Run。
+
+        入参：
+            experiment_id：实验标识。
+        返回值：
+            返回实验、全部 Run 和标签的 JSON 映射。
+        异常：
+            KeyError：实验不存在时抛出。
+        """
+        return self._aggregate(self._service.show(experiment_id))
+
+    def run(self, experiment_id: str, config: str) -> Mapping[str, object]:
+        """在指定实验下创建一个显式 Run。
+
+        入参：
+            experiment_id：实验标识；config：受信 Run YAML 文件名。
+        返回值：
+            返回加入新 Run 后的实验聚合。
+        异常：
+            KeyError：实验不存在时抛出；ValueError：Run 配置违反协议时抛出。
+        """
+        return self._aggregate(
+            self._service.add_run(experiment_id, self._read(config), actor="cli")
+        )
+
+    def rerun(self, run_id: str) -> Mapping[str, object]:
+        """从指定 Run 的冻结配置创建新 Run。
+
+        入参：
+            run_id：源 Run 标识。
+        返回值：
+            返回包含新 Run 的实验聚合。
+        异常：
+            KeyError：源 Run 不存在时抛出。
+        """
+        return self._aggregate(self._service.rerun(run_id, actor="cli"))
+
+    def list(self) -> Mapping[str, object]:
+        """列出最近创建的实验。
+
+        入参：
+            无。
+        返回值：
+            返回最近实验的 JSON 列表。
+        异常：
+            实验存储读取失败时传播持久化异常。
+        """
+        return {
+            "experiments": [
+                item.model_dump(mode="json") for item in self._service.list()
+            ]
+        }
+
+    def _read(self, value: str) -> str:
+        candidate = Path(value).resolve()
+        if not candidate.is_relative_to(self._config_root) or not candidate.is_file():
+            raise ValueError("experiment config must be a file inside configs")
+        return candidate.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _aggregate(value: Any) -> Mapping[str, object]:
+        experiment = value.experiment
+        runs = value.runs
+        tags = value.tags
+        return {
+            "experiment": experiment.model_dump(mode="json"),
+            "runs": [item.model_dump(mode="json") for item in runs],
+            "tags": list(tags),
+        }
+
+
+class LocalStrategyCommands:
+    """列出组合根登记的策略标识。
+
+    入参：
+        strategy_ids：已完成唯一性校验的策略标识元组。
+    返回值：
+        创建只读策略目录命令适配器。
+    异常：
+        构造过程不访问外部依赖。
+    """
+
+    def __init__(self, strategy_ids: tuple[str, ...]) -> None:
+        self._strategy_ids = strategy_ids
+
+    def list(self) -> Mapping[str, object]:
+        """返回稳定排序的策略目录。
+
+        入参：
+            无。
+        返回值：
+            返回带 strategies 数组的 JSON 映射。
+        异常：
+            该只读操作不主动抛出异常。
+        """
+        return {"strategies": list(self._strategy_ids)}
 
 
 class LocalWorkerCommands:
     """表示命令行流程中的``local``Worker``commands``及其业务不变量。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def __init__(
@@ -508,12 +585,12 @@ class LocalWorkerCommands:
     def once(self) -> Mapping[str, object]:
         """处理命令行中的``once``。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         if not self._worker.run_once():
             return {"worked": False}
@@ -532,12 +609,12 @@ class LocalWorkerCommands:
     def run(self) -> Mapping[str, object]:
         """执行完整处理流程。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         restorers: list[Callable[[], None]] = []
 
@@ -584,31 +661,31 @@ class LocalWorkerCommands:
 class ApplicationServices:
     """集中持有 CLI 使用的数据、任务、实验和 Worker 服务及关闭回调。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     pipeline: DataPipeline
     task_commands: TaskCommands | None = None
     experiment_commands: ExperimentCommands | None = None
+    strategy_commands: StrategyCommands | None = None
     worker_commands: WorkerCommands | None = None
-    research_commands: ResearchCommands | None = None
     close_callback: Callable[[], None] | None = field(default=None, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     def close(self) -> None:
         """关闭并释放持有的资源。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         if self._closed:
             return
@@ -622,25 +699,25 @@ def create_app(
 ) -> typer.Typer:
     """创建并返回约定对象；该函数作为稳定公开 API保留在模块级。
 
-该函数作为模块级确定性辅助或框架入口保留。
+    该函数作为模块级确定性辅助或框架入口保留。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
     application = typer.Typer(no_args_is_help=True)
     data = typer.Typer(no_args_is_help=True)
     tasks = typer.Typer(no_args_is_help=True)
-    research = typer.Typer(no_args_is_help=True)
-    components = typer.Typer(no_args_is_help=True)
+    experiments = typer.Typer(no_args_is_help=True)
+    strategies = typer.Typer(no_args_is_help=True)
     worker = typer.Typer(no_args_is_help=True)
     application.add_typer(data, name="data")
     application.add_typer(tasks, name="tasks")
-    application.add_typer(research, name="research")
-    application.add_typer(components, name="components")
+    application.add_typer(experiments, name="experiments")
+    application.add_typer(strategies, name="strategies")
     application.add_typer(worker, name="worker")
 
     @application.command("dashboard")
@@ -657,15 +734,17 @@ def create_app(
         )
 
     from quant_research.cli.data import _DataCommands
-    from quant_research.cli.research import _ResearchCommands
+    from quant_research.cli.experiments import _ExperimentCommands
     from quant_research.cli.runtime import _RuntimeCommands
+    from quant_research.cli.strategies import _StrategyCommands
     from quant_research.cli.tasks import _TaskCommands
     from quant_research.cli.worker import _WorkerCommands
 
     _RuntimeCommands.register(application)
     _DataCommands.register(data, services_factory)
     _TaskCommands.register(tasks, services_factory)
-    _ResearchCommands.register(research, components, services_factory)
+    _ExperimentCommands.register(experiments, services_factory)
+    _StrategyCommands.register(strategies, services_factory)
     _WorkerCommands.register(worker, services_factory)
     return application
 
@@ -688,10 +767,10 @@ class _CliSupport:
         return commands
 
     @staticmethod
-    def _research_commands(services: ApplicationServices) -> ResearchCommands:
-        commands = services.research_commands
+    def _strategy_commands(services: ApplicationServices) -> StrategyCommands:
+        commands = services.strategy_commands
         if commands is None:
-            _CliSupport._raise_service_unavailable("research")
+            _CliSupport._raise_service_unavailable("strategies")
         return commands
 
     @staticmethod
@@ -786,46 +865,6 @@ class _CliSupport:
         return {
             "code": error.get("code"),
             "retryable": error.get("retryable"),
-        }
-
-    @staticmethod
-    def _experiment_inspection(value: ExperimentInspection) -> Mapping[str, object]:
-        summary = value.summary
-        task = value.task
-        return {
-            "experiment": {
-                "experiment_id": summary.id,
-                "status": summary.status.value,
-                "strategy_id": summary.strategy_id,
-                "data_hash": summary.data_hash,
-                "config_hash": summary.config_hash,
-                "fingerprint": summary.fingerprint,
-            },
-            "task": _CliSupport._task_summary(task) if task is not None else None,
-            "attempts": [
-                _CliSupport._attempt_summary(attempt) for attempt in value.attempts
-            ],
-            "last_progress": dict(task.progress) if task is not None else None,
-            "error": _CliSupport._error_summary(task.error)
-            if task is not None
-            else None,
-            "result": {
-                "metrics": [
-                    {"name": metric.name, "value": metric.value, "unit": metric.unit}
-                    for metric in summary.metrics
-                ],
-                "artifacts": [
-                    {
-                        "name": artifact.name,
-                        "artifact_type": artifact.artifact_type,
-                        "content_hash": artifact.content_hash,
-                        "schema": artifact.metadata.get("schema"),
-                        "row_count": artifact.metadata.get("row_count"),
-                        "size_bytes": artifact.metadata.get("size_bytes"),
-                    }
-                    for artifact in summary.artifacts
-                ],
-            },
         }
 
     @staticmethod
@@ -1040,14 +1079,14 @@ class _CliSupport:
 def run(application: typer.Typer) -> int:
     """执行命令行；该函数作为稳定公开 API 或框架入口保留在模块级。
 
-该函数作为模块级确定性辅助或框架入口保留。
+    该函数作为模块级确定性辅助或框架入口保留。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
     command = typer.main.get_command(application)
     try:

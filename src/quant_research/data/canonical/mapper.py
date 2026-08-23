@@ -97,4 +97,3 @@ class CanonicalMapper(Protocol):
         异常：
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
-

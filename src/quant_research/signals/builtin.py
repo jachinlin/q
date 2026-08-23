@@ -25,12 +25,12 @@ from quant_research.signals.models import (
 class CrossSectionalMultifactorSignal:
     """把已完成 PIT 校验的长表因子转换为横截面综合分。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def __init__(self, signal_id: str, weights: Mapping[str, float]) -> None:
@@ -42,7 +42,9 @@ class CrossSectionalMultifactorSignal:
         if total <= 0.0:
             raise ValueError("factor weights must contain non-zero exposure")
         self._signal_id = signal_id
-        self._weights = dict(sorted((key, value / total) for key, value in weights.items()))
+        self._weights = dict(
+            sorted((key, value / total) for key, value in weights.items())
+        )
 
     def compute(
         self,
@@ -52,14 +54,21 @@ class CrossSectionalMultifactorSignal:
     ) -> CrossSectionalScoreArtifact:
         """按决策日标准化因子并生成稳定横截面评分。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
-        required = {"signal_date", "instrument_id", "factor_id", "value", "available_at", "is_valid"}
+        required = {
+            "signal_date",
+            "instrument_id",
+            "factor_id",
+            "value",
+            "available_at",
+            "is_valid",
+        }
         if not required.issubset(factors.columns):
             raise ValueError("factor frame lacks required signal columns")
         filtered = factors.filter(
@@ -94,14 +103,20 @@ class CrossSectionalMultifactorSignal:
         for row in scores.iter_rows(named=True):
             complete = cast(int, row["valid_count"]) == cast(int, row["required_count"])
             raw_score = row["score"]
-            score = float(cast(float, raw_score)) if complete and raw_score is not None else None
+            score = (
+                float(cast(float, raw_score))
+                if complete and raw_score is not None
+                else None
+            )
             rows.append(
                 CrossSectionalScoreRow(
                     signal_date=cast(date, row["signal_date"]),
                     instrument_id=cast(str, row["instrument_id"]),
                     signal_id=self._signal_id,
                     score=score,
-                    confidence=1.0 if complete else cast(int, row["valid_count"]) / len(self._weights),
+                    confidence=1.0
+                    if complete
+                    else cast(int, row["valid_count"]) / len(self._weights),
                     available_at=cast(datetime, row["available_at"]),
                     is_valid=complete,
                     invalid_reason=None if complete else "INCOMPLETE_FACTOR_SET",
@@ -113,15 +128,17 @@ class CrossSectionalMultifactorSignal:
 class DualMovingAverageSignal:
     """从前复权收盘价批量生成 LONG/FLAT 双均线信号。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
-    def __init__(self, *, short_window: int, long_window: int, signal_id: str = "dual_ma") -> None:
+    def __init__(
+        self, *, short_window: int, long_window: int, signal_id: str = "dual_ma"
+    ) -> None:
         if type(short_window) is not int or type(long_window) is not int:
             raise TypeError("moving-average windows must be integers")
         if short_window <= 0 or long_window <= short_window:
@@ -138,12 +155,12 @@ class DualMovingAverageSignal:
     ) -> DirectionalSignalArtifact:
         """使用完整窗口计算信号，并显式保留窗口不足样本。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         required = {"trade_date", "instrument_id", "close", "available_at"}
         if not required.issubset(adjusted_bars.columns):
@@ -151,18 +168,34 @@ class DualMovingAverageSignal:
         frame = (
             adjusted_bars.sort("instrument_id", "trade_date")
             .with_columns(
-                pl.col("close").rolling_mean(self._short, min_samples=self._short).over("instrument_id").alias("short_ma"),
-                pl.col("close").rolling_mean(self._long, min_samples=self._long).over("instrument_id").alias("long_ma"),
+                pl.col("close")
+                .rolling_mean(self._short, min_samples=self._short)
+                .over("instrument_id")
+                .alias("short_ma"),
+                pl.col("close")
+                .rolling_mean(self._long, min_samples=self._long)
+                .over("instrument_id")
+                .alias("long_ma"),
             )
             .with_columns((pl.col("short_ma") > pl.col("long_ma")).alias("is_long"))
-            .with_columns((pl.col("is_long") != pl.col("is_long").shift(1).over("instrument_id")).fill_null(False).alias("state_changed"))
+            .with_columns(
+                (pl.col("is_long") != pl.col("is_long").shift(1).over("instrument_id"))
+                .fill_null(False)
+                .alias("state_changed")
+            )
             .filter(pl.col("trade_date").is_in(tuple(sorted(set(decision_dates)))))
             .sort("trade_date", "instrument_id")
         )
         rows: list[DirectionalSignalRow] = []
         for row in frame.iter_rows(named=True):
             valid = row["short_ma"] is not None and row["long_ma"] is not None
-            direction = Direction.LONG if valid and row["is_long"] is True else Direction.FLAT if valid else None
+            direction = (
+                Direction.LONG
+                if valid and row["is_long"] is True
+                else Direction.FLAT
+                if valid
+                else None
+            )
             rows.append(
                 DirectionalSignalRow(
                     signal_date=cast(date, row["trade_date"]),
@@ -182,12 +215,12 @@ class DualMovingAverageSignal:
 class EtfRotationAllocationSignal:
     """按多窗口收益、趋势和波动率生成 ETF 目标暴露。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
     def __init__(
@@ -223,37 +256,63 @@ class EtfRotationAllocationSignal:
     ) -> AllocationSignalArtifact:
         """计算排名，趋势不合格或窗口不足的 ETF 暴露为零或无效。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+        入参：
+            参数和字段含义由公开签名及类型声明给出。
+        返回值：
+            返回该操作构造、计算或查询得到的领域结果。
+        异常：
+            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         frame = adjusted_bars.sort("instrument_id", "trade_date")
         expressions: list[pl.Expr] = []
         for window in self._weights:
             expressions.append(
-                (pl.col("close") / pl.col("close").shift(window).over("instrument_id") - 1.0).alias(f"return_{window}")
+                (
+                    pl.col("close")
+                    / pl.col("close").shift(window).over("instrument_id")
+                    - 1.0
+                ).alias(f"return_{window}")
             )
         frame = frame.with_columns(
             *expressions,
-            (pl.col("close") / pl.col("close").shift(self._trend).over("instrument_id") - 1.0).alias("trend"),
-            pl.col("close").log().diff().over("instrument_id").rolling_std(self._volatility, min_samples=self._volatility).over("instrument_id").alias("volatility"),
+            (
+                pl.col("close")
+                / pl.col("close").shift(self._trend).over("instrument_id")
+                - 1.0
+            ).alias("trend"),
+            pl.col("close")
+            .log()
+            .diff()
+            .over("instrument_id")
+            .rolling_std(self._volatility, min_samples=self._volatility)
+            .over("instrument_id")
+            .alias("volatility"),
         ).filter(pl.col("trade_date").is_in(tuple(sorted(set(decision_dates)))))
         rows: list[AllocationSignalRow] = []
         for signal_date in sorted(set(decision_dates)):
-            day = frame.filter(pl.col("trade_date") == signal_date).sort("instrument_id")
+            day = frame.filter(pl.col("trade_date") == signal_date).sort(
+                "instrument_id"
+            )
             scored: list[tuple[str, float, datetime]] = []
             invalid: list[tuple[str, datetime]] = []
             for row in day.iter_rows(named=True):
                 values = [row[f"return_{window}"] for window in self._weights]
                 available = cast(datetime, row["available_at"])
                 instrument = cast(str, row["instrument_id"])
-                if any(value is None or not isfinite(cast(float, value)) for value in values) or row["trend"] is None or row["volatility"] is None:
+                if (
+                    any(
+                        value is None or not isfinite(cast(float, value))
+                        for value in values
+                    )
+                    or row["trend"] is None
+                    or row["volatility"] is None
+                ):
                     invalid.append((instrument, available))
                     continue
-                score = sum(self._weights[window] * cast(float, row[f"return_{window}"]) for window in self._weights) - self._penalty * cast(float, row["volatility"])
+                score = sum(
+                    self._weights[window] * cast(float, row[f"return_{window}"])
+                    for window in self._weights
+                ) - self._penalty * cast(float, row["volatility"])
                 if cast(float, row["trend"]) > 0.0:
                     scored.append((instrument, score, available))
                 else:
@@ -266,9 +325,29 @@ class EtfRotationAllocationSignal:
             winners = {item[0] for item in ranked}
             weight = 1.0 / len(winners) if winners else 0.0
             for instrument, _, available in scored:
-                rows.append(AllocationSignalRow(signal_date, instrument, self._signal_id, weight if instrument in winners else 0.0, available, True, None))
+                rows.append(
+                    AllocationSignalRow(
+                        signal_date,
+                        instrument,
+                        self._signal_id,
+                        weight if instrument in winners else 0.0,
+                        available,
+                        True,
+                        None,
+                    )
+                )
             for instrument, available in invalid:
-                rows.append(AllocationSignalRow(signal_date, instrument, self._signal_id, None, available, False, "INSUFFICIENT_ROTATION_WINDOW"))
+                rows.append(
+                    AllocationSignalRow(
+                        signal_date,
+                        instrument,
+                        self._signal_id,
+                        None,
+                        available,
+                        False,
+                        "INSUFFICIENT_ROTATION_WINDOW",
+                    )
+                )
         rows.sort(key=lambda row: (row.signal_date, row.instrument_id, row.signal_id))
         return AllocationSignalArtifact(identity, tuple(rows))
 
@@ -276,14 +355,14 @@ class EtfRotationAllocationSignal:
 def signal_component_hash(component_id: str, config: Mapping[str, object]) -> str:
     """根据组件 ID 和规范配置生成独立组件哈希。
 
-该函数作为模块级确定性辅助或框架入口保留。
+    该函数作为模块级确定性辅助或框架入口保留。
 
-入参：
-    参数和字段含义由公开签名及类型声明给出。
-返回值：
-    返回该操作构造、计算或查询得到的领域结果。
-异常：
-    输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
+    入参：
+        参数和字段含义由公开签名及类型声明给出。
+    返回值：
+        返回该操作构造、计算或查询得到的领域结果。
+    异常：
+        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
     payload = repr((component_id, tuple(sorted(config.items())))).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()

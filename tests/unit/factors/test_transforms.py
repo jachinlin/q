@@ -188,7 +188,9 @@ def test_industry_neutralization_uses_equal_weight_group_means() -> None:
     assert result["is_valid"].to_list() == [True] * 6
 
 
-def test_industry_neutralization_preserves_upstream_invalidity_and_rejects_singletons() -> None:
+def test_industry_neutralization_preserves_upstream_invalidity_and_rejects_singletons() -> (
+    None
+):
     source = _frame(
         day=[1] * 7,
         industry=["A", "A", "B", "B", "C", None, "D"],

@@ -154,9 +154,7 @@ class AvgAmount20dFactor:
             .over("instrument_id")
         )
         latest_availability = (
-            pl.col("available_at")
-            .rolling_max(20, min_samples=20)
-            .over("instrument_id")
+            pl.col("available_at").rolling_max(20, min_samples=20).over("instrument_id")
         )
         return (
             frame.lazy()
