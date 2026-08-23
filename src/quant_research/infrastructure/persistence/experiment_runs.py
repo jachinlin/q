@@ -498,7 +498,7 @@ class ExperimentRunRegistry:
             self._audit(
                 session,
                 run_id,
-                row.task_id,
+                task.id if task is not None else None,
                 "RUN_DELETED",
                 actor,
                 {"experiment_id": row.experiment_id, "status": row.status},

@@ -179,3 +179,34 @@ def test_delete_experiment_requires_all_runs_terminal_and_cascades_aggregate(
         assert deleted.subject_kind == "EXPERIMENT"
         assert deleted.subject_id == experiment_id
     engine.dispose()
+
+
+def test_delete_terminal_run_accepts_a_previously_deleted_task(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    registry = ExperimentRunRegistry(engine)
+    definition = ExperimentConfigParser().parse_experiment(experiment_yaml()).definition
+    experiment_id, run_id, task_id = registry.create(
+        definition, "a" * 64, actor="test"
+    )
+    queue = TaskQueue(engine, task_log_root=tmp_path / "logs")
+    queue.request_cancel(task_id, actor="test")
+    registry.transition(
+        run_id,
+        RunStatus.QUEUED,
+        RunStatus.CANCELLED,
+        stage=RunStage.VALIDATE,
+    )
+    queue.delete(task_id, actor="test")
+
+    registry.delete_run(run_id, actor="test")
+
+    assert registry.get_experiment(experiment_id).runs == ()
+    with Session(engine) as session:
+        deleted = session.query(AuditEventORM).filter_by(event_type="RUN_DELETED").one()
+        assert deleted.run_id == run_id
+        assert deleted.task_id is None
+    engine.dispose()
