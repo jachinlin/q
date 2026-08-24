@@ -1,4 +1,4 @@
-"""提供统一实验创建、派生 Run、重跑、标记和查询用例。"""
+"""提供策略实验创建、派生 Run、重跑、标记和查询用例。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from quant_research.experiments.models import (
     ExperimentDefinition,
     ExperimentRecord,
     ResearchMark,
-    RunConfig,
     RunRecord,
     StrategyBacktestRunConfig,
 )
@@ -96,7 +95,7 @@ class ExperimentRegistry(Protocol):
     def add_run(
         self,
         experiment_id: str,
-        config: RunConfig,
+        config: StrategyBacktestRunConfig,
         catalog_hash: str,
         *,
         actor: str,
@@ -344,9 +343,7 @@ class ExperimentService:
             raise ValueError("validated catalog_hash must be a SHA-256 digest")
         return value
 
-    def _validate_strategy(self, config: RunConfig) -> None:
-        if not isinstance(config, StrategyBacktestRunConfig):
-            return
+    def _validate_strategy(self, config: StrategyBacktestRunConfig) -> None:
         strategy = config.strategy
         self._strategies.validate(
             strategy.strategy_id,

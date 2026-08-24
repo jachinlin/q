@@ -9,12 +9,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Never, Protocol
+from typing import Any, Never, Protocol, cast
 
 import typer
 from typer import _click
 
 from quant_research.application.experiments import ExperimentService
+from quant_research.application.factor_studies import FactorStudyService
 from quant_research.application.worker import WorkerRunResult
 from quant_research.data.pipeline.dataset import DatasetCurateResult, LocalizeResult
 from quant_research.data.pipeline.publish import DataPipeline, PipelineResult
@@ -73,86 +74,50 @@ class TaskCommands(Protocol):
 
 
 class ExperimentCommands(Protocol):
-    """定义实验命令组需要的应用服务端口。
-
-    入参：
-        实现方接收受信配置文件名、Experiment 标识或 Run 标识。
-    返回值：
-        实现方返回可安全 JSON 序列化的实验、Run 或校验结果。
-    异常：
-        配置非法、对象不存在或持久化失败时由实现方给出受控异常。
-    """
+    """定义策略命令端口。入参：实现实例。返回值：命令端口。异常：实现不满足协议时类型检查失败。"""
 
     def validate(self, config: str) -> object:
-        """校验实验 YAML，且不创建持久化记录。
-
-        入参：
-            config：位于受信配置根内的 YAML 文件名。
-        返回值：
-            返回规范化实验定义和配置哈希。
-        异常：
-            ValueError：路径不受信或 YAML 不符合严格 Schema 时抛出。
-        """
+        """校验策略配置。入参：受信配置路径。返回值：规范结果。异常：配置非法时抛出。"""
         ...
 
     def submit(self, config: str) -> object:
-        """提交并登记约定任务。
-
-        入参：
-            参数和字段含义由公开签名及类型声明给出。
-        返回值：
-            返回该操作构造、计算或查询得到的领域结果。
-        异常：
-            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
-        """
+        """提交策略实验。入参：受信配置路径。返回值：创建结果。异常：门禁或事务失败时抛出。"""
         ...
 
     def show(self, experiment_id: str) -> object:
-        """读取旧实验详情；仅供待移除实现内部完成切换。
-
-        入参：
-            参数和字段含义由公开签名及类型声明给出。
-        返回值：
-            返回该操作构造、计算或查询得到的领域结果。
-        异常：
-            输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
-        """
+        """读取策略实验。入参：实验 ID。返回值：实验聚合。异常：实验不存在时抛出。"""
         ...
 
     def run(self, experiment_id: str, config: str) -> object:
-        """在实验下创建一个显式 Run。
-
-        入参：
-            experiment_id：实验标识；config：受信 Run YAML 文件名。
-        返回值：
-            返回包含新 Run 的实验聚合。
-        异常：
-            KeyError：实验不存在时抛出；ValueError：配置不符合协议时抛出。
-        """
+        """创建策略运行。入参：实验 ID 和配置路径。返回值：运行结果。异常：配置或实验非法时抛出。"""
         ...
 
     def rerun(self, run_id: str) -> object:
-        """复制冻结配置并创建新 Run。
-
-        入参：
-            run_id：源 Run 标识。
-        返回值：
-            返回包含新 Run 的实验聚合。
-        异常：
-            KeyError：源 Run 不存在时抛出。
-        """
+        """重跑策略。入参：运行 ID。返回值：新运行结果。异常：运行不可重跑时抛出。"""
         ...
 
     def list(self) -> object:
-        """列出最近创建的实验。
+        """列出策略实验。入参：无。返回值：有序聚合。异常：仓储不可用时抛出。"""
+        ...
 
-        入参：
-            无。
-        返回值：
-            返回稳定排序的实验摘要。
-        异常：
-            实验存储不可读时传播受控持久化异常。
-        """
+
+class FactorStudyCommands(Protocol):
+    """定义研究命令端口。入参：实现实例。返回值：命令端口。异常：实现不满足协议时类型检查失败。"""
+
+    def validate(self, config: str) -> object:
+        """校验研究配置。入参：受信配置路径。返回值：规范结果。异常：配置非法时抛出。"""
+        ...
+
+    def submit(self, config: str) -> object:
+        """提交研究。入参：受信配置路径。返回值：研究快照。异常：门禁或事务失败时抛出。"""
+        ...
+
+    def show(self, study_id: str) -> object:
+        """读取研究。入参：研究 ID。返回值：研究快照。异常：研究不存在时抛出。"""
+        ...
+
+    def list(self) -> object:
+        """列出研究。入参：无。返回值：有序快照。异常：仓储不可用时抛出。"""
         ...
 
 
@@ -327,10 +292,15 @@ class LocalTaskCommands:
         输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
     """
 
-    def __init__(self, queue: _TaskQueuePort) -> None:
+    def __init__(
+        self,
+        queue: _TaskQueuePort,
+        factor_studies: FactorStudyService | None = None,
+    ) -> None:
         if queue is None:
             raise TypeError("queue must be supplied")
         self._queue = queue
+        self._factor_studies = factor_studies
 
     def list(
         self,
@@ -411,7 +381,15 @@ class LocalTaskCommands:
             输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
         """
         original = self._queue.get(task_id)
-        new_task_id = self._queue.retry(original.id, actor="cli")
+        if original.subject_kind == "FACTOR_STUDY":
+            if self._factor_studies is None:
+                raise ValueError("factor study retry service is not configured")
+            if original.subject_id is None:
+                raise ValueError("factor study task has no subject identity")
+            self._factor_studies.retry(original.subject_id, actor="cli")
+            new_task_id = original.id
+        else:
+            new_task_id = self._queue.retry(original.id, actor="cli")
         return {
             "task_id": original.id,
             "new_task_id": new_task_id,
@@ -531,6 +509,52 @@ class LocalExperimentCommands:
             "runs": [item.model_dump(mode="json") for item in runs],
             "tags": list(tags),
         }
+
+
+class LocalFactorStudyCommands:
+    """实现研究命令。入参：研究服务和配置根。返回值：本机命令实例。异常：依赖或路径非法时抛出。"""
+
+    def __init__(self, service: FactorStudyService, config_root: Path) -> None:
+        self._service = service
+        self._config_root = config_root.resolve()
+
+    def validate(self, config: str) -> Mapping[str, object]:
+        """校验研究配置。入参：配置路径。返回值：规范定义和哈希。异常：路径或配置非法时抛出。"""
+        resolved = self._service.validate(self._read(config))
+        return {
+            "definition": resolved.definition.model_dump(mode="json"),
+            "config_hash": resolved.config_hash,
+        }
+
+    def submit(self, config: str) -> Mapping[str, object]:
+        """提交研究。入参：配置路径。返回值：已排队快照。异常：路径、门禁或事务非法时抛出。"""
+        return cast(
+            Mapping[str, object],
+            self._service.submit(self._read(config), actor="cli").model_dump(
+                mode="json"
+            ),
+        )
+
+    def show(self, study_id: str) -> Mapping[str, object]:
+        """读取研究。入参：研究 ID。返回值：完整快照。异常：研究不存在时抛出。"""
+        return cast(
+            Mapping[str, object],
+            self._service.show(study_id).model_dump(mode="json"),
+        )
+
+    def list(self) -> Mapping[str, object]:
+        """列出研究。入参：无。返回值：有序快照。异常：仓储不可用时抛出。"""
+        return {
+            "factor_studies": [
+                item.model_dump(mode="json") for item in self._service.list()
+            ]
+        }
+
+    def _read(self, value: str) -> str:
+        candidate = Path(value).resolve()
+        if not candidate.is_relative_to(self._config_root) or not candidate.is_file():
+            raise ValueError("factor study config must be a file inside configs")
+        return candidate.read_text(encoding="utf-8")
 
 
 class LocalStrategyCommands:
@@ -672,6 +696,7 @@ class ApplicationServices:
     pipeline: DataPipeline
     task_commands: TaskCommands | None = None
     experiment_commands: ExperimentCommands | None = None
+    factor_study_commands: FactorStudyCommands | None = None
     strategy_commands: StrategyCommands | None = None
     worker_commands: WorkerCommands | None = None
     close_callback: Callable[[], None] | None = field(default=None, repr=False)
@@ -712,11 +737,13 @@ def create_app(
     data = typer.Typer(no_args_is_help=True)
     tasks = typer.Typer(no_args_is_help=True)
     experiments = typer.Typer(no_args_is_help=True)
+    factor_studies = typer.Typer(no_args_is_help=True)
     strategies = typer.Typer(no_args_is_help=True)
     worker = typer.Typer(no_args_is_help=True)
     application.add_typer(data, name="data")
     application.add_typer(tasks, name="tasks")
     application.add_typer(experiments, name="experiments")
+    application.add_typer(factor_studies, name="factor-studies")
     application.add_typer(strategies, name="strategies")
     application.add_typer(worker, name="worker")
 
@@ -735,6 +762,7 @@ def create_app(
 
     from quant_research.cli.data import _DataCommands
     from quant_research.cli.experiments import _ExperimentCommands
+    from quant_research.cli.factor_studies import _FactorStudyCommands
     from quant_research.cli.runtime import _RuntimeCommands
     from quant_research.cli.strategies import _StrategyCommands
     from quant_research.cli.tasks import _TaskCommands
@@ -744,6 +772,7 @@ def create_app(
     _DataCommands.register(data, services_factory)
     _TaskCommands.register(tasks, services_factory)
     _ExperimentCommands.register(experiments, services_factory)
+    _FactorStudyCommands.register(factor_studies, services_factory)
     _StrategyCommands.register(strategies, services_factory)
     _WorkerCommands.register(worker, services_factory)
     return application
@@ -771,6 +800,15 @@ class _CliSupport:
         commands = services.strategy_commands
         if commands is None:
             _CliSupport._raise_service_unavailable("strategies")
+        return commands
+
+    @staticmethod
+    def _factor_study_commands(
+        services: ApplicationServices,
+    ) -> FactorStudyCommands:
+        commands = services.factor_study_commands
+        if commands is None:
+            _CliSupport._raise_service_unavailable("factor-studies")
         return commands
 
     @staticmethod

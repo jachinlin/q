@@ -11,8 +11,9 @@ const nav = [
   ['/market', '市场全景', '02'],
   ['/data', '数据中心', '03'],
   ['/experiments', '实验中心', '04'],
-  ['/tasks', '运行中心', '05'],
-  ['/notebook', 'Notebook', '06'],
+  ['/factor-studies', '因子研究', '05'],
+  ['/tasks', '运行中心', '06'],
+  ['/notebook', 'Notebook', '07'],
 ]
 </script>
 

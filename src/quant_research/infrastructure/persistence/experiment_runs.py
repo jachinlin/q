@@ -1,4 +1,4 @@
-"""实现统一 Experiment → Run 聚合的 SQLite 登记簿。"""
+"""实现纯策略 Experiment → Run 聚合的 SQLite 登记簿。"""
 
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ from quant_research.experiments.models import (
     ExperimentRecord,
     ResearchMark,
     RunArtifactRecord,
-    RunConfig,
     RunMetricRecord,
     RunRecord,
     RunStage,
     RunStatus,
+    StrategyBacktestRunConfig,
 )
 from quant_research.infrastructure.persistence.orm import (
     AuditEventORM,
@@ -93,7 +93,6 @@ class ExperimentRunRegistry:
                     id=experiment_id,
                     name=definition.name,
                     description=definition.description,
-                    kind=definition.kind.value,
                     definition_json=definition_json,
                     definition_hash=self._hash(definition_json),
                     baseline_run_id=None,
@@ -127,7 +126,7 @@ class ExperimentRunRegistry:
     def add_run(
         self,
         experiment_id: str,
-        config: RunConfig,
+        config: StrategyBacktestRunConfig,
         catalog_hash: str,
         *,
         tags: tuple[str, ...] = (),
@@ -587,7 +586,7 @@ class ExperimentRunRegistry:
         run_id: str,
         task_id: str,
         definition: ExperimentDefinition,
-        config: RunConfig,
+        config: StrategyBacktestRunConfig,
         catalog_hash: str,
         instant: datetime,
     ) -> None:
@@ -674,11 +673,7 @@ class ExperimentRunRegistry:
 
     @staticmethod
     def _run(session: Session, row: RunORM) -> RunRecord:
-        from pydantic import TypeAdapter
-
-        from quant_research.experiments.models import RunConfig as RunConfigType
-
-        parsed: RunConfig = TypeAdapter(RunConfigType).validate_json(row.config_json)
+        parsed = StrategyBacktestRunConfig.model_validate_json(row.config_json)
         tags = tuple(
             session.scalars(
                 select(RunTagORM.tag)

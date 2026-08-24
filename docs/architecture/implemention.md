@@ -740,11 +740,11 @@ long_short = Q 组均值 − 1 组均值；终端组空/配对不足 → 原因�
 
 ---
 
-### 2.6 因子研究产物（FACTOR_STUDY kind）
+### 2.6 独立因子研究产物
 
-产物目录（实验层写，见 experiment-layer §）：
+产物目录 `artifacts/factor-studies/<factor_study_id>/`（独立 FactorStudy 发布器写）：
 `summary / coverage / label_quality / industry_coverage / ic / quantile_returns /
-long_short_returns / monotonicity / turnover / stability / cost_scenarios / correlation`。
+long_short_returns / monotonicity / turnover / cost_scenarios / correlation`。
 收益相关表的主键包含 `signal_variant, label_kind, factor_ref, horizon`；日度表再包含 `signal_date`。
 
 `signal_variant`：`DIRECTION_ADJUSTED`（固定发布）、`INDUSTRY_NEUTRALIZED`（配置 `industry` 时发布）。
@@ -1396,7 +1396,8 @@ params: {}                               # 插件策略在此放自身参数
 
 ### 5.1 职责
 
-实验层编排"一次策略回测或因子研究"：装配管线 → 分阶段执行 → 运行内一致性守卫 → 落盘 → 追踪与比较。
+实验层只编排策略回测：装配管线 → 分阶段执行 → 运行内一致性守卫 → 落盘 → 追踪与比较。
+因子研究由独立 `FactorStudy` 应用用例和任务处理器编排。
 **不做跨运行数据回放**（无历史 catalog、无 source/env 指纹和 run_identity），但每个 Run 的冻结配置与
 产物不可覆盖；可信 Manifest 逐文件记录并复核 SHA-256、字节数、行数、Schema、主键和排序。
 运行内一致性靠 `catalog_hash`（见 §5.5）。
@@ -1406,7 +1407,6 @@ params: {}                               # 插件策略在此放自身参数
 ### 5.2 追踪实体与状态机
 
 ```python
-class ExperimentKind(StrEnum): FACTOR_STUDY; STRATEGY_BACKTEST
 class RunStatus(StrEnum): CREATED; QUEUED; RUNNING; SUCCEEDED; FAILED; CANCELLED
 class ResearchMark(StrEnum): BASELINE; CANDIDATE; DISCARDED; NONE
 ```
@@ -1434,7 +1434,7 @@ transition(run_id, expected, target)：UPDATE ... WHERE id=? AND status=expected
 
 ```sql
 CREATE TABLE experiment (
-  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, description TEXT NOT NULL,
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
   definition_json TEXT NOT NULL, definition_hash TEXT NOT NULL,
   baseline_run_id TEXT, created_at TEXT NOT NULL);
 CREATE TABLE experiment_tag (experiment_id TEXT NOT NULL, tag TEXT NOT NULL,
@@ -1481,14 +1481,13 @@ CREATE TABLE task_attempt (
 
 ---
 
-### 5.4 阶段图与执行器（kind 无关）
+### 5.4 策略实验阶段图与执行器
 
 ```text
-STRATEGY_BACKTEST: VALIDATE → PREPARE_INPUTS → STRATEGY_RUN(交织 BACKTEST) → ANALYTICS → PERSIST
-FACTOR_STUDY:      VALIDATE → PREPARE_INPUTS(股票池+因子) → ANALYZE_FACTORS → PERSIST
+VALIDATE → UNIVERSE → FACTOR_COMPUTE → BACKTEST → ANALYTICS → ARTIFACT_VERIFY → REGISTER
 ```
 
-`StageGraph.stages(kind)` 返回阶段序列；`ExperimentRunner` 遍历，每阶段：
+`ExperimentRunner` 遍历固定阶段，每阶段：
 
 ```python
 def run_stage(stage, ctx):
@@ -1501,13 +1500,12 @@ def run_stage(stage, ctx):
 ```
 
 各阶段职责：
-- **VALIDATE**：校验配置、数据质量门开启、交易日历覆盖研究区间 + 最长未来窗口、策略/因子能力满足。
+- **VALIDATE**：校验配置、数据质量门开启、交易日历覆盖研究区间和策略能力满足。
 - **PREPARE_INPUTS**：构建 PIT 股票池；预算本次需要的因子（`FactorEngine.compute`）；装配策略/管线。
 - **STRATEGY_RUN**：`BacktestEngine.run(request, strategy, ...)`，逐日 `on_event`→撮合→账务，仅返回冻结结果与规范化内存表，不发布目录（见 backtest-engine）。
 - **ANALYTICS**：直接消费内存中的 `equity_fen/total_cost_fen` 当前 Schema，计算绩效、风险、执行质量和归因（§5.7）。
-- **ANALYZE_FACTORS**（因子研究）：双标签质量、IC/HAC、分位、单调性、毛多空、稳定性、
-  换手和日频成本代理（因子层 §5.6）。
-- **PERSIST**：统一写 staging、生成 Manifest、原子重命名、从最终目录复核并登记有限且已定义的 metrics；因子 Run 也只在此阶段发布。
+- **ARTIFACT_VERIFY / REGISTER**：写 staging、生成 Manifest、原子重命名、从最终目录复核并登记
+  有限且已定义的 metrics。
 
 失败/取消：清理 staging 临时目录，不留半成品；`FAILED` 写 error_json。
 
@@ -1537,15 +1535,19 @@ STRATEGY_BACKTEST: nav.parquet holdings.parquet fills.parquet costs.parquet
                    monthly_returns.parquet annual_returns.parquet
                    execution_summary.parquet exposure_summary.parquet attribution.parquet
                    config.json metrics.json quality_disclosure.json manifest.json
-FACTOR_STUDY:      summary.parquet coverage.parquet label_quality.parquet
-                   industry_coverage.parquet ic.parquet quantile_returns.parquet
-                   long_short_returns.parquet monotonicity.parquet turnover.parquet
-                   stability.parquet cost_scenarios.parquet correlation.parquet
-                   config.json metrics.json manifest.json
+```
+
+独立因子研究发布到 `artifacts/factor-studies/<factor_study_id>/`：
+
+```text
+summary.parquet coverage.parquet label_quality.parquet industry_coverage.parquet
+ic.parquet quantile_returns.parquet long_short_returns.parquet monotonicity.parquet
+turnover.parquet cost_scenarios.parquet correlation.parquet
+config.json metrics.json manifest.json
 ```
 
 发布：先写同文件系统 staging → 生成 Manifest → 原子 `os.replace` 到最终目录 → 从最终目录复核路径、
-SHA-256、字节数、行数、Schema、主键、排序和输入身份。`PERSIST` 成功后才
+SHA-256、字节数、行数、Schema、主键、排序和输入身份。登记成功后才
 `RUNNING→SUCCEEDED` 并写 `artifact_dir/manifest_hash`。最终目录已存在立即失败；重试创建新 Run，
 绝不接管或覆盖旧目录。
 
@@ -1626,9 +1628,8 @@ class SampleWindows:
 ### 5.11 配置 schema（实验 YAML）
 
 ```yaml
-kind: STRATEGY_BACKTEST                 # 或 FACTOR_STUDY
 name: mf_baseline_2020_2023
-strategy: {strategy_id: stock_multifactor, ...}     # 见 strategy-layer §5.7；FACTOR_STUDY 则为 factor 配置
+strategy: {strategy_id: stock_multifactor, ...}     # 见 strategy-layer §5.7
 start_date: 2020-01-02
 end_date: 2023-12-29
 benchmark: 000300.SH
@@ -1651,7 +1652,7 @@ sample_windows: {train: [2015-01-01, 2019-12-31], validation: [2020-01-01, 2021-
 - **指标 oracle**：Sharpe/Sortino/Calmar/回撤/IR/beta；首日 0 口径；undefined 记录不填 0。
 - **治理**：`uses_test_region` 正确标记；test 预算计数累加；多重检验记账。
 - **Worker**：幂等键收敛、取消协作退出、超时回收、重试建新 Run。
-- **kind 复用**：FACTOR_STUDY 与 STRATEGY_BACKTEST 共用同一 runner。
+- **边界**：`quant experiments` 拒绝因子研究配置，`quant factor-studies` 拒绝策略实验配置。
 
 ---
 
@@ -1663,7 +1664,7 @@ sample_windows: {train: [2015-01-01, 2019-12-31], validation: [2020-01-01, 2021-
 4. 产物经 staging、可信 Manifest 和最终目录复核后原子发布；`SUCCEEDED` 前落地成功。
 5. 绩效指标字面量 oracle；首日 0 收益口径明确；undefined 显式记录。
 6. 防过拟合护栏保留（test 预算 + 多重检验记账），不硬阻断。
-7. runner kind 无关；因子研究与策略回测共享同一执行器与比较视图。
+7. 因子研究与策略回测使用独立任务类型、执行器、持久化与 Dashboard。
 
 ---
 

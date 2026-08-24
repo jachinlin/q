@@ -7,6 +7,7 @@ from datetime import date, datetime
 from typing import Protocol
 
 from quant_research.application.experiments import ExperimentService
+from quant_research.application.factor_studies import FactorStudyService
 from quant_research.data.contracts import JsonValue
 from quant_research.data.pipeline.publish import DataUpdatePlan
 from quant_research.domain.enums import DatasetKind, Severity
@@ -146,10 +147,12 @@ class OperationalCommandService:
         queue: OperationalTaskQueue,
         planner: DataUpdatePlanningPort,
         experiments: ExperimentService,
+        factor_studies: FactorStudyService | None = None,
     ) -> None:
         self._queue = queue
         self._planner = planner
         self._experiments = experiments
+        self._factor_studies = factor_studies
 
     def preview_data_update(
         self,
@@ -312,6 +315,14 @@ class OperationalCommandService:
                 "experiment_id": aggregate.experiment.id,
                 "run_id": newest.id,
                 "task_id": newest.task_id,
+            }
+        if task.subject_kind == "FACTOR_STUDY" and task.subject_id is not None:
+            if self._factor_studies is None:
+                raise ValueError("factor study service is unavailable")
+            study = self._factor_studies.retry(task.subject_id, actor="dashboard")
+            return {
+                "factor_study_id": study.id,
+                "task_id": study.task_id,
             }
         if task.task_type == "DATA_UPDATE":
             try:

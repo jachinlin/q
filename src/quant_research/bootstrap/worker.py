@@ -42,16 +42,12 @@ from quant_research.data.contracts import (
     canonical_json_bytes,
 )
 from quant_research.data.repository import CanonicalResearchRepository
-from quant_research.domain.enums import Board
+from quant_research.domain.enums import Board, MultipleTestingMethod
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.experiments.models import (
-    FactorStudyRunConfig,
-    IndustryUnclassifiedPolicy,
-    MultipleTestingMethod,
     RunRecord,
     RunStage,
     RunStatus,
-    StrategyBacktestRunConfig,
 )
 from quant_research.experiments.runner import ExperimentRunHandler
 from quant_research.experiments.statistics import MultipleTestingCorrector
@@ -64,6 +60,14 @@ from quant_research.factor_studies.analysis import (
     analyze,
     build_future_returns,
 )
+from quant_research.factor_studies.models import (
+    FactorStudyDefinition,
+    FactorStudyRecord,
+    FactorStudyStage,
+    FactorStudyStatus,
+    IndustryUnclassifiedPolicy,
+)
+from quant_research.factor_studies.runner import FactorStudyHandler
 from quant_research.factors import (
     FactorArtifact,
     FactorContext,
@@ -78,6 +82,9 @@ from quant_research.infrastructure.persistence.database import (
 )
 from quant_research.infrastructure.persistence.experiment_runs import (
     ExperimentRunRegistry,
+)
+from quant_research.infrastructure.persistence.factor_studies import (
+    FactorStudyRegistry,
 )
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from quant_research.logging import TaskLogManager
@@ -134,14 +141,6 @@ _FACTOR_ARTIFACT_KEYS: dict[str, tuple[str, ...]] = {
         "signal_date",
     ),
     "turnover": ("signal_variant", "factor_ref", "signal_date"),
-    "stability": (
-        "signal_variant",
-        "label_kind",
-        "factor_ref",
-        "horizon",
-        "segment_type",
-        "segment_key",
-    ),
     "cost_scenarios": (
         "signal_variant",
         "label_kind",
@@ -153,6 +152,9 @@ _FACTOR_ARTIFACT_KEYS: dict[str, tuple[str, ...]] = {
 }
 _ACTIVE_RUN_STATUSES = frozenset(
     {RunStatus.CREATED, RunStatus.QUEUED, RunStatus.RUNNING}
+)
+_ACTIVE_FACTOR_STUDY_STATUSES = frozenset(
+    {FactorStudyStatus.QUEUED, FactorStudyStatus.RUNNING}
 )
 _ORPHAN_STALE_AFTER = timedelta(seconds=60)
 _ORPHAN_PAGE_SIZE = 200
@@ -529,10 +531,8 @@ class StrategyRunExecutor:
         """创建绑定一个冻结策略 Run 的阶段会话。
 
         入参：run：冻结策略 Run。返回值：任务专属会话。
-        异常：Run kind 错误时抛出 ``TypeError``。
+        异常：冻结配置不满足策略契约时抛出 ``TypeError``。
         """
-        if not isinstance(run.config, StrategyBacktestRunConfig):
-            raise TypeError("strategy executor requires STRATEGY_BACKTEST config")
         return _StrategyRunSession(
             run,
             self._repository,
@@ -609,7 +609,7 @@ class _StrategyRunSession:
     def _run_backtest(
         self, progress: ProgressSink, cancellation: CancellationToken
     ) -> None:
-        config = cast(StrategyBacktestRunConfig, self._run.config)
+        config = self._run.config
         strategy = self._strategies.build(
             config.strategy.strategy_id,
             cast(Mapping[str, JsonValue], config.strategy.parameters),
@@ -780,8 +780,8 @@ class _StrategyRunSession:
         return result
 
 
-class FactorRunExecutor:
-    """复用 FactorEngine 和因子分析统计内核执行统一因子 Run。
+class IndependentFactorStudyExecutor:
+    """复用 FactorEngine 和统计内核执行独立因子研究。
 
     入参：
         repository：Canonical 数据入口；registry：Run 登记簿；artifact_root：
@@ -795,7 +795,7 @@ class FactorRunExecutor:
     def __init__(
         self,
         repository: CanonicalResearchRepository,
-        registry: ExperimentRunRegistry,
+        registry: FactorStudyRegistry,
         rulebook: AShareRuleBook,
         artifact_root: Path,
     ) -> None:
@@ -806,16 +806,13 @@ class FactorRunExecutor:
             artifact_root,
         )
 
-    def create(self, run: RunRecord) -> _FactorRunSession:
-        """创建绑定一个冻结因子 Run 的阶段会话。
+    def create(self, study: FactorStudyRecord) -> _FactorStudySession:
+        """创建绑定一个冻结因子研究的阶段会话。
 
-        入参：run：冻结因子 Run。返回值：任务专属会话。
-        异常：Run kind 错误时抛出 ``TypeError``。
+        入参：study：冻结因子研究。返回值：任务专属会话。异常：无。
         """
-        if not isinstance(run.config, FactorStudyRunConfig):
-            raise TypeError("factor executor requires FACTOR_STUDY config")
-        return _FactorRunSession(
-            run,
+        return _FactorStudySession(
+            study,
             self._repository,
             self._registry,
             self._rulebook,
@@ -823,18 +820,18 @@ class FactorRunExecutor:
         )
 
 
-class _FactorRunSession:
-    """保存因子 Run 的分析表和待发布指标。"""
+class _FactorStudySession:
+    """保存独立因子研究的分析表和待发布指标。"""
 
     def __init__(
         self,
-        run: RunRecord,
+        study: FactorStudyRecord,
         repository: CanonicalResearchRepository,
-        registry: ExperimentRunRegistry,
+        registry: FactorStudyRegistry,
         rulebook: AShareRuleBook,
         artifact_root: Path,
     ) -> None:
-        self._run = run
+        self._study = study
         self._repository = repository
         self._registry = registry
         self._rulebook = rulebook
@@ -848,7 +845,7 @@ class _FactorRunSession:
 
     def execute(
         self,
-        stage: RunStage,
+        stage: FactorStudyStage,
         progress: ProgressSink,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
@@ -858,12 +855,12 @@ class _FactorRunSession:
         返回值：仅 PERSIST 返回可信发布身份，其余阶段返回空映射。
         异常：阶段次序、取消、计算、发布或登记失败时抛出。
         """
-        if stage in {RunStage.VALIDATE, RunStage.PREPARE_INPUTS}:
+        if stage in {FactorStudyStage.VALIDATE, FactorStudyStage.PREPARE_INPUTS}:
             return {}
-        if stage is RunStage.ANALYZE_FACTORS:
+        if stage is FactorStudyStage.ANALYZE_FACTORS:
             self._analyze(progress, cancellation)
             return {}
-        if stage is RunStage.PERSIST:
+        if stage is FactorStudyStage.PUBLISH:
             return self._persist(cancellation)
         raise ValueError(f"unsupported factor stage: {stage.value}")
 
@@ -876,7 +873,7 @@ class _FactorRunSession:
         if self._published_dir is None:
             return
         try:
-            self._registry.discard_outputs(self._run.id)
+            self._registry.discard_outputs(self._study.id)
         finally:
             if self._published_dir.is_relative_to(self._artifact_root.resolve()):
                 shutil.rmtree(self._published_dir, ignore_errors=True)
@@ -924,10 +921,10 @@ class _FactorRunSession:
         eligible: pl.DataFrame,
         universe_ids: tuple[InstrumentId, ...],
         sessions: tuple[date, ...],
-        config: FactorStudyRunConfig,
+        config: FactorStudyDefinition,
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
         """按显式 PIT 行业配置生成中性版本和逐日覆盖证据。"""
-        industry = config.factor_study.industry
+        industry = config.industry
         if industry is None:
             return factor_frame, pl.DataFrame(
                 schema={
@@ -1160,8 +1157,8 @@ class _FactorRunSession:
     def _analyze(
         self, progress: ProgressSink, cancellation: CancellationToken
     ) -> None:
-        config = cast(FactorStudyRunConfig, self._run.config)
-        source = CanonicalRunData(self._repository, self._run.catalog_hash)
+        config = self._study.definition
+        source = CanonicalRunData(self._repository, self._study.catalog_hash)
         sessions = source._sessions(config.start_date, config.end_date)
         if not sessions:
             raise ValueError("factor study has no trading sessions")
@@ -1201,15 +1198,15 @@ class _FactorRunSession:
             canonical_json_bytes(cast(list[JsonValue], universe_membership))
         ).hexdigest()
         descriptor = source._factor_engine.execution_descriptor(
-            config.factor_study.factor_ids
+            config.factor_ids
         )
         directions = {
             node.factor_ref: node.spec.direction for node in descriptor.plan
         }
         artifacts_by_factor = source._factor_engine.compute(
-            config.factor_study.factor_ids,
+            config.factor_ids,
             FactorContext(
-                self._run.catalog_hash,
+                self._study.catalog_hash,
                 universe_hash,
                 config.start_date,
                 config.end_date,
@@ -1217,14 +1214,14 @@ class _FactorRunSession:
         )
         factor_frame = self._analysis_factor_frame(
             artifacts_by_factor,
-            config.factor_study.factor_ids,
+            config.factor_ids,
             directions,
             eligible,
         )
         factor_frame, industry_coverage = self._industry_variants(
             factor_frame, eligible, universe_ids, sessions, config
         )
-        horizon_tail = max(config.factor_study.horizons)
+        horizon_tail = max(config.horizons)
         later = source._sessions(
             config.end_date + timedelta(days=1),
             config.end_date + timedelta(days=horizon_tail * 3 + 30),
@@ -1240,27 +1237,15 @@ class _FactorRunSession:
             bars,
             all_sessions,
             eligible,
-            config.factor_study.horizons,
+            config.horizons,
             executable_state,
         )
-        aggregate = self._registry.get_experiment(self._run.experiment_id)
-        windows = aggregate.experiment.definition.sample_windows
-        sample_segments = {
-            name: (max(config.start_date, window.start), min(config.end_date, window.end))
-            for name, window in (
-                ("TRAIN", windows.train),
-                ("VALIDATION", windows.validation),
-                ("TEST", windows.test),
-            )
-            if max(config.start_date, window.start) <= min(config.end_date, window.end)
-        }
         self._tables = analyze(
             factor_frame,
             eligible,
             future,
-            quantiles=config.factor_study.quantiles,
-            cost_bps_scenarios=config.factor_study.cost_bps_scenarios,
-            sample_segments=sample_segments,
+            quantiles=config.quantiles,
+            cost_bps_scenarios=config.cost_bps_scenarios,
         )
         self._tables["industry_coverage"] = industry_coverage
         self._analysis_identity = {
@@ -1280,8 +1265,8 @@ class _FactorRunSession:
             },
             "industry": cast(
                 JsonValue,
-                config.factor_study.industry.model_dump(mode="json")
-                if config.factor_study.industry is not None
+                config.industry.model_dump(mode="json")
+                if config.industry is not None
                 else None,
             ),
             "hac_kernel": "BARTLETT",
@@ -1289,11 +1274,10 @@ class _FactorRunSession:
             "turnover_formula": "0.5*sum(abs(weight_t-weight_t_minus_1)) per leg",
             "cost_formula": "gross_spread-total_turnover*bps/10000",
             "cost_bps_scenarios": list(
-                config.factor_study.cost_bps_scenarios
+                config.cost_bps_scenarios
             ),
         }
-        governance = aggregate.experiment.definition.governance
-        self._metrics = _FactorPublisher.metrics(self._tables, governance.correction)
+        self._metrics = _FactorPublisher.metrics(self._tables, config.correction)
 
     def _persist(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
         if (
@@ -1305,10 +1289,10 @@ class _FactorRunSession:
         if cancellation.is_cancelled():
             raise RuntimeError("factor persistence cancelled before publication")
         directory, manifest_hash, artifacts = _FactorPublisher(
-            self._artifact_root, self._run.experiment_id, self._run.id
+            self._artifact_root, self._study.id
         ).publish(
             self._tables,
-            self._run,
+            self._study,
             self._metrics,
             self._analysis_identity,
         )
@@ -1317,7 +1301,7 @@ class _FactorRunSession:
             self.abort()
             raise RuntimeError("factor persistence cancelled after publication")
         try:
-            self._registry.register_outputs(self._run.id, self._metrics, artifacts)
+            self._registry.register_outputs(self._study.id, self._metrics, artifacts)
         except BaseException:
             if directory.is_relative_to(self._artifact_root.resolve()):
                 shutil.rmtree(directory, ignore_errors=True)
@@ -1329,13 +1313,13 @@ class _FactorRunSession:
 class _FactorPublisher:
     """以同文件系统 staging 原子发布因子研究表和 Manifest。"""
 
-    def __init__(self, root: Path, experiment_id: str, run_id: str) -> None:
-        self._target = root.resolve() / "experiments" / experiment_id / run_id
+    def __init__(self, root: Path, factor_study_id: str) -> None:
+        self._target = root.resolve() / "factor-studies" / factor_study_id
 
     def publish(
         self,
         tables: Mapping[str, pl.DataFrame],
-        run: RunRecord,
+        study: FactorStudyRecord,
         metrics: Mapping[str, tuple[float, str | None, float | None, float | None]],
         analysis_identity: Mapping[str, JsonValue],
     ) -> tuple[Path, str, tuple[dict[str, JsonValue], ...]]:
@@ -1343,7 +1327,9 @@ class _FactorPublisher:
         if self._target.exists():
             raise FileExistsError("Run artifact directory already exists")
         self._target.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=f".{run.id}-", dir=self._target.parent))
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{study.id}-", dir=self._target.parent)
+        )
         try:
             entries: list[dict[str, JsonValue]] = []
             for name, frame in sorted(tables.items()):
@@ -1363,7 +1349,7 @@ class _FactorPublisher:
                 )
             config_path = staging / "config.json"
             config_path.write_bytes(
-                canonical_json_bytes(run.config.model_dump(mode="json"))
+                canonical_json_bytes(study.definition.model_dump(mode="json"))
             )
             entries.append(self._entry(config_path, "config", None, None))
             metrics_path = staging / "metrics.json"
@@ -1382,9 +1368,8 @@ class _FactorPublisher:
             )
             entries.append(self._entry(metrics_path, "metrics", None, None))
             manifest: dict[str, JsonValue] = {
-                "experiment_id": run.experiment_id,
-                "run_id": run.id,
-                "catalog_hash": run.catalog_hash,
+                "factor_study_id": study.id,
+                "catalog_hash": study.catalog_hash,
                 "analysis_identity": dict(analysis_identity),
                 "artifacts": cast(list[JsonValue], entries),
             }
@@ -1559,10 +1544,12 @@ class _WorkerRecovery:
         self,
         queue: TaskQueue,
         registry: ExperimentRunRegistry,
+        factor_studies: FactorStudyRegistry,
         stale_after: timedelta = _ORPHAN_STALE_AFTER,
     ) -> None:
         self._queue = queue
         self._registry = registry
+        self._factor_studies = factor_studies
         self._stale_after = stale_after
 
     def __call__(self, now: datetime) -> int:
@@ -1605,6 +1592,37 @@ class _WorkerRecovery:
             if len(tasks) < _ORPHAN_PAGE_SIZE:
                 break
             offset += len(tasks)
+        offset = 0
+        while True:
+            studies = self._queue.list(
+                status=TaskStatus.ORPHANED,
+                subject_kind="FACTOR_STUDY",
+                limit=_ORPHAN_PAGE_SIZE,
+                offset=offset,
+            )
+            for task in studies:
+                if task.subject_id is None:
+                    continue
+                try:
+                    study = self._factor_studies.get(task.subject_id)
+                except KeyError:
+                    continue
+                if study.status not in _ACTIVE_FACTOR_STUDY_STATUSES:
+                    continue
+                self._factor_studies.transition(
+                    study.id,
+                    study.status,
+                    FactorStudyStatus.FAILED,
+                    stage=study.stage,
+                    error={
+                        "code": "TASK_ORPHANED",
+                        "message": "Factor study heartbeat exceeded the stale threshold",
+                        "task_id": task.id,
+                    },
+                )
+            if len(studies) < _ORPHAN_PAGE_SIZE:
+                break
+            offset += len(studies)
         return recovered
 
 
@@ -1628,9 +1646,10 @@ def build_experiment_worker(
         处理器类型重复、规则或日志根非法时在装配阶段抛出。
     """
     log_root = artifact_root.parent / "state" / "task-logs"
-    queue, registry = (
+    queue, registry, factor_studies = (
         TaskQueue(engine, task_log_root=log_root),
         ExperimentRunRegistry(engine),
+        FactorStudyRegistry(engine),
     )
     handler = ExperimentRunHandler(
         registry,
@@ -1645,7 +1664,13 @@ def build_experiment_worker(
             rulebook,
             artifact_root,
         ),
-        FactorRunExecutor(repository, registry, rulebook, artifact_root),
+    )
+    factor_handler = FactorStudyHandler(
+        factor_studies,
+        CanonicalCatalogGuard(repository),
+        IndependentFactorStudyExecutor(
+            repository, factor_studies, rulebook, artifact_root
+        ),
     )
     logs = TaskLogManager(
         diagnostic_root=log_root, artifact_root=artifact_root, sensitive_values=()
@@ -1653,8 +1678,8 @@ def build_experiment_worker(
     return Worker(
         queue,
         worker_id=worker_id,
-        handlers=(handler, *extra_handlers),
-        orphan_recovery=_WorkerRecovery(queue, registry),
+        handlers=(handler, factor_handler, *extra_handlers),
+        orphan_recovery=_WorkerRecovery(queue, registry, factor_studies),
         task_logs=logs,
     )
 

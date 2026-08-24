@@ -9,16 +9,20 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from quant_research.application.experiments import ExperimentService
+from quant_research.application.factor_studies import FactorStudyService
 from quant_research.application.operations import OperationalCommandService
 from quant_research.backtest.rulebook import AShareRuleBook
 from quant_research.config import Settings
 from quant_research.dashboard.app import create_dashboard_app as create_http_app
 from quant_research.dashboard.experiments import ExperimentDashboardService
+from quant_research.dashboard.factor_studies import FactorStudyDashboardService
 from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.dashboard.notebook import NotebookProbe
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.data.pipeline.publish import DataUpdatePlanner
 from quant_research.data.repository import CanonicalResearchRepository
+from quant_research.factors.builtin import STOCK_FACTOR_REFERENCES
+from quant_research.factors.catalog import FactorReferenceCatalog
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,
     BaoStockCalendarPolicy,
@@ -32,6 +36,9 @@ from quant_research.infrastructure.persistence.database import (
 )
 from quant_research.infrastructure.persistence.experiment_runs import (
     ExperimentRunRegistry,
+)
+from quant_research.infrastructure.persistence.factor_studies import (
+    FactorStudyRegistry,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
@@ -146,6 +153,11 @@ class DashboardBootstrap:
             experiments = ExperimentService(
                 ExperimentRunRegistry(engine), repository.catalog(), strategies
             )
+            factor_studies = FactorStudyService(
+                FactorStudyRegistry(engine),
+                repository.catalog(),
+                FactorReferenceCatalog(STOCK_FACTOR_REFERENCES),
+            )
             commands = OperationalCommandService(
                 queue,
                 DataUpdatePlanner(
@@ -154,12 +166,16 @@ class DashboardBootstrap:
                     routes=BAOSTOCK_ROUTES,
                 ),
                 experiments,
+                factor_studies,
             )
             return create_http_app(
                 service=service,
                 commands=commands,
                 experiment_service=ExperimentDashboardService(
                     experiments, strategies, settings.artifact_root
+                ),
+                factor_study_service=FactorStudyDashboardService(
+                    factor_studies, settings.artifact_root
                 ),
                 notebook_probe=notebook_probe or _LocalNotebookProbe(),
                 static_dir=static_dir or source_root / "frontend" / "dist",

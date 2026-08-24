@@ -12,11 +12,13 @@ from sqlalchemy import Engine
 
 from quant_research.application.data import DataUpdateHandler, DataValidationHandler
 from quant_research.application.experiments import ExperimentService
+from quant_research.application.factor_studies import FactorStudyService
 from quant_research.backtest.rulebook import AShareRuleBook
 from quant_research.bootstrap.worker import build_default_experiment_worker
 from quant_research.cli.app import (
     ApplicationServices,
     LocalExperimentCommands,
+    LocalFactorStudyCommands,
     LocalStrategyCommands,
     LocalTaskCommands,
     LocalWorkerCommands,
@@ -28,6 +30,8 @@ from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.pipeline.publish import DataPipeline
 from quant_research.data.quality.runner import QualityRunner
 from quant_research.data.storage.partitions import RawPartitionStore
+from quant_research.factors.builtin import STOCK_FACTOR_REFERENCES
+from quant_research.factors.catalog import FactorReferenceCatalog
 from quant_research.infrastructure.baostock import (
     BAOSTOCK_ROUTES,
     BaoStockCalendarPolicy,
@@ -42,6 +46,9 @@ from quant_research.infrastructure.persistence.database import (
 )
 from quant_research.infrastructure.persistence.experiment_runs import (
     ExperimentRunRegistry,
+)
+from quant_research.infrastructure.persistence.factor_studies import (
+    FactorStudyRegistry,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
@@ -119,6 +126,11 @@ class CliBootstrap:
             experiments = ExperimentService(
                 ExperimentRunRegistry(engine), repository, strategies
             )
+            factor_studies = FactorStudyService(
+                FactorStudyRegistry(engine),
+                repository,
+                FactorReferenceCatalog(STOCK_FACTOR_REFERENCES),
+            )
             worker = build_default_experiment_worker(
                 worker_id=f"cli-worker-{os.getpid()}",
                 engine=engine,
@@ -129,13 +141,16 @@ class CliBootstrap:
             )
             return ApplicationServices(
                 pipeline,
-                task_commands=LocalTaskCommands(queue),
+                task_commands=LocalTaskCommands(queue, factor_studies),
                 worker_commands=LocalWorkerCommands(
                     worker,
                     queue=queue,
                 ),
                 experiment_commands=LocalExperimentCommands(
                     experiments, source_root / "configs"
+                ),
+                factor_study_commands=LocalFactorStudyCommands(
+                    factor_studies, source_root / "configs"
                 ),
                 strategy_commands=LocalStrategyCommands(strategies.strategy_ids()),
                 close_callback=lambda: cls._close_resources(

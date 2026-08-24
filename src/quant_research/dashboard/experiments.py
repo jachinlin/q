@@ -27,12 +27,6 @@ from quant_research.strategies.registry import StrategyRegistry
 
 _ARTIFACT_TYPES = frozenset(
     {
-        "correlation",
-        "cost_scenarios",
-        "coverage",
-        "ic",
-        "industry_coverage",
-        "label_quality",
         "signals",
         "orders",
         "fills",
@@ -49,48 +43,9 @@ _ARTIFACT_TYPES = frozenset(
         "metrics",
         "quality_disclosure",
         "manifest",
-        "long_short_returns",
-        "monotonicity",
-        "quantile_returns",
-        "stability",
-        "summary",
-        "turnover",
     }
 )
 _ARTIFACT_FILTERS: dict[str, frozenset[str]] = {
-    "summary": frozenset(
-        {"signal_variant", "label_kind", "factor_ref", "horizon"}
-    ),
-    "coverage": frozenset({"signal_variant", "factor_ref"}),
-    "label_quality": frozenset({"label_kind", "horizon", "reason"}),
-    "industry_coverage": frozenset({"taxonomy", "unclassified_policy"}),
-    "ic": frozenset(
-        {"signal_variant", "label_kind", "factor_ref", "horizon"}
-    ),
-    "quantile_returns": frozenset(
-        {"signal_variant", "label_kind", "factor_ref", "horizon"}
-    ),
-    "long_short_returns": frozenset(
-        {"signal_variant", "label_kind", "factor_ref", "horizon"}
-    ),
-    "monotonicity": frozenset(
-        {"signal_variant", "label_kind", "factor_ref", "horizon"}
-    ),
-    "turnover": frozenset({"signal_variant", "factor_ref"}),
-    "stability": frozenset(
-        {
-            "signal_variant",
-            "label_kind",
-            "factor_ref",
-            "horizon",
-            "segment_type",
-            "segment_key",
-        }
-    ),
-    "cost_scenarios": frozenset(
-        {"signal_variant", "label_kind", "factor_ref", "horizon", "cost_bps"}
-    ),
-    "correlation": frozenset({"signal_variant"}),
     "attribution": frozenset({"dimension"}),
     "exposure_summary": frozenset({"dimension"}),
 }
@@ -212,15 +167,7 @@ class ExperimentDashboardService:
         page: int,
         page_size: int,
         *,
-        signal_variant: str | None = None,
-        label_kind: str | None = None,
-        factor_ref: str | None = None,
-        horizon: int | None = None,
         dimension: str | None = None,
-        reason: str | None = None,
-        segment_type: str | None = None,
-        segment_key: str | None = None,
-        cost_bps: int | None = None,
     ) -> dict[str, JsonValue]:
         """只从登记 Run 的可信 Manifest 读取并校验白名单产物。
 
@@ -237,15 +184,7 @@ class ExperimentDashboardService:
         requested_filters: dict[str, str | int] = {
             name: value
             for name, value in {
-                "signal_variant": signal_variant,
-                "label_kind": label_kind,
-                "factor_ref": factor_ref,
-                "horizon": horizon,
                 "dimension": dimension,
-                "reason": reason,
-                "segment_type": segment_type,
-                "segment_key": segment_key,
-                "cost_bps": cost_bps,
             }.items()
             if value is not None
         }
@@ -551,12 +490,8 @@ class ExperimentDashboardService:
             raise ValueError("run_ids must be unique")
         runs = tuple(self._experiments.get_run(item) for item in run_ids)
         experiment_id = runs[0].experiment_id
-        kind = runs[0].config.kind
-        if any(
-            item.experiment_id != experiment_id or item.config.kind is not kind
-            for item in runs[1:]
-        ):
-            raise ValueError("compared Runs must belong to one Experiment and kind")
+        if any(item.experiment_id != experiment_id for item in runs[1:]):
+            raise ValueError("compared Runs must belong to one Experiment")
         aggregate = self._experiments.show(experiment_id)
         baseline_id = aggregate.experiment.baseline_run_id
         metrics_by_run = {
@@ -749,30 +684,14 @@ class ExperimentRoutes:
             artifact_type: str,
             page: int = Query(1, ge=1),
             page_size: int = Query(100, ge=1, le=1000),
-            signal_variant: str | None = Query(None, min_length=1),
-            label_kind: str | None = Query(None, min_length=1),
-            factor_ref: str | None = Query(None, min_length=1),
-            horizon: int | None = Query(None, gt=0),
             dimension: str | None = Query(None, min_length=1),
-            reason: str | None = Query(None, min_length=1),
-            segment_type: str | None = Query(None, min_length=1),
-            segment_key: str | None = Query(None, min_length=1),
-            cost_bps: int | None = Query(None, ge=0),
         ) -> dict[str, JsonValue]:
             return service.artifact(
                 run_id,
                 artifact_type,
                 page,
                 page_size,
-                signal_variant=signal_variant,
-                label_kind=label_kind,
-                factor_ref=factor_ref,
-                horizon=horizon,
                 dimension=dimension,
-                reason=reason,
-                segment_type=segment_type,
-                segment_key=segment_key,
-                cost_bps=cost_bps,
             )
 
 

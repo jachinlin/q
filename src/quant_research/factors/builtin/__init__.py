@@ -37,6 +37,17 @@ _RUNTIME_DEPENDENCY_ATTRIBUTES = (
     "_calendar",
 )
 
+STOCK_FACTOR_REFERENCES = (
+    "avg_amount_20d",
+    "book_to_price_mrq",
+    "downside_volatility_60d",
+    "earnings_yield_ttm",
+    "max_drawdown_120d",
+    "momentum_120_20",
+    "roe_pit",
+    "volatility_60d",
+)
+
 
 class _InitSupport:
     """集中承载本模块的私有实现逻辑。"""
@@ -181,6 +192,7 @@ def register_stock_factors(
 
 
 __all__ = [
+    "STOCK_FACTOR_REFERENCES",
     "AdjustedBarService",
     "Momentum12020Factor",
     "ReturnFactor",

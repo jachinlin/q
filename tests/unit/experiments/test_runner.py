@@ -21,14 +21,12 @@ from quant_research.tasks.models import ClaimedTask, TaskProgress, TaskStatus
 def _run() -> RunRecord:
     definition = ExperimentConfigParser().parse_experiment(
         """name: runner
-kind: STRATEGY_BACKTEST
 sample_windows:
   train: {start: 2020-01-01, end: 2020-12-31}
   validation: {start: 2021-01-01, end: 2021-12-31}
   test: {start: 2022-01-01, end: 2022-12-31}
 governance: {test_budget: 1, correction: BONFERRONI}
 initial_run:
-  kind: STRATEGY_BACKTEST
   start_date: 2020-01-01
   end_date: 2021-12-31
   strategy:
@@ -179,7 +177,7 @@ def test_strategy_run_executes_the_fixed_stage_order() -> None:
     catalog = _Catalog()
     session = _Session()
     handler = ExperimentRunHandler(
-        registry, catalog, _Factory(session), _Factory(_Session())
+        registry, catalog, _Factory(session)
     )
 
     outcome = handler.run(_task(), _Progress(), _Cancellation())
@@ -195,7 +193,7 @@ def test_analysis_failure_never_executes_persist() -> None:
     registry = _Registry(_run())
     session = _Session(fail_at=RunStage.ANALYTICS)
     handler = ExperimentRunHandler(
-        registry, _Catalog(), _Factory(session), _Factory(_Session())
+        registry, _Catalog(), _Factory(session)
     )
 
     with pytest.raises(RuntimeError, match="stage failed"):
@@ -211,7 +209,7 @@ def test_success_transition_failure_aborts_published_session() -> None:
     registry = _Registry(_run(), fail_success=True)
     session = _Session()
     handler = ExperimentRunHandler(
-        registry, _Catalog(), _Factory(session), _Factory(_Session())
+        registry, _Catalog(), _Factory(session)
     )
 
     with pytest.raises(RuntimeError, match="success transition failed"):

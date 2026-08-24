@@ -74,3 +74,13 @@ class DatasetKind(StrEnum):
     FINANCIAL_OBSERVATION = "financial_observation"
     INDUSTRY_CLASSIFICATION = "industry_classification"
     INDEX_BAR = "index_bar"
+
+
+class MultipleTestingMethod(StrEnum):
+    """定义研究假设族采用的多重检验校正方法。
+
+    入参：校正方法字符串。返回值：对应稳定枚举。异常：未知值抛出 ``ValueError``。
+    """
+
+    BONFERRONI = "BONFERRONI"
+    BH_FDR = "BH_FDR"

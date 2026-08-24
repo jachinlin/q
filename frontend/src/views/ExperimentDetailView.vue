@@ -28,7 +28,6 @@ const STRATEGY_GROUPS = [
   { title: '仓位与样本', metrics: [['average_cash_weight', '平均现金权重'], ['max_position_weight', '最大单票权重'], ['observations', '有效观察数']] },
 ] as const
 const LARGE_ARTIFACTS = new Set(['orders', 'fills', 'holdings', 'costs'])
-const FACTOR_FILTERED = new Set(['ic', 'quantile_returns', 'long_short_returns'])
 const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED'])
 
 const route = useRoute()
@@ -43,20 +42,12 @@ const compareIds = ref<string[]>([])
 const executionArtifact = ref('execution_summary')
 const performanceArtifact = ref('performance')
 const attributionArtifact = ref('attribution')
-const factorArtifact = ref('coverage')
-const factorExecutionArtifact = ref('correlation')
-const factorPerformanceArtifact = ref('ic')
 const artifactPage = ref(1)
 const showAllConfigDiffs = ref(false)
-const selectedVariant = ref(String(route.query.signal_variant ?? 'DIRECTION_ADJUSTED'))
-const selectedLabel = ref(String(route.query.label_kind ?? 'THEORETICAL_FORWARD_RETURN'))
-const selectedFactor = ref(String(route.query.factor ?? ''))
-const selectedHorizon = ref(Number(route.query.horizon ?? 0))
 
 const selectedRun = computed<ExperimentRun | undefined>(() => detail.data.value?.runs.find((item) => item.id === selectedRunId.value) ?? detail.data.value?.runs.at(-1))
 const baselineRun = computed(() => detail.data.value?.runs.find((item) => item.id === detail.data.value?.experiment.baseline_run_id))
 const hasActiveRuns = computed(() => detail.data.value?.runs.some((item) => !TERMINAL_RUN_STATUSES.has(item.status)) ?? false)
-const isFactorStudy = computed(() => detail.data.value?.experiment.definition.kind === 'FACTOR_STUDY')
 const selectedRunShortId = computed(() => selectedRun.value?.id.slice(0, 12) ?? '—')
 const testUses = computed(() => detail.data.value?.runs.filter((item) => item.uses_test_region).length ?? 0)
 const testBudget = computed(() => detail.data.value?.experiment.definition.governance.test_budget ?? 0)
@@ -76,19 +67,11 @@ const sampleRegion = computed(() => {
   return config.end_date && validation && config.end_date >= validation.start ? 'VALIDATION' : 'TRAIN'
 })
 
-const artifactType = computed(() => isFactorStudy.value
-  ? ({ signals: 'summary', portfolio: factorArtifact.value, execution: factorExecutionArtifact.value, performance: factorPerformanceArtifact.value } as Record<string, string>)[tab.value]
-  : ({ signals: 'signals', portfolio: 'holdings', execution: executionArtifact.value, performance: performanceArtifact.value, attribution: attributionArtifact.value } as Record<string, string>)[tab.value])
+const artifactType = computed(() => ({ signals: 'signals', portfolio: 'holdings', execution: executionArtifact.value, performance: performanceArtifact.value, attribution: attributionArtifact.value } as Record<string, string>)[tab.value])
 const isLargeArtifact = computed(() => LARGE_ARTIFACTS.has(artifactType.value))
 
 function artifactPath(type: string, page: number, pageSize: number) {
   const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
-  if (isFactorStudy.value) {
-    if (selectedVariant.value && ['summary', 'coverage', 'ic', 'quantile_returns', 'long_short_returns', 'monotonicity', 'turnover', 'stability', 'cost_scenarios', 'correlation'].includes(type)) params.set('signal_variant', selectedVariant.value)
-    if (selectedLabel.value && ['summary', 'ic', 'quantile_returns', 'long_short_returns', 'monotonicity', 'stability', 'cost_scenarios', 'label_quality'].includes(type)) params.set('label_kind', selectedLabel.value)
-    if (selectedFactor.value && ['coverage', 'turnover', ...FACTOR_FILTERED, 'monotonicity', 'stability', 'cost_scenarios'].includes(type)) params.set('factor_ref', selectedFactor.value)
-    if (selectedHorizon.value > 0 && [...FACTOR_FILTERED, 'monotonicity', 'stability', 'cost_scenarios', 'label_quality'].includes(type)) params.set('horizon', String(selectedHorizon.value))
-  }
   return `/api/v1/runs/${selectedRun.value?.id}/artifacts/${type}?${params.toString()}`
 }
 async function loadArtifact(): Promise<ArtifactPayload> {
@@ -101,38 +84,19 @@ async function loadArtifact(): Promise<ArtifactPayload> {
   return { ...first, items: [first, ...rest].flatMap((item) => item.items ?? []), total }
 }
 const artifact = useQuery({
-  queryKey: ['run-artifact', selectedRunId, artifactType, artifactPage, selectedVariant, selectedLabel, selectedFactor, selectedHorizon],
+  queryKey: ['run-artifact', selectedRunId, artifactType, artifactPage],
   queryFn: loadArtifact,
   enabled: computed(() => Boolean(selectedRun.value?.manifest_hash && artifactType.value)),
 })
 const quality = useQuery({
   queryKey: ['run-quality', selectedRunId],
   queryFn: () => api.get<{ value: RunQualityDisclosure }>(`/api/v1/runs/${selectedRun.value?.id}/artifacts/quality_disclosure?page=1&page_size=1`),
-  enabled: computed(() => Boolean(!isFactorStudy.value && selectedRun.value?.manifest_hash)),
+  enabled: computed(() => Boolean(selectedRun.value?.manifest_hash)),
 })
 const qualityValue = computed(() => quality.data.value?.value)
 const metricMap = computed(() => new Map((selectedRun.value?.metrics ?? []).map((item) => [item.name, item])))
 const rawArtifactRows = computed(() => artifact.data.value?.items ?? [])
-const artifactRows = computed<RunArtifactRow[]>(() => {
-  if (!isFactorStudy.value || artifactType.value !== 'summary') return rawArtifactRows.value
-  return rawArtifactRows.value.map((row) => {
-    const dimensions = [row.signal_variant, row.label_kind, row.factor_ref, row.horizon].map(String).join('/')
-    const rankMetric = metricMap.value.get(`rank_ic_mean/${dimensions}`)
-    return {
-      signal_variant: row.signal_variant,
-      label_kind: row.label_kind,
-      factor_ref: row.factor_ref,
-      horizon: row.horizon,
-      rank_ic_mean: row.rank_ic_mean,
-      rank_ic_hac_t_stat: row.rank_ic_hac_t_stat,
-      rank_ic_adjusted_p_value: rankMetric?.adjusted_p_value ?? null,
-      monotonicity_mean: row.monotonicity_mean,
-      gross_spread_mean: row.long_short_mean,
-      break_even_cost_bps: row.break_even_cost_bps,
-      total_turnover_mean: row.total_turnover_mean,
-    } as RunArtifactRow
-  })
-})
+const artifactRows = computed<RunArtifactRow[]>(() => rawArtifactRows.value)
 const artifactColumns = computed(() => Object.keys(artifactRows.value[0] ?? {}).slice(0, 14))
 const artifactTotal = computed(() => artifact.data.value?.total ?? artifactRows.value.length)
 
@@ -140,15 +104,7 @@ function displayMetric(name: string, label: string, detail = 'Run 指标'): Disp
   const metric = metricMap.value.get(name)
   return { name, label, value: metric?.value ?? null, unit: metric?.unit ?? null, detail: qualityValue.value?.undefined_metrics[name] ?? detail }
 }
-const factorCoreMetrics = computed<DisplayMetric[]>(() => {
-  const hypotheses = (selectedRun.value?.metrics ?? []).filter((item) => item.name.startsWith('rank_ic_mean/'))
-  const derived: Array<[string, string, number | null, string]> = [
-    ['significant', '显著 Rank IC', metricMap.value.get('significant_rank_ic_count')?.value ?? hypotheses.filter((item) => item.adjusted_p_value != null && item.adjusted_p_value <= 0.05).length, 'count'],
-    ['tested', '有效假设', metricMap.value.get('tested_rank_ic_count')?.value ?? hypotheses.length, 'count'],
-  ]
-  return [displayMetric('mean_factor_coverage', '因子覆盖率'), displayMetric('mean_pair_coverage', '配对覆盖率'), ...derived.map(([name, label, value, unit]) => ({ name, label, value, unit, detail: '因子 Run 健康度' }))]
-})
-const coreMetrics = computed(() => isFactorStudy.value ? factorCoreMetrics.value : STRATEGY_CORE.map(([name, label]) => displayMetric(name, label)))
+const coreMetrics = computed(() => STRATEGY_CORE.map(([name, label]) => displayMetric(name, label)))
 const groupedMetrics = computed(() => STRATEGY_GROUPS.map((group) => ({ title: group.title, metrics: group.metrics.map(([name, label]) => displayMetric(name, label, '未登记')) })))
 
 const effectiveCompareIds = computed(() => {
@@ -177,32 +133,18 @@ const formatMetric = (metric: { value: number | null; unit: string | null }) => 
 const chartOption = computed(() => {
   const rows = artifactRows.value
   if (!rows.length) return null
-  if (!isFactorStudy.value && tab.value === 'performance' && artifactType.value === 'performance') return {
+  if (tab.value === 'performance' && artifactType.value === 'performance') return {
     tooltip, legend: { data: ['组合净值', '基准净值', '回撤'] }, grid: { left: 55, right: 24, top: 40, bottom: 42 }, xAxis: { type: 'category', data: rows.map((row) => String(row.trade_date)), ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18 }],
     series: [{ name: '组合净值', type: 'line', symbol: 'none', data: rows.map((row) => row.nav) }, { name: '基准净值', type: 'line', symbol: 'none', data: rows.map((row) => row.benchmark_nav) }, { name: '回撤', type: 'line', symbol: 'none', data: rows.map((row) => row.drawdown), areaStyle: { opacity: 0.08 } }],
   }
-  if (!isFactorStudy.value && tab.value === 'performance' && ['monthly_returns', 'annual_returns'].includes(artifactType.value)) return {
+  if (tab.value === 'performance' && ['monthly_returns', 'annual_returns'].includes(artifactType.value)) return {
     tooltip, legend: { data: ['组合收益', '基准收益', '相对收益'] }, grid: { left: 55, right: 24, top: 40, bottom: 52 }, xAxis: { type: 'category', data: rows.map((row) => artifactType.value === 'monthly_returns' ? `${row.year}-${String(row.month).padStart(2, '0')}` : String(row.year)), ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18 }],
     series: [{ name: '组合收益', type: 'bar', data: rows.map((row) => row.portfolio_return) }, { name: '基准收益', type: 'bar', data: rows.map((row) => row.benchmark_return) }, { name: '相对收益', type: 'line', data: rows.map((row) => row.relative_return) }],
   }
-  if (!isFactorStudy.value && tab.value === 'execution') {
+  if (tab.value === 'execution') {
     const counts = new Map<string, number>()
     for (const row of rows) { const reason = String(row.reason_code ?? row.side ?? 'UNKNOWN'); counts.set(reason, (counts.get(reason) ?? 0) + Number(row.order_count ?? 1)) }
     return { tooltip, grid: { left: 55, right: 24, top: 24, bottom: 70 }, xAxis: { type: 'category', data: [...counts.keys()], ...axis, axisLabel: { rotate: 25 } }, yAxis: { type: 'value', ...axis }, series: [{ type: 'bar', data: [...counts.values()] }] }
-  }
-  if (isFactorStudy.value && tab.value === 'signals') return { tooltip, legend: { data: ['Rank IC', 'HAC t', '单调性'] }, grid: { left: 55, right: 24, top: 40, bottom: 80 }, xAxis: { type: 'category', data: rows.map((row) => `${row.factor_ref}/${row.label_kind}/${row.horizon}`), ...axis, axisLabel: { rotate: 30 } }, yAxis: { type: 'value', ...axis }, series: [{ name: 'Rank IC', type: 'bar', data: rows.map((row) => row.rank_ic_mean) }, { name: 'HAC t', type: 'bar', data: rows.map((row) => row.rank_ic_hac_t_stat) }, { name: '单调性', type: 'line', data: rows.map((row) => row.monotonicity_mean) }] }
-  if (isFactorStudy.value && tab.value === 'portfolio') {
-    if (factorArtifact.value === 'quantile_returns') { const quantiles = [...new Set(rows.map((row) => Number(row.quantile)))].sort((a, b) => a - b); const dates = [...new Set(rows.map((row) => String(row.signal_date)))]; return { tooltip, legend: { data: quantiles.map((q) => `Q${q}`) }, grid: { left: 55, right: 24, top: 40, bottom: 42 }, xAxis: { type: 'category', data: dates, ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18 }], series: quantiles.map((q) => ({ name: `Q${q}`, type: 'line', symbol: 'none', data: dates.map((date) => rows.find((row) => String(row.signal_date) === date && Number(row.quantile) === q)?.mean_return ?? null) })) } }
-    if (factorArtifact.value === 'label_quality') { const reasons = [...new Set(rows.map((row) => String(row.reason)))]; const dates = [...new Set(rows.map((row) => String(row.signal_date)))]; return { tooltip, legend: { data: reasons }, grid: { left: 55, right: 24, top: 40, bottom: 42 }, xAxis: { type: 'category', data: dates, ...axis }, yAxis: { type: 'value', ...axis }, series: reasons.map((reason) => ({ name: reason, type: 'bar', stack: 'quality', data: dates.map((date) => rows.find((row) => String(row.signal_date) === date && String(row.reason) === reason)?.rate ?? 0) })) } }
-    const field = factorArtifact.value === 'coverage' ? 'coverage' : factorArtifact.value === 'industry_coverage' ? 'usable_coverage' : 'long_short_return'
-    return { tooltip, grid: { left: 55, right: 24, top: 24, bottom: 42 }, xAxis: { type: 'category', data: rows.map((row) => String(row.signal_date)), ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18 }], series: [{ type: 'line', symbol: 'none', data: rows.map((row) => row[field]) }] }
-  }
-  if (isFactorStudy.value && tab.value === 'performance') { if (factorPerformanceArtifact.value === 'stability') return { tooltip, grid: { left: 55, right: 24, top: 24, bottom: 80 }, xAxis: { type: 'category', data: rows.map((row) => `${row.segment_type}/${row.segment_key}`), ...axis, axisLabel: { rotate: 30 } }, yAxis: { type: 'value', ...axis }, series: [{ type: 'bar', data: rows.map((row) => row.rank_ic_mean) }] }; if (factorPerformanceArtifact.value === 'monotonicity') return { tooltip, grid: { left: 55, right: 24, top: 24, bottom: 42 }, xAxis: { type: 'category', data: rows.map((row) => String(row.signal_date)), ...axis }, yAxis: { type: 'value', ...axis }, series: [{ type: 'line', symbol: 'none', data: rows.map((row) => row.quantile_rank_correlation) }] }; return { tooltip, legend: { data: ['Rank IC', '滚动 Rank IC', 'Pearson IC'] }, grid: { left: 55, right: 24, top: 40, bottom: 42 }, xAxis: { type: 'category', data: rows.map((row) => String(row.signal_date)), ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }, { type: 'slider', height: 18 }], series: [{ name: 'Rank IC', type: 'line', symbol: 'none', data: rows.map((row) => row.rank_ic) }, { name: '滚动 Rank IC', type: 'line', symbol: 'none', data: rows.map((row) => row.rank_ic_rolling_mean) }, { name: 'Pearson IC', type: 'line', symbol: 'none', data: rows.map((row) => row.pearson_ic) }] } }
-  if (isFactorStudy.value && tab.value === 'execution') {
-    if (factorExecutionArtifact.value === 'turnover') return { tooltip, legend: { data: ['秩自相关', '高分位换手', '低分位换手'] }, grid: { left: 55, right: 24, top: 40, bottom: 42 }, xAxis: { type: 'category', data: rows.map((row) => String(row.signal_date)), ...axis }, yAxis: { type: 'value', ...axis }, series: [{ name: '秩自相关', type: 'line', data: rows.map((row) => row.rank_autocorrelation) }, { name: '高分位换手', type: 'line', data: rows.map((row) => row.high_quantile_turnover) }, { name: '低分位换手', type: 'line', data: rows.map((row) => row.low_quantile_turnover) }] }
-    if (factorExecutionArtifact.value === 'cost_scenarios') return { tooltip, grid: { left: 55, right: 24, top: 24, bottom: 42 }, xAxis: { type: 'category', data: rows.map((row) => `${row.cost_bps}bps`), ...axis }, yAxis: { type: 'value', ...axis }, series: [{ type: 'line', data: rows.map((row) => row.net_spread_mean) }] }
-    const factors = [...new Set(rows.flatMap((row) => [String(row.factor_x), String(row.factor_y)]))].sort()
-    return { tooltip, grid: { left: 100, right: 30, top: 20, bottom: 80 }, xAxis: { type: 'category', data: factors, ...axis }, yAxis: { type: 'category', data: factors, ...axis }, visualMap: { min: -1, max: 1, calculable: true, orient: 'horizontal', left: 'center', bottom: 0 }, series: [{ type: 'heatmap', data: rows.map((row) => [factors.indexOf(String(row.factor_x)), factors.indexOf(String(row.factor_y)), row.rank_correlation]) }] }
   }
   return null
 })
@@ -268,10 +210,6 @@ async function deleteExperiment() {
 function selectForCompare(rows: ExperimentRun[]) { compareIds.value = rows.map((item) => item.id) }
 function selectRun(run: ExperimentRun) { selectedRunId.value = run.id; if (route.query.run !== run.id) void router.replace({ query: { ...route.query, run: run.id } }) }
 function runRowClassName({ row }: { row: ExperimentRun }) { return row.id === selectedRunId.value ? 'viewing-run' : '' }
-function selectFactorRow(row: RunArtifactRow) {
-  selectedVariant.value = String(row.signal_variant); selectedLabel.value = String(row.label_kind); selectedFactor.value = String(row.factor_ref); selectedHorizon.value = Number(row.horizon)
-  void router.replace({ query: { ...route.query, signal_variant: selectedVariant.value, label_kind: selectedLabel.value, factor: selectedFactor.value, horizon: String(selectedHorizon.value) } }); tab.value = 'performance'
-}
 watch([() => detail.data.value?.runs, () => route.query.run], ([runs, rawQueryRun]) => {
   if (!runs?.length) return
   const queryRun = Array.isArray(rawQueryRun) ? rawQueryRun[0] : rawQueryRun
@@ -280,15 +218,14 @@ watch([() => detail.data.value?.runs, () => route.query.run], ([runs, rawQueryRu
   selectedRunId.value = next.id
   if (queryRun !== next.id) void router.replace({ query: { ...route.query, run: next.id } })
 }, { immediate: true })
-watch([artifactType, selectedRunId, selectedVariant, selectedLabel, selectedFactor, selectedHorizon], () => { artifactPage.value = 1 })
-watch(artifactRows, (rows) => { if (isFactorStudy.value && artifactType.value === 'summary' && rows.length && !selectedFactor.value) { selectedVariant.value = String(rows[0].signal_variant); selectedLabel.value = String(rows[0].label_kind); selectedFactor.value = String(rows[0].factor_ref); selectedHorizon.value = Number(rows[0].horizon) } })
+watch([artifactType, selectedRunId], () => { artifactPage.value = 1 })
 </script>
 
 <template>
   <div class="page-stack">
     <ErrorState v-if="detail.error.value" :error="detail.error.value" />
     <template v-else-if="detail.data.value">
-      <section class="panel detail-head"><div><span class="eyebrow">{{ detail.data.value.experiment.definition.kind }}</span><h2>{{ detail.data.value.experiment.definition.name }}</h2><p>{{ detail.data.value.experiment.definition.description }}</p></div><div class="head-status"><StatusBadge v-if="selectedRun" :status="selectedRun.status" /><strong>{{ detail.data.value.runs.length }}</strong><small> RUNS</small><el-button type="danger" plain :disabled="hasActiveRuns" :loading="removeExperiment.isPending.value" @click="deleteExperiment">删除实验</el-button></div></section>
+      <section class="panel detail-head"><div><span class="eyebrow">STRATEGY BACKTEST</span><h2>{{ detail.data.value.experiment.definition.name }}</h2><p>{{ detail.data.value.experiment.definition.description }}</p></div><div class="head-status"><StatusBadge v-if="selectedRun" :status="selectedRun.status" /><strong>{{ detail.data.value.runs.length }}</strong><small> RUNS</small><el-button type="danger" plain :disabled="hasActiveRuns" :loading="removeExperiment.isPending.value" @click="deleteExperiment">删除实验</el-button></div></section>
       <section class="governance-grid">
         <article class="governance-card"><span>当前 Run</span><strong class="hash">{{ selectedRunShortId }}</strong><small>{{ selectedRun?.research_mark }}</small></article><article class="governance-card"><span>样本区域</span><strong>{{ sampleRegion }}</strong><small>{{ (selectedRun?.config as { start_date?: string })?.start_date ?? '—' }} 至 {{ (selectedRun?.config as { end_date?: string })?.end_date ?? '—' }}</small></article><article class="governance-card"><span>TEST 预算</span><strong>{{ testUses }} / {{ testBudget }}</strong><small>剩余 {{ testRemaining }} 次</small></article><article class="governance-card"><span>运行耗时</span><strong>{{ runDuration }}</strong><small>{{ selectedRun?.stage }}</small></article><article class="governance-card"><span>数据身份</span><strong class="hash identity">{{ selectedRun?.catalog_hash.slice(0, 16) ?? '—' }}</strong><small>catalog_hash</small></article>
       </section>
@@ -298,27 +235,21 @@ watch(artifactRows, (rows) => { if (isFactorStudy.value && artifactType.value ==
       </section>
       <section v-if="selectedRun?.status === 'SUCCEEDED'" class="metrics-grid core-metrics"><article v-for="metric in coreMetrics" :key="metric.name" class="metric-card"><span class="metric-top">{{ metric.label }}<i /></span><strong class="metric-value metric-small">{{ formatMetric(metric) }}</strong><p v-if="metric.value == null">{{ metric.detail }}</p></article></section>
       <section v-else class="panel run-state-panel"><h3>{{ selectedRun?.status === 'FAILED' ? 'Run 执行失败' : selectedRun?.status === 'CANCELLED' ? 'Run 已取消' : 'Run 尚未发布指标' }}</h3><p>{{ selectedRun?.error ? JSON.stringify(selectedRun.error) : `当前阶段：${selectedRun?.stage ?? '—'}` }}</p></section>
-      <section v-if="!isFactorStudy && selectedRun?.status === 'SUCCEEDED'" class="metric-groups"><article v-for="group in groupedMetrics" :key="group.title" class="panel metric-group"><h3>{{ group.title }}</h3><div v-for="metric in group.metrics" :key="metric.name" class="metric-row"><span>{{ metric.label }}</span><strong>{{ formatMetric(metric) }}</strong><small v-if="metric.value == null">{{ metric.detail }}</small></div></article></section>
+      <section v-if="selectedRun?.status === 'SUCCEEDED'" class="metric-groups"><article v-for="group in groupedMetrics" :key="group.title" class="panel metric-group"><h3>{{ group.title }}</h3><div v-for="metric in group.metrics" :key="metric.name" class="metric-row"><span>{{ metric.label }}</span><strong>{{ formatMetric(metric) }}</strong><small v-if="metric.value == null">{{ metric.detail }}</small></div></article></section>
       <section v-if="qualityValue?.warnings.length" class="panel quality-warning"><h3>质量披露</h3><el-tag v-for="warning in qualityValue.warnings" :key="warning" type="warning">{{ warning }}</el-tag></section>
       <section class="panel">
-        <el-tabs v-model="tab"><el-tab-pane label="协议/配置" name="protocol" /><el-tab-pane :label="isFactorStudy ? '因子矩阵' : '信号'" name="signals" /><el-tab-pane :label="isFactorStudy ? '覆盖/分层' : '持仓'" name="portfolio" /><el-tab-pane :label="isFactorStudy ? '相关性' : '成本/执行'" name="execution" /><el-tab-pane :label="isFactorStudy ? 'IC 下钻' : '绩效时序'" name="performance" /><el-tab-pane v-if="!isFactorStudy" label="归因" name="attribution" /><el-tab-pane label="产物" name="artifacts" /><el-tab-pane label="Run 比较" name="compare" /><el-tab-pane label="新增 Run" name="new-run" /></el-tabs>
+        <el-tabs v-model="tab"><el-tab-pane label="协议/配置" name="protocol" /><el-tab-pane label="信号" name="signals" /><el-tab-pane label="持仓" name="portfolio" /><el-tab-pane label="成本/执行" name="execution" /><el-tab-pane label="绩效时序" name="performance" /><el-tab-pane label="归因" name="attribution" /><el-tab-pane label="产物" name="artifacts" /><el-tab-pane label="Run 比较" name="compare" /><el-tab-pane label="新增 Run" name="new-run" /></el-tabs>
         <div v-if="tab === 'protocol'" class="config-grid"><article class="config-block"><h3>实验协议</h3><p>Experiment 级定义，由全部 Run 共享且不可变。</p><pre>{{ JSON.stringify(detail.data.value.experiment.definition, null, 2) }}</pre></article><article class="config-block"><h3>当前 Run 配置</h3><p><span class="hash">{{ selectedRun?.id }}</span> · {{ selectedRun?.status }}</p><pre>{{ JSON.stringify(selectedRun?.config, null, 2) }}</pre></article></div>
         <div v-else-if="tab === 'compare'" class="compare-stack"><div v-if="!effectiveCompareIds.length" class="empty-state">当前 Run 就是 baseline，或实验尚未标记 baseline；请勾选至少两个 Run。</div><ErrorState v-else-if="comparison.error.value" :error="comparison.error.value" /><div v-else-if="comparison.isLoading.value" class="empty-state">正在对齐配置与指标…</div><template v-else-if="comparison.data.value"><h3>指标差异</h3><el-table :data="comparison.data.value.metrics" max-height="520"><el-table-column prop="name" label="指标" min-width="210" /><el-table-column v-for="runItem in comparison.data.value.runs" :key="runItem.id" :label="runItem.id.slice(0, 10)" min-width="160"><template #default="scope"><strong>{{ formatMetric({ value: scope.row.values.find((item: { run_id: string }) => item.run_id === runItem.id)?.value ?? null, unit: scope.row.unit }) }}</strong><small class="delta">Δ {{ formatCell(scope.row.values.find((item: { run_id: string }) => item.run_id === runItem.id)?.delta_from_baseline) }}</small></template></el-table-column></el-table><div class="compare-heading"><h3>配置差异</h3><el-switch v-model="showAllConfigDiffs" active-text="显示全部" inactive-text="仅变化项" /></div><el-table :data="displayedConfigs" max-height="420"><el-table-column prop="path" label="配置路径" min-width="230" /><el-table-column v-for="runItem in comparison.data.value.runs" :key="runItem.id" :label="runItem.id.slice(0, 10)" min-width="180"><template #default="scope">{{ formatCell(scope.row.values.find((item: { run_id: string }) => item.run_id === runItem.id)?.value) }}</template></el-table-column></el-table></template></div>
         <div v-else-if="tab === 'new-run'" class="run-editor"><el-input v-model="runYaml" type="textarea" :rows="18" placeholder="粘贴严格 Run YAML" /><el-button type="primary" :loading="addRun.isPending.value" @click="addRun.mutate()">创建 Run</el-button></div>
         <div v-else-if="tab === 'artifacts'" class="artifact-list"><el-table :data="selectedRun?.artifacts ?? []" empty-text="等待 Run 成功发布"><el-table-column prop="artifact_type" label="类型" width="190" /><el-table-column prop="relative_path" label="相对路径" min-width="250" /><el-table-column prop="row_count" label="行数" width="100" /><el-table-column prop="byte_count" label="字节数" width="120" /><el-table-column label="SHA-256" min-width="240"><template #default="scope"><span class="hash">{{ scope.row.content_hash }}</span></template></el-table-column></el-table></div>
         <template v-else>
-          <div v-if="!isFactorStudy && tab === 'execution'" class="artifact-switch"><el-radio-group v-model="executionArtifact" size="small"><el-radio-button value="orders">订单</el-radio-button><el-radio-button value="fills">成交/拒绝</el-radio-button><el-radio-button value="costs">成本</el-radio-button><el-radio-button value="execution_summary">汇总</el-radio-button></el-radio-group></div>
-          <div v-if="!isFactorStudy && tab === 'performance'" class="artifact-switch"><el-radio-group v-model="performanceArtifact" size="small"><el-radio-button value="performance">净值/回撤</el-radio-button><el-radio-button value="monthly_returns">月度收益</el-radio-button><el-radio-button value="annual_returns">年度收益</el-radio-button></el-radio-group></div>
-          <div v-if="!isFactorStudy && tab === 'attribution'" class="artifact-switch"><el-radio-group v-model="attributionArtifact" size="small"><el-radio-button value="attribution">收益归因</el-radio-button><el-radio-button value="exposure_summary">仓位暴露</el-radio-button></el-radio-group></div>
-          <div v-if="isFactorStudy && ['signals', 'portfolio', 'execution', 'performance'].includes(tab)" class="artifact-switch"><el-radio-group v-model="selectedVariant" size="small"><el-radio-button value="DIRECTION_ADJUSTED">方向调整</el-radio-button><el-radio-button value="INDUSTRY_NEUTRALIZED">行业中性</el-radio-button></el-radio-group></div>
-          <div v-if="isFactorStudy && ['signals', 'portfolio', 'execution', 'performance'].includes(tab)" class="artifact-switch"><el-radio-group v-model="selectedLabel" size="small"><el-radio-button value="THEORETICAL_FORWARD_RETURN">理论标签</el-radio-button><el-radio-button value="EXECUTABLE_FORWARD_RETURN">可执行标签</el-radio-button></el-radio-group></div>
-          <div v-if="isFactorStudy && tab === 'portfolio'" class="artifact-switch"><el-radio-group v-model="factorArtifact" size="small"><el-radio-button value="coverage">因子覆盖</el-radio-button><el-radio-button value="label_quality">标签质量</el-radio-button><el-radio-button value="industry_coverage">行业覆盖</el-radio-button><el-radio-button value="quantile_returns">分层收益</el-radio-button><el-radio-button value="long_short_returns">多空收益</el-radio-button></el-radio-group></div>
-          <div v-if="isFactorStudy && tab === 'execution'" class="artifact-switch"><el-radio-group v-model="factorExecutionArtifact" size="small"><el-radio-button value="correlation">相关性</el-radio-button><el-radio-button value="turnover">换手</el-radio-button><el-radio-button value="cost_scenarios">成本情景</el-radio-button></el-radio-group></div>
-          <div v-if="isFactorStudy && tab === 'performance'" class="artifact-switch"><el-radio-group v-model="factorPerformanceArtifact" size="small"><el-radio-button value="ic">IC 时序</el-radio-button><el-radio-button value="monotonicity">单调性</el-radio-button><el-radio-button value="stability">稳定性</el-radio-button></el-radio-group></div>
-          <div v-if="isFactorStudy && selectedFactor && ['portfolio', 'execution', 'performance'].includes(tab)" class="selection-note">当前下钻：<strong>{{ selectedVariant }} / {{ selectedLabel }} / {{ selectedFactor }} / {{ selectedHorizon }}D</strong></div>
+          <div v-if="tab === 'execution'" class="artifact-switch"><el-radio-group v-model="executionArtifact" size="small"><el-radio-button value="orders">订单</el-radio-button><el-radio-button value="fills">成交/拒绝</el-radio-button><el-radio-button value="costs">成本</el-radio-button><el-radio-button value="execution_summary">汇总</el-radio-button></el-radio-group></div>
+          <div v-if="tab === 'performance'" class="artifact-switch"><el-radio-group v-model="performanceArtifact" size="small"><el-radio-button value="performance">净值/回撤</el-radio-button><el-radio-button value="monthly_returns">月度收益</el-radio-button><el-radio-button value="annual_returns">年度收益</el-radio-button></el-radio-group></div>
+          <div v-if="tab === 'attribution'" class="artifact-switch"><el-radio-group v-model="attributionArtifact" size="small"><el-radio-button value="attribution">收益归因</el-radio-button><el-radio-button value="exposure_summary">仓位暴露</el-radio-button></el-radio-group></div>
           <ErrorState v-if="artifact.error.value" :error="artifact.error.value" />
           <div v-else-if="artifact.isLoading.value" class="empty-state">正在读取并复核可信产物…</div>
-          <template v-else><ChartCard v-if="chartOption" :title="`${artifactType} 图表`" :subtitle="`可信 Manifest 读取 · 共 ${artifactTotal} 行`"><VChart class="artifact-chart" :option="chartOption" autoresize /></ChartCard><el-table :data="artifactRows" max-height="560" :empty-text="selectedRun?.manifest_hash ? '该产物没有记录' : '等待 Run 成功发布'" @row-click="(row: RunArtifactRow) => isFactorStudy && tab === 'signals' ? selectFactorRow(row) : undefined"><el-table-column v-for="column in artifactColumns" :key="column" :prop="column" :label="column" min-width="145" show-overflow-tooltip><template #default="scope">{{ formatArtifactCell(column, scope.row[column]) }}</template></el-table-column></el-table><el-pagination v-if="isLargeArtifact && artifactTotal > 100" v-model:current-page="artifactPage" :page-size="100" :total="artifactTotal" layout="prev, pager, next, total" class="artifact-pagination" /></template>
+          <template v-else><ChartCard v-if="chartOption" :title="`${artifactType} 图表`" :subtitle="`可信 Manifest 读取 · 共 ${artifactTotal} 行`"><VChart class="artifact-chart" :option="chartOption" autoresize /></ChartCard><el-table :data="artifactRows" max-height="560" :empty-text="selectedRun?.manifest_hash ? '该产物没有记录' : '等待 Run 成功发布'"><el-table-column v-for="column in artifactColumns" :key="column" :prop="column" :label="column" min-width="145" show-overflow-tooltip><template #default="scope">{{ formatArtifactCell(column, scope.row[column]) }}</template></el-table-column></el-table><el-pagination v-if="isLargeArtifact && artifactTotal > 100" v-model:current-page="artifactPage" :page-size="100" :total="artifactTotal" layout="prev, pager, next, total" class="artifact-pagination" /></template>
         </template>
       </section>
     </template>

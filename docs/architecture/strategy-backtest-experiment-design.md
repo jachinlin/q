@@ -542,8 +542,8 @@ src/quant_research/backtest/
 
 **输入**：
 
-- 实验配置（YAML，Pydantic 严格校验）：`kind∈{STRATEGY_BACKTEST, FACTOR_STUDY}`、`name`、
-  策略/因子配置、`start_date/end_date`、`benchmark`、`initial_cash_fen`、`execution`、`sample_windows`。
+- 策略实验配置（YAML，Pydantic 严格校验）：`name`、策略配置、`start_date/end_date`、
+  `benchmark`、`initial_cash_fen`、`execution`、`sample_windows`。
 - 装配依赖（组合根注入）：`CanonicalResearchRepository`、`FactorEngine`、`StrategyRegistry`、
   `BacktestEngine`、`ExperimentRunRegistry`、`TaskQueue`。
 - 当前 `catalog_hash`（运行开始捕获，用于运行内一致性门）。
@@ -553,11 +553,9 @@ src/quant_research/backtest/
 - **元数据**（SQLite）：`Experiment / Run`（`config_json` 冻结快照、`status`、`catalog_hash`、
   `uses_test_region`、`research_mark`、`artifact_dir`、`error_json`）、`run_metric`、`audit_event`、
   `task/task_attempt`。
-- **产物目录** `artifacts/experiments/<experiment_id>/<run_id>/`：回测 kind 输出
-  `signals/orders/fills/holdings/costs/nav/performance/monthly_returns/annual_returns/execution_summary/exposure_summary/attribution`；
-  因子 kind 输出 `summary/coverage/label_quality/industry_coverage/ic/quantile_returns/
-  long_short_returns/monotonicity/turnover/stability/cost_scenarios/correlation`；两类 Run 均输出
-  `config.json/metrics.json/manifest.json`，策略 Run 另有 `quality_disclosure.json`。
+- **产物目录** `artifacts/experiments/<experiment_id>/<run_id>/`：输出
+  `signals/orders/fills/holdings/costs/nav/performance/monthly_returns/annual_returns/execution_summary/exposure_summary/attribution`，
+  以及 `config.json/metrics.json/manifest.json/quality_disclosure.json`。
 - **读侧视图**：排行榜、配置/指标 diff、血缘、结论标记（供 Dashboard/CLI）。
 - 数据版本漂移/阶段失败/取消/状态冲突时抛 `EXPERIMENT_DATA_DRIFT / EXPERIMENT_STAGE_FAILED /
   EXPERIMENT_CANCELLED / EXPERIMENT_STATE_CONFLICT`。
@@ -573,7 +571,7 @@ Experiment（研究命名空间 / 意图 / 标签 / 结论 / baseline 指针）
 - **Run 记录**：`config_json`(冻结快照，便于比较)、`status`、`catalog_hash`(记录提交时数据版本，
   **用于展示与运行内一致性，不用于复现回放**)、`metrics`、`artifact_dir`、`error_json`。
 - 重跑只允许生成新 Run、新任务和新目录；旧 Run、指标和产物不可覆盖。
-- 统一因子研究（`FACTOR_STUDY`）与策略回测（`STRATEGY_BACKTEST`）到同一追踪主脊与比较视图。
+- 因子研究使用独立 `FactorStudy` 主脊；Experiment 和 Run 只表示策略回测。
 
 ### 4.4 状态机
 
@@ -586,20 +584,19 @@ CREATED → QUEUED → RUNNING → SUCCEEDED
 乐观并发迁移（携期望前态，CAS）；`SUCCEEDED` 前产物必须已落地；`FAILED` 只存结构化错误码 +
 安全上下文；一个 Run 只绑一个任务，重试建新 Run + 新任务。
 
-### 4.5 编排：kind 无关的阶段执行器
+### 4.5 策略实验阶段执行器
 
 ```text
-STRATEGY_BACKTEST: VALIDATE → PREPARE_INPUTS → STRATEGY_RUN(交织 BACKTEST) → ANALYTICS → PERSIST
-FACTOR_STUDY:      VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PERSIST
+VALIDATE → UNIVERSE → FACTOR_COMPUTE → BACKTEST → ANALYTICS → ARTIFACT_VERIFY → REGISTER
 ```
 
 - 截面策略在 `PREPARE_INPUTS` 内先算股票池/因子/管线信号；择时/事件驱动此阶段可能只 warmup。
-  差异由 `Strategy.spec` 声明的数据依赖驱动，runner 本身 kind 无关。
+  差异由 `Strategy.spec` 声明的数据依赖驱动。
 - **STRATEGY\_RUN 与 BACKTEST 交织**：引擎按交易日推进，每个决策时点调 `strategy.on_event(ctx)`
   取订单；`ctx` 只暴露 PIT 可见信息（防未来函数的物理边界，由回测层保证）。本阶段只返回
   冻结回测结果和内存表，不创建最终目录、不登记指标。
-- **ANALYTICS / ANALYZE_FACTORS**：在同一任务会话中完成全部分析计算，仍不发布产物。
-- **PERSIST**：策略和因子 Run 均在此一次性写 staging、生成 Manifest、原子重命名、从最终目录
+- **ANALYTICS**：在同一任务会话中完成绩效与归因分析，仍不发布产物。
+- **ARTIFACT_VERIFY / REGISTER**：一次性写 staging、生成 Manifest、原子重命名，从最终目录
   复核后登记产物与有限且已定义的数值指标。
 - 每阶段边界检查协作取消；失败/取消不留半成品目录。
 
@@ -878,31 +875,26 @@ class BacktestEngine:
 ### 5.5 实验层
 
 ```python
-class ExperimentKind(StrEnum): FACTOR_STUDY=...; STRATEGY_BACKTEST=...
 class RunStatus(StrEnum): CREATED=...; QUEUED=...; RUNNING=...; SUCCEEDED=...; FAILED=...; CANCELLED=...
 
 class ExperimentRunRegistry(Protocol):   # 消费者侧持久化端口
-    def create_experiment(self, name: str, kind: ExperimentKind, config: Mapping) -> str: ...
+    def create_experiment(self, name: str, config: Mapping) -> str: ...
     def create_run(self, experiment_id: str, config_snapshot: Mapping, catalog_hash: str) -> str: ...
     def transition(self, run_id: str, expected: RunStatus, target: RunStatus, **terminal) -> None: ...
     def record_metrics(self, run_id: str, metrics: Mapping[str, float]) -> None: ...
     def get_run(self, run_id: str) -> Mapping[str, object]: ...
     def list_runs(self, experiment_id: str) -> Sequence[Mapping[str, object]]: ...
 
-class StageGraph(Protocol):
-    def stages(self, kind: ExperimentKind) -> tuple["Stage", ...]: ...
-
 class ExperimentRunner:
     def run(self, run_id: str, progress, cancellation) -> "RunResult": ...
-    # 策略阶段: VALIDATE → PREPARE_INPUTS → STRATEGY_RUN → ANALYTICS → PERSIST
-    # 因子阶段: VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PERSIST
+    # VALIDATE → UNIVERSE → FACTOR_COMPUTE → BACKTEST → ANALYTICS → ARTIFACT_VERIFY → REGISTER
     # 每阶段前后校验 catalog_hash 未变(运行内一致性)，变则 EXPERIMENT_DATA_DRIFT
 ```
 
 #### 5.5.1 SQLite 表
 
 ```text
-experiment(id PK, name, kind, description, definition_json, definition_hash,
+experiment(id PK, name, description, definition_json, definition_hash,
            baseline_run_id NULL, created_at)
 experiment_tag(experiment_id FK, tag)
 run(id PK, experiment_id FK, status, config_json, catalog_hash,
@@ -920,7 +912,7 @@ task(id PK, subject_kind, subject_id, task_type, payload_json, status, priority,
 task_attempt(id PK, task_id FK, attempt_no, status, started_at, completed_at, error_json NULL)
 ```
 
-产物目录 `artifacts/experiments/<experiment_id>/<run_id>/`：含 kind 对应 Parquet、
+产物目录 `artifacts/experiments/<experiment_id>/<run_id>/`：含策略回测 Parquet、
 `config.json`、`metrics.json` 和可信 `manifest.json`；发布后不可覆盖。
 
 ### 5.6 严格 YAML Schema
@@ -930,7 +922,6 @@ task_attempt(id PK, task_id FK, attempt_no, status, started_at, completed_at, er
 ```yaml
 name: 非空名称
 description: 可空说明
-kind: STRATEGY_BACKTEST             # 或 FACTOR_STUDY
 tags: [按字典序、无重复]
 sample_windows:
   train:      {start: YYYY-MM-DD, end: YYYY-MM-DD}
@@ -939,11 +930,11 @@ sample_windows:
 governance:
   test_budget: 2
   correction: BONFERRONI             # 或 BH_FDR
-initial_run: <与 kind 对应的 RunConfig>
+initial_run: <StrategyBacktestRunConfig>
 ```
 
-三个窗口必须严格有序且互不重叠。策略 Run 只允许 `kind/start_date/end_date/strategy/benchmark/
-initial_cash_fen/execution`；因子 Run 只允许 `kind/start_date/end_date/factor_study`。Run 日期必须位于协议
+三个窗口必须严格有序且互不重叠。Run 只允许 `start_date/end_date/strategy/benchmark/
+initial_cash_fen/execution`。Run 日期必须位于协议
 总区间内。所有 Pydantic 模型均 `extra=forbid, strict, frozen`，日期只接受明确 `YYYY-MM-DD`。
 
 截面策略参数是唯一五模块流水线：
@@ -971,7 +962,7 @@ long_weight/target_tolerance`，不伪装成 Alpha 因子组合。
 - [股票多因子](../../configs/experiments/examples/multifactor.yaml)
 - [ETF 轮动](../../configs/experiments/examples/etf_rotation.yaml)
 - [双均线趋势](../../configs/experiments/examples/dual_ma_trend.yaml)
-- [因子研究](../../configs/experiments/examples/factor_study.yaml)
+- [独立因子研究](../../configs/factor_studies/examples/factor_study.yaml)
 
 ### 5.7 CLI 与 HTTP
 

@@ -2,7 +2,6 @@
 
 from quant_research.experiments.models import (
     ExperimentDefinition,
-    ExperimentKind,
     ExperimentRecord,
     RunRecord,
     RunStatus,
@@ -11,7 +10,6 @@ from quant_research.experiments.statistics import MultipleTestingCorrector
 
 __all__ = [
     "ExperimentDefinition",
-    "ExperimentKind",
     "ExperimentRecord",
     "MultipleTestingCorrector",
     "RunRecord",

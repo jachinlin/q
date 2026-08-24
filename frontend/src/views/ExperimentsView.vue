@@ -21,9 +21,9 @@ const counts = computed(() => {
   const items = experiments.data.value?.items ?? []
   return {
     total: items.length,
-    strategy: items.filter((item) => item.definition.kind === 'STRATEGY_BACKTEST').length,
-    factor: items.filter((item) => item.definition.kind === 'FACTOR_STUDY').length,
+    running: items.filter((item) => item.has_active_runs).length,
     baseline: items.filter((item) => item.baseline_run_id).length,
+    runs: items.reduce((sum, item) => sum + item.run_count, 0),
   }
 })
 const remove = useMutation({
@@ -52,21 +52,20 @@ async function deleteExperiment(experiment: ExperimentOverview) {
 <template>
   <div class="page-stack">
     <section class="panel experiment-hero">
-      <div><span class="eyebrow">EXPERIMENT → RUN</span><h2>统一策略回测与因子研究</h2><p>实验定义研究问题；每次参数变化或重试创建独立 Run，历史产物不会被覆盖。</p></div>
+      <div><span class="eyebrow">STRATEGY EXPERIMENT → RUN</span><h2>策略回测实验中心</h2><p>实验定义策略研究问题；每次参数变化或重试创建独立 Run，历史产物不会被覆盖。</p></div>
       <RouterLink to="/experiments/new"><el-button type="primary" size="large">创建实验</el-button></RouterLink>
     </section>
     <section class="metrics-grid">
       <article class="metric-card"><span class="metric-top">实验总数<i /></span><strong class="metric-value">{{ counts.total }}</strong><p>不可变研究定义</p></article>
-      <article class="metric-card tone-cyan"><span class="metric-top">策略回测<i /></span><strong class="metric-value">{{ counts.strategy }}</strong><p>订单驱动 T+1</p></article>
-      <article class="metric-card tone-green"><span class="metric-top">因子研究<i /></span><strong class="metric-value">{{ counts.factor }}</strong><p>IC、分层与显著性</p></article>
+      <article class="metric-card tone-cyan"><span class="metric-top">Run 总数<i /></span><strong class="metric-value">{{ counts.runs }}</strong><p>订单驱动 T+1</p></article>
+      <article class="metric-card tone-green"><span class="metric-top">运行中<i /></span><strong class="metric-value">{{ counts.running }}</strong><p>排队或阶段执行</p></article>
       <article class="metric-card"><span class="metric-top">基线<i /></span><strong class="metric-value">{{ counts.baseline }}</strong><p>精确指向 Run</p></article>
     </section>
     <ErrorState v-if="experiments.error.value" :error="experiments.error.value" />
     <section v-else class="panel table-panel">
-      <div class="panel-heading"><div><h2>实验</h2><p>策略回测和因子研究共享任务、指标与产物生命周期。</p></div></div>
+      <div class="panel-heading"><div><h2>策略实验</h2><p>策略 Run 共享任务、指标与不可变产物生命周期。</p></div></div>
       <el-table v-loading="experiments.isLoading.value" :data="experiments.data.value?.items ?? []" empty-text="尚无实验">
         <el-table-column label="实验" min-width="280"><template #default="scope"><RouterLink class="experiment-link" :to="`/experiments/${scope.row.id}`"><strong>{{ scope.row.definition.name }}</strong><small>{{ scope.row.definition.description || '—' }}</small></RouterLink></template></el-table-column>
-        <el-table-column label="类型" width="150"><template #default="scope">{{ scope.row.definition.kind === 'STRATEGY_BACKTEST' ? '策略回测' : '因子研究' }}</template></el-table-column>
         <el-table-column label="Run / TEST" width="120"><template #default="scope">{{ scope.row.run_count }} / {{ scope.row.test_uses }}</template></el-table-column>
         <el-table-column label="基线" width="130"><template #default="scope"><span class="hash">{{ scope.row.baseline_run_id?.slice(0, 10) ?? '—' }}</span></template></el-table-column>
         <el-table-column label="状态" width="110"><template #default="scope"><StatusBadge :status="scope.row.latest_run?.status ?? 'CREATED'" /></template></el-table-column>

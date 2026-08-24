@@ -1,24 +1,15 @@
-"""定义统一实验、运行、研究治理和持久化记录。"""
+"""定义纯策略实验、运行、研究治理和持久化记录。"""
 
 from __future__ import annotations
 
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from quant_research.data.contracts import JsonValue
-
-
-class ExperimentKind(StrEnum):
-    """区分策略回测和因子研究两种实验。
-
-    入参：实验 kind 字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
-    """
-
-    STRATEGY_BACKTEST = "STRATEGY_BACKTEST"
-    FACTOR_STUDY = "FACTOR_STUDY"
+from quant_research.domain.enums import MultipleTestingMethod
 
 
 class RunStatus(StrEnum):
@@ -47,28 +38,8 @@ class ResearchMark(StrEnum):
     DISCARDED = "DISCARDED"
 
 
-class MultipleTestingMethod(StrEnum):
-    """定义实验比较采用的多重检验校正方法。
-
-    入参：校正方法字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
-    """
-
-    BONFERRONI = "BONFERRONI"
-    BH_FDR = "BH_FDR"
-
-
-class IndustryUnclassifiedPolicy(StrEnum):
-    """定义行业状态缺失或 tombstone 时的因子研究处理策略。
-
-    入参：策略字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
-    """
-
-    EXCLUDE = "EXCLUDE"
-    UNCLASSIFIED = "UNCLASSIFIED"
-
-
 class RunStage(StrEnum):
-    """列出两种实验共享编排器可能执行的阶段。
+    """列出策略实验编排器可能执行的阶段。
 
     入参：阶段字符串。返回值：对应枚举成员。异常：未知值抛出 ``ValueError``。
     """
@@ -77,7 +48,6 @@ class RunStage(StrEnum):
     PREPARE_INPUTS = "PREPARE_INPUTS"
     STRATEGY_RUN = "STRATEGY_RUN"
     ANALYTICS = "ANALYTICS"
-    ANALYZE_FACTORS = "ANALYZE_FACTORS"
     PERSIST = "PERSIST"
 
 
@@ -217,7 +187,6 @@ class StrategyBacktestRunConfig(_FrozenModel):
     入参：日期、策略、基准、初始资金和撮合配置。返回值：冻结回测 Run。异常：日期或字段非法时抛出校验错误。
     """
 
-    kind: Literal[ExperimentKind.STRATEGY_BACKTEST]
     start_date: date
     end_date: date
     strategy: StrategyConfig
@@ -237,105 +206,21 @@ class StrategyBacktestRunConfig(_FrozenModel):
         return self
 
 
-class FactorIndustrySettings(_FrozenModel):
-    """定义因子研究显式使用的 PIT 行业分类口径。
-
-    入参：分类体系和未分类策略。返回值：冻结行业配置。异常：空分类体系或未知策略抛出校验错误。
-    """
-
-    taxonomy: Literal["证监会行业分类"]
-    unclassified_policy: IndustryUnclassifiedPolicy
-
-
-class FactorStudySettings(_FrozenModel):
-    """定义统一 Run 中因子研究所需的分析参数。
-
-    入参：因子、股票池、收益期限、分层数、可选行业策略和成本情景。
-    返回值：冻结分析配置。
-    异常：重复、乱序或非法参数抛出值错误。
-    """
-
-    factor_ids: tuple[str, ...] = Field(min_length=1)
-    universe: dict[str, JsonValue]
-    horizons: tuple[int, ...] = Field(min_length=1)
-    quantiles: int = Field(default=5, ge=2)
-    industry: FactorIndustrySettings | None = None
-    cost_bps_scenarios: tuple[int, ...] = (5, 10, 20)
-
-    @model_validator(mode="after")
-    def _unique(self) -> FactorStudySettings:
-        if len(set(self.factor_ids)) != len(self.factor_ids) or any(
-            not value for value in self.factor_ids
-        ):
-            raise ValueError("factor_ids must be unique and nonempty")
-        if tuple(sorted(set(self.horizons))) != self.horizons or any(
-            value <= 0 for value in self.horizons
-        ):
-            raise ValueError(
-                "horizons must be unique positive values in ascending order"
-            )
-        if (
-            not self.cost_bps_scenarios
-            or tuple(sorted(set(self.cost_bps_scenarios)))
-            != self.cost_bps_scenarios
-            or any(
-                type(value) is not int or value < 0
-                for value in self.cost_bps_scenarios
-            )
-        ):
-            raise ValueError(
-                "cost_bps_scenarios must be unique nonnegative integers in ascending order"
-            )
-        return self
-
-
-class FactorStudyRunConfig(_FrozenModel):
-    """定义因子研究 Run 的冻结业务输入。
-
-    入参：日期和因子研究配置。返回值：冻结因子 Run。异常：日期倒序或字段非法时抛出校验错误。
-    """
-
-    kind: Literal[ExperimentKind.FACTOR_STUDY]
-    start_date: date
-    end_date: date
-    factor_study: FactorStudySettings
-
-    @field_validator("start_date", "end_date", mode="before")
-    @classmethod
-    def _date(cls, value: object) -> date:
-        return _FrozenModel._parse_date(value)
-
-    @model_validator(mode="after")
-    def _range(self) -> FactorStudyRunConfig:
-        if self.start_date > self.end_date:
-            raise ValueError("run start_date must not follow end_date")
-        return self
-
-
-RunConfig = Annotated[
-    StrategyBacktestRunConfig | FactorStudyRunConfig,
-    Field(discriminator="kind"),
-]
-
-
 class ExperimentDefinition(_FrozenModel):
     """定义一个不可变研究问题及提交时立即运行的首个配置。
 
-    入参：名称、描述、kind、标签、样本协议、治理和首个 Run。返回值：冻结实验定义。异常：kind、标签或区间不一致时抛出值错误。
+    入参：名称、描述、标签、样本协议、治理和首个策略 Run。返回值：冻结实验定义。异常：标签或区间不一致时抛出值错误。
     """
 
     name: str = Field(min_length=1, max_length=128)
     description: str = Field(default="", max_length=4000)
-    kind: ExperimentKind
     tags: tuple[str, ...] = ()
     sample_windows: SampleWindows
     governance: GovernanceConfig
-    initial_run: RunConfig
+    initial_run: StrategyBacktestRunConfig
 
     @model_validator(mode="after")
     def _consistent(self) -> ExperimentDefinition:
-        if self.initial_run.kind is not self.kind:
-            raise ValueError("initial_run kind must equal experiment kind")
         if (
             len(set(self.tags)) != len(self.tags)
             or tuple(sorted(self.tags)) != self.tags
@@ -344,20 +229,18 @@ class ExperimentDefinition(_FrozenModel):
         self.validate_run(self.initial_run)
         return self
 
-    def validate_run(self, config: RunConfig) -> None:
-        """校验派生 Run 与实验 kind 和协议总区间一致。
+    def validate_run(self, config: StrategyBacktestRunConfig) -> None:
+        """校验派生策略 Run 与实验协议总区间一致。
 
-        入参：待追加的 Run 配置。返回值：无。异常：kind 不同或日期越界时抛出 ``ValueError``。
+        入参：待追加的策略 Run 配置。返回值：无。异常：日期越界时抛出 ``ValueError``。
         """
-        if config.kind is not self.kind:
-            raise ValueError("run kind must equal experiment kind")
         if (
             config.start_date < self.sample_windows.start
             or config.end_date > self.sample_windows.end
         ):
             raise ValueError("run dates must stay inside the experiment protocol")
 
-    def uses_test_region(self, config: RunConfig) -> bool:
+    def uses_test_region(self, config: StrategyBacktestRunConfig) -> bool:
         """返回 Run 是否触及锁定 TEST 区间。
 
         入参：已归属本实验的 Run 配置。返回值：相交时为真。异常：Run 不符合实验协议时抛出值错误。
@@ -413,7 +296,7 @@ class RunRecord(_FrozenModel):
 
     id: str
     experiment_id: str
-    config: RunConfig
+    config: StrategyBacktestRunConfig
     config_hash: str
     catalog_hash: str
     status: RunStatus
@@ -450,30 +333,15 @@ STRATEGY_STAGES = (
     RunStage.ANALYTICS,
     RunStage.PERSIST,
 )
-FACTOR_STAGES = (
-    RunStage.VALIDATE,
-    RunStage.PREPARE_INPUTS,
-    RunStage.ANALYZE_FACTORS,
-    RunStage.PERSIST,
-)
-
-
 __all__ = [
-    "FACTOR_STAGES",
     "STRATEGY_STAGES",
     "ExperimentAggregate",
     "ExperimentDefinition",
-    "ExperimentKind",
     "ExperimentRecord",
-    "FactorIndustrySettings",
-    "FactorStudyRunConfig",
-    "FactorStudySettings",
     "GovernanceConfig",
-    "IndustryUnclassifiedPolicy",
     "MultipleTestingMethod",
     "ResearchMark",
     "RunArtifactRecord",
-    "RunConfig",
     "RunMetricRecord",
     "RunRecord",
     "RunStage",

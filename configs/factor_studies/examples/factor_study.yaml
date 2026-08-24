@@ -1,0 +1,14 @@
+name: 价值动量因子研究
+description: 候选因子诊断
+tags: [factor]
+start_date: 2018-01-01
+end_date: 2022-12-31
+correction: BH_FDR
+factor_ids: [book_to_price_mrq, momentum_120_20]
+universe: {name: CN_STOCK_STANDARD}
+horizons: [1, 5, 20]
+quantiles: 5
+industry:
+  taxonomy: 证监会行业分类
+  unclassified_policy: EXCLUDE
+cost_bps_scenarios: [5, 10, 20]

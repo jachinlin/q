@@ -1,4 +1,4 @@
-"""严格解析并规范化统一实验和派生 Run YAML。"""
+"""严格解析并规范化纯策略实验和派生 Run YAML。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
-from quant_research.experiments.models import ExperimentDefinition, RunConfig
+from quant_research.experiments.models import (
+    ExperimentDefinition,
+    StrategyBacktestRunConfig,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +35,7 @@ class ResolvedRun:
     入参：Run 配置、规范字节和 SHA-256。返回值：冻结解析结果。异常：构造阶段不执行额外 I/O。
     """
 
-    config: RunConfig
+    config: StrategyBacktestRunConfig
     normalized: bytes
     config_hash: str
 
@@ -42,8 +45,6 @@ class ExperimentConfigParser:
 
     入参：各解析方法接收 YAML 文本或明确文件路径。返回值：规范模型和内容哈希。异常：YAML 或严格 Schema 非法时抛出 ``ValueError``。
     """
-
-    _run_adapter: TypeAdapter[RunConfig] = TypeAdapter(RunConfig)
 
     def parse_experiment(self, text: str) -> ResolvedExperiment:
         """解析实验 YAML，并返回稳定规范化结果。
@@ -69,7 +70,7 @@ class ExperimentConfigParser:
         """
         raw = self._mapping(text)
         try:
-            model = self._run_adapter.validate_python(raw, strict=False)
+            model = StrategyBacktestRunConfig.model_validate(raw, strict=False)
         except ValidationError as error:
             raise ValueError(self._message(error)) from error
         normalized = canonical_json_bytes(model.model_dump(mode="json"))

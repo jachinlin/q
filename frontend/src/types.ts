@@ -81,14 +81,12 @@ export type DataUpdateWindow = {
   trigger_date?: string
 }
 
-export type ExperimentKind = 'STRATEGY_BACKTEST' | 'FACTOR_STUDY'
 export type RunStatus = 'CREATED' | 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
 export type ResearchMark = 'UNREVIEWED' | 'BASELINE' | 'CANDIDATE' | 'DISCARDED'
 
 export type ExperimentDefinitionDto = {
   name: string
   description: string
-  kind: ExperimentKind
   tags: string[]
   sample_windows: Record<'train' | 'validation' | 'test', { start: string; end: string }>
   governance: { test_budget: number; correction: 'BONFERRONI' | 'BH_FDR' }
@@ -266,6 +264,89 @@ export type StrategyCatalog = {
   components: Record<string, string[]>
   component_schemas: Record<string, Array<{ model_id: string; params_schema: Record<string, unknown> }>>
   capability_rules: Array<Record<string, unknown>>
+}
+
+export type FactorDecisionMark = 'UNREVIEWED' | 'CANDIDATE' | 'DISCARDED'
+export type FactorStudyStatus = 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+
+export type FactorStudyDefinition = {
+  name: string
+  description: string
+  tags: string[]
+  start_date: string
+  end_date: string
+  correction: 'BONFERRONI' | 'BH_FDR'
+  factor_ids: string[]
+  universe: { name: 'CN_STOCK_STANDARD' }
+  horizons: number[]
+  quantiles: number
+  industry: { taxonomy: '证监会行业分类'; unclassified_policy: 'EXCLUDE' | 'UNCLASSIFIED' } | null
+  cost_bps_scenarios: number[]
+}
+
+export type FactorStudyDecision = {
+  signal_variant: string
+  label_kind: string
+  factor_ref: string
+  horizon: number
+  mark: Exclude<FactorDecisionMark, 'UNREVIEWED'>
+  note: string
+  actor: string
+  updated_at: string
+}
+
+export type FactorStudy = {
+  id: string
+  definition: FactorStudyDefinition
+  config_hash: string
+  catalog_hash: string
+  status: FactorStudyStatus
+  stage: string
+  task_id: string
+  artifact_dir: string | null
+  manifest_hash: string | null
+  error: Record<string, unknown> | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  metrics: Array<{ name: string; value: number; unit: string | null; p_value: number | null; adjusted_p_value: number | null }>
+  artifacts: Array<{ artifact_type: string; relative_path: string; content_hash: string; byte_count: number; row_count: number | null; schema: Record<string, string> | null }>
+  decisions: FactorStudyDecision[]
+}
+
+export type FactorStudyOverview = FactorStudy & {
+  matrix_total: number
+  candidate_count: number
+  discarded_count: number
+  unreviewed_count: number
+}
+
+export type FactorStudyMatrixRow = {
+  signal_variant: string
+  label_kind: string
+  factor_ref: string
+  horizon: number
+  rank_ic_mean: number | null
+  rank_ic_hac_t_stat: number | null
+  rank_ic_adjusted_p_value: number | null
+  monotonicity_mean: number | null
+  gross_spread_mean: number | null
+  break_even_cost_bps: number | null
+  total_turnover_mean: number | null
+  decision: FactorStudyDecision | null
+}
+
+export type FactorStudyCatalog = {
+  factors: Array<{ factor_id: string }>
+  universes: string[]
+  corrections: Array<'BONFERRONI' | 'BH_FDR'>
+  industry_policies: Array<'EXCLUDE' | 'UNCLASSIFIED'>
+  label_kinds: string[]
+}
+
+export type FactorStudyValidation = {
+  config_hash: string
+  normalized: FactorStudyDefinition
 }
 
 export type DataUpdateSkip = {

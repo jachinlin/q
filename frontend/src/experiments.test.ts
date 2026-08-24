@@ -15,7 +15,7 @@ vi.mock('./api', () => ({
 
 const experiment = {
   id: 'experiment-1',
-  definition: { name: '可删除实验', description: 'test', kind: 'FACTOR_STUDY' },
+  definition: { name: '可删除策略实验', description: 'test' },
   baseline_run_id: null,
   created_at: '2026-08-23T00:00:00Z',
   latest_run: { status: 'FAILED' },
@@ -43,7 +43,7 @@ describe('experiment list deletion', () => {
     apiDelete.mockResolvedValue({ experiment_id: experiment.id, run_count: 2, status: 'DELETED' })
     vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
     const wrapper = await mountList()
-    await vi.waitFor(() => expect(wrapper.text()).toContain('可删除实验'))
+    await vi.waitFor(() => expect(wrapper.text()).toContain('可删除策略实验'))
 
     const remove = wrapper.findAll('button').find((button) => button.text() === '删除')
     if (!remove) throw new Error('missing experiment delete button')

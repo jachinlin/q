@@ -243,89 +243,6 @@ def test_artifact_route_serializes_parquet_dates_as_iso_strings(
     }
 
 
-def test_artifact_filters_after_integrity_validation_and_before_paging(
-    tmp_path: Path,
-) -> None:
-    artifact_dir = tmp_path / "experiment" / "run"
-    artifact_dir.mkdir(parents=True)
-    artifact_path = artifact_dir / "summary.parquet"
-    frame = pl.DataFrame(
-        {
-            "signal_variant": ["RAW", "RAW"],
-            "label_kind": [
-                "THEORETICAL_FORWARD_RETURN",
-                "EXECUTABLE_FORWARD_RETURN",
-            ],
-            "factor_ref": ["momentum", "value"],
-            "horizon": [5, 5],
-            "rank_ic_mean": [0.1, 0.2],
-        }
-    ).sort(["signal_variant", "label_kind", "factor_ref", "horizon"])
-    frame.write_parquet(artifact_path)
-    content = artifact_path.read_bytes()
-    manifest = {
-        "artifacts": [
-            {
-                "artifact_type": "summary",
-                "relative_path": "summary.parquet",
-                "content_hash": hashlib.sha256(content).hexdigest(),
-                "byte_count": len(content),
-                "row_count": 2,
-                "schema": {name: str(dtype) for name, dtype in frame.schema.items()},
-                "primary_key": [
-                    "signal_variant",
-                    "label_kind",
-                    "factor_ref",
-                    "horizon",
-                ],
-                "sort_key": [
-                    "signal_variant",
-                    "label_kind",
-                    "factor_ref",
-                    "horizon",
-                ],
-            }
-        ]
-    }
-    manifest_path = artifact_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    service = ExperimentDashboardService(
-        cast(
-            Any,
-            _ArtifactExperimentService(
-                _ArtifactRun(
-                    str(artifact_dir),
-                    hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-                )
-            ),
-        ),
-        StrategyRegistry.builtins(commission_bps=3.0, commission_minimum_fen=500),
-        tmp_path,
-    )
-    app = FastAPI()
-    ExperimentRoutes.mount(app, service)
-    client = TestClient(app)
-
-    response = client.get(
-        "/api/v1/runs/run/artifacts/summary",
-        params={
-            "label_kind": "EXECUTABLE_FORWARD_RETURN",
-            "factor_ref": "value",
-            "horizon": 5,
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["total"] == 1
-    assert response.json()["items"][0]["factor_ref"] == "value"
-    assert (
-        response.json()["items"][0]["label_kind"]
-        == "EXECUTABLE_FORWARD_RETURN"
-    )
-    with pytest.raises(ValueError, match="unsupported filter for signals"):
-        service.artifact("run", "signals", 1, 100, factor_ref="value")
-
-
 class _ComparisonExperimentService:
     """返回同一实验中的两个固定 Run。"""
 
@@ -345,14 +262,12 @@ class _ComparisonExperimentService:
 def _comparison_runs() -> tuple[SimpleNamespace, SimpleNamespace]:
     parsed = ExperimentConfigParser().parse_experiment(
         """name: compare
-kind: STRATEGY_BACKTEST
 sample_windows:
   train: {start: 2020-01-01, end: 2020-12-31}
   validation: {start: 2021-01-01, end: 2021-12-31}
   test: {start: 2022-01-01, end: 2022-12-31}
 governance: {test_budget: 1, correction: BONFERRONI}
 initial_run:
-  kind: STRATEGY_BACKTEST
   start_date: 2020-01-01
   end_date: 2021-12-31
   strategy:

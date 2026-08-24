@@ -2,11 +2,13 @@
 
 from quant_research.application.data import DataUpdateHandler, DataValidationHandler
 from quant_research.application.experiments import ExperimentService
+from quant_research.application.factor_studies import FactorStudyService
 from quant_research.application.worker import Worker
 
 __all__ = [
     "DataUpdateHandler",
     "DataValidationHandler",
     "ExperimentService",
+    "FactorStudyService",
     "Worker",
 ]

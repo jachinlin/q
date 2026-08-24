@@ -1,4 +1,4 @@
-"""验证统一 Experiment/Run 严格配置和 TEST 隔离语义。"""
+"""验证纯策略 Experiment/Run 严格配置和 TEST 隔离语义。"""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,8 +7,8 @@ from typing import Any, cast
 import pytest
 
 from quant_research.application.experiments import ExperimentService
+from quant_research.domain.enums import MultipleTestingMethod
 from quant_research.experiments.config import ExperimentConfigParser
-from quant_research.experiments.models import ExperimentKind, MultipleTestingMethod
 from quant_research.experiments.statistics import MultipleTestingCorrector
 from quant_research.strategies.registry import StrategyRegistry
 
@@ -39,7 +39,6 @@ def experiment_yaml(end_date: str = "2022-12-31") -> str:
         (
             "name: dual ma",
             "description: trend",
-            "kind: STRATEGY_BACKTEST",
             "tags: [trend]",
             "sample_windows:",
             "  train: {start: 2018-01-01, end: 2020-12-31}",
@@ -47,7 +46,6 @@ def experiment_yaml(end_date: str = "2022-12-31") -> str:
             "  test: {start: 2023-01-01, end: 2024-12-31}",
             "governance: {test_budget: 1, correction: BONFERRONI}",
             "initial_run:",
-            "  kind: STRATEGY_BACKTEST",
             "  start_date: 2018-01-01",
             f"  end_date: {end_date}",
             "  strategy:",
@@ -65,7 +63,6 @@ def test_strict_config_is_deterministic_and_marks_test_use() -> None:
     resolved = parser.parse_experiment(experiment_yaml("2023-01-02"))
     repeated = parser.parse_experiment(experiment_yaml("2023-01-02"))
     assert resolved.config_hash == repeated.config_hash
-    assert resolved.definition.kind is ExperimentKind.STRATEGY_BACKTEST
     assert resolved.definition.uses_test_region(resolved.definition.initial_run)
 
 
@@ -90,43 +87,32 @@ def test_all_checked_in_examples_are_strict_and_strategy_buildable() -> None:
     assert [path.name for path in paths] == [
         "dual_ma_trend.yaml",
         "etf_rotation.yaml",
-        "factor_study.yaml",
         "multifactor.yaml",
     ]
     for path in paths:
         definition = parser.parse_experiment_file(path).definition
-        if definition.kind is ExperimentKind.STRATEGY_BACKTEST:
-            run = definition.initial_run
-            assert run.kind is ExperimentKind.STRATEGY_BACKTEST
-            strategies.validate(run.strategy.strategy_id, run.strategy.parameters)
+        run = definition.initial_run
+        strategies.validate(run.strategy.strategy_id, run.strategy.parameters)
 
 
-def test_factor_study_example_uses_final_industry_and_cost_contract() -> None:
+def test_legacy_factor_study_experiment_is_rejected() -> None:
     parser = ExperimentConfigParser()
-    resolved = parser.parse_experiment_file(
-        Path("configs/experiments/examples/factor_study.yaml")
-    )
-    run = resolved.definition.initial_run
-
-    assert run.kind is ExperimentKind.FACTOR_STUDY
-    assert run.factor_study.cost_bps_scenarios == (5, 10, 20)
-    assert run.factor_study.industry is not None
-    assert run.factor_study.industry.taxonomy == "证监会行业分类"
-    assert run.factor_study.industry.unclassified_policy.value == "EXCLUDE"
-
-    legacy = Path("configs/experiments/examples/factor_study.yaml").read_text(
-        encoding="utf-8"
-    ).replace(
-        "    industry:\n      taxonomy: 证监会行业分类\n      unclassified_policy: EXCLUDE",
-        "    industry_neutral: true",
-    )
-    with pytest.raises(ValueError, match="industry_neutral"):
+    legacy = """name: old factor study
+kind: FACTOR_STUDY
+tags: [factor]
+sample_windows:
+  train: {start: 2018-01-01, end: 2020-12-31}
+  validation: {start: 2021-01-01, end: 2021-12-31}
+  test: {start: 2022-01-01, end: 2022-12-31}
+governance: {test_budget: 1, correction: BH_FDR}
+initial_run:
+  kind: FACTOR_STUDY
+  start_date: 2018-01-01
+  end_date: 2022-12-31
+  factor_study: {factor_ids: [value], horizons: [5]}
+"""
+    with pytest.raises(ValueError, match="kind|strategy"):
         parser.parse_experiment(legacy)
-    unsupported_taxonomy = Path(
-        "configs/experiments/examples/factor_study.yaml"
-    ).read_text(encoding="utf-8").replace("证监会行业分类", "申万行业分类")
-    with pytest.raises(ValueError, match="taxonomy"):
-        parser.parse_experiment(unsupported_taxonomy)
 
 
 def test_multiple_testing_corrections_use_literal_oracles() -> None:

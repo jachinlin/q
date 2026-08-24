@@ -118,7 +118,7 @@ uv run quant data validate daily_bar
 
 `validate <dataset>` 只生成诊断结果；只有 `validate-all` 能开放研究读取。
 
-## 实验与任务
+## 策略实验、因子研究与任务
 
 提交实验只创建不可变实验和后台任务，不在 CLI 进程中同步执行：
 
@@ -133,6 +133,15 @@ uv run quant worker once
 uv run quant experiments show <experiment-id>
 ```
 
+因子研究使用独立的扁平配置和命令组：
+
+```powershell
+uv run quant factor-studies validate configs/factor_studies/examples/factor_study.yaml
+uv run quant factor-studies submit configs/factor_studies/examples/factor_study.yaml
+uv run quant factor-studies show <factor-study-id>
+uv run quant factor-studies list
+```
+
 管理任务：
 
 ```powershell
@@ -142,13 +151,16 @@ uv run quant tasks cancel <task-id>
 uv run quant tasks retry <task-id>
 ```
 
-重试会创建新任务；实验类任务还会创建新实验身份，不覆盖旧运行和旧产物。
+失败或取消的因子研究重试会复用同一任务和冻结配置并创建新 attempt；成功研究不可重跑。
+策略实验的重跑继续创建新的 Run 和产物，任何成功产物都不可覆盖。
 
 实验示例：
 
 - `configs/experiments/examples/etf_rotation.yaml`
 - `configs/experiments/examples/multifactor.yaml`
-- `configs/experiments/examples/offline_etf.yaml`
+- `configs/experiments/examples/dual_ma_trend.yaml`
+
+因子研究示例：`configs/factor_studies/examples/factor_study.yaml`。
 
 ## CLI 输出
 

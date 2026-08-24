@@ -26,14 +26,14 @@ const run = {
 }
 
 function aggregate(
-  kind: 'STRATEGY_BACKTEST' | 'FACTOR_STUDY',
+  _kind: 'STRATEGY_BACKTEST',
   runs: Array<Record<string, unknown>> = [run],
 ) {
   return {
     experiment: {
       id: 'exp-1', baseline_run_id: run.id, created_at: '2026-08-01T00:00:00Z',
       definition: {
-        name: kind === 'STRATEGY_BACKTEST' ? '双均线实验' : '价值因子研究', description: 'test', kind, tags: [],
+        name: '双均线实验', description: 'test', tags: [],
         sample_windows: { train: { start: '2020-01-01', end: '2020-12-31' }, validation: { start: '2021-01-01', end: '2021-12-31' }, test: { start: '2022-01-01', end: '2022-12-31' } },
         governance: { test_budget: 1, correction: 'BONFERRONI' }, initial_run: {},
       },
@@ -90,32 +90,6 @@ describe('unified experiment detail', () => {
     if (!monthly.exists()) throw new Error('missing monthly returns selector')
     await monthly.setValue(true)
     await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/monthly_returns')))
-  })
-
-  it('renders factor summary independently from strategy artifacts', async () => {
-    apiGet.mockImplementation((path: string) => {
-      if (typeof path !== 'string') return Promise.resolve({})
-      if (path === '/api/v1/experiments/exp-1') return Promise.resolve(aggregate('FACTOR_STUDY'))
-      if (path.includes('/artifacts/summary')) return Promise.resolve({ items: [
-        { signal_variant: 'DIRECTION_ADJUSTED', label_kind: 'THEORETICAL_FORWARD_RETURN', factor_ref: 'book_to_price_mrq', horizon: 5, rank_ic_mean: 0.06, rank_ic_hac_t_stat: 2.4, monotonicity_mean: 0.9, long_short_mean: 0.02, break_even_cost_bps: 18, total_turnover_mean: 0.7 },
-      ], total: 1 })
-      if (path.includes('/artifacts/ic')) return Promise.resolve({ items: [], total: 0 })
-      return Promise.reject(new Error(`unexpected API path: ${path}`))
-    })
-    const { wrapper, router } = await mountDetail()
-    await clickTab(wrapper, '因子矩阵')
-    await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/summary')))
-    await flushPromises()
-    expect(wrapper.findComponent({ name: 'VChart' }).exists()).toBe(true)
-    expect(wrapper.text()).toContain('book_to_price_mrq')
-    expect(wrapper.text()).not.toContain('cumulative_return')
-    const matrixRow = wrapper.findAll('.el-table__body-wrapper tbody tr').find((row) => row.text().includes('book_to_price_mrq'))
-    if (!matrixRow) throw new Error('missing factor matrix row')
-    await matrixRow.trigger('click')
-    await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringMatching(/artifacts\/ic.*label_kind=THEORETICAL_FORWARD_RETURN.*factor_ref=book_to_price_mrq.*horizon=5/)))
-    await vi.waitFor(() => expect(router.currentRoute.value.query).toMatchObject({
-      signal_variant: 'DIRECTION_ADJUSTED', label_kind: 'THEORETICAL_FORWARD_RETURN', factor: 'book_to_price_mrq', horizon: '5',
-    }))
   })
 
   it('defaults to the latest Run, marks it clearly, and persists explicit selection in the URL', async () => {

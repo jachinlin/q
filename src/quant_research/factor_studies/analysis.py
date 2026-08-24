@@ -351,13 +351,12 @@ def analyze(
     *,
     quantiles: int,
     cost_bps_scenarios: tuple[int, ...],
-    sample_segments: Mapping[str, tuple[date, date]],
     minimum: int = MIN_CROSS_SECTION,
     ic_rolling_window: int = IC_ROLLING_WINDOW,
     ic_rolling_min_valid: int = IC_ROLLING_MIN_VALID,
     ic_quantile_probabilities: tuple[float, ...] = IC_QUANTILE_PROBABILITIES,
 ) -> dict[str, pl.DataFrame]:
-    """计算覆盖、IC、分层、稳定性、换手和成本代理完整诊断。
+    """计算覆盖、IC、分层、换手和成本代理完整诊断。
 
     该函数作为因子研究稳定模块级公开入口保留，集中发布固定 Schema 的可信产物。
 
@@ -367,13 +366,12 @@ def analyze(
         future_returns：按持有期和标签隔离的未来收益。
         quantiles：分位组数量。
         cost_bps_scenarios：严格升序且唯一的成本基点情景。
-        sample_segments：冻结的 TRAIN、VALIDATION 和 TEST 区间。
         minimum：计算日度 IC 的最小截面数。
         ic_rolling_window：IC 滚动窗口。
         ic_rolling_min_valid：IC 滚动窗口最少有效样本数。
         ic_quantile_probabilities：IC 描述统计分位点。
     返回值：
-        返回覆盖、标签质量、IC、分层、稳定性、换手和成本等固定产物表。
+        返回覆盖、标签质量、IC、分层、换手和成本等固定产物表。
     异常：
         ValueError：输入 Schema 或配置违反研究契约时抛出。
     """
@@ -381,7 +379,6 @@ def analyze(
         quantiles=quantiles,
         minimum=minimum,
         cost_bps_scenarios=cost_bps_scenarios,
-        sample_segments=sample_segments,
         ic_analyzer=InformationCoefficientAnalyzer(
             rolling_window=ic_rolling_window,
             rolling_min_valid=ic_rolling_min_valid,
@@ -400,13 +397,11 @@ class _StudyAnalyzer:
         quantiles: int,
         minimum: int,
         cost_bps_scenarios: tuple[int, ...],
-        sample_segments: Mapping[str, tuple[date, date]],
         ic_analyzer: InformationCoefficientAnalyzer,
     ) -> None:
         self._quantiles = quantiles
         self._minimum = minimum
         self._cost_bps_scenarios = cost_bps_scenarios
-        self._sample_segments = dict(sample_segments)
         self._ic_analyzer = ic_analyzer
 
     def run(
@@ -432,7 +427,6 @@ class _StudyAnalyzer:
         long_short_frames: list[pl.DataFrame] = []
         monotonicity_frames: list[pl.DataFrame] = []
         turnover_frames: list[pl.DataFrame] = []
-        stability_frames: list[pl.DataFrame] = []
         cost_rows: list[dict[str, object]] = []
         correlation_frames: list[pl.DataFrame] = []
         refs = sorted(set(cast(list[str], factors["factor_id"].to_list())))
@@ -533,12 +527,6 @@ class _StudyAnalyzer:
                         pl.lit(horizon).alias("horizon"),
                         pl.lit(label_kind).alias("label_kind"),
                     )
-                    stability = self._stability(ic, horizon).with_columns(
-                        pl.lit(variant).alias("signal_variant"),
-                        pl.lit(factor_ref).alias("factor_ref"),
-                        pl.lit(horizon).alias("horizon"),
-                        pl.lit(label_kind).alias("label_kind"),
-                    )
                     costs, break_even = self._costs(
                         long_short,
                         turnover,
@@ -565,7 +553,6 @@ class _StudyAnalyzer:
                     quantile_frames.append(quantile)
                     long_short_frames.append(long_short)
                     monotonicity_frames.append(monotonicity)
-                    stability_frames.append(stability)
         return {
             "summary": pl.DataFrame(summary_rows).sort(
                 "signal_variant", "label_kind", "factor_ref", "horizon"
@@ -610,14 +597,6 @@ class _StudyAnalyzer:
             ),
             "turnover": pl.concat(turnover_frames).sort(
                 "signal_variant", "factor_ref", "signal_date"
-            ),
-            "stability": pl.concat(stability_frames).sort(
-                "signal_variant",
-                "label_kind",
-                "factor_ref",
-                "horizon",
-                "segment_type",
-                "segment_key",
             ),
             "cost_scenarios": pl.DataFrame(cost_rows).sort(
                 "signal_variant",
@@ -880,74 +859,6 @@ class _StudyAnalyzer:
             },
             orient="row",
         ).sort("signal_date")
-
-    def _stability(self, ic: pl.DataFrame, horizon: int) -> pl.DataFrame:
-        dates = cast(list[date], ic["signal_date"].to_list())
-        segments: list[tuple[str, str, date, date]] = []
-        for key, (start, end) in sorted(self._sample_segments.items()):
-            segments.append(("SAMPLE_REGION", key, start, end))
-        for year in sorted({value.year for value in dates}):
-            segments.append(
-                (
-                    "CALENDAR_YEAR",
-                    str(year),
-                    date(year, 1, 1),
-                    date(year, 12, 31),
-                )
-            )
-        for year, month in sorted(
-            {(value.year, value.month) for value in dates}
-        ):
-            month_dates = [
-                value
-                for value in dates
-                if value.year == year and value.month == month
-            ]
-            segments.append(
-                (
-                    "CALENDAR_MONTH",
-                    f"{year:04d}-{month:02d}",
-                    min(month_dates),
-                    max(month_dates),
-                )
-            )
-        full_values = cast(
-            list[float],
-            ic.filter(pl.col("is_valid"))["rank_ic"].drop_nulls().to_list(),
-        )
-        full_mean = self._mean(full_values)
-        rows: list[dict[str, object]] = []
-        for segment_type, key, start, end in segments:
-            values = cast(
-                list[float],
-                ic.filter(
-                    pl.col("signal_date").is_between(
-                        start, end, closed="both"
-                    )
-                    & pl.col("is_valid")
-                )["rank_ic"].drop_nulls().to_list(),
-            )
-            summary = HacMeanAnalyzer.summarize(values, horizon)
-            rows.append(
-                {
-                    "segment_type": segment_type,
-                    "segment_key": key,
-                    "segment_start": start,
-                    "segment_end": end,
-                    **summary.columns("rank_ic"),
-                    "sign_consistent": (
-                        None
-                        if full_mean is None
-                        or summary.mean is None
-                        or full_mean == 0.0
-                        or summary.mean == 0.0
-                        else (full_mean > 0.0) == (summary.mean > 0.0)
-                    ),
-                    "is_valid": summary.invalid_reason is None,
-                    "invalid_reason": summary.invalid_reason,
-                }
-            )
-        return pl.DataFrame(rows)
 
     def _costs(
         self,

@@ -507,7 +507,7 @@ CanonicalMapper(Protocol)       # 规范化：供应商字段 → Canonical sche
 - **未来收益标签**：主键 `signal_date, instrument_id, horizon, label_kind`，列
   `return_start, return_end, future_return, is_valid, invalid_reason`（固定优先级原因码）。
 - **统计诊断**（因子研究产物）：`summary / coverage / label_quality / industry_coverage / ic /
-  quantile_returns / long_short_returns / monotonicity / turnover / stability / cost_scenarios / correlation`；
+  quantile_returns / long_short_returns / monotonicity / turnover / cost_scenarios / correlation`；
   收益相关主键含 `signal_variant, label_kind, factor_ref, horizon`。
 - 缺依赖能力时抛 `FACTOR_CAPABILITY_UNAVAILABLE`。
 
@@ -591,13 +591,12 @@ MISSING_EXIT_PRICE / NONFINITE_RETURN
 
 全部统计公式用硬编码 oracle 校验，覆盖并列、常数截面、单样本、NaN/Inf、空组、零方差。
 
-### 5.9 因子研究作为一种实验 kind
+### 5.9 独立因子研究
 
-- 因子研究（质量/IC/分层/单调性/稳定性/换手/成本代理）由实验层 `FACTOR_STUDY` kind 编排，
-  与策略回测共享同一 `Experiment → Run` 追踪主脊与比较视图（见
-  [策略、回测与实验设计](strategy-backtest-experiment-design.md) `§4`）。
+- 因子研究（质量/IC/分层/单调性/换手/成本代理）由独立 `FactorStudy` 任务编排，
+  不创建 Experiment 或 Run（见[独立因子研究设计](factor-analysis-design.md)）。
 - 固定产物：summary / coverage / label\_quality / industry\_coverage / ic / quantile\_returns /
-  long\_short\_returns / monotonicity / turnover / stability / cost\_scenarios / correlation。
+  long\_short\_returns / monotonicity / turnover / cost\_scenarios / correlation。
 
 ### 5.10 与其他层边界
 
@@ -1202,12 +1201,11 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 **交付**：
 
 - `Experiment/Run` 模型 + CAS 状态机 + `ExperimentRunRegistry`（SQLite）。
-- 唯一 `EXPERIMENT_RUN` handler：策略阶段图
-  `VALIDATE→PREPARE_INPUTS→STRATEGY_RUN→ANALYTICS→PERSIST`，因子阶段图
-  `VALIDATE→PREPARE_INPUTS→ANALYZE_FACTORS→PERSIST`。
+- `EXPERIMENT_RUN` handler 只执行策略固定七阶段；独立 `FACTOR_STUDY` handler 执行
+  `VALIDATE→PREPARE_INPUTS→ANALYZE_FACTORS→PUBLISH`。
 - 运行内一致性门（`catalog_hash` 在阶段和长回测交易日边界校验，漂移即失败）。
 - `analytics/`：绩效（Sharpe/Sortino/Calmar/回撤/IR/beta/alpha）、成交质量、归因（多空分腿随 P3b）。
-- Worker：唯一实验任务 handler（`EXPERIMENT_RUN`）接入**通用 Worker 队列**——队列本身
+- Worker：策略实验和因子研究 handler 接入**通用 Worker 队列**——队列本身
   （`task`/`task_attempt` 表、CAS 领取、心跳/租约、幂等、主循环）在 P0/P1 已建（数据类任务先用），
   P5 只注册实验 handler（详见 `第 10 章` / [实现级细化](implemention.md)第 6 章）。CLI `quant worker once|run` + 提交实验。
 - 防过拟合治理：SampleWindows + test 预算计数 + 多重检验记账。
@@ -1216,7 +1214,7 @@ infrastructure 只被 bootstrap 装配；能力包只经 ResearchDataRepository 
 
 - 绩效指标字面量 oracle；首日 0 收益口径锁定。
 - 阶段失败/取消不留半成品目录；状态迁移冲突失败不覆盖。
-- 因子研究 kind 与策略回测 kind 共享同一 runner 与追踪主脊。
+- 因子研究与策略回测使用独立状态机、持久化和产物目录。
 - 数据漂移触发 `EXPERIMENT_DATA_DRIFT`。
 
 ### 12.10 阶段 P6 — 四范式策略 + 异构验收

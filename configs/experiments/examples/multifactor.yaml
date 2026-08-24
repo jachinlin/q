@@ -1,6 +1,5 @@
 name: 股票多因子周频回测
 description: 价值与动量复合分数的纯多头等权组合
-kind: STRATEGY_BACKTEST
 tags: [equity, multifactor]
 sample_windows:
   train: {start: 2018-01-01, end: 2020-12-31}
@@ -10,7 +9,6 @@ governance:
   test_budget: 2
   correction: BH_FDR
 initial_run:
-  kind: STRATEGY_BACKTEST
   start_date: 2018-01-01
   end_date: 2022-12-31
   strategy:

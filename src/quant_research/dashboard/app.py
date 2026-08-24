@@ -20,6 +20,10 @@ from quant_research.dashboard.experiments import (
     ExperimentDashboardService,
     ExperimentRoutes,
 )
+from quant_research.dashboard.factor_studies import (
+    FactorStudyDashboardService,
+    FactorStudyRoutes,
+)
 from quant_research.dashboard.notebook import NotebookProbe
 from quant_research.dashboard.routes.api import _DashboardRoutes
 from quant_research.dashboard.views import DashboardViewService
@@ -31,6 +35,7 @@ def create_dashboard_app(
     service: DashboardViewService,
     commands: OperationalCommandService,
     experiment_service: ExperimentDashboardService,
+    factor_study_service: FactorStudyDashboardService | None = None,
     notebook_probe: NotebookProbe,
     static_dir: Path,
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "[::1]"),
@@ -189,6 +194,8 @@ def create_dashboard_app(
 
     _DashboardRoutes.mount(app, service, commands, notebook_probe)
     ExperimentRoutes.mount(app, experiment_service)
+    if factor_study_service is not None:
+        FactorStudyRoutes.mount(app, factor_study_service)
 
     built = static_dir.resolve()
     index = built / "index.html"

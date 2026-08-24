@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from math import erfc, isfinite, sqrt
 
-from quant_research.experiments.models import MultipleTestingMethod
+from quant_research.domain.enums import MultipleTestingMethod
 
 
 class MultipleTestingCorrector:

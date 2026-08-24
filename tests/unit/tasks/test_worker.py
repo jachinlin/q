@@ -1130,6 +1130,7 @@ def test_handler_registry_names_standard_types_and_rejects_duplicate_registratio
         "DATA_UPDATE",
         "DATA_VALIDATION",
         "EXPERIMENT_RUN",
+        "FACTOR_STUDY",
     }
     assert getattr(module, "STANDARD_TASK_TYPES", None) == frozenset(standard)
     registry = registry_type()

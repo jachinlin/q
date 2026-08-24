@@ -256,13 +256,13 @@ function taskName(task: Task) {
       </div>
 
       <section class="panel research-launch-panel">
-        <header class="panel-heading"><div><h2>参考实验模板</h2><p>策略回测和因子研究共享 Experiment、Run、任务与产物主脊</p></div><span class="hash">{{ shortHash(data.gate.catalog_hash) }}</span></header>
+        <header class="panel-heading"><div><h2>研究入口</h2><p>策略实验与独立因子研究分别冻结配置、任务和不可变产物。</p></div><span class="hash">{{ shortHash(data.gate.catalog_hash) }}</span></header>
         <div class="three-grid">
           <article class="benchmark-card"><h3>股票多因子</h3><strong>CROSS SECTION</strong><p>动态股票池 · 价值/动量 · Alpha-Risk-Cost 优化</p></article>
           <article class="benchmark-card"><h3>双均线趋势</h3><strong>LONG / FLAT</strong><p>固定标的 · 时序方向信号 · 状态变化调仓</p></article>
           <article class="benchmark-card"><h3>ETF 轮动</h3><strong>ALLOCATION</strong><p>多周期动量 · 趋势过滤 · 月频约束投影</p></article>
         </div>
-        <div class="toolbar launch-action"><span class="spacer" /><RouterLink to="/experiments/new"><el-button type="primary">使用模板创建实验</el-button></RouterLink></div>
+        <div class="toolbar launch-action"><RouterLink to="/factor-studies/new"><el-button>创建因子研究</el-button></RouterLink><span class="spacer" /><RouterLink to="/experiments/new"><el-button type="primary">使用模板创建策略实验</el-button></RouterLink></div>
       </section>
     </template>
 

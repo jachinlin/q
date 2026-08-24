@@ -321,28 +321,22 @@ class DataInitializationStateORM(Base):
 
 
 class ExperimentORM(Base):
-    """持久化不可变实验定义和精确 baseline Run 指针。
+    """持久化不可变策略实验定义和精确 baseline Run 指针。
 
     入参：
-        字段保存实验标识、名称、类型、冻结定义、标签关系和基线指针。
+        字段保存实验标识、名称、冻结定义、标签关系和基线指针。
     返回值：
         SQLAlchemy 查询或构造时返回实验 ORM 记录。
     异常：
-        数据库约束拒绝非法实验类型、重复主键或缺失必填字段。
+        数据库约束拒绝重复主键或缺失必填字段。
     """
 
     __tablename__ = "experiment"
-    __table_args__ = (
-        CheckConstraint(
-            "kind IN ('STRATEGY_BACKTEST', 'FACTOR_STUDY')", name="ck_experiment_kind"
-        ),
-        Index("ix_experiment_created", "created_at", "id"),
-    )
+    __table_args__ = (Index("ix_experiment_created", "created_at", "id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    kind: Mapped[str] = mapped_column(String(32), nullable=False)
     definition_json: Mapped[str] = mapped_column(Text, nullable=False)
     definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     baseline_run_id: Mapped[str | None] = mapped_column(String(36))
@@ -484,6 +478,107 @@ class RunArtifactORM(Base):
     row_count: Mapped[int | None] = mapped_column(Integer)
     schema_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class FactorStudyORM(Base):
+    """映射研究主表。入参：ORM 字段。返回值：持久化实体。异常：约束非法时数据库拒绝。"""
+
+    __tablename__ = "factor_study"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_factor_study_status",
+        ),
+        CheckConstraint(
+            "stage IN ('VALIDATE', 'PREPARE_INPUTS', 'ANALYZE_FACTORS', 'PUBLISH')",
+            name="ck_factor_study_stage",
+        ),
+        Index("ix_factor_study_created", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    definition_json: Mapped[str] = mapped_column(Text, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    catalog_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    artifact_dir: Mapped[str | None] = mapped_column(String)
+    manifest_hash: Mapped[str | None] = mapped_column(String(64))
+    error_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[str | None] = mapped_column(String(32))
+    completed_at: Mapped[str | None] = mapped_column(String(32))
+
+
+class FactorStudyTagORM(Base):
+    """映射研究标签。入参：研究 ID 和标签。返回值：持久化实体。异常：主键重复时数据库拒绝。"""
+
+    __tablename__ = "factor_study_tag"
+
+    factor_study_id: Mapped[str] = mapped_column(
+        ForeignKey("factor_study.id", ondelete="CASCADE"), primary_key=True
+    )
+    tag: Mapped[str] = mapped_column(String(64), primary_key=True)
+
+
+class FactorStudyMetricORM(Base):
+    """映射研究指标。入参：维度指标与显著性。返回值：持久化实体。异常：约束非法时数据库拒绝。"""
+
+    __tablename__ = "factor_study_metric"
+
+    factor_study_id: Mapped[str] = mapped_column(
+        ForeignKey("factor_study.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(String(256), primary_key=True)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(32))
+    p_value: Mapped[float | None] = mapped_column(Float)
+    adjusted_p_value: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class FactorStudyArtifactORM(Base):
+    """映射研究产物。入参：Manifest 证据。返回值：持久化实体。异常：约束非法时数据库拒绝。"""
+
+    __tablename__ = "factor_study_artifact"
+
+    factor_study_id: Mapped[str] = mapped_column(
+        ForeignKey("factor_study.id", ondelete="CASCADE"), primary_key=True
+    )
+    artifact_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    relative_path: Mapped[str] = mapped_column(String, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_count: Mapped[int | None] = mapped_column(Integer)
+    schema_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class FactorStudyDecisionORM(Base):
+    """映射人工结论。入参：四维键和审计字段。返回值：持久化实体。异常：标记或主键非法时数据库拒绝。"""
+
+    __tablename__ = "factor_study_decision"
+    __table_args__ = (
+        CheckConstraint(
+            "mark IN ('CANDIDATE', 'DISCARDED')",
+            name="ck_factor_study_decision_mark",
+        ),
+    )
+
+    factor_study_id: Mapped[str] = mapped_column(
+        ForeignKey("factor_study.id", ondelete="CASCADE"), primary_key=True
+    )
+    signal_variant: Mapped[str] = mapped_column(String(64), primary_key=True)
+    label_kind: Mapped[str] = mapped_column(String(64), primary_key=True)
+    factor_ref: Mapped[str] = mapped_column(String(128), primary_key=True)
+    horizon: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mark: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
 class TaskORM(Base):

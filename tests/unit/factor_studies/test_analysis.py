@@ -52,14 +52,13 @@ def run_analysis(
     *,
     quantiles: int = 5,
 ) -> dict[str, pl.DataFrame]:
-    """使用固定成本和空样本分段运行统计内核。"""
+    """使用固定成本运行统计内核。"""
     return analyze(
         factors,
         eligible,
         study_labels(labels),
         quantiles=quantiles,
         cost_bps_scenarios=(5, 10, 20),
-        sample_segments={},
     )
 
 
@@ -111,7 +110,6 @@ def test_coverage_schema_accepts_reason_after_inference_window() -> None:
         study_labels({1: future}),
         quantiles=2,
         cost_bps_scenarios=(5,),
-        sample_segments={},
         minimum=2,
     )["coverage"]
 
@@ -533,7 +531,7 @@ def test_hac_uses_horizon_overlap_lag_and_literal_mean() -> None:
     assert summary.invalid_reason is None
 
 
-def test_monotonicity_turnover_stability_and_cost_use_literal_oracles() -> None:
+def test_monotonicity_turnover_and_cost_use_literal_oracles() -> None:
     days = [date(2026, 1, 5) + timedelta(days=index) for index in range(3)]
     instruments = [f"{index:06d}.SZ" for index in range(30)]
     factor_rows: list[dict[str, object]] = []
@@ -575,7 +573,6 @@ def test_monotonicity_turnover_stability_and_cost_use_literal_oracles() -> None:
         study_labels({1: pl.DataFrame(return_rows)}),
         quantiles=5,
         cost_bps_scenarios=(5, 10, 20),
-        sample_segments={"TRAIN": (days[0], days[-1])},
     )
 
     monotonicity = result["monotonicity"]
@@ -595,8 +592,4 @@ def test_monotonicity_turnover_stability_and_cost_use_literal_oracles() -> None:
     assert costs.filter(pl.col("cost_bps") == 5)["net_spread_mean"].item() == pytest.approx(
         0.2395
     )
-    assert set(result["stability"]["segment_type"].to_list()) == {
-        "SAMPLE_REGION",
-        "CALENDAR_YEAR",
-        "CALENDAR_MONTH",
-    }
+    assert "stability" not in result

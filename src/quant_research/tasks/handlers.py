@@ -12,6 +12,7 @@ STANDARD_TASK_TYPES = frozenset(
         "DATA_UPDATE",
         "DATA_VALIDATION",
         "EXPERIMENT_RUN",
+        "FACTOR_STUDY",
     }
 )
 

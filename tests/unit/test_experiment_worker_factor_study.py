@@ -1,4 +1,4 @@
-"""验证 Experiment Worker 的因子研究输入适配语义。"""
+"""验证独立 FactorStudy Worker 的输入适配语义。"""
 
 from __future__ import annotations
 
@@ -8,14 +8,13 @@ from typing import Any, cast
 
 import polars as pl
 
-from quant_research.bootstrap.worker import _FactorPublisher, _FactorRunSession
-from quant_research.experiments.models import (
-    ExperimentKind,
+from quant_research.bootstrap.worker import _FactorPublisher, _FactorStudySession
+from quant_research.domain.enums import MultipleTestingMethod
+from quant_research.factor_studies.models import (
     FactorIndustrySettings,
-    FactorStudyRunConfig,
-    FactorStudySettings,
+    FactorStudyDefinition,
+    FactorStudyUniverse,
     IndustryUnclassifiedPolicy,
-    MultipleTestingMethod,
 )
 from quant_research.factors import FACTOR_OUTPUT_SCHEMA, FactorArtifact
 
@@ -109,7 +108,7 @@ def test_factor_study_maps_date_applies_direction_and_pit_scope() -> None:
         "momentum_120_20": cast(FactorArtifact, _Artifact(frame)),
     }
 
-    result = _FactorRunSession._analysis_factor_frame(
+    result = _FactorStudySession._analysis_factor_frame(
         artifacts,
         ("momentum_120_20",),
         {"momentum_120_20": -1},
@@ -144,7 +143,7 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
             "is_classified": [True, True, True, False],
         }
     )
-    session = _FactorRunSession(
+    session = _FactorStudySession(
         cast(Any, object()),
         cast(Any, _IndustryRepository(state)),
         cast(Any, object()),
@@ -170,20 +169,23 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
         }
     )
 
-    def config(policy: IndustryUnclassifiedPolicy) -> FactorStudyRunConfig:
-        return FactorStudyRunConfig(
-            kind=ExperimentKind.FACTOR_STUDY,
+    def config(policy: IndustryUnclassifiedPolicy) -> FactorStudyDefinition:
+        return FactorStudyDefinition(
+            name="industry policy",
+            description="",
+            tags=(),
             start_date=day,
             end_date=day,
-            factor_study=FactorStudySettings(
-                factor_ids=("value",),
-                universe={"kind": "ALL_A_SHARES"},
-                horizons=(1,),
-                industry=FactorIndustrySettings(
-                    taxonomy="证监会行业分类",
-                    unclassified_policy=policy,
-                ),
+            correction=MultipleTestingMethod.BH_FDR,
+            factor_ids=("value",),
+            universe=FactorStudyUniverse(name="CN_STOCK_STANDARD"),
+            horizons=(1,),
+            quantiles=5,
+            industry=FactorIndustrySettings(
+                taxonomy="证监会行业分类",
+                unclassified_policy=policy,
             ),
+            cost_bps_scenarios=(5, 10, 20),
         )
 
     excluded, exclude_coverage = session._industry_variants(
@@ -262,7 +264,7 @@ def test_factor_metrics_keep_rank_and_spread_corrections_in_separate_families() 
 
 
 def test_empty_security_status_keeps_executable_state_fixed_schema() -> None:
-    session = _FactorRunSession(
+    session = _FactorStudySession(
         cast(Any, object()),
         cast(Any, _EmptyExecutableRepository()),
         cast(Any, object()),

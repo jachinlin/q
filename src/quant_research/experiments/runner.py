@@ -1,4 +1,4 @@
-"""实现两种实验共享的唯一 EXPERIMENT_RUN Worker 处理器。"""
+"""实现纯策略实验的唯一 EXPERIMENT_RUN Worker 处理器。"""
 
 from __future__ import annotations
 
@@ -6,9 +6,7 @@ from typing import Protocol
 
 from quant_research.data.contracts import JsonValue
 from quant_research.experiments.models import (
-    FACTOR_STAGES,
     STRATEGY_STAGES,
-    ExperimentKind,
     RunRecord,
     RunStage,
     RunStatus,
@@ -111,7 +109,7 @@ class RunExecutionSession(Protocol):
 class RunExecutor(Protocol):
     """为冻结 Run 创建隔离的阶段执行会话。
 
-    入参：Run。返回值：任务专属执行会话。异常：Run kind 不匹配时抛出类型错误。
+    入参：Run。返回值：任务专属执行会话。异常：配置不满足策略契约时抛出类型错误。
     """
 
     def create(self, run: RunRecord) -> RunExecutionSession:
@@ -123,13 +121,12 @@ class RunExecutor(Protocol):
 
 
 StrategyRunExecutor = RunExecutor
-FactorRunExecutor = RunExecutor
 
 
 class ExperimentRunHandler:
-    """根据 Experiment kind 执行固定阶段图和 Run CAS 状态机。
+    """执行策略 Experiment 的固定阶段图和 Run CAS 状态机。
 
-    入参：构造时注入 Run 仓储、目录守卫和两种执行器。返回值：``run`` 返回任务终态。异常：状态冲突、漂移或阶段执行失败时抛出对应异常。
+    入参：构造时注入 Run 仓储、目录守卫和策略执行器。返回值：``run`` 返回任务终态。异常：状态冲突、漂移或阶段执行失败时抛出对应异常。
     """
 
     task_type = "EXPERIMENT_RUN"
@@ -139,12 +136,10 @@ class ExperimentRunHandler:
         registry: RunRegistry,
         catalog: CatalogGuard,
         strategy: StrategyRunExecutor,
-        factor: FactorRunExecutor,
     ) -> None:
         self._registry = registry
         self._catalog = catalog
         self._strategy = strategy
-        self._factor = factor
 
     def run(
         self,
@@ -162,19 +157,11 @@ class ExperimentRunHandler:
         self._registry.transition(
             run.id, RunStatus.QUEUED, RunStatus.RUNNING, stage=RunStage.VALIDATE
         )
-        stages = (
-            STRATEGY_STAGES
-            if run.config.kind is ExperimentKind.STRATEGY_BACKTEST
-            else FACTOR_STAGES
-        )
+        stages = STRATEGY_STAGES
         result: dict[str, JsonValue] = {}
         session: RunExecutionSession | None = None
         try:
-            session = (
-                self._strategy.create(run)
-                if run.config.kind is ExperimentKind.STRATEGY_BACKTEST
-                else self._factor.create(run)
-            )
+            session = self._strategy.create(run)
             for index, stage in enumerate(stages):
                 self._catalog.assert_unchanged(run.catalog_hash)
                 if cancellation.is_cancelled():
@@ -245,7 +232,6 @@ class ExperimentRunHandler:
 
 __all__ = [
     "ExperimentRunHandler",
-    "FactorRunExecutor",
     "RunExecutionSession",
     "RunExecutor",
     "StrategyRunExecutor",

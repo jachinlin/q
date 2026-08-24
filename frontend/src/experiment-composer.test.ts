@@ -30,8 +30,8 @@ const catalog = {
   capability_rules: [],
 }
 
-describe('experiment composer schema synchronization', () => {
-  it('derives fields from backend schema and follows direct YAML edits', async () => {
+describe('strategy experiment composer', () => {
+  it('contains only strategy templates and invalidates backend validation after edits', async () => {
     apiGet.mockResolvedValue(catalog)
     apiPost.mockImplementation((path: string) => {
       if (path === '/api/v1/experiments/validate') return Promise.resolve({ config_hash: 'a'.repeat(64), normalized: {} })
@@ -47,15 +47,11 @@ describe('experiment composer schema synchronization', () => {
     if (!template) throw new Error('missing stock template')
     await template.trigger('click')
     await flushPromises()
-    expect(wrapper.text()).toContain('construction.top_n')
-    expect(wrapper.text()).toContain('constraint.max_positions')
+    expect(wrapper.text()).not.toContain('FACTOR_STUDY')
 
     const editor = wrapper.get('.yaml-editor textarea')
     const yaml = (editor.element as HTMLTextAreaElement).value
-    await editor.setValue(yaml.replace('risk: {model_id: none}', 'risk: {model_id: shrinkage, params: {lookback: 120, shrinkage: 0.2}}'))
-    await flushPromises()
-    expect(wrapper.text()).toContain('risk.lookback')
-    expect(wrapper.text()).toContain('risk.shrinkage')
+    expect(yaml).not.toContain('kind:')
 
     const validateButton = wrapper.findAll('button').find((item) => item.text() === '校验')
     const submitButton = wrapper.findAll('button').find((item) => item.text() === '提交')

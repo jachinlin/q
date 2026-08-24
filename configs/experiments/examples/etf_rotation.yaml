@@ -1,6 +1,5 @@
 name: ETF 月频动量轮动
 description: 固定 ETF 池按前复权区间收益排序并持有前两名
-kind: STRATEGY_BACKTEST
 tags: [etf, rotation]
 sample_windows:
   train: {start: 2018-01-01, end: 2020-12-31}
@@ -10,7 +9,6 @@ governance:
   test_budget: 2
   correction: BONFERRONI
 initial_run:
-  kind: STRATEGY_BACKTEST
   start_date: 2018-01-01
   end_date: 2022-12-31
   strategy:

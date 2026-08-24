@@ -53,7 +53,7 @@ def test_create_mark_and_rerun_use_distinct_run_and_task(tmp_path: Path) -> None
     engine.dispose()
 
 
-def test_empty_database_migration_contains_only_unified_research_tables(
+def test_empty_database_migration_contains_strategy_and_factor_study_tables(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "state.sqlite3"
@@ -61,9 +61,8 @@ def test_empty_database_migration_contains_only_unified_research_tables(
     engine = create_sqlite_engine(database)
     tables = set(inspect(engine).get_table_names())
     assert {"experiment", "run", "run_metric", "run_artifact", "task"}.issubset(tables)
-    assert not {"research_family", "research_variant", "factor_study"}.intersection(
-        tables
-    )
+    assert "factor_study" in tables
+    assert not {"research_family", "research_variant"}.intersection(tables)
     engine.dispose()
 
 
