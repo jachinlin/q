@@ -63,6 +63,69 @@ def run_analysis(
     )
 
 
+def test_coverage_schema_accepts_reason_after_inference_window() -> None:
+    days = [date(2026, 1, 1) + timedelta(days=index) for index in range(101)]
+    instruments = ["000001.SZ", "000002.SZ"]
+    eligible = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "eligible": True,
+            }
+            for day in days
+            for instrument_id in instruments
+        ]
+    )
+    factors = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "factor_id": factor_id,
+                "value": float(instrument_index),
+                "is_valid": factor_id == "all_valid" or instrument_index == 0,
+            }
+            for factor_id in ("all_valid", "later_invalid")
+            for day in days
+            for instrument_index, instrument_id in enumerate(instruments)
+        ]
+    )
+    future = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "return_start": day + timedelta(days=1),
+                "return_end": day + timedelta(days=1),
+                "future_return": float(instrument_index) / 100.0,
+            }
+            for day in days
+            for instrument_index, instrument_id in enumerate(instruments)
+        ]
+    )
+
+    coverage = analyze(
+        factors,
+        eligible,
+        study_labels({1: future}),
+        quantiles=2,
+        cost_bps_scenarios=(5,),
+        sample_segments={},
+        minimum=2,
+    )["coverage"]
+
+    assert coverage.schema["quality_reason"] == pl.String
+    assert coverage.filter(pl.col("factor_ref") == "all_valid")[
+        "quality_reason"
+    ].null_count() == 101
+    assert set(
+        coverage.filter(pl.col("factor_ref") == "later_invalid")[
+            "quality_reason"
+        ].to_list()
+    ) == {"INSUFFICIENT_CROSS_SECTION"}
+
+
 def test_future_return_uses_next_open_and_horizon_close() -> None:
     sessions = tuple(date(2026, 1, 5) + timedelta(days=index) for index in range(4))
     bars = pl.DataFrame(

@@ -30,6 +30,17 @@ IC_ROLLING_WINDOW = 20
 MIN_CROSS_SECTION = 30
 _NORMAL_95 = 1.959963984540054
 
+_COVERAGE_SCHEMA = {
+    "signal_variant": pl.String,
+    "factor_ref": pl.String,
+    "signal_date": pl.Date,
+    "eligible_count": pl.Int64,
+    "valid_count": pl.Int64,
+    "coverage": pl.Float64,
+    "is_valid": pl.Boolean,
+    "quality_reason": pl.String,
+}
+
 _INDUSTRY_COVERAGE_SCHEMA = {
     "signal_date": pl.Date,
     "taxonomy": pl.String,
@@ -559,7 +570,9 @@ class _StudyAnalyzer:
             "summary": pl.DataFrame(summary_rows).sort(
                 "signal_variant", "label_kind", "factor_ref", "horizon"
             ),
-            "coverage": pl.DataFrame(coverage_rows).sort(
+            "coverage": pl.DataFrame(
+                coverage_rows, schema=_COVERAGE_SCHEMA
+            ).sort(
                 "signal_variant", "factor_ref", "signal_date"
             ),
             "label_quality": self._label_quality(future_returns),
