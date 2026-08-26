@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import threading
+import time
 from datetime import UTC, date, datetime
 from io import StringIO
 from pathlib import Path
@@ -9,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
+
+import pytest
 
 from quant_research.data.contracts import (
     PublishedPartition,
@@ -74,6 +78,70 @@ class _RequestSource(_Source):
         )
 
 
+class _ConcurrentRequestSource(_Source):
+    def __init__(self, request_count: int = 8) -> None:
+        super().__init__()
+        self.request_count = request_count
+        self.active = 0
+        self.max_active = 0
+        self.fetch_order: list[int] = []
+        self._lock = threading.Lock()
+        self._all_started = threading.Event()
+
+    def requests(
+        self, endpoint: str, start: date, end: date
+    ) -> tuple[dict[str, object], ...]:
+        del start, end
+        return tuple(
+            {"endpoint": endpoint, "ordinal": index, "fields": "ts_code"}
+            for index in range(self.request_count)
+        )
+
+    def fetch(self, endpoint: str, request: dict[str, object]) -> tuple[RawBatch, ...]:
+        ordinal = int(request["ordinal"])
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == min(4, self.request_count):
+                self._all_started.set()
+        assert self._all_started.wait(timeout=2)
+        time.sleep((self.request_count - ordinal) * 0.003)
+        with self._lock:
+            self.fetch_order.append(ordinal)
+            self.active -= 1
+        return super().fetch(endpoint, request)
+
+
+class _FailingConcurrentSource(_ConcurrentRequestSource):
+    def fetch(self, endpoint: str, request: dict[str, object]) -> tuple[RawBatch, ...]:
+        ordinal = int(request["ordinal"])
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == 4:
+                self._all_started.set()
+        assert self._all_started.wait(timeout=2)
+        if ordinal == 1:
+            raise ConnectionError("planned request failure")
+        if ordinal == 0:
+            time.sleep(0.02)
+        with self._lock:
+            self.fetch_order.append(ordinal)
+            self.active -= 1
+        return _Source.fetch(self, endpoint, request)
+
+
+class _DelayedRequestSource(_ConcurrentRequestSource):
+    def fetch(self, endpoint: str, request: dict[str, object]) -> tuple[RawBatch, ...]:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.04)
+        with self._lock:
+            self.active -= 1
+        return _Source.fetch(self, endpoint, request)
+
+
 class _Calendar:
     def explicit_window(self, start: date, end: date) -> tuple[date, date]:
         return start, end
@@ -122,6 +190,16 @@ class _RawStore:
         return None
 
 
+class _RecordingRawStore(_RawStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.published: list[int] = []
+
+    def publish(self, batch: RawBatch) -> PublishedPartition:
+        self.published.append(int(batch.request["ordinal"]))
+        return super().publish(batch)
+
+
 class _Observer:
     def __init__(self) -> None:
         self.stages: list[tuple[str, int]] = []
@@ -144,6 +222,26 @@ class _Observer:
 
     def is_cancelled(self) -> bool:
         return False
+
+
+class _CancelAfterFirstObserver(_Observer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = False
+
+    def boundary(
+        self,
+        stage: str,
+        dataset: DatasetKind,
+        kind: str,
+        details: dict[str, object],
+    ) -> None:
+        super().boundary(stage, dataset, kind, details)
+        if kind == "raw_request" and details.get("status") == "COMPLETED":
+            self.cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self.cancelled
 
 
 def _partial_plan() -> DataUpdatePlan:
@@ -360,6 +458,146 @@ def test_localize_logs_current_request_before_fetch_and_reports_its_slice(
     )
     assert started_index < completed_index
     assert records[started_index]["context"]["request"]["list_status"] == "L"
+
+
+def test_localize_fetches_with_bounded_concurrency_and_publishes_in_order(
+    tmp_path: Path,
+) -> None:
+    source = _ConcurrentRequestSource()
+    raw_store = _RecordingRawStore(tmp_path / "raw")
+    pipeline = DataPipeline(
+        source=source,  # type: ignore[arg-type]
+        mapper=object(),  # type: ignore[arg-type]
+        calendar=_Calendar(),  # type: ignore[arg-type]
+        raw_store=raw_store,  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+        repository=_Repository(),  # type: ignore[arg-type]
+        quality_runner=object(),  # type: ignore[arg-type]
+        routes=TUSHARE_ROUTES,
+        max_concurrent_requests=lambda: 4,
+    )
+
+    result = pipeline.localize(
+        DatasetKind.STOCK_MASTER,
+        start=date(2026, 8, 15),
+        end=date(2026, 8, 15),
+    )
+
+    assert result.fetched == source.request_count
+    assert source.max_active == 4
+    assert source.fetch_order != list(range(source.request_count))
+    assert raw_store.published == list(range(source.request_count))
+
+
+def test_localize_concurrency_one_preserves_serial_fetching(tmp_path: Path) -> None:
+    source = _ConcurrentRequestSource(request_count=1)
+    pipeline = DataPipeline(
+        source=source,  # type: ignore[arg-type]
+        mapper=object(),  # type: ignore[arg-type]
+        calendar=_Calendar(),  # type: ignore[arg-type]
+        raw_store=_RecordingRawStore(tmp_path / "raw"),  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+        repository=_Repository(),  # type: ignore[arg-type]
+        quality_runner=object(),  # type: ignore[arg-type]
+        routes=TUSHARE_ROUTES,
+        max_concurrent_requests=lambda: 1,
+    )
+
+    pipeline.localize(
+        DatasetKind.STOCK_MASTER,
+        start=date(2026, 8, 15),
+        end=date(2026, 8, 15),
+    )
+
+    assert source.max_active == 1
+
+
+def test_localize_failure_keeps_only_the_ordered_published_prefix(
+    tmp_path: Path,
+) -> None:
+    source = _FailingConcurrentSource()
+    raw_store = _RecordingRawStore(tmp_path / "raw")
+    pipeline = DataPipeline(
+        source=source,  # type: ignore[arg-type]
+        mapper=object(),  # type: ignore[arg-type]
+        calendar=_Calendar(),  # type: ignore[arg-type]
+        raw_store=raw_store,  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+        repository=_Repository(),  # type: ignore[arg-type]
+        quality_runner=object(),  # type: ignore[arg-type]
+        routes=TUSHARE_ROUTES,
+        max_concurrent_requests=lambda: 4,
+    )
+
+    with pytest.raises(ConnectionError, match="planned request failure"):
+        pipeline.localize(
+            DatasetKind.STOCK_MASTER,
+            start=date(2026, 8, 15),
+            end=date(2026, 8, 15),
+        )
+
+    assert raw_store.published == [0]
+    assert 4 not in source.fetch_order
+
+
+def test_localize_cancellation_discards_results_after_published_prefix(
+    tmp_path: Path,
+) -> None:
+    source = _ConcurrentRequestSource()
+    raw_store = _RecordingRawStore(tmp_path / "raw")
+    observer = _CancelAfterFirstObserver()
+    pipeline = DataPipeline(
+        source=source,  # type: ignore[arg-type]
+        mapper=object(),  # type: ignore[arg-type]
+        calendar=_Calendar(),  # type: ignore[arg-type]
+        raw_store=raw_store,  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+        repository=_Repository(),  # type: ignore[arg-type]
+        quality_runner=object(),  # type: ignore[arg-type]
+        routes=TUSHARE_ROUTES,
+        max_concurrent_requests=lambda: 4,
+    )
+
+    with pytest.raises(RuntimeError, match="cancellation requested"):
+        pipeline.localize(
+            DatasetKind.STOCK_MASTER,
+            start=date(2026, 8, 15),
+            end=date(2026, 8, 15),
+            observer=observer,
+        )
+
+    assert raw_store.published == [0]
+
+
+@pytest.mark.performance
+def test_four_way_localize_concurrency_improves_network_throughput(
+    tmp_path: Path,
+) -> None:
+    def elapsed(concurrency: int, name: str) -> float:
+        source = _DelayedRequestSource(request_count=12)
+        pipeline = DataPipeline(
+            source=source,  # type: ignore[arg-type]
+            mapper=object(),  # type: ignore[arg-type]
+            calendar=_Calendar(),  # type: ignore[arg-type]
+            raw_store=_RecordingRawStore(tmp_path / name / "raw"),  # type: ignore[arg-type]
+            curated_store=SimpleNamespace(root=tmp_path / name / "canonical"),
+            repository=_Repository(),  # type: ignore[arg-type]
+            quality_runner=object(),  # type: ignore[arg-type]
+            routes=TUSHARE_ROUTES,
+            max_concurrent_requests=lambda: concurrency,
+        )
+        started = time.monotonic()
+        pipeline.localize(
+            DatasetKind.STOCK_MASTER,
+            start=date(2026, 8, 15),
+            end=date(2026, 8, 15),
+        )
+        return time.monotonic() - started
+
+    serial = elapsed(1, "serial")
+    concurrent = elapsed(4, "concurrent")
+
+    assert concurrent < serial * 0.45
 
 
 def test_pipeline_stages_use_independent_business_log_contexts(

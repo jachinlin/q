@@ -90,6 +90,7 @@ class _DashboardRoutes:
             token = body.data_source_token
             rate_limit = body.data_source_rate_limit
             proxy = body.data_source_proxy
+            concurrency = body.data_source_concurrency
             return settings.change(
                 token_operation=None if token is None else token.operation,
                 token_value=None if token is None else token.value,
@@ -101,6 +102,14 @@ class _DashboardRoutes:
                 ),
                 proxy_operation=None if proxy is None else proxy.operation,
                 proxy_url=None if proxy is None else proxy.url,
+                concurrency_operation=(
+                    None if concurrency is None else concurrency.operation
+                ),
+                max_concurrent_requests=(
+                    None
+                    if concurrency is None
+                    else concurrency.max_concurrent_requests
+                ),
             )
 
         @app.get("/api/v1/data/datasets", response_model=DatasetListResponse)

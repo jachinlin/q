@@ -15,6 +15,7 @@ const client = useQueryClient()
 const token = ref('')
 const requestsPerMinute = ref(480)
 const proxyUrl = ref('')
+const maxConcurrentRequests = ref(4)
 
 const settings = useQuery({
   queryKey: ['settings'],
@@ -42,6 +43,13 @@ const proxySourceLabel = computed(() => {
   return '未配置（Tushare 官方入口）'
 })
 
+const concurrencySourceLabel = computed(() => {
+  const source = settings.data.value?.data_source_concurrency.source
+  if (source === 'DATA_ROOT_ENV') return '数据根 .env'
+  if (source === 'PROCESS_ENVIRONMENT') return '进程环境变量'
+  return '内置默认值'
+})
+
 watch(
   () => settings.data.value?.data_source_rate_limit.requests_per_minute,
   value => {
@@ -53,6 +61,14 @@ watch(
 watch(
   () => settings.data.value?.data_source_proxy.url,
   value => { proxyUrl.value = value ?? '' },
+  { immediate: true },
+)
+
+watch(
+  () => settings.data.value?.data_source_concurrency.max_concurrent_requests,
+  value => {
+    if (value !== undefined) maxConcurrentRequests.value = value
+  },
   { immediate: true },
 )
 
@@ -142,6 +158,34 @@ const clearProxy = useMutation({
   onError: showError,
 })
 
+const saveConcurrency = useMutation({
+  mutationFn: () => api.patch<DashboardSettings>('/api/v1/settings', {
+    data_source_concurrency: {
+      operation: 'SET',
+      max_concurrent_requests: maxConcurrentRequests.value,
+    },
+  }),
+  onSuccess: result => {
+    client.setQueryData(['settings'], result)
+    ElMessage.success('LOCALIZE 并发数已保存，将在下一个数据集请求批次生效')
+  },
+  onError: showError,
+})
+
+const clearConcurrency = useMutation({
+  mutationFn: () => api.patch<DashboardSettings>('/api/v1/settings', {
+    data_source_concurrency: { operation: 'CLEAR' },
+  }),
+  onSuccess: result => {
+    client.setQueryData(['settings'], result)
+    const fallback = result.data_source_concurrency.source === 'PROCESS_ENVIRONMENT'
+      ? '进程环境变量'
+      : '内置默认值 4'
+    ElMessage.success(`Dashboard 并发设置已清除，已回退到${fallback}`)
+  },
+  onError: showError,
+})
+
 async function confirmClear() {
   await ElMessageBox.confirm(
     '将从数据根 .env 删除 Dashboard 管理的 Token。若进程环境变量仍有 Token，它会重新生效。',
@@ -167,6 +211,15 @@ async function confirmClearProxy() {
     { type: 'warning', confirmButtonText: '确认清除' },
   )
   clearProxy.mutate()
+}
+
+async function confirmClearConcurrency() {
+  await ElMessageBox.confirm(
+    '将从数据根 .env 删除 Dashboard 管理的并发数。清除后会回退到进程环境变量或内置默认值 4。',
+    '确认清除 LOCALIZE 并发设置',
+    { type: 'warning', confirmButtonText: '确认清除' },
+  )
+  clearConcurrency.mutate()
 }
 </script>
 
@@ -311,6 +364,50 @@ async function confirmClearProxy() {
               :disabled="settings.data.value?.data_source_proxy.source !== 'DATA_ROOT_ENV'"
               @click="confirmClearProxy"
             >清除 Dashboard 代理</el-button>
+          </div>
+        </el-form>
+
+        <el-divider />
+
+        <div class="rate-limit-heading">
+          <h3>LOCALIZE 并发</h3>
+          <p>只并发网络抓取；Raw 发布、元数据登记和数据集顺序仍保持串行、确定。</p>
+        </div>
+        <div class="settings-status-grid">
+          <div><small>最大并发请求数</small><strong>{{ settings.data.value?.data_source_concurrency.max_concurrent_requests ?? 4 }}</strong></div>
+          <div><small>配置来源</small><strong>{{ concurrencySourceLabel }}</strong></div>
+          <div><small>文件更新时间</small><strong>{{ formatTime(settings.data.value?.data_source_concurrency.updated_at) }}</strong></div>
+        </div>
+        <el-alert
+          title="范围 1–32，默认 4。修改在下一个数据集请求批次生效；已运行的线程池不会中途扩缩容。"
+          type="info"
+          :closable="false"
+          show-icon
+        />
+        <el-form class="token-form" label-position="top" @submit.prevent="saveConcurrency.mutate()">
+          <el-form-item label="最大并发请求数">
+            <el-input-number
+              v-model="maxConcurrentRequests"
+              data-testid="data-source-concurrency"
+              :min="1"
+              :max="32"
+              controls-position="right"
+              style="width:100%"
+            />
+          </el-form-item>
+          <div class="settings-actions">
+            <el-button
+              type="primary"
+              native-type="submit"
+              :loading="saveConcurrency.isPending.value"
+            >保存并在下个批次生效</el-button>
+            <el-button
+              type="danger"
+              plain
+              :loading="clearConcurrency.isPending.value"
+              :disabled="settings.data.value?.data_source_concurrency.source !== 'DATA_ROOT_ENV'"
+              @click="confirmClearConcurrency"
+            >清除 Dashboard 并发设置</el-button>
           </div>
         </el-form>
       </section>

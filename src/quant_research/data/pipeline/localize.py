@@ -23,6 +23,7 @@ type PublishOrReuse = Callable[
 type FilterCompleted = Callable[
     [Sequence[RequestUnit], str], tuple[PendingRequestUnit, ...]
 ]
+type ExecutePending = Callable[[Sequence[PendingRequestUnit]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,7 @@ class LocalizePlanContext:
     publish_batch: PublishBatch
     publish_or_reuse: PublishOrReuse
     filter_completed: FilterCompleted
+    execute_pending: ExecutePending
     ensure_active: Callable[[], None]
     raise_contract: Callable[[str], Never]
 
@@ -67,15 +69,7 @@ class _RequestPlanSupport:
         units: Sequence[RequestUnit],
         checkpoint: str,
     ) -> None:
-        for endpoint, request, force_fetch in context.filter_completed(
-            units, checkpoint
-        ):
-            context.publish_or_reuse(
-                endpoint,
-                request,
-                partial(context.source.fetch, endpoint, request),
-                force_fetch,
-            )
+        context.execute_pending(context.filter_completed(units, checkpoint))
 
 
 class _MarketSnapshotPlan:

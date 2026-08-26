@@ -751,6 +751,19 @@ class DataSourceProxyStatusResponse(DashboardModel):
     updated_at: str | None
 
 
+class DataSourceConcurrencyStatusResponse(DashboardModel):
+    """返回 LOCALIZE 最大并发请求数及其配置来源。
+
+    入参：并发数、解析来源和可选文件更新时间。
+    返回值：构造可安全展示的冻结响应。
+    异常：字段类型、范围或来源非法时由 Pydantic 抛出校验异常。
+    """
+
+    max_concurrent_requests: int = Field(ge=1, le=32)
+    source: Literal["DATA_ROOT_ENV", "PROCESS_ENVIRONMENT", "DEFAULT"]
+    updated_at: str | None
+
+
 class DashboardSettingsResponse(DashboardModel):
     """返回 Dashboard 支持的通用设置安全投影。
 
@@ -763,6 +776,7 @@ class DashboardSettingsResponse(DashboardModel):
     data_source_token: DataSourceTokenStatusResponse
     data_source_rate_limit: DataSourceRateLimitStatusResponse
     data_source_proxy: DataSourceProxyStatusResponse
+    data_source_concurrency: DataSourceConcurrencyStatusResponse
 
 
 class DataSourceTokenChangeRequest(DashboardModel):
@@ -843,6 +857,36 @@ class DataSourceProxyChangeRequest(DashboardModel):
         return self
 
 
+class DataSourceConcurrencyChangeRequest(DashboardModel):
+    """定义 LOCALIZE 最大并发请求数的设置或清除操作。
+
+    入参：操作名称和仅 ``SET`` 允许携带的并发数。
+    返回值：构造经过组合校验的冻结修改请求。
+    异常：操作和值组合不一致或范围非法时抛出值错误。
+    """
+
+    operation: Literal["SET", "CLEAR"]
+    max_concurrent_requests: int | None = Field(default=None, ge=1, le=32)
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> DataSourceConcurrencyChangeRequest:
+        """校验 SET 必须带值且 CLEAR 必须省略值。
+
+        入参：无。
+        返回值：组合合法的当前请求模型。
+        异常：操作和值不形成唯一合法组合时抛出值错误。
+        """
+        if self.operation == "SET" and self.max_concurrent_requests is None:
+            raise ValueError(
+                "SET data source concurrency requires max_concurrent_requests"
+            )
+        if self.operation == "CLEAR" and self.max_concurrent_requests is not None:
+            raise ValueError(
+                "CLEAR data source concurrency must omit max_concurrent_requests"
+            )
+        return self
+
+
 class DashboardSettingsPatchRequest(DashboardModel):
     """定义可逐字段扩展的通用 Dashboard 设置修改请求。
 
@@ -854,6 +898,7 @@ class DashboardSettingsPatchRequest(DashboardModel):
     data_source_token: DataSourceTokenChangeRequest | None = None
     data_source_rate_limit: DataSourceRateLimitChangeRequest | None = None
     data_source_proxy: DataSourceProxyChangeRequest | None = None
+    data_source_concurrency: DataSourceConcurrencyChangeRequest | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> DashboardSettingsPatchRequest:
@@ -867,6 +912,7 @@ class DashboardSettingsPatchRequest(DashboardModel):
             self.data_source_token is None
             and self.data_source_rate_limit is None
             and self.data_source_proxy is None
+            and self.data_source_concurrency is None
         ):
             raise ValueError("settings patch must contain at least one change")
         return self

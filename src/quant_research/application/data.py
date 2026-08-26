@@ -61,7 +61,11 @@ class _DataUpdateObserver(PipelineObserver):
                 completed=completed,
                 total=total,
                 message=f"{stage} 已完成 {name}（{completed}/{total}）",
-                context={"dataset": name, **dict(details)},
+                context={
+                    "dataset": name,
+                    "boundary": "dataset_completed",
+                    **dict(details),
+                },
             )
         )
 

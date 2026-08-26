@@ -601,6 +601,11 @@ export type DashboardSettings = {
     source: 'DATA_ROOT_ENV' | 'PROCESS_ENVIRONMENT' | 'NONE'
     updated_at: string | null
   }
+  data_source_concurrency: {
+    max_concurrent_requests: number
+    source: 'DATA_ROOT_ENV' | 'PROCESS_ENVIRONMENT' | 'DEFAULT'
+    updated_at: string | null
+  }
 }
 
 export type DatasetDetail = Dataset & {

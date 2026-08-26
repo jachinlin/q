@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -1174,6 +1177,7 @@ class DataPipeline:
         routes：为每个数据集选择已启用供应商的静态路由表。
         clock：生成带时区当前时间的可注入时钟。
         logger：记录各阶段请求、输入身份和发布结果的结构化日志器。
+        max_concurrent_requests：在每个待下载请求批次开始时解析最大网络并发数。
     返回值：
         构造并返回 ``DataPipeline`` 实例。
     异常：
@@ -1194,6 +1198,7 @@ class DataPipeline:
         catalog: DatasetCatalog = DATASET_CATALOG,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         logger: StructuredLogger | None = None,
+        max_concurrent_requests: Callable[[], int] = lambda: 4,
     ) -> None:
         self._source = source
         self._mapper = mapper
@@ -1206,6 +1211,7 @@ class DataPipeline:
         self._routes = routes
         self._clock = clock
         self._logger = logger
+        self._max_concurrent_requests = max_concurrent_requests
         self._source_session_active = False
         data_root = raw_store.root.parent
         if curated_store.root.parent != data_root:
@@ -1339,18 +1345,17 @@ class DataPipeline:
             fetched += 1
             return partition
 
-        def publish_or_reuse(
+        def start_raw_request(
             endpoint: str,
             request: Mapping[str, JsonValue],
-            fetch: Callable[[], Iterable[RawBatch]],
             *,
-            force_fetch: bool = False,
-        ) -> PublishedPartition | None:
-            nonlocal fetched, request_completed, skipped
-            if progress.is_cancelled():
-                raise DataPipelineCancelled("data pipeline cancellation requested")
-            request_index = request_completed + 1
-            effective_total = max(request_total, request_index)
+            force_fetch: bool,
+            request_index: int,
+            effective_total: int,
+            max_concurrency: int | None = None,
+            active_concurrency: int | None = None,
+            in_flight: int | None = None,
+        ) -> dict[str, JsonValue]:
             request_hash = hashlib.sha256(
                 canonical_json_bytes(dict(request))
             ).hexdigest()
@@ -1364,6 +1369,14 @@ class DataPipeline:
                 "request_total": effective_total,
                 "completed_requests": request_completed,
             }
+            if max_concurrency is not None:
+                progress_context.update(
+                    {
+                        "max_concurrency": max_concurrency,
+                        "active_concurrency": active_concurrency,
+                        "in_flight": in_flight,
+                    }
+                )
             self._localize_log(
                 "localize.raw_started",
                 request=request,
@@ -1376,10 +1389,38 @@ class DataPipeline:
                 completed_requests=request_completed,
                 request_hash=request_hash,
                 force_fetch=force_fetch,
+                max_concurrency=max_concurrency,
+                active_concurrency=active_concurrency,
+                in_flight=in_flight,
             )
-            progress.boundary(
-                "LOCALIZE", dataset, "raw_request", progress_context
+            progress.boundary("LOCALIZE", dataset, "raw_request", progress_context)
+            return progress_context
+
+        def publish_or_reuse(
+            endpoint: str,
+            request: Mapping[str, JsonValue],
+            fetch: Callable[[], Iterable[RawBatch]],
+            *,
+            force_fetch: bool = False,
+            started_context: Mapping[str, JsonValue] | None = None,
+        ) -> PublishedPartition | None:
+            nonlocal fetched, request_completed, skipped
+            if progress.is_cancelled():
+                raise DataPipelineCancelled("data pipeline cancellation requested")
+            request_index = request_completed + 1
+            effective_total = max(request_total, request_index)
+            progress_context = (
+                start_raw_request(
+                    endpoint,
+                    request,
+                    force_fetch=force_fetch,
+                    request_index=request_index,
+                    effective_total=effective_total,
+                )
+                if started_context is None
+                else dict(started_context)
             )
+            request_hash = str(progress_context["request_hash"])
 
             def complete_request(
                 *,
@@ -1578,6 +1619,171 @@ class DataPipeline:
             if progress.is_cancelled():
                 raise DataPipelineCancelled("data pipeline cancellation requested")
 
+        def execute_pending_requests(
+            units: Sequence[tuple[str, Mapping[str, JsonValue], bool]],
+        ) -> None:
+            """并发抓取待下载请求，并由当前线程按原序发布结果。"""
+            if not units:
+                return
+            configured = self._max_concurrent_requests()
+            if type(configured) is not int or not 1 <= configured <= 32:
+                raise ValueError("max concurrent requests must be from 1 through 32")
+            concurrency = min(configured, len(units))
+            base_completed = request_completed
+            futures: dict[int, Future[tuple[tuple[RawBatch, ...], float, float]]] = {}
+            queued_at: dict[int, float] = {}
+            progress_contexts: dict[int, dict[str, JsonValue]] = {}
+            next_submit = 0
+            failure_seen = threading.Event()
+
+            def fetch_unit(
+                endpoint: str,
+                request: Mapping[str, JsonValue],
+            ) -> tuple[tuple[RawBatch, ...], float, float]:
+                started = time.monotonic()
+                batches = tuple(self._source.fetch(endpoint, request))
+                return batches, started, time.monotonic()
+
+            executor = ThreadPoolExecutor(
+                max_workers=concurrency,
+                thread_name_prefix="tushare-localize",
+            )
+
+            def submit_one(index: int) -> None:
+                endpoint, request, force_fetch = units[index]
+                ensure_active()
+                queued_at[index] = time.monotonic()
+                in_flight = len(futures) + 1
+                progress_contexts[index] = start_raw_request(
+                    endpoint,
+                    request,
+                    force_fetch=force_fetch,
+                    request_index=base_completed + index + 1,
+                    effective_total=request_total,
+                    max_concurrency=configured,
+                    active_concurrency=concurrency,
+                    in_flight=in_flight,
+                )
+                futures[index] = executor.submit(fetch_unit, endpoint, request)
+
+                def notice_failure(
+                    future: Future[tuple[tuple[RawBatch, ...], float, float]],
+                ) -> None:
+                    if not future.cancelled() and future.exception() is not None:
+                        failure_seen.set()
+
+                futures[index].add_done_callback(notice_failure)
+                self._localize_log(
+                    "localize.raw_queued",
+                    request=request,
+                    dataset=dataset.value,
+                    source=source_name,
+                    endpoint=endpoint,
+                    plan=request_plan,
+                    request_index=base_completed + index + 1,
+                    request_total=request_total,
+                    max_concurrency=configured,
+                    active_concurrency=concurrency,
+                    in_flight=in_flight,
+                    force_fetch=force_fetch,
+                )
+
+            try:
+                while next_submit < concurrency:
+                    submit_one(next_submit)
+                    next_submit += 1
+                for index, (endpoint, request, force_fetch) in enumerate(units):
+                    try:
+                        batches, fetch_started, fetch_finished = futures.pop(
+                            index
+                        ).result()
+                        ensure_active()
+                    except Exception as error:
+                        for future in futures.values():
+                            future.cancel()
+                        self._localize_log(
+                            "localize.raw_failed",
+                            request=request,
+                            level="ERROR",
+                            dataset=dataset.value,
+                            source=source_name,
+                            endpoint=endpoint,
+                            plan=request_plan,
+                            request_index=base_completed + index + 1,
+                            request_total=request_total,
+                            max_concurrency=configured,
+                            active_concurrency=concurrency,
+                            error_type=type(error).__name__,
+                            error_message=str(error),
+                            error_code=(
+                                error.detail.code
+                                if isinstance(error, QuantError)
+                                else None
+                            ),
+                        )
+                        raise
+                    publish_started = time.monotonic()
+                    self._localize_log(
+                        "localize.network_completed",
+                        request=request,
+                        dataset=dataset.value,
+                        source=source_name,
+                        endpoint=endpoint,
+                        plan=request_plan,
+                        request_index=base_completed + index + 1,
+                        request_total=request_total,
+                        max_concurrency=configured,
+                        active_concurrency=concurrency,
+                        in_flight=len(futures),
+                        queued_ms=round((fetch_started - queued_at[index]) * 1000, 3),
+                        network_fetch_ms=round(
+                            (fetch_finished - fetch_started) * 1000, 3
+                        ),
+                        batch_count=len(batches),
+                    )
+
+                    def downloaded_batches(
+                        value: tuple[RawBatch, ...] = batches,
+                    ) -> Iterable[RawBatch]:
+                        return value
+
+                    publish_or_reuse(
+                        endpoint,
+                        request,
+                        downloaded_batches,
+                        force_fetch=force_fetch,
+                        started_context=progress_contexts.pop(index),
+                    )
+                    publish_finished = time.monotonic()
+                    self._localize_log(
+                        "localize.request_completed",
+                        request=request,
+                        dataset=dataset.value,
+                        source=source_name,
+                        endpoint=endpoint,
+                        plan=request_plan,
+                        request_index=base_completed + index + 1,
+                        request_total=request_total,
+                        max_concurrency=configured,
+                        active_concurrency=concurrency,
+                        in_flight=len(futures),
+                        queued_ms=round((fetch_started - queued_at[index]) * 1000, 3),
+                        network_fetch_ms=round(
+                            (fetch_finished - fetch_started) * 1000, 3
+                        ),
+                        raw_publish_ms=round(
+                            (publish_finished - publish_started) * 1000, 3
+                        ),
+                        total_ms=round(
+                            (publish_finished - queued_at[index]) * 1000, 3
+                        ),
+                    )
+                    if next_submit < len(units) and not failure_seen.is_set():
+                        submit_one(next_submit)
+                        next_submit += 1
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+
         def raise_source_contract(message: str) -> Never:
             self._raise("DATA_SOURCE_CONTRACT", message)
 
@@ -1620,6 +1826,7 @@ class DataPipeline:
                     filter_completed=lambda units, plan: filter_completed_requests(
                         units, plan=plan
                     ),
+                    execute_pending=execute_pending_requests,
                     ensure_active=ensure_active,
                     raise_contract=raise_source_contract,
                 ),

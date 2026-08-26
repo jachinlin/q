@@ -572,6 +572,7 @@ $env:QUANT_DATA_ROOT = "D:\quant-data"
 QUANT_TUSHARE_TOKEN=<your-token>
 QUANT_TUSHARE_REQUESTS_PER_MINUTE=480
 QUANT_TUSHARE_PROXY_URL=https://proxy.example.com
+QUANT_TUSHARE_MAX_CONCURRENT_REQUESTS=4
 ```
 
 运行时优先读取数据根 `.env`，缺失时才回退到进程环境变量。源码树不提供
@@ -589,6 +590,13 @@ CLI 进程分别计数；并行启动多个进程时，账户总频率可能高�
 入口，保存时移除末尾斜杠，并在下一次真实请求前重建 Tushare Pro 客户端。清除数据根
 设置后会回退到进程环境变量；两处都没有配置时使用官方入口。代理设置不改变端点设计，
 仍禁止 `pro_bar` 和除基准指数外的逐证券采集。
+
+LOCALIZE 的逻辑请求默认使用 4 路有界线程并发，设置范围为 1–32。每个工作线程维护
+独立 Tushare Pro 会话，所有线程共享同一进程的均匀限流器。基金端点同一交易日的
+offset 分页仍在一个逻辑请求内串行。主线程严格按请求规划序号发布 Raw Parquet、登记
+SQLite 和更新任务进度，因此网络响应逆序完成不会改变产物或日志中的发布顺序。线程池
+采用滑动窗口，内存中最多保留当前并发数对应的响应；设置变更从下一个数据集请求批次
+生效，已经运行的线程池不在中途扩缩容。
 
 首次构建最近五年数据：
 

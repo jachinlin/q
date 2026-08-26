@@ -76,6 +76,38 @@ class DataSourceRateLimitSetting:
 
 
 @dataclass(frozen=True, slots=True)
+class DataSourceConcurrencySetting:
+    """表示 Tushare LOCALIZE 批次的最大并发请求数。
+
+    入参：最大并发请求数、解析来源和可选文件更新时间。
+    返回值：构造可安全展示的不可变并发设置。
+    异常：构造阶段不主动校验；外部值应先调用 ``validated_value``。
+    """
+
+    DEFAULT_MAX_CONCURRENT_REQUESTS = 4
+    MIN_MAX_CONCURRENT_REQUESTS = 1
+    MAX_MAX_CONCURRENT_REQUESTS = 32
+
+    max_concurrent_requests: int
+    source: Literal["DATA_ROOT_ENV", "PROCESS_ENVIRONMENT", "DEFAULT"]
+    updated_at: datetime | None
+
+    @classmethod
+    def validated_value(cls, value: object) -> int:
+        """校验最大并发请求数。
+
+        入参：来自 API、进程环境或数据根文件的候选值。
+        返回值：范围为 1 至 32 的严格整数。
+        异常：值不是严格整数或超出范围时抛出类型或值错误。
+        """
+        if type(value) is not int:
+            raise TypeError("data source concurrency must be an integer")
+        if not cls.MIN_MAX_CONCURRENT_REQUESTS <= value <= cls.MAX_MAX_CONCURRENT_REQUESTS:
+            raise ValueError("data source concurrency must be from 1 through 32")
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class DataSourceProxySetting:
     """表示 Tushare HTTP 代理入口及其非敏感来源证据。
 
@@ -175,6 +207,15 @@ class RuntimeSettingsPort(Protocol):
         """
         ...
 
+    def read_data_source_concurrency(self) -> DataSourceConcurrencySetting:
+        """读取 LOCALIZE 最大并发请求数。
+
+        入参：无。
+        返回值：数据根优先、进程环境回退、最终使用默认值的并发设置。
+        异常：文件、环境变量或数值非法时传播对应异常。
+        """
+        ...
+
     def apply_changes(
         self,
         *,
@@ -184,10 +225,13 @@ class RuntimeSettingsPort(Protocol):
         requests_per_minute: int | None,
         proxy_operation: Literal["SET", "CLEAR"] | None,
         proxy_url: str | None,
+        concurrency_operation: Literal["SET", "CLEAR"] | None = None,
+        max_concurrent_requests: int | None = None,
     ) -> tuple[
         DataSourceTokenSetting,
         DataSourceRateLimitSetting,
         DataSourceProxySetting,
+        DataSourceConcurrencySetting,
     ]:
         """原子应用一个或多个已经校验的类型化设置修改。
 
@@ -220,6 +264,7 @@ class DashboardSettingsService:
             self._store.read_data_source_token(),
             self._store.read_data_source_rate_limit(),
             self._store.read_data_source_proxy(),
+            self._store.read_data_source_concurrency(),
         )
 
     def change(
@@ -231,6 +276,8 @@ class DashboardSettingsService:
         requests_per_minute: int | None,
         proxy_operation: Literal["SET", "CLEAR"] | None,
         proxy_url: str | None,
+        concurrency_operation: Literal["SET", "CLEAR"] | None,
+        max_concurrent_requests: int | None,
     ) -> dict[str, object]:
         """原子修改 Token、请求限流和/或代理并返回安全投影。
 
@@ -242,6 +289,7 @@ class DashboardSettingsService:
             token_operation is None
             and rate_limit_operation is None
             and proxy_operation is None
+            and concurrency_operation is None
         ):
             raise ValueError("settings change must contain at least one operation")
         validated_token = token_value
@@ -273,15 +321,28 @@ class DashboardSettingsService:
         elif proxy_operation is not None:
             raise ValueError("unsupported data source proxy operation")
 
-        token, rate, proxy = self._store.apply_changes(
+        validated_concurrency = max_concurrent_requests
+        if concurrency_operation == "SET":
+            validated_concurrency = DataSourceConcurrencySetting.validated_value(
+                max_concurrent_requests
+            )
+        elif concurrency_operation == "CLEAR":
+            if max_concurrent_requests is not None:
+                raise ValueError("CLEAR data source concurrency must omit a value")
+        elif concurrency_operation is not None:
+            raise ValueError("unsupported data source concurrency operation")
+
+        token, rate, proxy, concurrency = self._store.apply_changes(
             token_operation=token_operation,
             token_value=validated_token,
             rate_limit_operation=rate_limit_operation,
             requests_per_minute=validated_rate,
             proxy_operation=proxy_operation,
             proxy_url=validated_proxy,
+            concurrency_operation=concurrency_operation,
+            max_concurrent_requests=validated_concurrency,
         )
-        return self._safe_view(token, rate, proxy)
+        return self._safe_view(token, rate, proxy, concurrency)
 
     def change_data_source_token(
         self,
@@ -297,27 +358,31 @@ class DashboardSettingsService:
         """
         if operation == "SET":
             validated = DataSourceTokenSetting.validated_value(value)
-            token, rate, proxy = self._store.apply_changes(
+            token, rate, proxy, concurrency = self._store.apply_changes(
                 token_operation="SET",
                 token_value=validated,
                 rate_limit_operation=None,
                 requests_per_minute=None,
                 proxy_operation=None,
                 proxy_url=None,
+                concurrency_operation=None,
+                max_concurrent_requests=None,
             )
-            return self._safe_view(token, rate, proxy)
+            return self._safe_view(token, rate, proxy, concurrency)
         if operation == "CLEAR":
             if value is not None:
                 raise ValueError("CLEAR data source token operation must omit value")
-            token, rate, proxy = self._store.apply_changes(
+            token, rate, proxy, concurrency = self._store.apply_changes(
                 token_operation="CLEAR",
                 token_value=None,
                 rate_limit_operation=None,
                 requests_per_minute=None,
                 proxy_operation=None,
                 proxy_url=None,
+                concurrency_operation=None,
+                max_concurrent_requests=None,
             )
-            return self._safe_view(token, rate, proxy)
+            return self._safe_view(token, rate, proxy, concurrency)
         raise ValueError("unsupported data source token operation")
 
     def _safe_view(
@@ -325,6 +390,7 @@ class DashboardSettingsService:
         token: DataSourceTokenSetting,
         rate_limit: DataSourceRateLimitSetting,
         proxy: DataSourceProxySetting,
+        concurrency: DataSourceConcurrencySetting,
     ) -> dict[str, object]:
         return {
             "settings_path": str(self._store.settings_path),
@@ -349,6 +415,15 @@ class DashboardSettingsService:
                 "source": proxy.source,
                 "updated_at": (
                     None if proxy.updated_at is None else proxy.updated_at.isoformat()
+                ),
+            },
+            "data_source_concurrency": {
+                "max_concurrent_requests": concurrency.max_concurrent_requests,
+                "source": concurrency.source,
+                "updated_at": (
+                    None
+                    if concurrency.updated_at is None
+                    else concurrency.updated_at.isoformat()
                 ),
             },
         }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import math
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -317,6 +318,15 @@ class TushareSdkGateway:
         return cast(TushareFrame, method(**kwargs))
 
 
+class _TushareThreadSession(threading.local):
+    """保存单一工作线程独享的 Tushare Pro 会话。"""
+
+    def __init__(self) -> None:
+        self.api: TushareApi | None = None
+        self.connected_token: str | None = None
+        self.connected_proxy_url: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class TushareConfig:
     """定义连接配置。入参：令牌、基准、重试与限流。返回值：配置。异常：配置非法时抛出。"""
@@ -437,20 +447,23 @@ class TushareClient:
         self._rate_limiter = rate_limiter or TushareRateLimiter(
             config.resolved_requests_per_minute
         )
-        self._api: TushareApi | None = None
-        self._connected_token: str | None = None
-        self._connected_proxy_url: str | None = None
+        self._session = _TushareThreadSession()
 
     def login(self) -> None:
         """登录。入参：无。返回值：无。异常：认证失败时传播。"""
         token = self._config.resolved_token()
         proxy_url = self._config.resolved_proxy_url()
-        token_changed = self._connected_token is None or not secrets.compare_digest(
-            self._connected_token, token
+        token_changed = (
+            self._session.connected_token is None
+            or not secrets.compare_digest(self._session.connected_token, token)
         )
-        if self._api is None or token_changed or self._connected_proxy_url != proxy_url:
+        if (
+            self._session.api is None
+            or token_changed
+            or self._session.connected_proxy_url != proxy_url
+        ):
             try:
-                self._api = self._gateway.connect(token, proxy_url)
+                self._session.api = self._gateway.connect(token, proxy_url)
             except Exception as error:
                 raise QuantError(
                     ErrorDetail(
@@ -462,14 +475,14 @@ class TushareClient:
                         retryable=False,
                     )
                 ) from error
-            self._connected_token = token
-            self._connected_proxy_url = proxy_url
+            self._session.connected_token = token
+            self._session.connected_proxy_url = proxy_url
 
     def close(self) -> None:
         """关闭。入参：无。返回值：无。异常：无。"""
-        self._api = None
-        self._connected_token = None
-        self._connected_proxy_url = None
+        self._session.api = None
+        self._session.connected_token = None
+        self._session.connected_proxy_url = None
 
     def requests(
         self, endpoint: str, start: date, end: date
@@ -542,8 +555,7 @@ class TushareClient:
             raise ValueError("request endpoint does not match fetch endpoint")
         if endpoint != "index_daily" and "ts_code" in request:
             raise ValueError("only index_daily may contain ts_code")
-        if self._api is None:
-            raise RuntimeError("Tushare client is not logged in")
+        self.login()
         fields = _FIELDS[endpoint]
         params = {
             key: value
@@ -658,12 +670,13 @@ class TushareClient:
         params: Mapping[str, JsonValue],
         fields: tuple[str, ...],
     ) -> TushareFrame:
-        self.login()
-        assert self._api is not None
         for attempt in range(self._config.max_attempts):
+            self.login()
+            api = self._session.api
+            assert api is not None
             self._rate_limiter.acquire()
             try:
-                return self._gateway.call(self._api, endpoint, params, fields)
+                return self._gateway.call(api, endpoint, params, fields)
             except (ConnectionError, OSError, TimeoutError):
                 if attempt + 1 == self._config.max_attempts:
                     raise

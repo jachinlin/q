@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
-from threading import Thread
+from threading import Barrier, Lock, Thread
 
 import pytest
 
@@ -172,6 +172,63 @@ def test_dynamic_proxy_provider_reconnects_with_normalized_url() -> None:
         ("token", None),
         ("token", "https://proxy.example.test"),
     ]
+
+
+def test_concurrent_fetches_use_one_pro_session_per_worker_thread() -> None:
+    connected: list[object] = []
+    called: list[object] = []
+    lock = Lock()
+    barrier = Barrier(4)
+
+    class _ThreadGateway(_Gateway):
+        def connect(self, token: str, proxy_url: str | None) -> object:
+            assert token == "token" and proxy_url is None
+            api = object()
+            with lock:
+                connected.append(api)
+            return api
+
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del endpoint, params
+            barrier.wait(timeout=2)
+            with lock:
+                called.append(api)
+            return _Frame(fields)
+
+    class _NoWaitLimiter(TushareRateLimiter):
+        def acquire(self) -> None:
+            return None
+
+    client = TushareClient(
+        _ThreadGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+        rate_limiter=_NoWaitLimiter(lambda: 480),
+    )
+    request = client.requests("daily", date(2026, 8, 25), date(2026, 8, 25))[0]
+    threads = [
+        Thread(target=lambda: tuple(client.fetch("daily", request)))
+        for _ in range(4)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(connected) == len({id(api) for api in connected}) == 4
+    assert {id(api) for api in called} == {id(api) for api in connected}
 
 
 def test_sdk_gateway_writes_proxy_url_to_data_api_object() -> None:

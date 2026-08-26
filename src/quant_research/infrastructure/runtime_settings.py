@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from quant_research.application.settings import (
+    DataSourceConcurrencySetting,
     DataSourceProxySetting,
     DataSourceRateLimitSetting,
     DataSourceTokenSetting,
@@ -27,7 +28,10 @@ class DataRootEnvSettingsStore:
     _TOKEN_KEY = "QUANT_TUSHARE_TOKEN"
     _RATE_LIMIT_KEY = "QUANT_TUSHARE_REQUESTS_PER_MINUTE"
     _PROXY_KEY = "QUANT_TUSHARE_PROXY_URL"
-    _SUPPORTED_KEYS = frozenset({_TOKEN_KEY, _RATE_LIMIT_KEY, _PROXY_KEY})
+    _CONCURRENCY_KEY = "QUANT_TUSHARE_MAX_CONCURRENT_REQUESTS"
+    _SUPPORTED_KEYS = frozenset(
+        {_TOKEN_KEY, _RATE_LIMIT_KEY, _PROXY_KEY, _CONCURRENCY_KEY}
+    )
     _MAX_BYTES = 64 * 1024
 
     def __init__(
@@ -119,6 +123,30 @@ class DataRootEnvSettingsStore:
             return DataSourceProxySetting(value, "PROCESS_ENVIRONMENT", None)
         return DataSourceProxySetting(None, "NONE", None)
 
+    def read_data_source_concurrency(self) -> DataSourceConcurrencySetting:
+        """读取最大并发请求数，并回退到进程环境或内置默认值。
+
+        入参：无。
+        返回值：完成严格整数校验的并发设置及非敏感来源证据。
+        异常：dotenv、环境变量或数值范围非法时失败关闭。
+        """
+        path = self._validated_path(must_exist=False)
+        lines, indexes = self._read_lines(path)
+        index = indexes.get(self._CONCURRENCY_KEY)
+        if index is not None:
+            value = self._concurrency_value(self._line_value(lines[index]))
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            return DataSourceConcurrencySetting(value, "DATA_ROOT_ENV", updated_at)
+        environment_value = self._environment.get(self._CONCURRENCY_KEY)
+        if environment_value is not None:
+            value = self._concurrency_value(environment_value)
+            return DataSourceConcurrencySetting(value, "PROCESS_ENVIRONMENT", None)
+        return DataSourceConcurrencySetting(
+            DataSourceConcurrencySetting.DEFAULT_MAX_CONCURRENT_REQUESTS,
+            "DEFAULT",
+            None,
+        )
+
     def write_data_source_token(self, value: str) -> DataSourceTokenSetting:
         """原子新增或替换数据根中的数据源 Token。
 
@@ -126,13 +154,15 @@ class DataRootEnvSettingsStore:
         返回值：写入后重新解析的 Dashboard 优先状态。
         异常：路径、既有格式或文件系统操作失败时保持原语义。
         """
-        token, _, _ = self.apply_changes(
+        token, _, _, _ = self.apply_changes(
             token_operation="SET",
             token_value=DataSourceTokenSetting.validated_value(value),
             rate_limit_operation=None,
             requests_per_minute=None,
             proxy_operation=None,
             proxy_url=None,
+            concurrency_operation=None,
+            max_concurrent_requests=None,
         )
         return token
 
@@ -143,13 +173,15 @@ class DataRootEnvSettingsStore:
         返回值：删除后的最新解析状态。
         异常：路径、既有格式或文件系统删除失败时保持原语义。
         """
-        token, _, _ = self.apply_changes(
+        token, _, _, _ = self.apply_changes(
             token_operation="CLEAR",
             token_value=None,
             rate_limit_operation=None,
             requests_per_minute=None,
             proxy_operation=None,
             proxy_url=None,
+            concurrency_operation=None,
+            max_concurrent_requests=None,
         )
         return token
 
@@ -162,10 +194,13 @@ class DataRootEnvSettingsStore:
         requests_per_minute: int | None,
         proxy_operation: str | None = None,
         proxy_url: str | None = None,
+        concurrency_operation: str | None = None,
+        max_concurrent_requests: int | None = None,
     ) -> tuple[
         DataSourceTokenSetting,
         DataSourceRateLimitSetting,
         DataSourceProxySetting,
+        DataSourceConcurrencySetting,
     ]:
         """通过一次原子替换应用 Token、限流和/或代理修改。
 
@@ -177,6 +212,7 @@ class DataRootEnvSettingsStore:
             token_operation is None
             and rate_limit_operation is None
             and proxy_operation is None
+            and concurrency_operation is None
         ):
             raise ValueError("runtime settings change must not be empty")
         if token_operation == "SET":
@@ -202,6 +238,15 @@ class DataRootEnvSettingsStore:
                 raise ValueError("CLEAR data source proxy must omit a URL")
         elif proxy_operation is not None:
             raise ValueError("unsupported data source proxy operation")
+        if concurrency_operation == "SET":
+            max_concurrent_requests = DataSourceConcurrencySetting.validated_value(
+                max_concurrent_requests
+            )
+        elif concurrency_operation == "CLEAR":
+            if max_concurrent_requests is not None:
+                raise ValueError("CLEAR data source concurrency must omit a value")
+        elif concurrency_operation is not None:
+            raise ValueError("unsupported data source concurrency operation")
 
         self._prepare_root()
         path = self._validated_path(must_exist=False)
@@ -220,6 +265,12 @@ class DataRootEnvSettingsStore:
         if proxy_operation is not None:
             replacements[self._PROXY_KEY] = (
                 None if proxy_operation == "CLEAR" else proxy_url
+            )
+        if concurrency_operation is not None:
+            replacements[self._CONCURRENCY_KEY] = (
+                None
+                if concurrency_operation == "CLEAR"
+                else str(max_concurrent_requests)
             )
         for key in sorted(replacements):
             value = replacements[key]
@@ -248,6 +299,7 @@ class DataRootEnvSettingsStore:
             self.read_data_source_token(),
             self.read_data_source_rate_limit(),
             self.read_data_source_proxy(),
+            self.read_data_source_concurrency(),
         )
 
     def _prepare_root(self) -> None:
@@ -300,6 +352,8 @@ class DataRootEnvSettingsStore:
                 self._rate_limit_value(value)
             elif key == self._PROXY_KEY:
                 DataSourceProxySetting.validated_value(value)
+            elif key == self._CONCURRENCY_KEY:
+                self._concurrency_value(value)
             indexes[key] = index
         return lines, indexes
 
@@ -314,6 +368,13 @@ class DataRootEnvSettingsStore:
         if not value or not value.isascii() or not value.isdecimal():
             raise ValueError("data source requests per minute must be a decimal integer")
         return DataSourceRateLimitSetting.validated_value(int(value))
+
+    @staticmethod
+    def _concurrency_value(value: str) -> int:
+        """把 dotenv 单行值解析为严格十进制并发整数。"""
+        if not value or not value.isascii() or not value.isdecimal():
+            raise ValueError("data source concurrency must be a decimal integer")
+        return DataSourceConcurrencySetting.validated_value(int(value))
 
     def _validate_resolved_settings(
         self,
@@ -340,6 +401,13 @@ class DataRootEnvSettingsStore:
             )
         elif (proxy := self._environment.get(self._PROXY_KEY)) is not None:
             DataSourceProxySetting.validated_value(proxy)
+        concurrency_index = indexes.get(self._CONCURRENCY_KEY)
+        if concurrency_index is not None:
+            self._concurrency_value(self._line_value(lines[concurrency_index]))
+        elif (
+            concurrency := self._environment.get(self._CONCURRENCY_KEY)
+        ) is not None:
+            self._concurrency_value(concurrency)
 
     def _atomic_write(self, path: Path, content: str) -> None:
         temporary = self._root / f".env.tmp-{uuid4().hex}"

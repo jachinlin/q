@@ -127,6 +127,9 @@ class CliBootstrap:
                 quality_runner=QualityRunner(),
                 routes=TUSHARE_ROUTES,
                 logger=pipeline_logger,
+                max_concurrent_requests=lambda: (
+                    runtime_settings.read_data_source_concurrency().max_concurrent_requests
+                ),
             )
             queue = TaskQueue(
                 engine,

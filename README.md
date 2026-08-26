@@ -38,12 +38,15 @@ $env:QUANT_DATA_ROOT = "D:\quant-data"
 QUANT_TUSHARE_TOKEN=<your-token>
 QUANT_TUSHARE_REQUESTS_PER_MINUTE=480
 QUANT_TUSHARE_PROXY_URL=https://proxy.example.com
+QUANT_TUSHARE_MAX_CONCURRENT_REQUESTS=4
 ```
 
 请求频率可在 Dashboard 动态调整，合法范围为 1–10000 次/分钟，默认 480。
 同一进程内的 Tushare 调用均匀发送；不同 Worker、Dashboard 或 CLI 进程分别计算额度。
 代理 URL 可省略；配置后会作为 Tushare API 入口应用于 Pro 客户端，并在下一次请求前
 动态生效。设置高于账户实际频次额度的限流值不会提升供应商额度，可能触发上游拒绝。
+LOCALIZE 默认同时抓取 4 个逻辑请求，可在 Dashboard 设置为 1–32；新值从下一个
+数据集请求批次生效。并发只覆盖网络等待，Raw 发布、SQLite 登记和数据集执行仍串行。
 不要在代码根目录创建或提交包含 Token 的 `.env`。
 
 ## 快速开始

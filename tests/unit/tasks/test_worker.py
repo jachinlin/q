@@ -139,6 +139,24 @@ class _DetailedProgressHandler:
         return TaskOutcome(status=TaskStatus.SUCCEEDED)
 
 
+class _BurstProgressHandler:
+    task_type = "BACKTEST"
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, cancellation
+        for completed in range(10):
+            progress.update(
+                TaskProgress(
+                    stage="LOCALIZE",
+                    completed=completed,
+                    total=10,
+                    message=f"request {completed}",
+                    context={"boundary": "raw_request"},
+                )
+            )
+        return TaskOutcome(status=TaskStatus.SUCCEEDED)
+
+
 class _TypedSuccessHandler(_SuccessHandler):
     def __init__(self, task_type: str) -> None:
         super().__init__()
@@ -800,6 +818,27 @@ def test_progress_is_immediate_and_periodic_heartbeat_reuses_latest_value(
     assert task["progress_json"] == attempt["progress_json"]
     assert '"completed":3' in task["progress_json"]
     assert queue.heartbeat_stopped_before_finish is True
+
+
+def test_rapid_request_progress_is_coalesced_and_terminal_value_is_flushed(
+    engine: Engine,
+) -> None:
+    delegate = TaskQueue(engine, clock=lambda: NOW)
+    task_id = delegate.enqueue("BACKTEST", {}, 0)
+    queue = _RecordingQueue(delegate, threading.Event())
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(_BurstProgressHandler(),),
+        clock=lambda: NOW,
+    )
+
+    assert worker.run_once() is True
+
+    assert [item.completed for item in queue.heartbeats] == [0, 9]
+    task, attempt = _runtime_rows(engine, task_id)
+    assert json.loads(task["progress_json"])["completed"] == 9
+    assert task["progress_json"] == attempt["progress_json"]
 
 
 def test_periodic_heartbeat_cannot_overwrite_newer_immediate_progress(

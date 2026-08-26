@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -162,6 +163,11 @@ class _LatestProgress:
             self._value = progress
             persist(progress)
 
+    def update(self, progress: TaskProgress) -> None:
+        """只更新内存中的最新进度，不触发持久化。"""
+        with self._lock:
+            self._value = progress
+
     def persist_latest(self, persist: Callable[[TaskProgress], None]) -> None:
         with self._lock:
             persist(self._value)
@@ -192,6 +198,8 @@ class _CoordinationFailure:
 
 
 class _DurableProgressSink:
+    _MIN_PERSIST_INTERVAL_SECONDS = 0.5
+
     def __init__(
         self,
         queue: _Queue,
@@ -200,6 +208,7 @@ class _DurableProgressSink:
         clock: Callable[[], datetime],
         failure: _CoordinationFailure,
         logger: StructuredLogger | None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._queue = queue
         self._task = task
@@ -207,15 +216,27 @@ class _DurableProgressSink:
         self._clock = clock
         self._failure = failure
         self._logger = logger
+        self._monotonic = monotonic
+        self._last_persisted_at = float("-inf")
+        self._last_stage = latest.current().stage
+        self._persist_lock = threading.Lock()
+        self._dirty = False
 
     def update(self, progress: TaskProgress) -> None:
         if not isinstance(progress, TaskProgress):
             raise TypeError("progress must be a TaskProgress")
         try:
-            self._latest.update_and_persist(
-                progress,
-                self._persist,
+            previous_stage = self._last_stage
+            self._latest.update(progress)
+            self._dirty = True
+            self._last_stage = progress.stage
+            boundary = progress.context.get("boundary")
+            immediate = (
+                progress.stage != previous_stage
+                or boundary == "dataset_completed"
+                or progress.stage == "COMPLETE"
             )
+            self._persist_if_due(force=immediate)
             if self._logger is not None:
                 self._logger.emit(
                     "INFO",
@@ -228,6 +249,14 @@ class _DurableProgressSink:
                         "total": progress.total,
                     },
                 )
+        except Exception as error:
+            self._failure.record(error)
+            raise
+
+    def flush(self) -> None:
+        """强制持久化当前最新进度，用于失败、取消和任务终态。"""
+        try:
+            self._persist_if_due(force=True)
         except Exception as error:
             self._failure.record(error)
             raise
@@ -257,6 +286,21 @@ class _DurableProgressSink:
             progress,
             self._clock(),
         )
+
+    def _persist_if_due(self, *, force: bool) -> None:
+        with self._persist_lock:
+            if force and not self._dirty:
+                return
+            now = self._monotonic()
+            if (
+                not force
+                and now - self._last_persisted_at
+                < self._MIN_PERSIST_INTERVAL_SECONDS
+            ):
+                return
+            self._latest.persist_latest(self._persist)
+            self._last_persisted_at = now
+            self._dirty = False
 
 
 class _QueueCancellationToken:
@@ -576,6 +620,11 @@ class Worker:
         except Exception as error:  # noqa: BLE001 - sanitize handler boundary
             handler_error = error
         finally:
+            try:
+                progress.flush()
+            except Exception as error:  # noqa: BLE001 - transferred below
+                if handler_error is None:
+                    handler_error = error
             stop_heartbeat.set()
             heartbeat.join(timeout=self._heartbeat_join_timeout)
         if heartbeat.is_alive():

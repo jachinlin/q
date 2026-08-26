@@ -30,6 +30,7 @@ describe('dashboard settings', () => {
         updated_at: null,
       },
       data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+      data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
     })
   })
 
@@ -52,6 +53,7 @@ describe('dashboard settings', () => {
         updated_at: null,
       },
       data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+      data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
     })
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const wrapper = mount(SettingsView, {
@@ -92,6 +94,7 @@ describe('dashboard settings', () => {
         updated_at: null,
       },
       data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+      data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
     })
     vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -129,6 +132,7 @@ describe('dashboard settings', () => {
           updated_at: '2026-08-26T12:02:00Z',
         },
         data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+        data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
       })
       .mockResolvedValueOnce({
         settings_path: 'C:\\Users\\tester\\qlab-data\\.env',
@@ -143,6 +147,7 @@ describe('dashboard settings', () => {
           updated_at: null,
         },
         data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+        data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
       })
     vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -195,6 +200,7 @@ describe('dashboard settings', () => {
           source: 'DATA_ROOT_ENV',
           updated_at: '2026-08-26T12:03:00Z',
         },
+        data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
       })
       .mockResolvedValueOnce({
         settings_path: 'C:\\Users\\tester\\qlab-data\\.env',
@@ -209,6 +215,7 @@ describe('dashboard settings', () => {
           updated_at: null,
         },
         data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+        data_source_concurrency: { max_concurrent_requests: 4, source: 'DEFAULT', updated_at: null },
       })
     vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -240,6 +247,61 @@ describe('dashboard settings', () => {
       data_source_proxy: { operation: 'CLEAR' },
     })
     expect(wrapper.text()).toContain('Tushare 官方入口')
+    wrapper.unmount()
+  })
+
+  it('saves and clears bounded LOCALIZE concurrency', async () => {
+    apiPatch
+      .mockResolvedValueOnce({
+        settings_path: 'C:\\Users\\tester\\qlab-data\\.env',
+        data_source_token: { configured: true, source: 'DATA_ROOT_ENV', updated_at: null },
+        data_source_rate_limit: { requests_per_minute: 480, source: 'DEFAULT', updated_at: null },
+        data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+        data_source_concurrency: {
+          max_concurrent_requests: 8,
+          source: 'DATA_ROOT_ENV',
+          updated_at: '2026-08-27T01:00:00Z',
+        },
+      })
+      .mockResolvedValueOnce({
+        settings_path: 'C:\\Users\\tester\\qlab-data\\.env',
+        data_source_token: { configured: true, source: 'DATA_ROOT_ENV', updated_at: null },
+        data_source_rate_limit: { requests_per_minute: 480, source: 'DEFAULT', updated_at: null },
+        data_source_proxy: { url: null, source: 'NONE', updated_at: null },
+        data_source_concurrency: {
+          max_concurrent_requests: 4,
+          source: 'DEFAULT',
+          updated_at: null,
+        },
+      })
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue({} as never)
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = mount(SettingsView, {
+      global: { plugins: [[VueQueryPlugin, { queryClient }]] },
+      attachTo: document.body,
+    })
+    await flushPromises()
+
+    const input = wrapper.get('[data-testid="data-source-concurrency"]')
+    await input.get('input').setValue('8')
+    await wrapper.findAll('form')[3].trigger('submit')
+    await flushPromises()
+
+    expect(apiPatch).toHaveBeenCalledWith('/api/v1/settings', {
+      data_source_concurrency: {
+        operation: 'SET',
+        max_concurrent_requests: 8,
+      },
+    })
+    const clear = wrapper.findAll('button')
+      .find(item => item.text().includes('清除 Dashboard 并发设置'))
+    await clear?.trigger('click')
+    await flushPromises()
+
+    expect(apiPatch).toHaveBeenLastCalledWith('/api/v1/settings', {
+      data_source_concurrency: { operation: 'CLEAR' },
+    })
+    expect(wrapper.text()).toContain('内置默认值')
     wrapper.unmount()
   })
 })
