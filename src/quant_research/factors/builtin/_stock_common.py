@@ -28,7 +28,7 @@ class BarRepository(Protocol):
         由具体实现按接口契约定义。
     """
 
-    def bars(
+    def stock_bars(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
@@ -47,7 +47,7 @@ class BarRepository(Protocol):
         """
         ...
 
-    def daily_basics(
+    def stock_daily_basics(
         self,
         instruments: Sequence[InstrumentId],
         start: date,

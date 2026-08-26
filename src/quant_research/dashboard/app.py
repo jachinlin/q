@@ -16,6 +16,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from quant_research.application.operations import OperationalCommandService
+from quant_research.application.settings import DashboardSettingsService
 from quant_research.dashboard.experiments import (
     ExperimentDashboardService,
     ExperimentRoutes,
@@ -34,6 +35,7 @@ def create_dashboard_app(
     *,
     service: DashboardViewService,
     commands: OperationalCommandService,
+    settings_service: DashboardSettingsService,
     experiment_service: ExperimentDashboardService,
     factor_study_service: FactorStudyDashboardService | None = None,
     notebook_probe: NotebookProbe,
@@ -46,6 +48,7 @@ def create_dashboard_app(
     入参：
         service：只读 Dashboard 展示服务。
         commands：受控研究写用例服务。
+        settings_service：只暴露安全投影并执行类型化修改的设置服务。
         notebook_probe：本机 JupyterLab 就绪状态的消费者侧探测器。
         static_dir：已构建 SPA 的静态目录。
         allowed_hosts：参与本次处理的允许``hosts``；调用方不得依赖未声明的顺序。
@@ -192,7 +195,7 @@ def create_dashboard_app(
             remediation="稍后重试；若问题持续，请检查本机 Worker 和状态数据库。",
         )
 
-    _DashboardRoutes.mount(app, service, commands, notebook_probe)
+    _DashboardRoutes.mount(app, service, commands, notebook_probe, settings_service)
     ExperimentRoutes.mount(app, experiment_service)
     if factor_study_service is not None:
         FactorStudyRoutes.mount(app, factor_study_service)

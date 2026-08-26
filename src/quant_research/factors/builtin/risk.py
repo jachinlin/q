@@ -20,7 +20,7 @@ from quant_research.factors.builtin.momentum import (
     _MarketFactor,
 )
 
-_PRICE_BASIS = "baostock_forward_log_return"
+_PRICE_BASIS = "tushare_local_forward_log_return"
 _LOG_RETURN_FORMULA = "log_close_minus_log_preclose"
 _PATH_CONSTRUCTION = "window_forward_cumsum"
 _ANNUALIZATION_SCALE = sqrt(252.0)

@@ -131,7 +131,7 @@ class RawPartitionStore:
                     ]
                     retained.append(entry)
                     if (
-                        batch.endpoint == "query_stock_basic"
+                        batch.endpoint == "stock_basic"
                         and len(retained) > _INSTRUMENT_MANIFEST_FILE_LIMIT
                     ):
                         retained = retained[-_INSTRUMENT_MANIFEST_FILE_LIMIT:]

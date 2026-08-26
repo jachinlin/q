@@ -40,6 +40,22 @@ class _BarsRepository:
             schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
         ).lazy()
 
+    def factors(
+        self,
+        instruments: tuple[InstrumentId, ...],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        del instruments
+        days = [day for day in self._bars["trade_date"].to_list() if start <= day <= end]
+        return pl.DataFrame(
+            {
+                "instrument_id": ["300114.SZ"] * len(days),
+                "trade_date": days,
+                "adjustment_factor": [1.0] * len(days),
+            }
+        ).lazy()
+
 
 def test_adjustment_mode_excludes_backward_prices() -> None:
     assert {mode.value for mode in AdjustmentMode} == {"RAW", "FORWARD"}
@@ -62,7 +78,7 @@ def test_forward_adjustment_omits_untraded_suspension_placeholders() -> None:
         }
     )
     repository = _BarsRepository(bars)
-    service = _PriceAdjustmentEngine(repository)
+    service = _PriceAdjustmentEngine(repository, repository.bars, repository.factors)
 
     result = service.adjusted_bars(
         (InstrumentId.parse("300114.SZ"),),
@@ -109,7 +125,7 @@ def test_log_returns_distinguish_suspension_from_missing_session() -> None:
         },
     )
     repository = _BarsRepository(bars, sessions)
-    service = _PriceAdjustmentEngine(repository)
+    service = _PriceAdjustmentEngine(repository, repository.bars, repository.factors)
 
     result = service.log_returns(
         (InstrumentId.parse("300114.SZ"),),

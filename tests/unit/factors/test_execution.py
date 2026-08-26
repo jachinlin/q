@@ -101,7 +101,7 @@ def test_factor_spec_can_explicitly_declare_industry_dataset_dependency() -> Non
             "taxonomy": "证监会行业分类",
             "unclassified_policy": "EXCLUDE",
         },
-        required_datasets=(DatasetKind.INDUSTRY_CLASSIFICATION,),
+        required_datasets=(DatasetKind.INDUSTRY_MEMBERSHIP,),
     )
 
-    assert spec.required_datasets == (DatasetKind.INDUSTRY_CLASSIFICATION,)
+    assert spec.required_datasets == (DatasetKind.INDUSTRY_MEMBERSHIP,)

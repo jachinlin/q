@@ -120,6 +120,34 @@ class _ValidationQueue:
         return self.task
 
 
+class _BootstrapQueue(_ValidationQueue):
+    def enqueue(
+        self,
+        task_type: str,
+        payload: Mapping[str, JsonValue],
+        priority: int,
+        *,
+        idempotency_key: str | None = None,
+        available_at: datetime | None = None,
+        actor: str = "system",
+        request_id: str | None = None,
+        subject_kind: str | None = None,
+        subject_id: str | None = None,
+    ) -> str:
+        assert task_type == "DATA_BOOTSTRAP"
+        return super().enqueue(
+            task_type,
+            payload,
+            priority,
+            idempotency_key=idempotency_key,
+            available_at=available_at,
+            actor=actor,
+            request_id=request_id,
+            subject_kind=subject_kind,
+            subject_id=subject_id,
+        )
+
+
 def _plan() -> DataUpdatePlan:
     return DataUpdatePlan(
         window_mode="AUTO_INCREMENTAL",
@@ -128,7 +156,7 @@ def _plan() -> DataUpdatePlan:
         end=date(2026, 8, 14),
         dataset_windows=(
             DataUpdateWindow(
-                dataset=DatasetKind.DAILY_BAR,
+                dataset=DatasetKind.STOCK_DAILY_BAR,
                 basis=DataUpdateWindowBasis.INCREMENTAL,
                 start=date(2026, 8, 10),
                 end=date(2026, 8, 14),
@@ -164,7 +192,7 @@ def test_preview_and_enqueue_persist_the_same_complete_plan() -> None:
     queue = _Queue()
     planner = _Planner(plan)
     service = _service(queue, planner)
-    selected = (DatasetKind.DAILY_BAR,)
+    selected = (DatasetKind.STOCK_DAILY_BAR,)
 
     assert (
         service.preview_data_update(
@@ -189,6 +217,36 @@ def test_preview_and_enqueue_persist_the_same_complete_plan() -> None:
     assert key == f"dashboard-data-update-{plan.plan_hash[:24]}"
     assert "null" not in str(payload).lower()
     assert planner.datasets == [selected, selected]
+
+
+def test_bootstrap_enqueue_freezes_years_in_a_deduplicated_task() -> None:
+    queue = _BootstrapQueue()
+    service = _service(cast(Any, queue), _Planner(_plan()))
+
+    result = service.enqueue_data_bootstrap(years=5, request_id="request-1")
+
+    assert queue.enqueued == (
+        "DATA_BOOTSTRAP",
+        {"years": 5},
+        "dashboard-data-bootstrap-5",
+    )
+    assert result == {
+        "task_id": "quality-task-1",
+        "request_id": "request-1",
+        "status": "QUEUED",
+        "years": 5,
+    }
+
+
+@pytest.mark.parametrize("years", (0, -1, True))
+def test_bootstrap_enqueue_rejects_invalid_years(years: int) -> None:
+    queue = _BootstrapQueue()
+    service = _service(cast(Any, queue), _Planner(_plan()))
+
+    with pytest.raises((TypeError, ValueError)):
+        service.enqueue_data_bootstrap(years=years, request_id="request-1")
+
+    assert queue.enqueued is None
 
 
 def test_stale_preview_is_rejected_before_task_creation() -> None:
@@ -216,7 +274,7 @@ def test_disclosure_pending_plan_cannot_create_an_empty_update_task() -> None:
         dataset_windows=(),
         skipped_datasets=(
             DataUpdateSkip(
-                dataset=DatasetKind.FINANCIAL_OBSERVATION,
+                dataset=DatasetKind.STOCK_FINANCIAL_INDICATOR,
                 reason="DISCLOSURE_DEADLINE_PENDING",
                 trigger_date=date(2026, 8, 31),
             ),
@@ -229,7 +287,7 @@ def test_disclosure_pending_plan_cannot_create_an_empty_update_task() -> None:
         service.enqueue_data_update(
             start=None,
             end=None,
-            datasets=(DatasetKind.FINANCIAL_OBSERVATION,),
+            datasets=(DatasetKind.STOCK_FINANCIAL_INDICATOR,),
             expected_plan_hash=plan.plan_hash,
             request_id="request-1",
         )
@@ -248,9 +306,9 @@ def test_disclosure_pending_plan_cannot_create_an_empty_update_task() -> None:
             "ALL",
         ),
         (
-            DatasetKind.DAILY_BAR,
-            {"scope": "DATASET", "dataset": "daily_bar"},
-            "dashboard-data-validation-daily_bar",
+            DatasetKind.STOCK_DAILY_BAR,
+            {"scope": "DATASET", "dataset": "stock_daily_bar"},
+            "dashboard-data-validation-stock_daily_bar",
             "DATASET",
         ),
     ),

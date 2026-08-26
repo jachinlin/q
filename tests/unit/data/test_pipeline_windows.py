@@ -15,6 +15,6 @@ def test_non_calendar_window_is_not_extended() -> None:
     window = date(2026, 8, 1), date(2026, 8, 11)
 
     assert (
-        _DatasetPipelineSupport._calendar_horizon(DatasetKind.DAILY_BAR, window)
+        _DatasetPipelineSupport._calendar_horizon(DatasetKind.STOCK_DAILY_BAR, window)
         == window
     )

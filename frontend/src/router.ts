@@ -12,6 +12,7 @@ export const routes = [
   { path: '/factor-studies/:factorStudyId', name: 'factor-study-detail', component: () => import('./views/FactorStudyDetailView.vue'), meta: { title: '因子研究详情' } },
   { path: '/tasks', name: 'tasks', component: () => import('./views/TasksView.vue'), meta: { title: '运行中心' } },
   { path: '/notebook', name: 'notebook', component: () => import('./views/NotebookView.vue'), meta: { title: 'Notebook', fullBleed: true } },
+  { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue'), meta: { title: '设置' } },
 ]
 
 export default createRouter({ history: createWebHistory(), routes })

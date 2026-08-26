@@ -17,7 +17,7 @@ from quant_research.backtest.models import ExecutionConfig, FillResult, MarketSl
 from quant_research.backtest.rulebook import MarketRuleBook
 from quant_research.backtest.run_schema import RunTableSchema
 from quant_research.data.contracts import JsonValue
-from quant_research.domain.identifiers import InstrumentId
+from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.strategies.base import (
     AccountView,
     DecisionContext,
@@ -45,7 +45,7 @@ class BacktestRequest:
     catalog_hash: str
     start_date: date
     end_date: date
-    benchmark: InstrumentId
+    benchmark: IndexId
     initial_cash_fen: int
     rulebook_hash: str
     execution_config: ExecutionConfig
@@ -139,6 +139,10 @@ class BacktestMarketData(Protocol):
         异常：
             ValueError：该日行情不存在或不完整时抛出。
         """
+        ...
+
+    def benchmark_close(self, benchmark: IndexId, trade_date: date) -> float:
+        """读取基准。入参：指数和交易日。返回值：收盘价。异常：缺失时抛出。"""
         ...
 
 
@@ -320,7 +324,10 @@ class BacktestEngine:
             if bound.market.trade_date != trade_date:
                 raise ValueError("market slice is bound to a different date")
             market = bound.market
-            closes, benchmark_close = self._closes(market, request.benchmark)
+            closes = self._closes(market)
+            benchmark_close = self._market_data.benchmark_close(
+                request.benchmark, trade_date
+            )
             account.begin_session(trade_date)
             execution_view = account.execution_view()
             execution = self._execution.execute(
@@ -385,20 +392,14 @@ class BacktestEngine:
         )
 
     @staticmethod
-    def _closes(
-        market: MarketSlice, benchmark: InstrumentId
-    ) -> tuple[dict[InstrumentId, float], float]:
+    def _closes(market: MarketSlice) -> dict[InstrumentId, float]:
         closes: dict[InstrumentId, float] = {}
         for identifier, close in market.bars.select(
             "instrument_id", "close"
         ).iter_rows():
             if close is not None and float(close) > 0:
                 closes[InstrumentId.parse(identifier)] = float(close)
-        try:
-            benchmark_close = closes[benchmark]
-        except KeyError as error:
-            raise ValueError("benchmark close is missing from market slice") from error
-        return closes, benchmark_close
+        return closes
 
     @staticmethod
     def _append_orders(

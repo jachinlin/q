@@ -129,7 +129,7 @@ const industryStyle = (value: number | null) => {
     : { background: `rgba(22,130,95,${alpha})`, borderColor: 'rgba(22,130,95,.32)' }
 }
 
-const valuationLabel: Record<string, string> = { pe_ttm: 'PE TTM', pb_mrq: 'PB MRQ', ps_ttm: 'PS TTM' }
+const valuationLabel: Record<string, string> = { pe_ttm: 'PE TTM', pb: 'PB', ps_ttm: 'PS TTM' }
 const eventLabel: Record<string, string> = {
   LIMIT_UP: '涨停',
   LIMIT_DOWN: '跌停',

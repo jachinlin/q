@@ -21,7 +21,7 @@ from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS, CanonicalSc
 from quant_research.data.storage.verified_files import open_verified_file
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
-from quant_research.domain.identifiers import InstrumentId
+from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.infrastructure.persistence.repositories import (
     CanonicalDatasetRecord,
     CanonicalPartitionRecord,
@@ -36,15 +36,7 @@ _MAX_ROW_GROUP_BYTES = 512 * 1024 * 1024
 
 
 class ResearchDataRepository(Protocol):
-    """从当前已通过 ``validate-all`` 的 Canonical 目录读取研究数据。
-
-    入参：
-        无。
-    返回值：
-        构造并返回 ``ResearchDataRepository`` 实例。
-    异常：
-        由具体实现按接口契约定义。
-    """
+    """定义研究读取端口。入参：查询条件。返回值：Canonical 帧。异常：门禁失败时抛出。"""
 
     def catalog(self) -> CanonicalCatalog:
         """返回研究读取所绑定的只读 Canonical 目录。
@@ -58,16 +50,16 @@ class ResearchDataRepository(Protocol):
         """
         ...
 
-    def instruments(self) -> pl.LazyFrame:
-        """读取全部当前有效的证券主数据。
+    def stocks(self) -> pl.LazyFrame:
+        """读取股票。入参：无。返回值：股票帧。异常：门禁失败时抛出。"""
+        ...
 
-        入参：
-            无。
-        返回值：
-            返回证券集合（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
+    def funds(self) -> pl.LazyFrame:
+        """读取基金。入参：无。返回值：基金帧。异常：门禁失败时抛出。"""
+        ...
+
+    def indexes(self) -> pl.LazyFrame:
+        """读取指数。入参：无。返回值：指数帧。异常：门禁失败时抛出。"""
         ...
 
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
@@ -83,45 +75,43 @@ class ResearchDataRepository(Protocol):
         """
         ...
 
-    def bars(
+    def stock_bars(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """读取指定证券和日期闭区间内的日行情。
-
-        入参：
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-            start：处理区间的开始日期，类型为 ``date``。
-            end：处理区间的结束日期，类型为 ``date``。
-        返回值：
-            返回行情（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
+        """读取股票行情。入参：股票和范围。返回值：行情帧。异常：范围或门禁非法时抛出。"""
         ...
 
-    def adjusted_bars(
+    def fund_bars(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """读取以结束日为信息截止日期的前复权日行情。
-
-        入参：
-            instruments：待查询的证券标识集合。
-            start：查询日期闭区间的开始日期。
-            end：查询日期闭区间的结束日期及 PIT 信息截止日期。
-        返回值：
-            返回包含复权因子和审计列的前复权行情。
-        异常：
-            日期、目录门禁或 Canonical 分区不满足契约时传播对应异常。
-        """
+        """读取基金行情。入参：基金和范围。返回值：行情帧。异常：范围或门禁非法时抛出。"""
         ...
 
-    def log_returns(
+    def adjusted_stock_bars(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        """读取股票复权行情。入参：股票和范围。返回值：行情帧。异常：因子缺失时抛出。"""
+        ...
+
+    def adjusted_fund_bars(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        """读取基金复权行情。入参：基金和范围。返回值：行情帧。异常：因子缺失时抛出。"""
+        ...
+
+    def stock_log_returns(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
@@ -129,166 +119,74 @@ class ResearchDataRepository(Protocol):
         *,
         lookback_sessions: int,
     ) -> pl.LazyFrame:
-        """返回按交易会话补齐的前复权对数收益。
+        """读取股票收益。入参：股票、范围和回看。返回值：收益帧。异常：参数非法时抛出。"""
+        ...
 
-        入参：
-            instruments：待查询的证券标识集合。
-            start：结果区间的开始日期。
-            end：结果区间的结束日期及 PIT 信息截止日期。
-            lookback_sessions：在 ``start`` 前额外读取的交易会话数量。
-        返回值：
-            返回停牌补零、真实缺失保空的会话级对数收益。
-        异常：
-            参数、目录门禁或 Canonical 分区不满足契约时传播对应异常。
-        """
+    def fund_log_returns(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+        *,
+        lookback_sessions: int,
+    ) -> pl.LazyFrame:
+        """读取基金收益。入参：基金、范围和回看。返回值：收益帧。异常：参数非法时抛出。"""
         ...
 
     def index_bars(
         self,
-        indexes: Sequence[InstrumentId],
+        indexes: Sequence[IndexId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """读取指定指数和日期闭区间内的指数行情。
-
-        入参：
-            indexes: 待查询的规范指数标识；空序列返回空结果。
-            start: 查询开始日期，包含该日。
-            end: 查询结束日期，包含该日且不得早于 ``start``。
-
-        返回值：
-            绑定当前已验证 ``index_bar`` 分区的 ``pl.LazyFrame``。
-
-        异常：
-            ValueError: 日期范围非法或当前分区完整性校验失败。
-        """
+        """读取指数行情。入参：指数和范围。返回值：行情帧。异常：范围非法时抛出。"""
         ...
 
-    def daily_basics(
+    def stock_daily_basics(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """读取指定证券和日期闭区间内的每日基础指标。
-
-        入参：
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-            start：处理区间的开始日期，类型为 ``date``。
-            end：处理区间的结束日期，类型为 ``date``。
-        返回值：
-            返回``basics``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
+        """读取股票指标。入参：股票和范围。返回值：指标帧。异常：范围非法时抛出。"""
         ...
 
-    def financials_as_of(
-        self,
-        field_ids: Sequence[str],
-        as_of: date,
-        instruments: Sequence[InstrumentId] | None = None,
-    ) -> pl.LazyFrame:
-        """读取截至指定日期可见的最新财务观测。
-
-        入参：
-            field_ids：参与本次处理的字段``ids``；调用方不得依赖未声明的顺序。
-            as_of：PIT 查询和资格判断所依据的观察日。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回截至日``of``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        ...
-
-    def financial_history(
-        self,
-        field_ids: Sequence[str],
-        as_of: date,
-        instruments: Sequence[InstrumentId] | None = None,
-    ) -> pl.LazyFrame:
-        """读取截至指定日期可见的全部财务修订历史。
-
-        入参：
-            field_ids：参与本次处理的字段``ids``；调用方不得依赖未声明的顺序。
-            as_of：PIT 查询和资格判断所依据的观察日。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回``history``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        ...
-
-    def industry_classifications_as_of(
-        self,
-        instruments: Sequence[InstrumentId] | None,
-        as_of: date,
-    ) -> pl.LazyFrame:
-        """读取指定日期时点有效且当时已知的行业分类。
-
-        入参：
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-            as_of：PIT 查询和资格判断所依据的观察日。
-        返回值：
-            返回行业分类截至日``of``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        ...
-
-    def industry_classifications_on_dates(
-        self,
-        instruments: Sequence[InstrumentId] | None,
-        dates: Sequence[date],
-    ) -> pl.LazyFrame:
-        """一次读取并重建多个查询日的供应商 as-of 行业状态。
-
-        入参：
-            instruments：证券集合；``None`` 表示全市场。
-            dates：消费者实际需要的查询日期集合。
-        返回值：
-            返回含 ``query_date``、命中事件和全部审计列的惰性数据帧。
-        异常：
-            日期、目录门禁或 Canonical 分区不满足契约时传播对应异常。
-        """
-        ...
-
-    def security_status(
+    def stock_financial_indicators(
         self,
         as_of: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
-        """读取指定交易日的证券状态。
-
-        入参：
-            as_of：PIT 查询和资格判断所依据的观察日。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回状态（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
+        """读取财务指标。入参：观察日和股票。返回值：指标帧。异常：门禁失败时抛出。"""
         ...
 
-    def security_status_range(
+    def industry_catalog(self) -> pl.LazyFrame:
+        """读取行业目录。入参：无。返回值：目录帧。异常：门禁失败时抛出。"""
+        ...
+
+    def industry_memberships_on_dates(
+        self,
+        instruments: Sequence[InstrumentId] | None = None,
+        dates: Sequence[date] = (),
+    ) -> pl.LazyFrame:
+        """读取行业成员。入参：股票和日期。返回值：成员帧。异常：门禁失败时抛出。"""
+        ...
+
+    def stock_suspensions(
         self,
         start: date,
         end: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
-        """读取日期闭区间内可用于时点研究的证券状态。
+        """读取停牌。入参：范围和股票。返回值：事件帧。异常：范围非法时抛出。"""
+        ...
 
-        入参：
-            start：处理区间的开始日期，类型为 ``date``。
-            end：处理区间的结束日期，类型为 ``date``。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回状态``range``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
+    def stock_risk_warnings(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取风险警示。入参：范围和股票。返回值：记录帧。异常：范围非法时抛出。"""
         ...
 
 
@@ -399,7 +297,12 @@ class CanonicalResearchRepository:
         self._catalog = catalog
         self._partition_verifier = _CanonicalPartitionVerifier(trusted_curated_root)
         self._partition_leases = _CanonicalPartitionLeasePool(self._partition_verifier)
-        self._price_adjustments = _PriceAdjustmentEngine(self)
+        self._stock_price_adjustments = _PriceAdjustmentEngine(
+            self, self.stock_bars, self._stock_adjustment_factors
+        )
+        self._fund_price_adjustments = _PriceAdjustmentEngine(
+            self, self.fund_bars, self._fund_adjustment_factors
+        )
 
     @classmethod
     def from_sqlite(
@@ -443,17 +346,17 @@ class CanonicalResearchRepository:
         """
         return self._catalog
 
-    def instruments(self) -> pl.LazyFrame:
-        """读取全部当前有效的证券主数据。
+    def stocks(self) -> pl.LazyFrame:
+        """读取股票。入参：无。返回值：股票帧。异常：门禁失败时抛出。"""
+        return self._read(DatasetKind.STOCK_MASTER, "TRUE", [])
 
-        入参：
-            无。
-        返回值：
-            返回证券集合（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        return self._read(DatasetKind.INSTRUMENT, "TRUE", [])
+    def funds(self) -> pl.LazyFrame:
+        """读取基金。入参：无。返回值：基金帧。异常：门禁失败时抛出。"""
+        return self._read(DatasetKind.FUND_MASTER, "TRUE", [])
+
+    def indexes(self) -> pl.LazyFrame:
+        """读取指数。入参：无。返回值：指数帧。异常：门禁失败时抛出。"""
+        return self._read(DatasetKind.INDEX_MASTER, "TRUE", [])
 
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
         """读取指定闭区间内的交易日历。
@@ -474,27 +377,39 @@ class CanonicalResearchRepository:
             [start, end],
         )
 
-    def bars(
+    def stock_bars(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """读取指定证券和日期闭区间内的日行情。
+        """读取股票行情。入参：股票和范围。返回值：行情帧。异常：范围或门禁非法时抛出。"""
+        return self._instrument_bars(
+            DatasetKind.STOCK_DAILY_BAR, instruments, start, end
+        )
 
-        入参：
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-            start：处理区间的开始日期，类型为 ``date``。
-            end：处理区间的结束日期，类型为 ``date``。
-        返回值：
-            返回行情（``pl.LazyFrame``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
+    def fund_bars(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        """读取基金行情。入参：基金和范围。返回值：行情帧。异常：范围或门禁非法时抛出。"""
+        return self._instrument_bars(
+            DatasetKind.FUND_DAILY_BAR, instruments, start, end
+        )
+
+    def _instrument_bars(
+        self,
+        dataset: DatasetKind,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
         if start > end:
             raise ValueError("start must not follow end")
-        _, leases = self._verify_current_dataset(DatasetKind.DAILY_BAR)
-        definition = CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR]
+        _, leases = self._verify_current_dataset(dataset)
+        definition = CANONICAL_SCHEMAS[dataset]
         instrument_ids = [instrument.canonical() for instrument in instruments]
         scope = (
             pl.col("instrument_id").is_in(instrument_ids)
@@ -516,26 +431,66 @@ class CanonicalResearchRepository:
             .map_batches(self._partition_leases.retain(leases))
         )
 
-    def adjusted_bars(
+    def _stock_adjustment_factors(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
-        """读取以结束日为信息截止日期的前复权日行情。
+        return self._adjustment_factors(
+            DatasetKind.STOCK_ADJUSTMENT_FACTOR, instruments, start, end
+        )
 
-        入参：
-            instruments：待查询的证券标识集合。
-            start：查询日期闭区间的开始日期。
-            end：查询日期闭区间的结束日期及 PIT 信息截止日期。
-        返回值：
-            返回包含复权因子和审计列的前复权行情。
-        异常：
-            日期、目录门禁或 Canonical 分区不满足契约时传播对应异常。
-        """
-        return self._price_adjustments.adjusted_bars(instruments, start, end)
+    def _fund_adjustment_factors(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        return self._adjustment_factors(
+            DatasetKind.FUND_ADJUSTMENT_FACTOR, instruments, start, end
+        )
 
-    def log_returns(
+    def _adjustment_factors(
+        self,
+        dataset: DatasetKind,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        if start > end:
+            raise ValueError("start must not follow end")
+        predicates, parameters = self._instrument_predicate(instruments)
+        predicates.extend(
+            (
+                "trade_date <= ?",
+                "pit_usable = TRUE",
+                "available_at IS NOT NULL",
+                "available_at <= ?",
+            )
+        )
+        parameters.extend((end, self._shanghai_day_end_utc(end)))
+        return self._read(dataset, " AND ".join(predicates), parameters)
+
+    def adjusted_stock_bars(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        """读取股票复权行情。入参：股票和范围。返回值：行情帧。异常：因子缺失时抛出。"""
+        return self._stock_price_adjustments.adjusted_bars(instruments, start, end)
+
+    def adjusted_fund_bars(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        """读取基金复权行情。入参：基金和范围。返回值：行情帧。异常：因子缺失时抛出。"""
+        return self._fund_price_adjustments.adjusted_bars(instruments, start, end)
+
+    def stock_log_returns(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
@@ -543,19 +498,24 @@ class CanonicalResearchRepository:
         *,
         lookback_sessions: int,
     ) -> pl.LazyFrame:
-        """返回按交易会话补齐的前复权对数收益。
+        """读取股票收益。入参：股票、范围和回看。返回值：收益帧。异常：参数非法时抛出。"""
+        return self._stock_price_adjustments.log_returns(
+            instruments,
+            start,
+            end,
+            lookback_sessions=lookback_sessions,
+        )
 
-        入参：
-            instruments：待查询的证券标识集合。
-            start：结果区间的开始日期。
-            end：结果区间的结束日期及 PIT 信息截止日期。
-            lookback_sessions：在 ``start`` 前额外读取的交易会话数量。
-        返回值：
-            返回停牌补零、真实缺失保空的会话级对数收益。
-        异常：
-            参数、目录门禁或 Canonical 分区不满足契约时传播对应异常。
-        """
-        return self._price_adjustments.log_returns(
+    def fund_log_returns(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+        *,
+        lookback_sessions: int,
+    ) -> pl.LazyFrame:
+        """读取基金收益。入参：基金、范围和回看。返回值：收益帧。异常：参数非法时抛出。"""
+        return self._fund_price_adjustments.log_returns(
             instruments,
             start,
             end,
@@ -564,7 +524,7 @@ class CanonicalResearchRepository:
 
     def index_bars(
         self,
-        indexes: Sequence[InstrumentId],
+        indexes: Sequence[IndexId],
         start: date,
         end: date,
     ) -> pl.LazyFrame:
@@ -583,8 +543,8 @@ class CanonicalResearchRepository:
         """
         if start > end:
             raise ValueError("start must not follow end")
-        _, leases = self._verify_current_dataset(DatasetKind.INDEX_BAR)
-        definition = CANONICAL_SCHEMAS[DatasetKind.INDEX_BAR]
+        _, leases = self._verify_current_dataset(DatasetKind.INDEX_DAILY_BAR)
+        definition = CANONICAL_SCHEMAS[DatasetKind.INDEX_DAILY_BAR]
         index_ids = [index.canonical() for index in indexes]
         scope = pl.col("index_id").is_in(index_ids) if index_ids else pl.lit(False)
         return (
@@ -602,7 +562,7 @@ class CanonicalResearchRepository:
             .map_batches(self._partition_leases.retain(leases))
         )
 
-    def daily_basics(
+    def stock_daily_basics(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
@@ -621,8 +581,8 @@ class CanonicalResearchRepository:
         """
         if start > end:
             raise ValueError("start must not follow end")
-        _, leases = self._verify_current_dataset(DatasetKind.DAILY_BASIC)
-        definition = CANONICAL_SCHEMAS[DatasetKind.DAILY_BASIC]
+        _, leases = self._verify_current_dataset(DatasetKind.STOCK_DAILY_BASIC)
+        definition = CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BASIC]
         instrument_ids = [instrument.canonical() for instrument in instruments]
         scope = (
             pl.col("instrument_id").is_in(instrument_ids)
@@ -644,138 +604,46 @@ class CanonicalResearchRepository:
             .map_batches(self._partition_leases.retain(leases))
         )
 
-    def financials_as_of(
+    def stock_financial_indicators(
         self,
-        field_ids: Sequence[str],
         as_of: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
-        """读取截至指定日期上海时区日终已知的最新财务观测。
-
-        入参：
-            field_ids：参与本次处理的字段``ids``；调用方不得依赖未声明的顺序。
-            as_of：PIT 查询和资格判断所依据的观察日。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回截至日``of``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
+        """读取财务指标。入参：观察日和股票。返回值：指标帧。异常：门禁失败时抛出。"""
         predicates, parameters = self._instrument_predicate(instruments)
-        field_predicate, field_parameters = self._value_predicate("metric", field_ids)
-        predicates.extend(field_predicate)
         predicates.extend(
-            (
-                "pit_usable = TRUE",
-                "available_at IS NOT NULL",
-                "available_at <= ?",
-            )
+            ("pit_usable = TRUE", "available_at IS NOT NULL", "available_at <= ?")
         )
-        parameters.extend(field_parameters)
         parameters.append(self._shanghai_day_end_utc(as_of))
-        definition = CANONICAL_SCHEMAS[DatasetKind.FINANCIAL_OBSERVATION]
+        definition = CANONICAL_SCHEMAS[DatasetKind.STOCK_FINANCIAL_INDICATOR]
         columns = self._columns(definition)
-        order = self._order(definition)
         query = (
             "SELECT "
             + columns
             + " FROM (SELECT "
             + columns
-            + ", ROW_NUMBER() OVER (PARTITION BY instrument_id, report_period, metric "
+            + ", ROW_NUMBER() OVER (PARTITION BY instrument_id, report_period "
             "ORDER BY available_at DESC, revision DESC) AS _pit_rank FROM data WHERE "
             + " AND ".join(predicates)
             + ") WHERE _pit_rank = 1 ORDER BY "
-            + order
+            + self._order(definition)
         )
         return self._read_query(
-            DatasetKind.FINANCIAL_OBSERVATION,
-            query,
-            parameters,
+            DatasetKind.STOCK_FINANCIAL_INDICATOR, query, parameters
         )
 
-    def financial_history(
+    def industry_catalog(self) -> pl.LazyFrame:
+        """读取行业目录。入参：无。返回值：目录帧。异常：门禁失败时抛出。"""
+        return self._read(DatasetKind.INDUSTRY_CATALOG, "TRUE", [])
+
+    def industry_memberships_on_dates(
         self,
-        field_ids: Sequence[str],
-        as_of: date,
         instruments: Sequence[InstrumentId] | None = None,
+        dates: Sequence[date] = (),
     ) -> pl.LazyFrame:
-        """读取截至指定日期上海时区日终已知的全部财务修订历史。
-
-        入参：
-            field_ids：参与本次处理的字段``ids``；调用方不得依赖未声明的顺序。
-            as_of：PIT 查询和资格判断所依据的观察日。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回``history``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        predicates, parameters = self._instrument_predicate(instruments)
-        field_predicate, field_parameters = self._value_predicate("metric", field_ids)
-        predicates.extend(field_predicate)
-        predicates.extend(
-            (
-                "pit_usable = TRUE",
-                "available_at IS NOT NULL",
-                "available_at <= ?",
-            )
-        )
-        parameters.extend(field_parameters)
-        parameters.append(self._shanghai_day_end_utc(as_of))
-        return self._read(
-            DatasetKind.FINANCIAL_OBSERVATION,
-            " AND ".join(predicates),
-            parameters,
-        )
-
-    def industry_classifications_as_of(
-        self,
-        instruments: Sequence[InstrumentId] | None,
-        as_of: date,
-    ) -> pl.LazyFrame:
-        """读取指定日期有效且在上海时区日终前已知的行业分类。
-
-        入参：
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-            as_of：PIT 查询和资格判断所依据的观察日。
-        返回值：
-            返回行业分类截至日``of``（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        definition = CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_CLASSIFICATION]
-        return (
-            self._industry_classifications_on_dates(instruments, (as_of,))
-            .drop("query_date")
-            .cast(definition.columns)
-        )
-
-    def industry_classifications_on_dates(
-        self,
-        instruments: Sequence[InstrumentId] | None,
-        dates: Sequence[date],
-    ) -> pl.LazyFrame:
-        """一次读取并重建多个查询日的供应商 as-of 行业状态。
-
-        入参：
-            instruments：证券集合；``None`` 表示全市场。
-            dates：消费者实际需要的查询日期集合。
-        返回值：
-            返回含 ``query_date``、命中事件和全部审计列的惰性数据帧。
-        异常：
-            日期、目录门禁或 Canonical 分区不满足契约时传播对应异常。
-        """
-        return self._industry_classifications_on_dates(instruments, dates)
-
-    def _industry_classifications_on_dates(
-        self,
-        instruments: Sequence[InstrumentId] | None,
-        dates: Sequence[date],
-    ) -> pl.LazyFrame:
-        definition = CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_CLASSIFICATION]
-        output_schema = pl.Schema(
-            [("query_date", pl.Date), *definition.columns.items()]
-        )
+        """读取行业成员。入参：股票和日期。返回值：成员帧。异常：门禁失败时抛出。"""
+        definition = CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_MEMBERSHIP]
+        output_schema = pl.Schema([("query_date", pl.Date), *definition.columns.items()])
         requested_dates = tuple(sorted(set(dates)))
         if not requested_dates:
             return pl.DataFrame(schema=output_schema).lazy()
@@ -784,8 +652,13 @@ class CanonicalResearchRepository:
             (
                 "pit_usable = TRUE",
                 "available_at IS NOT NULL",
-                "as_of_date <= requested.query_date",
-                "available_at <= requested.cutoff",
+                "in_date <= requested.query_date",
+                "in_available_at <= requested.cutoff",
+                (
+                    "(out_date IS NULL OR out_date > requested.query_date "
+                    "OR out_available_at IS NULL "
+                    "OR out_available_at > requested.cutoff)"
+                ),
             )
         )
         values = ", ".join("(?, ?)" for _ in requested_dates)
@@ -796,15 +669,11 @@ class CanonicalResearchRepository:
         query = (
             "SELECT query_date, "
             + columns
-            + " FROM (SELECT requested.query_date, "
-            + columns
-            + ", ROW_NUMBER() OVER (PARTITION BY requested.query_date, "
-            "instrument_id, taxonomy ORDER BY as_of_date DESC, available_at DESC) "
-            "AS _pit_rank FROM data CROSS JOIN requested WHERE "
+            + " FROM data CROSS JOIN requested WHERE "
             + " AND ".join(predicates)
-            + ") WHERE _pit_rank = 1 ORDER BY query_date, instrument_id, taxonomy"
+            + " ORDER BY query_date, instrument_id, level1_code"
         )
-        _, leases = self._verify_current_dataset(DatasetKind.INDUSTRY_CLASSIFICATION)
+        _, leases = self._verify_current_dataset(DatasetKind.INDUSTRY_MEMBERSHIP)
         source_query, source_parameters = self._parquet_sources(
             [lease.path for lease in leases]
         )
@@ -828,54 +697,35 @@ class CanonicalResearchRepository:
         frame = cast(pl.DataFrame, pl.from_arrow(result))
         return frame.cast(output_schema).lazy()
 
-    def security_status(
-        self,
-        as_of: date,
-        instruments: Sequence[InstrumentId] | None = None,
-    ) -> pl.LazyFrame:
-        """读取指定交易日的证券状态。
-
-        入参：
-            as_of：PIT 查询和资格判断所依据的观察日。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回状态（``pl.LazyFrame``）。
-        异常：
-            无。
-        """
-        predicates, parameters = self._instrument_predicate(instruments)
-        predicates.extend(
-            (
-                "trade_date = ?",
-                "pit_usable = TRUE",
-                "available_at IS NOT NULL",
-                "available_at <= ?",
-            )
-        )
-        parameters.extend((as_of, self._shanghai_day_end_utc(as_of)))
-        return self._read(
-            DatasetKind.SECURITY_STATUS,
-            " AND ".join(predicates),
-            parameters,
-        )
-
-    def security_status_range(
+    def stock_suspensions(
         self,
         start: date,
         end: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
-        """读取日期闭区间内可用于时点研究的证券状态。
+        """读取停牌。入参：范围和股票。返回值：事件帧。异常：范围非法时抛出。"""
+        return self._stock_event_range(
+            DatasetKind.STOCK_SUSPENSION, start, end, instruments
+        )
 
-        入参：
-            start：处理区间的开始日期，类型为 ``date``。
-            end：处理区间的结束日期，类型为 ``date``。
-            instruments：本次查询、计算或组合构建涉及的规范证券集合。
-        返回值：
-            返回状态``range``（``pl.LazyFrame``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
+    def stock_risk_warnings(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取风险警示。入参：范围和股票。返回值：记录帧。异常：范围非法时抛出。"""
+        return self._stock_event_range(
+            DatasetKind.STOCK_RISK_WARNING, start, end, instruments
+        )
+
+    def _stock_event_range(
+        self,
+        dataset: DatasetKind,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None,
+    ) -> pl.LazyFrame:
         if start > end:
             raise ValueError("start must not follow end")
         predicates, parameters = self._instrument_predicate(instruments)
@@ -890,7 +740,7 @@ class CanonicalResearchRepository:
         )
         parameters.extend((start, end, self._shanghai_day_end_utc(end)))
         return self._read(
-            DatasetKind.SECURITY_STATUS,
+            dataset,
             " AND ".join(predicates),
             parameters,
         )
@@ -1070,6 +920,11 @@ class _CanonicalPartitionVerifier:
     ) -> int:
         message = "canonical partition fails catalog integrity checks"
         try:
+            relative = partition.path.absolute().relative_to(self.trusted_root)
+            if not relative.parts or relative.parts[0] != "source=tushare":
+                raise ValueError(
+                    "canonical partition must use the source=tushare namespace"
+                )
             with open_verified_file(
                 partition.path.absolute(),
                 trusted_root=self.trusted_root,

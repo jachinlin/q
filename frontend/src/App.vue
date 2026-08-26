@@ -14,6 +14,7 @@ const nav = [
   ['/factor-studies', '因子研究', '05'],
   ['/tasks', '运行中心', '06'],
   ['/notebook', 'Notebook', '07'],
+  ['/settings', '设置', '08'],
 ]
 </script>
 

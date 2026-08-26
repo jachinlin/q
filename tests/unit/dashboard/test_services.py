@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -26,13 +26,13 @@ from quant_research.data.quality.models import (
 )
 from quant_research.data.repository import ResearchDataRepository
 from quant_research.domain.enums import DatasetKind, Severity
-from quant_research.infrastructure.baostock.routing import BAOSTOCK_ROUTES
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
+from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 from quant_research.logging import MAX_TASK_LOG_BYTES, LogContext, TaskLogManager
 from quant_research.tasks.models import TaskOutcome, TaskStatus
 
@@ -55,7 +55,7 @@ def test_data_datasets_lists_every_defined_dataset_before_curate(
             settings,
             _REPOSITORY,
             cast(MarketReviewService, object()),
-            BAOSTOCK_ROUTES,
+            TUSHARE_ROUTES,
         ).data_datasets()
     finally:
         engine.dispose()
@@ -78,8 +78,8 @@ def test_data_datasets_lists_every_defined_dataset_before_curate(
     assert all(item["partition_count"] == 0 for item in datasets)
     assert all(item["row_count"] == 0 for item in datasets)
     assert (
-        next(item for item in datasets if item["dataset"] == "daily_bar")["source"]
-        == "baostock"
+        next(item for item in datasets if item["dataset"] == "stock_daily_bar")["source"]
+        == "tushare"
     )
     DatasetListResponse.model_validate(payload)
 
@@ -100,17 +100,63 @@ def test_data_summary_separates_gate_and_freshness_without_run_evidence(
             settings,
             _REPOSITORY,
             cast(MarketReviewService, object()),
-            BAOSTOCK_ROUTES,
+            TUSHARE_ROUTES,
         ).data_summary()
     finally:
         engine.dispose()
 
     response = DataSummaryResponse.model_validate(payload)
+    assert response.initialization.status == "NOT_STARTED"
+    assert response.initialization.years is None
     assert response.gate.status == "BLOCKED"
     assert response.gate.reason == "NEVER_VALIDATED"
     assert response.freshness.status == "MISSING"
     assert response.gate_quality_run is None
     assert response.latest_quality_run is None
+
+
+def test_data_summary_exposes_resumable_initialization_and_active_task(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        timezone=ZoneInfo("Asia/Shanghai"),
+        data_root=tmp_path,
+        max_partition_size=100,
+    )
+    upgrade_database(settings.state_db)
+    engine = create_sqlite_engine(settings.state_db)
+    repository = MetadataRepository(engine)
+    started_at = datetime(2026, 8, 15, 3, tzinfo=UTC)
+    repository.begin_data_initialization(
+        years=5,
+        start_date=date(2021, 8, 14),
+        end_date=date(2026, 8, 14),
+        started_at=started_at,
+    )
+    task_id = TaskQueue(
+        engine,
+        clock=lambda: started_at,
+        task_log_root=settings.data_root / "state" / "task-logs",
+    ).enqueue("DATA_BOOTSTRAP", {"years": 5}, 0)
+    try:
+        payload = DashboardViewService(
+            engine,
+            settings,
+            _REPOSITORY,
+            cast(MarketReviewService, object()),
+            TUSHARE_ROUTES,
+        ).data_summary()
+    finally:
+        engine.dispose()
+
+    response = DataSummaryResponse.model_validate(payload)
+    assert response.initialization.status == "IN_PROGRESS"
+    assert response.initialization.years == 5
+    assert response.initialization.start_date == "2021-08-14"
+    assert response.initialization.end_date == "2026-08-14"
+    assert response.active_update is not None
+    assert response.active_update.id == task_id
+    assert response.active_update.task_type == "DATA_BOOTSTRAP"
 
 
 def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
@@ -127,7 +173,7 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
     now = datetime(2026, 8, 14, 10, tzinfo=UTC)
     run = repository.register_quality_run(
         QualityRunSpec(
-            dataset_hashes={DatasetKind.DAILY_BAR.value: "b" * 64},
+            dataset_hashes={DatasetKind.STOCK_DAILY_BAR.value: "b" * 64},
             input_hash="a" * 64,
             scope="DATASET",
             started_at=now,
@@ -136,7 +182,7 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
                 QualityIssue(
                     rule_id="primary_key_duplicate",
                     severity=Severity.FATAL,
-                    dataset=DatasetKind.DAILY_BAR,
+                    dataset=DatasetKind.STOCK_DAILY_BAR,
                     scope={"partition": "year=2026"},
                     actual=2,
                     threshold=0,
@@ -151,7 +197,7 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
         settings,
         _REPOSITORY,
         cast(MarketReviewService, object()),
-        BAOSTOCK_ROUTES,
+        TUSHARE_ROUTES,
     )
     try:
         response = QualityRunDetailResponse.model_validate(
@@ -159,7 +205,7 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
         )
         complete = repository.register_quality_run(
             QualityRunSpec(
-                dataset_hashes={DatasetKind.DAILY_BAR.value: "c" * 64},
+                dataset_hashes={DatasetKind.STOCK_DAILY_BAR.value: "c" * 64},
                 input_hash="d" * 64,
                 scope="DATASET",
                 started_at=now,
@@ -168,7 +214,7 @@ def test_quality_run_detail_marks_unpersisted_legacy_results_unknown(
                 rule_results=(
                     QualityRuleResult(
                         rule_id="canonical_schema",
-                        dataset=DatasetKind.DAILY_BAR,
+                        dataset=DatasetKind.STOCK_DAILY_BAR,
                         status=QualityRuleStatus.PASS,
                         severity=Severity.FATAL,
                         title="运行时标题",
@@ -237,7 +283,7 @@ def test_overview_uses_global_task_counts_without_legacy_research_payloads(
         settings,
         _REPOSITORY,
         cast(MarketReviewService, object()),
-        BAOSTOCK_ROUTES,
+        TUSHARE_ROUTES,
     )
     try:
         response = OverviewResponse.model_validate(service.overview())
@@ -326,7 +372,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         settings,
         _REPOSITORY,
         cast(MarketReviewService, object()),
-        BAOSTOCK_ROUTES,
+        TUSHARE_ROUTES,
     )
     try:
         filtered = service.task_list(status="FAILED", page=1, page_size=1)
@@ -448,7 +494,7 @@ def test_task_log_degrades_for_missing_file_and_ignores_malformed_jsonl(
         settings,
         _REPOSITORY,
         cast(MarketReviewService, object()),
-        BAOSTOCK_ROUTES,
+        TUSHARE_ROUTES,
     )
     try:
         parsed = service.task_log(task_id, claimed.attempt_id, tail_lines=500)
@@ -515,7 +561,7 @@ def test_task_log_keeps_trusted_path_and_file_size_boundaries(tmp_path: Path) ->
         settings,
         _REPOSITORY,
         cast(MarketReviewService, object()),
-        BAOSTOCK_ROUTES,
+        TUSHARE_ROUTES,
     )
     outside = tmp_path / "outside.log"
     outside.write_text("outside", encoding="utf-8")

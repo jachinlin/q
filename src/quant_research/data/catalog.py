@@ -38,12 +38,12 @@ class FetchGranularity(StrEnum):
         ValueError：字段、枚举值或跨字段约束不合法时抛出。
     """
 
-    TRADING_DAY = "trading_day"
+    MARKET_TRADE_DATE = "market_trade_date"
     DATE_RANGE = "date_range"
-    FULL_SNAPSHOT = "full_snapshot"
-    FINANCIAL_CELL = "instrument_year_quarter_endpoint"
-    INSTRUMENT = "instrument"
-    INDEX_RANGE = "index_range"
+    MARKET_SNAPSHOT = "market_snapshot"
+    REPORT_PERIOD = "report_period"
+    INDUSTRY_L1 = "industry_l1"
+    INDEX_RANGE_EXCEPTION = "index_range_exception"
 
 
 class FetchPlan(StrEnum):
@@ -52,12 +52,12 @@ class FetchPlan(StrEnum):
     入参：按枚举值构造。返回值：返回枚举成员。异常：非法值抛出 ``ValueError``。
     """
 
-    INSTRUMENT_SNAPSHOT = "instrument_snapshot"
+    MARKET_SNAPSHOT = "market_snapshot"
     TRADE_CALENDAR_RANGE = "trade_calendar_range"
-    DAILY_MARKET = "daily_market"
-    INDEX_RANGE = "index_range"
-    FINANCIAL_CELL = "financial_cell"
-    INDUSTRY_AS_OF = "industry_as_of"
+    MARKET_TRADE_DATE = "market_trade_date"
+    INDEX_RANGE_EXCEPTION = "index_range_exception"
+    REPORT_PERIOD = "report_period"
+    INDUSTRY_L1 = "industry_l1"
 
 
 class UpdateCadence(StrEnum):
@@ -145,7 +145,6 @@ class EndpointMapping:
     入参：
         endpoint：供应商原生端点名称。
         field_map：供应商原生字段名到 Canonical 字段名的映射。
-        fan_out：同一 Raw 响应能够同时生成的 Canonical 数据集集合。
     返回值：
         构造并返回 ``EndpointMapping`` 实例。
     异常：
@@ -154,8 +153,6 @@ class EndpointMapping:
 
     endpoint: str
     field_map: Mapping[str, str]
-    fan_out: tuple[DatasetKind, ...] = ()
-
     def __post_init__(self) -> None:
         if not self.endpoint:
             raise ValueError("endpoint must not be empty")
@@ -305,273 +302,168 @@ class DatasetCatalog(Mapping[DatasetKind, DatasetSpec]):
             raise ValueError(f"unsupported dataset: {value}") from error
 
 
-_AUDIT = (
-    "source",
-    "available_at",
-    "availability_source",
-    "pit_usable",
-    "ingested_at",
-)
-_DAILY_ENDPOINT = "query_daily_history_k_AStock"
-_ETF_ENDPOINT = "query_etf_history_k_data_plus"
-_DAILY_FAN_OUT = (
-    DatasetKind.DAILY_BAR,
-    DatasetKind.DAILY_BASIC,
-    DatasetKind.SECURITY_STATUS,
-)
-_ETF_FAN_OUT = (
-    DatasetKind.DAILY_BAR,
-    DatasetKind.SECURITY_STATUS,
-)
+_AUDIT = ("source", "available_at", "availability_source", "pit_usable", "ingested_at")
 
 
 class _DatasetSpecFactory:
-    """集中构造目录常量使用的端点映射。"""
+    """集中构造 Tushare 一端点一数据集目录。"""
 
     @staticmethod
-    def endpoint(
-        name: str,
+    def spec(
+        kind: DatasetKind,
+        endpoint: str,
+        partitioning: Partitioning,
+        granularity: FetchGranularity,
+        plan: FetchPlan,
+        cadence: UpdateCadence,
+        reuse: ReuseSemantics,
+        overlap_days: int,
+        freshness: FreshnessPolicy,
         fields: Mapping[str, str],
         *,
-        fan_out: tuple[DatasetKind, ...] = (),
-    ) -> EndpointMapping:
-        return EndpointMapping(name, fields, fan_out)
+        extra_pit_fields: tuple[str, ...] = (),
+    ) -> DatasetSpec:
+        return DatasetSpec(
+            kind,
+            CANONICAL_SCHEMAS[kind],
+            partitioning,
+            _AUDIT + extra_pit_fields,
+            granularity,
+            plan,
+            cadence,
+            reuse,
+            overlap_days,
+            {"tushare": (EndpointMapping(endpoint, fields),)},
+            freshness,
+        )
+
+
+_BAR_FIELDS = {
+    "ts_code": "instrument_id", "trade_date": "trade_date", "open": "open",
+    "high": "high", "low": "low", "close": "close", "pre_close": "preclose",
+    "change": "change", "pct_chg": "pct_change", "vol": "volume",
+    "amount": "amount",
+}
 
 
 DATASET_CATALOG = DatasetCatalog(
     (
-        DatasetSpec(
-            DatasetKind.DAILY_BAR,
-            CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR],
-            Partitioning.YEAR,
-            _AUDIT,
-            FetchGranularity.TRADING_DAY,
-            FetchPlan.DAILY_MARKET,
-            UpdateCadence.DAILY,
-            ReuseSemantics.APPEND_ONLY,
-            5,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        _DAILY_ENDPOINT,
-                        {
-                            "code": "instrument_id",
-                            "date": "trade_date",
-                            "open": "open",
-                            "high": "high",
-                            "low": "low",
-                            "close": "close",
-                            "preclose": "preclose",
-                            "volume": "volume",
-                            "amount": "amount",
-                            "adjustflag": "adjustment_flag",
-                            "pctChg": "pct_change",
-                        },
-                        fan_out=_DAILY_FAN_OUT,
-                    ),
-                    _DatasetSpecFactory.endpoint(
-                        _ETF_ENDPOINT,
-                        {
-                            "code": "instrument_id",
-                            "date": "trade_date",
-                            "open": "open",
-                            "high": "high",
-                            "low": "low",
-                            "close": "close",
-                            "preclose": "preclose",
-                            "volume": "volume",
-                            "amount": "amount",
-                            "adjustflag": "adjustment_flag",
-                            "pctChg": "pct_change",
-                        },
-                        fan_out=_ETF_FAN_OUT,
-                    ),
-                )
-            },
-            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
-        ),
-        DatasetSpec(
-            DatasetKind.DAILY_BASIC,
-            CANONICAL_SCHEMAS[DatasetKind.DAILY_BASIC],
-            Partitioning.YEAR,
-            _AUDIT,
-            FetchGranularity.TRADING_DAY,
-            FetchPlan.DAILY_MARKET,
-            UpdateCadence.DAILY,
-            ReuseSemantics.APPEND_ONLY,
-            5,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        _DAILY_ENDPOINT,
-                        {
-                            "code": "instrument_id",
-                            "date": "trade_date",
-                            "peTTM": "pe_ttm",
-                            "pbMRQ": "pb_mrq",
-                            "psTTM": "ps_ttm",
-                            "turn": "turnover",
-                        },
-                        fan_out=_DAILY_FAN_OUT,
-                    ),
-                )
-            },
-            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
-        ),
-        DatasetSpec(
-            DatasetKind.SECURITY_STATUS,
-            CANONICAL_SCHEMAS[DatasetKind.SECURITY_STATUS],
-            Partitioning.YEAR,
-            _AUDIT,
-            FetchGranularity.TRADING_DAY,
-            FetchPlan.DAILY_MARKET,
-            UpdateCadence.DAILY,
-            ReuseSemantics.APPEND_ONLY,
-            5,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        _DAILY_ENDPOINT,
-                        {
-                            "code": "instrument_id",
-                            "date": "trade_date",
-                            "tradestatus": "is_suspended",
-                            "isST": "is_st",
-                        },
-                        fan_out=_DAILY_FAN_OUT,
-                    ),
-                    _DatasetSpecFactory.endpoint(
-                        _ETF_ENDPOINT,
-                        {
-                            "code": "instrument_id",
-                            "date": "trade_date",
-                            "tradestatus": "is_suspended",
-                            "isST": "is_st",
-                        },
-                        fan_out=_ETF_FAN_OUT,
-                    ),
-                )
-            },
-            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
-        ),
-        DatasetSpec(
-            DatasetKind.TRADE_CALENDAR,
-            CANONICAL_SCHEMAS[DatasetKind.TRADE_CALENDAR],
-            Partitioning.ALL,
-            _AUDIT,
-            FetchGranularity.DATE_RANGE,
-            FetchPlan.TRADE_CALENDAR_RANGE,
-            UpdateCadence.DAILY,
-            ReuseSemantics.APPEND_WITH_TAIL_REVISION,
-            30,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        "query_trade_dates",
-                        {
-                            "calendar_date": "trade_date",
-                            "is_trading_day": "is_trading_day",
-                        },
-                    ),
-                )
-            },
-            FreshnessPolicy(FreshnessBasis.CALENDAR_HORIZON, "trade_date", 30),
-        ),
-        DatasetSpec(
-            DatasetKind.INSTRUMENT,
-            CANONICAL_SCHEMAS[DatasetKind.INSTRUMENT],
-            Partitioning.ALL,
-            _AUDIT,
-            FetchGranularity.FULL_SNAPSHOT,
-            FetchPlan.INSTRUMENT_SNAPSHOT,
-            UpdateCadence.DAILY,
-            ReuseSemantics.FULL_REFRESH,
-            0,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        "query_stock_basic",
-                        {
-                            "code": "instrument_id",
-                            "code_name": "name",
-                            "ipoDate": "list_date",
-                            "outDate": "delist_date",
-                            "type": "instrument_type",
-                            "status": "listing_status",
-                        },
-                    ),
-                )
-            },
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_MASTER, "stock_basic", Partitioning.ALL,
+            FetchGranularity.MARKET_SNAPSHOT, FetchPlan.MARKET_SNAPSHOT,
+            UpdateCadence.DAILY, ReuseSemantics.FULL_REFRESH, 0,
             FreshnessPolicy(FreshnessBasis.SUCCESSFUL_REFRESH, None, 0),
+            {"ts_code": "instrument_id"},
         ),
-        DatasetSpec(
-            DatasetKind.FINANCIAL_OBSERVATION,
-            CANONICAL_SCHEMAS[DatasetKind.FINANCIAL_OBSERVATION],
-            Partitioning.REPORT_YEAR,
-            _AUDIT + ("announced_at",),
-            FetchGranularity.FINANCIAL_CELL,
-            FetchPlan.FINANCIAL_CELL,
-            UpdateCadence.QUARTERLY_DISCLOSURE,
-            ReuseSemantics.APPEND_WITH_RESTATEMENT,
-            0,
-            {"baostock": (_DatasetSpecFactory.endpoint("query_dupont_data", {}),)},
-            FreshnessPolicy(FreshnessBasis.DISCLOSURE_DEADLINE, None, 0),
+        _DatasetSpecFactory.spec(
+            DatasetKind.FUND_MASTER, "fund_basic", Partitioning.ALL,
+            FetchGranularity.MARKET_SNAPSHOT, FetchPlan.MARKET_SNAPSHOT,
+            UpdateCadence.DAILY, ReuseSemantics.FULL_REFRESH, 0,
+            FreshnessPolicy(FreshnessBasis.SUCCESSFUL_REFRESH, None, 0),
+            {"ts_code": "instrument_id"},
         ),
-        DatasetSpec(
-            DatasetKind.INDUSTRY_CLASSIFICATION,
-            CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_CLASSIFICATION],
-            Partitioning.YEAR,
-            _AUDIT,
-            FetchGranularity.TRADING_DAY,
-            FetchPlan.INDUSTRY_AS_OF,
-            UpdateCadence.DAILY,
-            ReuseSemantics.APPEND_WITH_RESTATEMENT,
-            5,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        "query_stock_industry",
-                        {
-                            "as_of_date": "as_of_date",
-                            "updateDate": "supplier_update_date",
-                            "code": "instrument_id",
-                            "industry": "industry_name",
-                        },
-                    ),
-                )
-            },
-            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "as_of_date", 0),
+        _DatasetSpecFactory.spec(
+            DatasetKind.INDEX_MASTER, "index_basic", Partitioning.ALL,
+            FetchGranularity.MARKET_SNAPSHOT, FetchPlan.MARKET_SNAPSHOT,
+            UpdateCadence.DAILY, ReuseSemantics.FULL_REFRESH, 0,
+            FreshnessPolicy(FreshnessBasis.SUCCESSFUL_REFRESH, None, 0),
+            {"ts_code": "index_id"},
         ),
-        DatasetSpec(
-            DatasetKind.INDEX_BAR,
-            CANONICAL_SCHEMAS[DatasetKind.INDEX_BAR],
-            Partitioning.YEAR,
-            _AUDIT,
-            FetchGranularity.INDEX_RANGE,
-            FetchPlan.INDEX_RANGE,
-            UpdateCadence.DAILY,
-            ReuseSemantics.APPEND_ONLY,
-            5,
-            {
-                "baostock": (
-                    _DatasetSpecFactory.endpoint(
-                        "query_history_k_data_plus",
-                        {
-                            "code": "index_id",
-                            "date": "trade_date",
-                            "open": "open",
-                            "high": "high",
-                            "low": "low",
-                            "close": "close",
-                            "preclose": "preclose",
-                            "volume": "volume",
-                            "amount": "amount",
-                            "pctChg": "pct_change",
-                        },
-                    ),
-                )
-            },
+        _DatasetSpecFactory.spec(
+            DatasetKind.TRADE_CALENDAR, "trade_cal", Partitioning.ALL,
+            FetchGranularity.DATE_RANGE, FetchPlan.TRADE_CALENDAR_RANGE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 30,
+            FreshnessPolicy(FreshnessBasis.CALENDAR_HORIZON, "trade_date", 30),
+            {"cal_date": "trade_date", "is_open": "is_trading_day",
+             "pretrade_date": "previous_trade_date"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_DAILY_BAR, "daily_vip", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
             FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {**_BAR_FIELDS, "ah_vol": "after_hours_volume",
+             "ah_amount": "after_hours_amount"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_ADJUSTMENT_FACTOR, "adj_factor", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {"ts_code": "instrument_id", "trade_date": "trade_date",
+             "adj_factor": "adjustment_factor"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.FUND_DAILY_BAR, "fund_daily", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            _BAR_FIELDS,
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.FUND_ADJUSTMENT_FACTOR, "fund_adj", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {"ts_code": "instrument_id", "trade_date": "trade_date",
+             "adj_factor": "adjustment_factor"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.INDEX_DAILY_BAR, "index_daily", Partitioning.YEAR,
+            FetchGranularity.INDEX_RANGE_EXCEPTION,
+            FetchPlan.INDEX_RANGE_EXCEPTION, UpdateCadence.DAILY,
+            ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {**_BAR_FIELDS, "ts_code": "index_id"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_DAILY_BASIC, "daily_basic", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {"ts_code": "instrument_id", "trade_date": "trade_date"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_SUSPENSION, "suspend_d", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {"ts_code": "instrument_id", "trade_date": "trade_date"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_RISK_WARNING, "stock_st", Partitioning.YEAR,
+            FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
+            FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),
+            {"ts_code": "instrument_id", "trade_date": "trade_date",
+             "type": "risk_type", "type_name": "risk_type_name"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_FINANCIAL_INDICATOR, "fina_indicator_vip",
+            Partitioning.REPORT_YEAR, FetchGranularity.REPORT_PERIOD,
+            FetchPlan.REPORT_PERIOD, UpdateCadence.QUARTERLY_DISCLOSURE,
+            ReuseSemantics.APPEND_WITH_RESTATEMENT, 0,
+            FreshnessPolicy(FreshnessBasis.DISCLOSURE_DEADLINE, None, 0),
+            {"ts_code": "instrument_id", "ann_date": "announcement_date",
+             "end_date": "report_period"},
+            extra_pit_fields=("announcement_date",),
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.INDUSTRY_CATALOG, "index_classify", Partitioning.ALL,
+            FetchGranularity.MARKET_SNAPSHOT, FetchPlan.MARKET_SNAPSHOT,
+            UpdateCadence.WEEKLY, ReuseSemantics.FULL_REFRESH, 0,
+            FreshnessPolicy(FreshnessBasis.SUCCESSFUL_REFRESH, None, 7),
+            {"index_code": "industry_index_id", "src": "taxonomy"},
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.INDUSTRY_MEMBERSHIP, "index_member_all", Partitioning.ALL,
+            FetchGranularity.INDUSTRY_L1, FetchPlan.INDUSTRY_L1,
+            UpdateCadence.WEEKLY, ReuseSemantics.FULL_REFRESH, 0,
+            FreshnessPolicy(FreshnessBasis.SUCCESSFUL_REFRESH, None, 7),
+            {"ts_code": "instrument_id", "name": "instrument_name",
+             "l1_code": "level1_code", "l1_name": "level1_name",
+             "l2_code": "level2_code", "l2_name": "level2_name",
+             "l3_code": "level3_code", "l3_name": "level3_name"},
         ),
     )
 )

@@ -10,7 +10,11 @@ from typing import TextIO
 
 from sqlalchemy import Engine
 
-from quant_research.application.data import DataUpdateHandler, DataValidationHandler
+from quant_research.application.data import (
+    DataBootstrapHandler,
+    DataUpdateHandler,
+    DataValidationHandler,
+)
 from quant_research.application.experiments import ExperimentService
 from quant_research.application.factor_studies import FactorStudyService
 from quant_research.backtest.rulebook import AShareRuleBook
@@ -32,14 +36,6 @@ from quant_research.data.quality.runner import QualityRunner
 from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.factors.builtin import STOCK_FACTOR_REFERENCES
 from quant_research.factors.catalog import FactorReferenceCatalog
-from quant_research.infrastructure.baostock import (
-    BAOSTOCK_ROUTES,
-    BaoStockCalendarPolicy,
-    BaoStockClient,
-    BaoStockConfig,
-    BaoStockMapper,
-    BaoStockSdkGateway,
-)
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -52,6 +48,15 @@ from quant_research.infrastructure.persistence.factor_studies import (
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
+from quant_research.infrastructure.runtime_settings import DataRootEnvSettingsStore
+from quant_research.infrastructure.tushare import (
+    TUSHARE_ROUTES,
+    TushareCalendarPolicy,
+    TushareClient,
+    TushareConfig,
+    TushareMapper,
+    TushareSdkGateway,
+)
 from quant_research.logging import (
     LogContext,
     StructuredLogger,
@@ -91,25 +96,26 @@ class CliBootstrap:
         pipeline_stream: TextIO | None = None
         try:
             repository = MetadataRepository(engine)
-            source_config = BaoStockConfig(
-                max_instruments_per_batch=100,
-                max_days_per_batch=366,
-                max_attempts=5,
-                retry_backoff_seconds=(1.0, 2.0, 4.0, 8.0),
-                retryable_error_codes=frozenset({"-1", "10002007"}),
+            runtime_settings = DataRootEnvSettingsStore(settings.data_root)
+            source_config = TushareConfig(
+                token="",
+                benchmark_indexes=settings.tushare.benchmark_indexes,
+                max_attempts=settings.tushare.max_attempts,
+                retry_backoff_seconds=settings.tushare.retry_backoff_seconds,
+                token_provider=lambda: runtime_settings.read_data_source_token().value,
             )
-            source = BaoStockClient(BaoStockSdkGateway(), None, source_config)
-            calendar_client = BaoStockClient(BaoStockSdkGateway(), None, source_config)
+            source = TushareClient(TushareSdkGateway(), source_config)
+            calendar_client = TushareClient(TushareSdkGateway(), source_config)
             pipeline_logger, pipeline_stream = cls._pipeline_logger(settings.data_root)
             pipeline = DataPipeline(
                 source=source,
-                mapper=BaoStockMapper(),
-                calendar=BaoStockCalendarPolicy(calendar_client),
+                mapper=TushareMapper(),
+                calendar=TushareCalendarPolicy(calendar_client),
                 raw_store=RawPartitionStore(settings.raw_root),
                 curated_store=CuratedPartitionStore(settings.curated_root),
                 repository=repository,
                 quality_runner=QualityRunner(),
-                routes=BAOSTOCK_ROUTES,
+                routes=TUSHARE_ROUTES,
                 logger=pipeline_logger,
             )
             queue = TaskQueue(
@@ -135,6 +141,7 @@ class CliBootstrap:
                 worker_id=f"cli-worker-{os.getpid()}",
                 engine=engine,
                 extra_handlers=(
+                    DataBootstrapHandler(pipeline),
                     DataUpdateHandler(pipeline),
                     DataValidationHandler(pipeline),
                 ),

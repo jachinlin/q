@@ -17,6 +17,7 @@ class Exchange(StrEnum):
 
     SSE = "SSE"
     SZSE = "SZSE"
+    BSE = "BSE"
 
 
 class Board(StrEnum):
@@ -34,6 +35,7 @@ class Board(StrEnum):
     MAIN = "MAIN"
     CHINEXT = "CHINEXT"
     STAR = "STAR"
+    BSE = "BSE"
 
 
 class Severity(StrEnum):
@@ -66,14 +68,21 @@ class DatasetKind(StrEnum):
     Kinds of vendor-neutral datasets managed by the platform.
     """
 
-    INSTRUMENT = "instrument"
+    STOCK_MASTER = "stock_master"
+    FUND_MASTER = "fund_master"
+    INDEX_MASTER = "index_master"
     TRADE_CALENDAR = "trade_calendar"
-    DAILY_BAR = "daily_bar"
-    DAILY_BASIC = "daily_basic"
-    SECURITY_STATUS = "security_status"
-    FINANCIAL_OBSERVATION = "financial_observation"
-    INDUSTRY_CLASSIFICATION = "industry_classification"
-    INDEX_BAR = "index_bar"
+    STOCK_DAILY_BAR = "stock_daily_bar"
+    STOCK_ADJUSTMENT_FACTOR = "stock_adjustment_factor"
+    FUND_DAILY_BAR = "fund_daily_bar"
+    FUND_ADJUSTMENT_FACTOR = "fund_adjustment_factor"
+    INDEX_DAILY_BAR = "index_daily_bar"
+    STOCK_DAILY_BASIC = "stock_daily_basic"
+    STOCK_SUSPENSION = "stock_suspension"
+    STOCK_RISK_WARNING = "stock_risk_warning"
+    STOCK_FINANCIAL_INDICATOR = "stock_financial_indicator"
+    INDUSTRY_CATALOG = "industry_catalog"
+    INDUSTRY_MEMBERSHIP = "industry_membership"
 
 
 class MultipleTestingMethod(StrEnum):

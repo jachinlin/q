@@ -138,13 +138,13 @@ function windowBasisLabel(value: string) {
 }
 
 function windowState(window: DataUpdateWindow) {
-  if (['financial_observation', 'instrument'].includes(window.dataset)) return '不适用'
+  if (['stock_financial_indicator', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) return '不适用'
   if (window.dataset === 'trade_calendar') return `覆盖至 ${window.current_watermark ?? '—'}`
   return window.current_watermark ?? '—'
 }
 
 function windowLookback(window: DataUpdateWindow) {
-  if (['financial_observation', 'instrument'].includes(window.dataset)) return '不适用'
+  if (['stock_financial_indicator', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) return '不适用'
   return window.dataset === 'trade_calendar'
     ? `修订回看 ${window.overlap_days} 天`
     : `${window.overlap_days} 天`

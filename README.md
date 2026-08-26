@@ -25,11 +25,20 @@ PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashbo
 - [`uv`](https://docs.astral.sh/uv/)；
 - Node.js 和 npm，仅构建或开发 Dashboard 前端时需要。
 
-数据根必须位于源码目录之外。默认位置为 `~/.q-data`，也可以在 PowerShell 中显式设置：
+数据根必须位于源码目录之外。默认位置为 `~/qlab-data`，也可以在 PowerShell 中显式设置：
 
 ```powershell
 $env:QUANT_DATA_ROOT = "D:\quant-data"
 ```
+
+数据源 Token 可在 Dashboard「设置」页维护，也可直接写入数据根目录下的明文
+`.env`：
+
+```dotenv
+QUANT_TUSHARE_TOKEN=<your-token>
+```
+
+不要在代码根目录创建或提交包含 Token 的 `.env`。
 
 ## 快速开始
 
@@ -52,11 +61,13 @@ Pop-Location
 ### 3. 初始化数据
 
 ```powershell
-uv run quant data bootstrap
+uv run quant data bootstrap --years 5
 ```
 
-首次初始化会访问 BaoStock，并按照 `configs/base.yaml` 的 `bootstrap_years` 构建数据。
+首次初始化会通过 Tushare 全市场端点构建指定年数的基线。
 数据完成 `LOCALIZE → CURATE → VALIDATE` 后，研究读取门禁才会开放。
+也可以先启动本地服务，再在 Dashboard「数据中心」点击「初始化数据」提交相同的后台任务；
+初始化未完成时，界面不会显示日常更新和质量运行入口。
 
 如果已经存在本地数据，可以使用增量命令：
 
@@ -204,7 +215,7 @@ Dashboard 写请求要求同源 JSON 和有效 `X-Request-ID`。界面不提供�
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `QUANT_DATA_ROOT` | `~/.q-data` | Raw、Canonical、SQLite、日志和产物根目录。 |
+| `QUANT_DATA_ROOT` | `~/qlab-data` | Raw、Canonical、SQLite、日志和产物根目录。 |
 | `QUANT_CONFIG` | `configs/base.yaml` | 应用配置文件。 |
 | `QUANT_WORKER_PROFILE` | `baostock` | `baostock` 或 `offline-etf` Worker Profile。 |
 | `QUANT_DASHBOARD_DEV_ORIGIN` | 空 | 本地前端开发时允许的 Vite Origin。 |
@@ -214,7 +225,6 @@ Dashboard 写请求要求同源 JSON 和有效 `X-Request-ID`。界面不提供�
 ```yaml
 timezone: Asia/Shanghai
 max_partition_size: 100
-bootstrap_years: 2
 ```
 
 交易规则唯一来源为 `configs/rules/a_share.yaml`，其内容哈希进入实验身份。

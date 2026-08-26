@@ -244,8 +244,8 @@ def test_instruments_manifest_history_is_capped_at_twenty(tmp_path: Path) -> Non
         published.append(
             store.publish(
                 RawBatch(
-                    source="example",
-                    endpoint="query_stock_basic",
+                    source="tushare",
+                    endpoint="stock_basic",
                     request={"scope": "ALL"},
                     retrieved_at=datetime(2026, 7, 31, 9, 30, tzinfo=UTC),
                     schema=("code", "close"),

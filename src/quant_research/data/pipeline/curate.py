@@ -92,6 +92,19 @@ class CuratedPartitionStore:
 
     def __init__(self, root: Path) -> None:
         self._root = resolved_storage_root(root)
+        legacy = tuple(self._root.glob("dataset=*"))
+        foreign = tuple(
+            item
+            for item in self._root.glob("source=*")
+            if item.name != "source=tushare"
+        )
+        if legacy or foreign:
+            raise ValueError(
+                "legacy or non-Tushare Canonical layout detected; "
+                "choose a new QUANT_DATA_ROOT and rerun data bootstrap"
+            )
+        self._source_root = self._root / "source=tushare"
+        validate_storage_path(self._root, self._source_root)
 
     @property
     def root(self) -> Path:
@@ -174,6 +187,8 @@ class CuratedPartitionStore:
         异常：
             QuantError、ValueError：输入、供应商响应、目录状态或文件完整性不满足契约时抛出。
         """
+        if source != "tushare":
+            raise ValueError("Canonical publication requires source=tushare")
         replacement_keys = [item.partition_key for item in replacements]
         if len(replacement_keys) != len(set(replacement_keys)):
             raise ValueError("canonical replacement partition keys must be unique")
@@ -348,6 +363,8 @@ class CuratedPartitionStore:
         异常：
             QuantError：输入、供应商响应、目录状态或文件完整性不满足契约时抛出。
         """
+        if source != "tushare":
+            raise ValueError("Canonical publication requires source=tushare")
         grouped: dict[DatasetKind, dict[str, list[pl.DataFrame]]] = defaultdict(
             lambda: defaultdict(list)
         )
@@ -665,7 +682,7 @@ class CuratedPartitionStore:
         if not self._valid_partition_key(dataset, key):
             raise ValueError("curated catalog path is outside curated root")
         expected = (
-            self._root
+            self._source_root
             / f"dataset={dataset.value}"
             / key
             / f"{partition.content_hash}.parquet"
@@ -684,14 +701,17 @@ class CuratedPartitionStore:
     @staticmethod
     def _valid_partition_key(dataset: DatasetKind, key: str) -> bool:
         if dataset in {
-            DatasetKind.DAILY_BAR,
-            DatasetKind.DAILY_BASIC,
-            DatasetKind.SECURITY_STATUS,
-            DatasetKind.INDEX_BAR,
-            DatasetKind.INDUSTRY_CLASSIFICATION,
+            DatasetKind.STOCK_DAILY_BAR,
+            DatasetKind.STOCK_ADJUSTMENT_FACTOR,
+            DatasetKind.FUND_DAILY_BAR,
+            DatasetKind.FUND_ADJUSTMENT_FACTOR,
+            DatasetKind.INDEX_DAILY_BAR,
+            DatasetKind.STOCK_DAILY_BASIC,
+            DatasetKind.STOCK_SUSPENSION,
+            DatasetKind.STOCK_RISK_WARNING,
         }:
             return re.fullmatch(r"year=\d{4}", key) is not None
-        if dataset is DatasetKind.FINANCIAL_OBSERVATION:
+        if dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
             return re.fullmatch(r"report_year=\d{4}", key) is not None
         return key == "all"
 
@@ -702,18 +722,17 @@ class CuratedPartitionStore:
         column = None
         label = "partition"
         if dataset in {
-            DatasetKind.DAILY_BAR,
-            DatasetKind.DAILY_BASIC,
-            DatasetKind.SECURITY_STATUS,
-            DatasetKind.INDEX_BAR,
-            DatasetKind.INDUSTRY_CLASSIFICATION,
+            DatasetKind.STOCK_DAILY_BAR,
+            DatasetKind.STOCK_ADJUSTMENT_FACTOR,
+            DatasetKind.FUND_DAILY_BAR,
+            DatasetKind.FUND_ADJUSTMENT_FACTOR,
+            DatasetKind.INDEX_DAILY_BAR,
+            DatasetKind.STOCK_DAILY_BASIC,
+            DatasetKind.STOCK_SUSPENSION,
+            DatasetKind.STOCK_RISK_WARNING,
         }:
-            column, label = (
-                ("as_of_date", "year")
-                if dataset is DatasetKind.INDUSTRY_CLASSIFICATION
-                else ("trade_date", "year")
-            )
-        elif dataset is DatasetKind.FINANCIAL_OBSERVATION:
+            column, label = "trade_date", "year"
+        elif dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
             column, label = "report_period", "report_year"
         if column is None:
             return (("all", frame),)
@@ -733,7 +752,7 @@ class CuratedPartitionStore:
     ) -> tuple[CanonicalPartitionSpec, bool]:
         """Publish one content-addressed partition; return (spec, was_written)."""
         table = frame.to_arrow()
-        directory = self._root / f"dataset={dataset.value}" / partition_key
+        directory = self._source_root / f"dataset={dataset.value}" / partition_key
         validate_storage_path(self._root, directory)
         directory.mkdir(parents=True, exist_ok=True)
         validate_storage_path(self._root, directory)

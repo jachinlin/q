@@ -15,7 +15,7 @@ from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.data.repository import ResearchDataRepository
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.errors import QuantError
-from quant_research.domain.identifiers import InstrumentId, QualityRunId
+from quant_research.domain.identifiers import IndexId, InstrumentId, QualityRunId
 from quant_research.infrastructure.persistence.repositories import (
     CanonicalDatasetRecord,
     DataCatalogState,
@@ -53,10 +53,11 @@ class _Catalog:
                 updated_at=now,
             )
             for dataset in (
-                DatasetKind.DAILY_BAR,
-                DatasetKind.DAILY_BASIC,
-                DatasetKind.SECURITY_STATUS,
-                DatasetKind.INDEX_BAR,
+                DatasetKind.STOCK_DAILY_BAR,
+                DatasetKind.STOCK_DAILY_BASIC,
+                DatasetKind.STOCK_SUSPENSION,
+                DatasetKind.STOCK_RISK_WARNING,
+                DatasetKind.INDEX_DAILY_BAR,
             )
         )
 
@@ -118,22 +119,6 @@ class _Repository:
                 zip(self.stock_ids, boards, listings, strict=True)
             )
         ]
-        instruments.extend(
-            {
-                "instrument_id": identifier,
-                "instrument_type": "INDEX",
-                "name": name,
-                "board": "MAIN",
-                "list_date": date(2005, 1, 1),
-            }
-            for identifier, name in (
-                ("399317.SZ", "国证A指"),
-                ("000016.SH", "上证50"),
-                ("000300.SH", "沪深300"),
-                ("000905.SH", "中证500"),
-                ("000852.SH", "中证1000"),
-            )
-        )
         self.instrument_frame = pl.DataFrame(instruments)
 
         statuses: list[dict[str, object]] = []
@@ -167,11 +152,11 @@ class _Repository:
                 }
                 if session == selected:
                     overrides = {
-                        "600000.SH": (10.0, 11.0, 10.0, 11.0, 10.0),
-                        "600001.SH": (10.5, 10.5, 10.5, 10.5, 5.0),
-                        "688001.SH": (10.0, 12.0, 10.0, 12.0, 20.0),
-                        "600003.SH": (10.0, 10.0, 9.0, 9.0, -10.0),
-                        "600004.SH": (10.0, 11.0, 10.0, 10.5, 5.0),
+                        "600000.SH": (10.0, 11.0, 10.0, 11.0, 0.10),
+                        "600001.SH": (10.5, 10.5, 10.5, 10.5, 0.05),
+                        "688001.SH": (10.0, 12.0, 10.0, 12.0, 0.20),
+                        "600003.SH": (10.0, 10.0, 9.0, 9.0, -0.10),
+                        "600004.SH": (10.0, 11.0, 10.0, 10.5, 0.05),
                     }
                     if identifier in overrides:
                         open_price, high, low, close, pct = overrides[identifier]
@@ -190,18 +175,16 @@ class _Repository:
                 "instrument_id": list(self.stock_ids),
                 "trade_date": [selected] * len(self.stock_ids),
                 "pe_ttm": [10.0, -2.0, 20.0, 30.0, 40.0, 50.0, 60.0],
-                "pb_mrq": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                "pb": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 "ps_ttm": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-                "turnover": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                "turnover_rate": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07],
             }
         )
         self.industry_frame = pl.DataFrame(
             {
                 "instrument_id": list(self.stock_ids[:-1]),
-                "taxonomy": ["证监会行业分类"] * (len(self.stock_ids) - 1),
-                "industry_code": ["金融", "金融", "科技", "科技", "工业", "工业"],
-                "industry_name": ["金融", "金融", "科技", "科技", "工业", "工业"],
-                "is_classified": [True] * (len(self.stock_ids) - 1),
+                "level1_code": ["金融", "金融", "科技", "科技", "工业", "工业"],
+                "level1_name": ["金融", "金融", "科技", "科技", "工业", "工业"],
             }
         )
         index_rows: list[dict[str, object]] = []
@@ -222,7 +205,7 @@ class _Repository:
                         "low": close - 1.0,
                         "close": close,
                         "preclose": close - 1.0,
-                        "pct_change": 1.0,
+                        "pct_change": 0.01,
                     }
                 )
         self.index_frame = pl.DataFrame(index_rows)
@@ -230,7 +213,7 @@ class _Repository:
     def catalog(self) -> _Catalog:
         return self._catalog
 
-    def instruments(self) -> pl.LazyFrame:
+    def stocks(self) -> pl.LazyFrame:
         return self.instrument_frame.lazy()
 
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
@@ -242,7 +225,7 @@ class _Repository:
             }
         ).lazy()
 
-    def bars(
+    def stock_bars(
         self, instruments: tuple[InstrumentId, ...], start: date, end: date
     ) -> pl.LazyFrame:
         identifiers = [item.canonical() for item in instruments]
@@ -252,7 +235,7 @@ class _Repository:
         ).lazy()
 
     def index_bars(
-        self, indexes: tuple[InstrumentId, ...], start: date, end: date
+        self, indexes: tuple[IndexId, ...], start: date, end: date
     ) -> pl.LazyFrame:
         identifiers = [item.canonical() for item in indexes]
         return self.index_frame.filter(
@@ -260,27 +243,39 @@ class _Repository:
             & pl.col("trade_date").is_between(start, end)
         ).lazy()
 
-    def security_status_range(
+    def stock_suspensions(
         self,
         start: date,
         end: date,
         instruments: tuple[InstrumentId, ...] | None = None,
     ) -> pl.LazyFrame:
         return self.status_frame.filter(
-            pl.col("trade_date").is_between(start, end)
-        ).lazy()
+            pl.col("trade_date").is_between(start, end) & pl.col("is_suspended")
+        ).select("instrument_id", "trade_date").lazy()
 
-    def daily_basics(
+    def stock_risk_warnings(
+        self,
+        start: date,
+        end: date,
+        instruments: tuple[InstrumentId, ...] | None = None,
+    ) -> pl.LazyFrame:
+        return self.status_frame.filter(
+            pl.col("trade_date").is_between(start, end) & pl.col("is_st")
+        ).select("instrument_id", "trade_date").lazy()
+
+    def stock_daily_basics(
         self, instruments: tuple[InstrumentId, ...], start: date, end: date
     ) -> pl.LazyFrame:
         return self.basic_frame.filter(
             pl.col("trade_date").is_between(start, end)
         ).lazy()
 
-    def industry_classifications_as_of(
-        self, instruments: tuple[InstrumentId, ...] | None, as_of: date
+    def industry_memberships_on_dates(
+        self,
+        instruments: tuple[InstrumentId, ...] | None,
+        dates: tuple[date, ...],
     ) -> pl.LazyFrame:
-        return self.industry_frame.lazy()
+        return self.industry_frame.with_columns(pl.lit(dates[0]).alias("query_date")).lazy()
 
 
 def _service() -> tuple[MarketReviewService, _Repository]:
@@ -389,10 +384,8 @@ def test_market_review_distinguishes_snapshot_with_zero_selected_coverage() -> N
     repository.industry_frame = pl.DataFrame(
         {
             "instrument_id": ["601999.SH"],
-            "taxonomy": ["证监会行业分类"],
-            "industry_code": ["C39"],
-            "industry_name": ["C39"],
-            "is_classified": [True],
+            "level1_code": ["C39"],
+            "level1_name": ["C39"],
         }
     )
 
@@ -407,9 +400,8 @@ def test_market_review_distinguishes_snapshot_with_zero_selected_coverage() -> N
 def test_market_review_tombstones_do_not_inherit_old_industry() -> None:
     service, repository = _service()
     repository.industry_frame = repository.industry_frame.with_columns(
-        pl.lit(None, dtype=pl.String).alias("industry_code"),
-        pl.lit(None, dtype=pl.String).alias("industry_name"),
-        pl.lit(False).alias("is_classified"),
+        pl.lit(None, dtype=pl.String).alias("level1_code"),
+        pl.lit(None, dtype=pl.String).alias("level1_name"),
     )
 
     result = service.review(None, exclude_st=False)

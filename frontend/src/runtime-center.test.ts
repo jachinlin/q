@@ -207,8 +207,8 @@ describe('runtime center', () => {
       window_mode: 'AUTO_INCREMENTAL', planned_at: '2026-08-15T01:00:00Z',
       start: '2026-08-10', end: '2026-11-18', plan_hash: 'a'.repeat(64),
       dataset_windows: [
-        { dataset: 'daily_bar', basis: 'INCREMENTAL', start: '2026-08-10', end: '2026-08-14', overlap_days: 4, current_watermark: '2026-08-13' },
-        { dataset: 'instrument', basis: 'SNAPSHOT_REFRESH', start: '2026-08-15', end: '2026-08-15', overlap_days: 0 },
+        { dataset: 'stock_daily_bar', basis: 'INCREMENTAL', start: '2026-08-10', end: '2026-08-14', overlap_days: 4, current_watermark: '2026-08-13' },
+        { dataset: 'stock_master', basis: 'SNAPSHOT_REFRESH', start: '2026-08-15', end: '2026-08-15', overlap_days: 0 },
         { dataset: 'trade_calendar', basis: 'INCREMENTAL', start: '2026-07-21', end: '2026-11-18', overlap_days: 30, current_watermark: '2026-11-18' },
       ],
       skipped_datasets: [],
@@ -218,7 +218,7 @@ describe('runtime center', () => {
     await flushPromises()
     expect(document.body.textContent).toContain('更新模式')
     expect(document.body.textContent).toContain('自动增量')
-    expect(document.body.textContent).toContain('daily_bar')
+    expect(document.body.textContent).toContain('stock_daily_bar')
     expect(document.body.textContent).toContain('增量水位')
     expect(document.body.textContent).toContain('2026-08-10 至 2026-08-14')
     expect(document.body.textContent).toContain('全量快照')

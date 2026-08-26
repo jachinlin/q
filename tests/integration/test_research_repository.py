@@ -88,12 +88,12 @@ class _ResearchRepositoryHarness:
             ),
             previous_datasets={},
             run_id="research-repository-test",
-            source="test",
+            source="tushare",
             start=date(2026, 8, 11),
             end=date(2026, 8, 11),
             repository=self.metadata,
         )
-        self.record = result.datasets[DatasetKind.INSTRUMENT.value]
+        self.record = result.datasets[DatasetKind.STOCK_MASTER.value]
         state = self.metadata.catalog_state()
         quality = self.metadata.register_quality_run(
             QualityRunSpec(
@@ -133,15 +133,15 @@ class _ResearchRepositoryHarness:
                 "listing_status": ["LISTED"],
                 "list_date": [date(1999, 11, 10)],
                 "delist_date": [None],
-                "source": ["test"],
+                "source": ["tushare"],
                 "available_at": [_NOW],
                 "availability_source": ["test"],
                 "pit_usable": [True],
                 "ingested_at": [_NOW],
             },
-            schema=CANONICAL_SCHEMAS[DatasetKind.INSTRUMENT].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_MASTER].columns,
         )
-        return CanonicalBatch(DatasetKind.INSTRUMENT, frame, ("a" * 64,))
+        return CanonicalBatch(DatasetKind.STOCK_MASTER, frame, ("a" * 64,))
 
     @staticmethod
     def _index_bar_batch() -> CanonicalBatch:
@@ -157,15 +157,15 @@ class _ResearchRepositoryHarness:
                 "volume": [1_000_000],
                 "amount": [10_000_000.0],
                 "pct_change": [0.735294],
-                "source": ["test"],
+                "source": ["tushare"],
                 "available_at": [_NOW],
                 "availability_source": ["test"],
                 "pit_usable": [True],
                 "ingested_at": [_NOW],
             },
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDEX_BAR].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.INDEX_DAILY_BAR].columns,
         )
-        return CanonicalBatch(DatasetKind.INDEX_BAR, frame, ("b" * 64,))
+        return CanonicalBatch(DatasetKind.INDEX_DAILY_BAR, frame, ("b" * 64,))
 
     @staticmethod
     def _daily_bar_batch() -> CanonicalBatch:
@@ -183,7 +183,7 @@ class _ResearchRepositoryHarness:
                 "amount": [10_000.0, 12_000.0, 14_000.0],
                 "adjustment_flag": ["3"] * 3,
                 "pct_change": [0.0, 10.0, 9.090909],
-                "source": ["test"] * 3,
+                "source": ["tushare"] * 3,
                 "available_at": [
                     datetime(2026, 8, day.day, tzinfo=UTC) for day in days
                 ],
@@ -191,9 +191,9 @@ class _ResearchRepositoryHarness:
                 "pit_usable": [True] * 3,
                 "ingested_at": [_NOW] * 3,
             },
-            schema=CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BAR].columns,
         )
-        return CanonicalBatch(DatasetKind.DAILY_BAR, frame, ("c" * 64,))
+        return CanonicalBatch(DatasetKind.STOCK_DAILY_BAR, frame, ("c" * 64,))
 
     @staticmethod
     def _trade_calendar_batch() -> CanonicalBatch:
@@ -202,7 +202,7 @@ class _ResearchRepositoryHarness:
             {
                 "trade_date": days,
                 "is_trading_day": [True] * 3,
-                "source": ["test"] * 3,
+                "source": ["tushare"] * 3,
                 "available_at": [
                     datetime(2026, 8, day.day, tzinfo=UTC) for day in days
                 ],
@@ -250,9 +250,9 @@ class _ResearchRepositoryHarness:
             )
         frame = pl.DataFrame(
             rows,
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_CLASSIFICATION].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_MEMBERSHIP].columns,
         )
-        return CanonicalBatch(DatasetKind.INDUSTRY_CLASSIFICATION, frame, ("e" * 64,))
+        return CanonicalBatch(DatasetKind.INDUSTRY_MEMBERSHIP, frame, ("e" * 64,))
 
 
 class _FinancialRepositoryHarness:
@@ -268,17 +268,17 @@ class _FinancialRepositoryHarness:
             (self._financial_batch(),),
             previous_datasets={},
             run_id="financial-history-test",
-            source="test",
+            source="tushare",
             start=date(2025, 12, 31),
             end=date(2025, 12, 31),
             repository=self.metadata,
         )
-        record = result.datasets[DatasetKind.FINANCIAL_OBSERVATION.value]
+        record = result.datasets[DatasetKind.STOCK_FINANCIAL_INDICATOR.value]
         state = self.metadata.catalog_state()
         quality = self.metadata.register_quality_run(
             QualityRunSpec(
                 dataset_hashes={
-                    DatasetKind.FINANCIAL_OBSERVATION.value: record.content_hash
+                    DatasetKind.STOCK_FINANCIAL_INDICATOR.value: record.content_hash
                 },
                 input_hash=state.catalog_hash,
                 scope="ALL",
@@ -313,15 +313,15 @@ class _FinancialRepositoryHarness:
                 "value": [0.10, 0.11, 0.12, 0.99],
                 "revision": [0, 1, 2, 3],
                 "announced_at": available,
-                "source": ["test"] * 4,
+                "source": ["tushare"] * 4,
                 "available_at": available,
                 "availability_source": ["announcement"] * 4,
                 "pit_usable": [True, True, True, False],
                 "ingested_at": [_NOW] * 4,
             },
-            schema=CANONICAL_SCHEMAS[DatasetKind.FINANCIAL_OBSERVATION].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_FINANCIAL_INDICATOR].columns,
         )
-        return CanonicalBatch(DatasetKind.FINANCIAL_OBSERVATION, frame, ("b" * 64,))
+        return CanonicalBatch(DatasetKind.STOCK_FINANCIAL_INDICATOR, frame, ("b" * 64,))
 
 
 def test_every_public_read_api_enters_internal_verification(
@@ -342,17 +342,17 @@ def test_every_public_read_api_enters_internal_verification(
     monkeypatch.setattr(repository, "_verify_current_dataset", reject)
     query_date = date(2026, 8, 11)
     calls = (
-        (DatasetKind.INSTRUMENT, repository.instruments),
+        (DatasetKind.STOCK_MASTER, repository.instruments),
         (
             DatasetKind.TRADE_CALENDAR,
             lambda: repository.trade_calendar(query_date, query_date),
         ),
         (
-            DatasetKind.DAILY_BAR,
+            DatasetKind.STOCK_DAILY_BAR,
             lambda: repository.bars((), query_date, query_date),
         ),
         (
-            DatasetKind.DAILY_BAR,
+            DatasetKind.STOCK_DAILY_BAR,
             lambda: repository.adjusted_bars((), query_date, query_date),
         ),
         (
@@ -365,31 +365,31 @@ def test_every_public_read_api_enters_internal_verification(
             ),
         ),
         (
-            DatasetKind.INDEX_BAR,
+            DatasetKind.INDEX_DAILY_BAR,
             lambda: repository.index_bars((), query_date, query_date),
         ),
         (
-            DatasetKind.DAILY_BASIC,
+            DatasetKind.STOCK_DAILY_BASIC,
             lambda: repository.daily_basics((), query_date, query_date),
         ),
         (
-            DatasetKind.FINANCIAL_OBSERVATION,
+            DatasetKind.STOCK_FINANCIAL_INDICATOR,
             lambda: repository.financials_as_of((), query_date),
         ),
         (
-            DatasetKind.FINANCIAL_OBSERVATION,
+            DatasetKind.STOCK_FINANCIAL_INDICATOR,
             lambda: repository.financial_history((), query_date),
         ),
         (
-            DatasetKind.INDUSTRY_CLASSIFICATION,
+            DatasetKind.INDUSTRY_MEMBERSHIP,
             lambda: repository.industry_classifications_as_of(None, query_date),
         ),
         (
-            DatasetKind.INDUSTRY_CLASSIFICATION,
+            DatasetKind.INDUSTRY_MEMBERSHIP,
             lambda: repository.industry_classifications_on_dates(None, (query_date,)),
         ),
         (
-            DatasetKind.SECURITY_STATUS,
+            DatasetKind.STOCK_SUSPENSION,
             lambda: repository.security_status(query_date),
         ),
     )
@@ -410,11 +410,11 @@ def test_from_sqlite_exposes_bound_read_only_catalog(tmp_path: Path) -> None:
 
         assert catalog.require_validated_catalog() == harness.state
         assert {record.dataset for record in catalog.list_canonical_datasets()} == {
-            DatasetKind.INSTRUMENT,
-            DatasetKind.DAILY_BAR,
-            DatasetKind.INDEX_BAR,
+            DatasetKind.STOCK_MASTER,
+            DatasetKind.STOCK_DAILY_BAR,
+            DatasetKind.INDEX_DAILY_BAR,
             DatasetKind.TRADE_CALENDAR,
-            DatasetKind.INDUSTRY_CLASSIFICATION,
+            DatasetKind.INDUSTRY_MEMBERSHIP,
         }
         assert harness.repository.instruments().collect().height == 1
     finally:

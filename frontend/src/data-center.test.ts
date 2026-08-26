@@ -25,8 +25,16 @@ vi.mock('./api', () => ({
 }))
 
 describe('data center core loop', () => {
+  let initialization: {
+    status: string
+    years: number | null
+    start_date: string | null
+    end_date: string | null
+    started_at: string | null
+    completed_at: string | null
+  }
   const dataset = {
-    dataset: 'daily_bar', source: 'baostock', start_date: '2026-01-01', end_date: '2026-08-13',
+    dataset: 'stock_daily_bar', source: 'tushare', start_date: '2026-01-01', end_date: '2026-08-13',
     partition_count: 2, row_count: 100, content_hash: 'a'.repeat(64), updated_at: '2026-08-14T10:00:00Z',
     partitioning: 'year', cadence: 'daily', fetch_granularity: 'trading_day', reuse: 'append_only', overlap_days: 0,
     freshness: { status: 'STALE', actual_watermark: '2026-08-13', expected_watermark: '2026-08-14', lag_days: 1, evaluated_at: '2026-08-15T10:00:00Z', reason: 'watermark is behind target', trigger_date: null, update_required: null },
@@ -48,7 +56,7 @@ describe('data center core loop', () => {
   }
   const financialDataset = {
     ...dataset,
-    dataset: 'financial_observation',
+    dataset: 'stock_financial_indicator',
     cadence: 'quarterly_disclosure',
     overlap_days: 0,
     freshness: {
@@ -57,9 +65,9 @@ describe('data center core loop', () => {
       trigger_date: '2026-08-31', update_required: false,
     },
   }
-  const instrumentDataset = {
+  const stockMasterDataset = {
     ...dataset,
-    dataset: 'instrument',
+    dataset: 'stock_master',
     start_date: '1990-12-10',
     end_date: '2026-08-24',
     cadence: 'daily',
@@ -79,15 +87,20 @@ describe('data center core loop', () => {
   }
 
   beforeEach(() => {
+    initialization = {
+      status: 'COMPLETED', years: 5, start_date: '2021-08-14', end_date: '2026-08-14',
+      started_at: '2026-08-14T09:00:00Z', completed_at: '2026-08-14T10:02:00Z',
+    }
     apiGet.mockReset()
     apiPost.mockReset()
     apiGet.mockImplementation((path: string) => {
       if (path === '/api/v1/data/summary') return Promise.resolve({
+        initialization,
         gate: { status: 'READY', reason: 'VALIDATED', catalog_hash: 'a'.repeat(64), validated_catalog_hash: 'a'.repeat(64), quality_run_id: 'run-1', updated_at: '2026-08-14T10:00:00Z', validated_at: '2026-08-14T10:02:00Z' },
         freshness: { status: 'STALE', counts: { CURRENT: 7, STALE: 1, MISSING: 0, UNKNOWN: 0 }, evaluated_at: '2026-08-15T10:00:00Z', latest_complete_session: '2026-08-14' },
         gate_quality_run: null, latest_quality_run: null, active_update: null, last_successful_update: null, worker: null, active_research_task_count: 2,
       })
-      if (path === '/api/v1/data/datasets') return Promise.resolve({ items: [dataset, calendarDataset, financialDataset, instrumentDataset] })
+      if (path === '/api/v1/data/datasets') return Promise.resolve({ items: [dataset, calendarDataset, financialDataset, stockMasterDataset] })
       if (path.startsWith('/api/v1/data/quality-runs?')) return Promise.resolve({ items: [{ run_id: 'run-1', scope: 'all', input_hash: 'a'.repeat(64), status: 'PASSED', started_at: '2026-08-14T10:00:00Z', completed_at: '2026-08-14T10:02:00Z', issue_count: 1, blocking_issue_count: 0 }], page: 1, page_size: 50, total: 1 })
       if (path.startsWith('/api/v1/tasks/')) return Promise.resolve({
         id: path.split('/').at(-1), task_type: 'DATA_VALIDATION', status: 'SUCCEEDED',
@@ -96,17 +109,17 @@ describe('data center core loop', () => {
       if (path === '/api/v1/data/quality-runs/run-1') return Promise.resolve({
         run_id: 'run-1', scope: 'ALL', input_hash: 'a'.repeat(64), status: 'FAILED',
         started_at: '2026-08-14T10:00:00Z', completed_at: '2026-08-14T10:02:00Z',
-        issue_count: 1, blocking_issue_count: 1, dataset_hashes: { daily_bar: 'b'.repeat(64) },
+        issue_count: 1, blocking_issue_count: 1, dataset_hashes: { stock_daily_bar: 'b'.repeat(64) },
         results_complete: false, result_counts: { PASS: 1, FAIL: 1, SKIPPED: 1, UNKNOWN: 1 },
         rule_results: [
-          { rule_id: 'canonical_schema', dataset: 'daily_bar', status: 'PASS', severity: 'FATAL', title: 'Canonical Schema 一致', description: '逐分区核对 Schema。', pass_criterion: '不匹配分区数为 0。', scope: {}, actual: 0, threshold: 0, skip_reason: null, evidence: 'RUN_SNAPSHOT', issues: [] },
-          { rule_id: 'primary_key_duplicate', dataset: 'daily_bar', status: 'FAIL', severity: 'FATAL', title: '主键唯一', description: '检查重复主键。', pass_criterion: '重复主键数为 0。', scope: { partition: 'year=2026' }, actual: 2, threshold: 0, skip_reason: null, evidence: 'LEGACY_ISSUE', issues: [{ rule_id: 'primary_key_duplicate', severity: 'FATAL', dataset: 'daily_bar', scope: {}, actual: 2, threshold: 0, message: '发现重复主键', remediation: '重新清洗分区' }] },
-          { rule_id: 'trading_day_coverage', dataset: 'daily_bar', status: 'SKIPPED', severity: 'SEVERE', title: '交易日覆盖完整', description: '检查交易日覆盖。', pass_criterion: '缺失交易日数为 0。', scope: {}, actual: 0, threshold: 0, skip_reason: '缺少交易日历', evidence: 'RUN_SNAPSHOT', issues: [] },
-          { rule_id: 'negative_volume', dataset: 'daily_bar', status: 'UNKNOWN', severity: 'SEVERE', title: '成交量非负', description: '检查负成交量。', pass_criterion: '负成交量数为 0。', scope: {}, actual: null, threshold: null, skip_reason: '未保存执行证据', evidence: 'MISSING', issues: [] },
+          { rule_id: 'canonical_schema', dataset: 'stock_daily_bar', status: 'PASS', severity: 'FATAL', title: 'Canonical Schema 一致', description: '逐分区核对 Schema。', pass_criterion: '不匹配分区数为 0。', scope: {}, actual: 0, threshold: 0, skip_reason: null, evidence: 'RUN_SNAPSHOT', issues: [] },
+          { rule_id: 'primary_key_duplicate', dataset: 'stock_daily_bar', status: 'FAIL', severity: 'FATAL', title: '主键唯一', description: '检查重复主键。', pass_criterion: '重复主键数为 0。', scope: { partition: 'year=2026' }, actual: 2, threshold: 0, skip_reason: null, evidence: 'LEGACY_ISSUE', issues: [{ rule_id: 'primary_key_duplicate', severity: 'FATAL', dataset: 'stock_daily_bar', scope: {}, actual: 2, threshold: 0, message: '发现重复主键', remediation: '重新清洗分区' }] },
+          { rule_id: 'trading_day_coverage', dataset: 'stock_daily_bar', status: 'SKIPPED', severity: 'SEVERE', title: '交易日覆盖完整', description: '检查交易日覆盖。', pass_criterion: '缺失交易日数为 0。', scope: {}, actual: 0, threshold: 0, skip_reason: '缺少交易日历', evidence: 'RUN_SNAPSHOT', issues: [] },
+          { rule_id: 'negative_volume', dataset: 'stock_daily_bar', status: 'UNKNOWN', severity: 'SEVERE', title: '成交量非负', description: '检查负成交量。', pass_criterion: '负成交量数为 0。', scope: {}, actual: null, threshold: null, skip_reason: '未保存执行证据', evidence: 'MISSING', issues: [] },
         ],
         issues: [],
       })
-      if (path === '/api/v1/data/datasets/daily_bar') return Promise.resolve({ ...dataset, contract: { partitioning: 'year', fetch_granularity: 'trading_day', cadence: 'daily', reuse: 'append_only', overlap_days: 0, primary_key: ['trade_date', 'instrument_id'], sort_key: ['trade_date'], pit_fields: [], schema: [{ name: 'trade_date', type: 'Date' }], sources: [{ source: 'baostock', endpoints: ['query_history_k_data_plus'] }] }, partitions: [] })
+      if (path === '/api/v1/data/datasets/stock_daily_bar') return Promise.resolve({ ...dataset, contract: { partitioning: 'year', fetch_granularity: 'trading_day', cadence: 'daily', reuse: 'append_only', overlap_days: 0, primary_key: ['trade_date', 'instrument_id'], sort_key: ['trade_date'], pit_fields: [], schema: [{ name: 'trade_date', type: 'Date' }], sources: [{ source: 'tushare', endpoints: ['daily_vip'] }] }, partitions: [] })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
   })
@@ -120,12 +133,12 @@ describe('data center core loop', () => {
     window_mode: 'AUTO_INCREMENTAL', planned_at: '2026-08-15T10:00:00Z',
     start: '2026-08-10', end: '2026-11-18', plan_hash: 'b'.repeat(64),
     dataset_windows: [
-      { dataset: 'daily_bar', basis: 'INCREMENTAL', start: '2026-08-10', end: '2026-08-14', overlap_days: 4, current_watermark: '2026-08-13' },
-      { dataset: 'instrument', basis: 'SNAPSHOT_REFRESH', start: '2026-08-15', end: '2026-08-15', overlap_days: 0 },
+      { dataset: 'stock_daily_bar', basis: 'INCREMENTAL', start: '2026-08-10', end: '2026-08-14', overlap_days: 4, current_watermark: '2026-08-13' },
+      { dataset: 'stock_master', basis: 'SNAPSHOT_REFRESH', start: '2026-08-15', end: '2026-08-15', overlap_days: 0 },
       { dataset: 'trade_calendar', basis: 'INCREMENTAL', start: '2026-07-21', end: '2026-11-18', overlap_days: 30, current_watermark: '2026-11-18' },
     ],
     skipped_datasets: [
-      { dataset: 'financial_observation', reason: 'DISCLOSURE_DEADLINE_PENDING', trigger_date: '2026-08-31' },
+      { dataset: 'stock_financial_indicator', reason: 'DISCLOSURE_DEADLINE_PENDING', trigger_date: '2026-08-31' },
     ],
   }
 
@@ -149,16 +162,16 @@ describe('data center core loop', () => {
     expect(dailyCells[1].text()).toBe('2026-01-01')
     expect(dailyCells[2].text()).toBe('2026-08-13')
     expect(calendarCells[1].text()).toBe('2024-01-02')
-    const instrumentRow = assetRows.find((row) => row.text().includes('instrument'))
-    expect(instrumentRow?.findAll('td')[1]?.text()).toBe('2026-08-20')
-    expect(instrumentRow?.findAll('td')[2]?.text()).toBe('2026-08-20')
-    expect(instrumentRow?.text()).toContain('全量快照 · 最近刷新')
+    const stockMasterRow = assetRows.find((row) => row.text().includes('stock_master'))
+    expect(stockMasterRow?.findAll('td')[1]?.text()).toBe('2026-08-20')
+    expect(stockMasterRow?.findAll('td')[2]?.text()).toBe('2026-08-20')
+    expect(stockMasterRow?.text()).toContain('全量快照 · 最近刷新')
     expect(calendarCells[2].text()).toBe('2026-11-18')
     expect(assetRows[1].text()).toContain('日历覆盖至 2026-11-18 · 已检查至 2026-08-20')
     expect(apiGet).not.toHaveBeenCalledWith('/api/v1/data/catalog')
     await wrapper.find('.el-table__row').trigger('click')
     await flushPromises()
-    expect(apiGet).toHaveBeenCalledWith('/api/v1/data/datasets/daily_bar')
+    expect(apiGet).toHaveBeenCalledWith('/api/v1/data/datasets/stock_daily_bar')
     expect(document.body.textContent).toContain('Schema')
     wrapper.unmount()
   })
@@ -207,7 +220,7 @@ describe('data center core loop', () => {
       if (path === '/api/v1/data/update-plans/preview') return Promise.resolve(updatePlan)
       if (path === '/api/v1/data/updates') {
         expect(body).toEqual({
-          datasets: ['daily_bar', 'financial_observation', 'instrument', 'trade_calendar'],
+          datasets: ['stock_daily_bar', 'stock_financial_indicator', 'stock_master', 'trade_calendar'],
           plan_hash: updatePlan.plan_hash,
         })
         return Promise.resolve({ task_id: 'task-plan-1', status: 'QUEUED', plan_hash: updatePlan.plan_hash })
@@ -226,7 +239,7 @@ describe('data center core loop', () => {
     await create?.trigger('click')
     await flushPromises()
     expect(apiPost).toHaveBeenCalledWith('/api/v1/data/update-plans/preview', {
-      datasets: ['daily_bar', 'financial_observation', 'instrument', 'trade_calendar'],
+      datasets: ['stock_daily_bar', 'stock_financial_indicator', 'stock_master', 'trade_calendar'],
     })
     expect(document.body.textContent).toContain('自动增量')
     expect(document.body.textContent).toContain('2026-08-10 至 2026-11-18')
@@ -244,10 +257,51 @@ describe('data center core loop', () => {
     await flushPromises()
     await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith(
       '/api/v1/data/updates', {
-        datasets: ['daily_bar', 'financial_observation', 'instrument', 'trade_calendar'],
+        datasets: ['stock_daily_bar', 'stock_financial_indicator', 'stock_master', 'trade_calendar'],
         plan_hash: updatePlan.plan_hash,
       },
     ))
+    wrapper.unmount()
+  })
+
+  it('offers bootstrap instead of update before data initialization', async () => {
+    initialization = {
+      status: 'NOT_STARTED', years: null, start_date: null, end_date: null,
+      started_at: null, completed_at: null,
+    }
+    apiPost.mockImplementation((path: string, body: Record<string, unknown>) => {
+      if (path === '/api/v1/data/bootstrap') {
+        expect(body).toEqual({ years: 5 })
+        return Promise.resolve({
+          task_id: 'bootstrap-task-1', request_id: 'request-1', status: 'QUEUED', years: 5,
+        })
+      }
+      return Promise.reject(new Error(`unexpected API path: ${path}`))
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }, { path: '/tasks', component: { template: '<div />' } }] })
+    await router.push('/')
+    await router.isReady()
+    const wrapper = mount(DataCenterView, { global: { plugins: [[VueQueryPlugin, { queryClient }], router] }, attachTo: document.body })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('数据尚未初始化')
+    expect(wrapper.text()).not.toContain('创建更新任务')
+    await wrapper.find('[data-testid="bootstrap-action"]').trigger('click')
+    await flushPromises()
+    expect(document.body.textContent).toContain('初始化 Tushare 数据')
+    expect(document.body.textContent).toContain('设置页配置数据源 Token')
+    expect(document.body.textContent).toContain('打开设置')
+
+    const submit = Array.from(document.body.querySelectorAll('button'))
+      .find((item) => item.textContent?.trim() === '提交初始化任务') as HTMLButtonElement
+    submit.click()
+    await flushPromises()
+
+    await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith(
+      '/api/v1/data/bootstrap', { years: 5 },
+    ))
+    expect(wrapper.text()).toContain('初始化任务 bootstra')
     wrapper.unmount()
   })
 
@@ -292,7 +346,7 @@ describe('data center core loop', () => {
   it('creates a diagnostic quality run for one selected dataset', async () => {
     apiPost.mockResolvedValue({
       task_id: 'quality-task-2', request_id: 'request-2', status: 'QUEUED',
-      scope: 'DATASET', dataset: 'daily_bar',
+      scope: 'DATASET', dataset: 'stock_daily_bar',
     })
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }, { path: '/tasks', component: { template: '<div />' } }] })
@@ -305,7 +359,7 @@ describe('data center core loop', () => {
     await flushPromises()
     const selector = wrapper.findAllComponents({ name: 'ElSelect' })
       .find((item) => item.attributes('data-testid') === 'quality-run-dataset')
-    selector?.vm.$emit('update:modelValue', 'daily_bar')
+    selector?.vm.$emit('update:modelValue', 'stock_daily_bar')
     await flushPromises()
     expect(document.body.textContent).toContain('单数据集运行仅用于诊断')
 
@@ -314,7 +368,7 @@ describe('data center core loop', () => {
     submit.click()
     await flushPromises()
     await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith(
-      '/api/v1/data/quality-runs', { dataset: 'daily_bar' },
+      '/api/v1/data/quality-runs', { dataset: 'stock_daily_bar' },
     ))
     wrapper.unmount()
   })
@@ -342,10 +396,10 @@ describe('data center core loop', () => {
     await flushPromises()
     const selector = wrapper.findAllComponents({ name: 'ElSelect' })
       .find((item) => item.attributes('data-testid') === 'update-dataset-select')
-    selector?.vm.$emit('update:modelValue', ['daily_bar'])
+    selector?.vm.$emit('update:modelValue', ['stock_daily_bar'])
     await flushPromises()
     await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith(
-      '/api/v1/data/update-plans/preview', { datasets: ['daily_bar'] },
+      '/api/v1/data/update-plans/preview', { datasets: ['stock_daily_bar'] },
     ))
     expect(document.body.textContent).toContain('1 / 0')
 
@@ -395,7 +449,7 @@ describe('data center core loop', () => {
     await flushPromises()
     const selector = wrapper.findAllComponents({ name: 'ElSelect' })
       .find((item) => item.attributes('data-testid') === 'update-dataset-select')
-    selector?.vm.$emit('update:modelValue', ['daily_bar'])
+    selector?.vm.$emit('update:modelValue', ['stock_daily_bar'])
     await flushPromises()
     const submit = Array.from(document.body.querySelectorAll('button'))
       .find((item) => item.textContent?.includes('确认并提交计划')) as HTMLButtonElement
@@ -403,10 +457,10 @@ describe('data center core loop', () => {
     await flushPromises()
 
     await vi.waitFor(() => expect(previewBodies.filter(
-      (body) => JSON.stringify(body.datasets) === JSON.stringify(['daily_bar']),
+      (body) => JSON.stringify(body.datasets) === JSON.stringify(['stock_daily_bar']),
     )).toHaveLength(2))
     expect(apiPost).toHaveBeenCalledWith('/api/v1/data/updates', {
-      datasets: ['daily_bar'],
+      datasets: ['stock_daily_bar'],
       plan_hash: updatePlan.plan_hash,
     })
     wrapper.unmount()

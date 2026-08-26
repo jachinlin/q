@@ -44,6 +44,7 @@ from quant_research.data.quality.models import (
     thaw_json,
 )
 from quant_research.data.quality.runner import QualityRunner
+from quant_research.data.sources.contracts import PipelineSource
 from quant_research.data.sources.financials import FinancialDisclosureSchedule
 from quant_research.data.sources.routing import RoutingTable
 from quant_research.data.storage.partitions import RawPartitionStore
@@ -62,6 +63,16 @@ from quant_research.infrastructure.persistence.repositories import (
     RawPartitionSpec,
 )
 from quant_research.logging import StructuredLogger
+
+_SNAPSHOT_DATASETS = frozenset(
+    {
+        DatasetKind.STOCK_MASTER,
+        DatasetKind.FUND_MASTER,
+        DatasetKind.INDEX_MASTER,
+        DatasetKind.INDUSTRY_CATALOG,
+        DatasetKind.INDUSTRY_MEMBERSHIP,
+    }
+)
 
 
 class DatasetSource(Protocol):
@@ -474,7 +485,7 @@ class DataUpdateWindow:
             raise ValueError("DATA_UPDATE overlap_days must be non-negative")
         if self.basis is DataUpdateWindowBasis.DISCLOSURE_TRIGGER:
             if (
-                self.dataset is not DatasetKind.FINANCIAL_OBSERVATION
+                self.dataset is not DatasetKind.STOCK_FINANCIAL_INDICATOR
                 or self.current_watermark is not None
                 or self.overlap_days != 0
                 or self.trigger_date is None
@@ -482,7 +493,7 @@ class DataUpdateWindow:
                 raise ValueError("financial disclosure window fields are inconsistent")
         elif self.basis is DataUpdateWindowBasis.SNAPSHOT_REFRESH:
             if (
-                self.dataset is not DatasetKind.INSTRUMENT
+                self.dataset not in _SNAPSHOT_DATASETS
                 or self.current_watermark is not None
                 or self.overlap_days != 0
                 or self.trigger_date is not None
@@ -575,7 +586,7 @@ class DataUpdateSkip:
 
     def __post_init__(self) -> None:
         if (
-            self.dataset is not DatasetKind.FINANCIAL_OBSERVATION
+            self.dataset is not DatasetKind.STOCK_FINANCIAL_INDICATOR
             or self.reason != "DISCLOSURE_DEADLINE_PENDING"
         ):
             raise ValueError("unsupported DATA_UPDATE skip decision")
@@ -859,7 +870,7 @@ class DataUpdatePlanner:
             (item for item in self._catalog if self._routes[item]),
             key=lambda item: item.value,
         ):
-            if dataset is DatasetKind.INSTRUMENT:
+            if dataset in _SNAPSHOT_DATASETS:
                 actual = (planning_date, planning_date)
                 basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
             else:
@@ -967,7 +978,7 @@ class DataUpdatePlanner:
             resolved = self._calendar.explicit_window(start, end)
             for dataset in selected:
                 record = records[dataset]
-                if dataset is DatasetKind.INSTRUMENT:
+                if dataset in _SNAPSHOT_DATASETS:
                     actual = (planning_date, planning_date)
                     basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
                 else:
@@ -987,8 +998,8 @@ class DataUpdatePlanner:
                             if record is None
                             or dataset
                             in {
-                                DatasetKind.FINANCIAL_OBSERVATION,
-                                DatasetKind.INSTRUMENT,
+                                DatasetKind.STOCK_FINANCIAL_INDICATOR,
+                                *_SNAPSHOT_DATASETS,
                             }
                             else record.end_date
                         ),
@@ -1002,12 +1013,12 @@ class DataUpdatePlanner:
                 if record is None or record.end_date is None:
                     raise RuntimeError("validated baseline record unexpectedly missing")
                 overlap = self._catalog[dataset].overlap_days
-                if dataset is DatasetKind.INSTRUMENT:
+                if dataset in _SNAPSHOT_DATASETS:
                     actual = (planning_date, planning_date)
                     basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
                     watermark = None
                     trigger_date = None
-                elif dataset is DatasetKind.FINANCIAL_OBSERVATION:
+                elif dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
                     batch = FinancialDisclosureSchedule.latest_completed_batch(
                         planning_date
                     )
@@ -1172,7 +1183,7 @@ class DataPipeline:
     def __init__(
         self,
         *,
-        source: DatasetSource,
+        source: PipelineSource,
         mapper: CanonicalMapper,
         calendar: CalendarPolicy,
         raw_store: RawPartitionStore,
@@ -1246,7 +1257,7 @@ class DataPipeline:
     ) -> LocalizeResult:
         progress = observer or _NullPipelineObserver()
         spec = self._catalog[dataset]
-        is_financial_cell = spec.fetch_plan is FetchPlan.FINANCIAL_CELL
+        is_financial_cell = spec.fetch_plan is FetchPlan.REPORT_PERIOD
         source_name = self._routes.source_for(dataset)
         if source_name != self._source.provider:
             self._raise(
@@ -2555,11 +2566,17 @@ class DataPipeline:
             )
         return quality.id
 
-    def bootstrap(self, *, years: int) -> PipelineResult:
+    def bootstrap(
+        self,
+        *,
+        years: int,
+        observer: PipelineObserver | None = None,
+    ) -> PipelineResult:
         """从空数据根目录执行首次全量数据流水线。
 
         入参：
             years：首次基线向前覆盖的正整数年数。
+            observer：可选的阶段进度与协作取消观察器。
         返回值：
             返回``bootstrap``（``PipelineResult``）。
         异常：
@@ -2567,9 +2584,14 @@ class DataPipeline:
             ``DATA_PIPELINE_ALREADY_RUNNING``；其余阶段错误保持原错误码。
         """
         with self._execution_lock:
-            return self._bootstrap(years=years)
+            return self._bootstrap(years=years, observer=observer)
 
-    def _bootstrap(self, *, years: int) -> PipelineResult:
+    def _bootstrap(
+        self,
+        *,
+        years: int,
+        observer: PipelineObserver | None,
+    ) -> PipelineResult:
         if type(years) is not int or years <= 0:
             self._raise(
                 "DATA_PIPELINE_ARGUMENT",
@@ -2634,9 +2656,22 @@ class DataPipeline:
                 started_at=plan.planned_at,
             )
         run_id = uuid4().hex
-        self.localize_all(windows=plan.dataset_windows)
-        self.curate_all()
+        progress = observer or _NullPipelineObserver()
+        self.localize_all(windows=plan.dataset_windows, observer=progress)
+        self.curate_all(observer=progress)
+        if progress.is_cancelled():
+            raise DataPipelineCancelled("data pipeline cancellation requested")
+        datasets = tuple(dataset for dataset in self._catalog if self._routes[dataset])
+        progress.stage_started("VALIDATE", len(datasets))
         quality = self.validate()
+        for index, dataset in enumerate(datasets, start=1):
+            progress.dataset_completed(
+                "VALIDATE",
+                dataset,
+                index,
+                len(datasets),
+                {"quality_run_id": str(quality)},
+            )
         state = self._repository.catalog_state()
         self._repository.complete_data_initialization(
             catalog_hash=state.catalog_hash,
@@ -2743,7 +2778,7 @@ class DataPipeline:
         batches: Sequence[CanonicalBatch], start: date | None, end: date | None
     ) -> tuple[date, date]:
         if batches and all(
-            batch.dataset is DatasetKind.INSTRUMENT for batch in batches
+            batch.dataset in _SNAPSHOT_DATASETS for batch in batches
         ):
             snapshot_dates = [
                 value.astimezone(ZoneInfo("Asia/Shanghai")).date()

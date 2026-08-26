@@ -183,7 +183,17 @@ class DashboardViewService:
             else None
         )
         freshness, latest_complete_session = self._freshness_state()
-        data_tasks = self._tasks.list(task_type="DATA_UPDATE", limit=100)
+        initialization = self._catalog.find_data_initialization()
+        data_tasks = tuple(
+            sorted(
+                (
+                    *self._tasks.list(task_type="DATA_BOOTSTRAP", limit=100),
+                    *self._tasks.list(task_type="DATA_UPDATE", limit=100),
+                ),
+                key=lambda item: (item.created_at, item.id),
+                reverse=True,
+            )
+        )
         active = next(
             (
                 item
@@ -232,6 +242,27 @@ class DashboardViewService:
             else "CURRENT"
         )
         return {
+            "initialization": (
+                {
+                    "status": "NOT_STARTED",
+                    "years": None,
+                    "start_date": None,
+                    "end_date": None,
+                    "started_at": None,
+                    "completed_at": None,
+                }
+                if initialization is None
+                else {
+                    "status": initialization.status,
+                    "years": initialization.years,
+                    "start_date": initialization.start_date.isoformat(),
+                    "end_date": initialization.end_date.isoformat(),
+                    "started_at": _ServicesSupport._iso(initialization.started_at),
+                    "completed_at": _ServicesSupport._iso(
+                        initialization.completed_at
+                    ),
+                }
+            ),
             "gate": {
                 "status": "READY" if state.is_validated else "BLOCKED",
                 "reason": self._gate_reason(

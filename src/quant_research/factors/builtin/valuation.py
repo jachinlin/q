@@ -49,7 +49,7 @@ class DailyBasicsCache:
         with self._lock:
             if self._ctx == ctx and self._frame is not None:
                 return self._frame
-            frame = self._repository.daily_basics(
+            frame = self._repository.stock_daily_basics(
                 self._instruments, ctx.start, ctx.end
             ).collect()
             self._validate(frame)
@@ -64,7 +64,7 @@ class DailyBasicsCache:
             "trade_date": pl.Date,
             "instrument_id": pl.String,
             "pe_ttm": pl.Float64,
-            "pb_mrq": pl.Float64,
+            "pb": pl.Float64,
             "available_at": pl.Datetime("us", "UTC"),
         }
         missing = sorted(set(required) - set(frame.columns))
@@ -201,6 +201,6 @@ class BookToPriceFactor(_ReciprocalMultipleFactor):
             repository,
             instruments,
             factor_id="book_to_price_mrq",
-            field="pb_mrq",
+            field="pb",
             daily_basics=daily_basics,
         )

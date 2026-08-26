@@ -32,9 +32,8 @@ class FinancialProvider(TradeCalendarProvider, Protocol):
         由具体实现按接口契约定义。
     """
 
-    def financial_history(
+    def stock_financial_indicators(
         self,
-        field_ids: Sequence[str],
         as_of: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
@@ -64,7 +63,7 @@ class RoePitFactor:
         无；构造阶段只保存已提供的依赖或值对象。
     """
 
-    fields = ("dupont_roe",)
+    fields = ("roe",)
 
     def __init__(
         self, provider: FinancialProvider, instruments: Sequence[InstrumentId]
@@ -78,7 +77,7 @@ class RoePitFactor:
             (),
             1,
             {
-                "source_metric": "dupont_roe",
+                "source_metric": "roe",
                 "selection": "latest_report_period_as_of_signal",
                 "staleness_age_basis": "active_record_available_at_shanghai_date",
                 "staleness_calendar_days": _ROE_STALENESS_CALENDAR_DAYS,
@@ -113,8 +112,8 @@ class RoePitFactor:
         signal_dates = trading_signal_dates(self._provider, ctx.start, ctx.end)
         if not signal_dates or not self._instruments:
             return pl.DataFrame(schema=FACTOR_OUTPUT_SCHEMA).lazy()
-        history = self._provider.financial_history(
-            self.fields, ctx.end, self._instruments
+        history = self._provider.stock_financial_indicators(
+            ctx.end, self._instruments
         ).collect()
         transitions = _PitFinancialSupport.transitions(history)
         grid = _PitFinancialSupport.signal_grid(signal_dates, self._instruments)
@@ -209,7 +208,7 @@ class _PitFinancialSupport:
                     cast(datetime, active["available_at"]),
                 )
                 if identity != active_identity:
-                    raw_value = active["value"]
+                    raw_value = active["roe"]
                     value = (
                         float(raw_value)
                         if isinstance(raw_value, (int, float))
@@ -261,8 +260,7 @@ class _PitFinancialSupport:
         required = {
             "instrument_id": pl.String,
             "report_period": pl.Date,
-            "metric": pl.String,
-            "value": pl.Float64,
+            "roe": pl.Float64,
             "revision": pl.Int64,
             "available_at": pl.Datetime("us", "UTC"),
         }
@@ -273,16 +271,14 @@ class _PitFinancialSupport:
             if frame.schema[column] != dtype:
                 raise TypeError(f"financial data {column} must have dtype {dtype}")
         if frame.select(
-            pl.struct("instrument_id", "report_period", "metric", "revision")
+            pl.struct("instrument_id", "report_period", "revision")
             .is_duplicated()
             .any()
         ).item():
             raise ValueError("duplicate financial revision key")
-        if frame.filter(pl.col("metric") != "dupont_roe").height:
-            raise ValueError("financial history contains an unexpected metric")
         for value in frame["available_at"].to_list():
             if not isinstance(value, datetime) or value.tzinfo is None:
                 raise TypeError("financial available_at must be timezone-aware")
-        for value in frame["value"].to_list():
+        for value in frame["roe"].to_list():
             if value is not None and not isinstance(value, float):
                 raise TypeError("financial value must be a Float64 value")

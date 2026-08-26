@@ -172,6 +172,42 @@ class OperationalCommandService:
         """
         return self._planner.plan(start=start, end=end, datasets=datasets).to_payload()
 
+    def enqueue_data_bootstrap(
+        self,
+        *,
+        years: int,
+        request_id: str,
+    ) -> dict[str, JsonValue]:
+        """入队首次 Canonical 基线初始化任务。
+
+        入参：
+            years：从初始化结束日向前覆盖的正整数年数。
+            request_id：Dashboard 请求关联身份。
+        返回值：
+            返回任务身份、请求身份、状态和冻结年数。
+        异常：
+            ``TypeError``、``ValueError``：年数不是正整数时抛出；队列异常保持原语义。
+        """
+        if type(years) is not int:
+            raise TypeError("data bootstrap years must be an integer")
+        if years <= 0:
+            raise ValueError("data bootstrap years must be positive")
+        task_id = self._queue.enqueue(
+            "DATA_BOOTSTRAP",
+            {"years": years},
+            0,
+            idempotency_key=f"dashboard-data-bootstrap-{years}",
+            actor="dashboard",
+            request_id=request_id,
+        )
+        task = self._queue.get(task_id)
+        return {
+            "task_id": task.id,
+            "request_id": request_id,
+            "status": task.status.value,
+            "years": years,
+        }
+
     def enqueue_data_update(
         self,
         *,
@@ -338,7 +374,15 @@ class OperationalCommandService:
                         retryable=False,
                     )
                 ) from error
-        if task.task_type not in {"DATA_UPDATE", "DATA_VALIDATION"}:
+        if task.task_type == "DATA_BOOTSTRAP":
+            years = task.payload.get("years")
+            if set(task.payload) != {"years"} or type(years) is not int or years <= 0:
+                raise ValueError("data bootstrap task has an invalid frozen year count")
+        if task.task_type not in {
+            "DATA_BOOTSTRAP",
+            "DATA_UPDATE",
+            "DATA_VALIDATION",
+        }:
             raise ValueError("task type cannot be retried by the target platform")
         retried = self._queue.retry(task_id, actor="dashboard", request_id=request_id)
         return {"task_id": retried}

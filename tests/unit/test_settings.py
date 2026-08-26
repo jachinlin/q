@@ -82,4 +82,4 @@ def test_settings_load_defaults_data_root_to_user_home(
 
     settings = Settings.load()
 
-    assert settings.data_root == (Path.home() / ".q-data").resolve()
+    assert settings.data_root == (Path.home() / "qlab-data").resolve()

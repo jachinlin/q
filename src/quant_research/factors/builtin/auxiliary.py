@@ -202,7 +202,9 @@ class AvgAmount20dFactor:
         )
 
     def _load(self, ctx: FactorContext, start: date) -> pl.DataFrame:
-        frame = self._repository.bars(self._instruments, start, ctx.end).collect()
+        frame = self._repository.stock_bars(
+            self._instruments, start, ctx.end
+        ).collect()
         required = {"instrument_id", "trade_date", "amount", "available_at"}
         if not required.issubset(frame.columns):
             raise ValueError("amount bars missing required columns")

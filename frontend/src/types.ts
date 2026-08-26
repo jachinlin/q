@@ -494,7 +494,7 @@ export type MarketReview = {
   }
   valuation: {
     metrics: Array<{
-      metric: 'pe_ttm' | 'pb_mrq' | 'ps_ttm'
+      metric: 'pe_ttm' | 'pb' | 'ps_ttm'
       median: number | null
       p25: number | null
       p75: number | null
@@ -553,6 +553,14 @@ export type QualityRun = {
 }
 
 export type DataSummary = {
+  initialization: {
+    status: 'NOT_STARTED' | 'IN_PROGRESS' | 'COMPLETED'
+    years: number | null
+    start_date: string | null
+    end_date: string | null
+    started_at: string | null
+    completed_at: string | null
+  }
   gate: {
     status: 'READY' | 'BLOCKED'
     reason: string
@@ -574,6 +582,15 @@ export type DataSummary = {
   last_successful_update: Task | null
   worker: { worker_id: string | null; task_id: string; task_status: string; heartbeat_at: string | null } | null
   active_research_task_count: number
+}
+
+export type DashboardSettings = {
+  settings_path: string
+  data_source_token: {
+    configured: boolean
+    source: 'DATA_ROOT_ENV' | 'PROCESS_ENVIRONMENT' | 'NONE'
+    updated_at: string | null
+  }
 }
 
 export type DatasetDetail = Dataset & {

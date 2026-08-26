@@ -7,7 +7,11 @@ from datetime import date
 from fastapi import FastAPI, Query, Request
 
 from quant_research.application.operations import OperationalCommandService
+from quant_research.application.settings import DashboardSettingsService
 from quant_research.dashboard.models import (
+    DashboardSettingsPatchRequest,
+    DashboardSettingsResponse,
+    DataBootstrapRequest,
     DatasetDetailResponse,
     DatasetListResponse,
     DataSummaryResponse,
@@ -34,6 +38,7 @@ class _DashboardRoutes:
         dashboard: DashboardViewService,
         mutation: OperationalCommandService,
         notebook: NotebookProbe,
+        settings: DashboardSettingsService,
     ) -> None:
         @app.get("/api/v1/health")
         def health() -> dict[str, object]:
@@ -63,6 +68,32 @@ class _DashboardRoutes:
         @app.get("/api/v1/data/summary", response_model=DataSummaryResponse)
         def data_summary() -> dict[str, object]:
             return dashboard.data_summary()
+
+        @app.post("/api/v1/data/bootstrap", status_code=202)
+        def data_bootstrap(
+            request: Request,
+            body: DataBootstrapRequest,
+        ) -> dict[str, JsonValue]:
+            return mutation.enqueue_data_bootstrap(
+                years=body.years,
+                request_id=request.state.request_id,
+            )
+
+        @app.get("/api/v1/settings", response_model=DashboardSettingsResponse)
+        def dashboard_settings() -> dict[str, object]:
+            return settings.view()
+
+        @app.patch("/api/v1/settings", response_model=DashboardSettingsResponse)
+        def change_dashboard_settings(
+            body: DashboardSettingsPatchRequest,
+        ) -> dict[str, object]:
+            change = body.data_source_token
+            if change is None:
+                raise ValueError("settings patch must contain a data source token change")
+            return settings.change_data_source_token(
+                operation=change.operation,
+                value=change.value,
+            )
 
         @app.get("/api/v1/data/datasets", response_model=DatasetListResponse)
         def data_datasets() -> dict[str, object]:

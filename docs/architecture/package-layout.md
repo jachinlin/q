@@ -22,7 +22,7 @@ src/quant_research/
 ├── experiments/        # Experiment/Run 模型、配置、阶段和统计治理
 ├── tasks/              # 通用任务模型、Handler 和消费者侧端口
 ├── application/        # 数据及实验用例，不导入基础设施实现
-├── infrastructure/     # SQLite/Alembic、任务队列、BaoStock 适配器
+├── infrastructure/     # SQLite/Alembic、任务队列、Tushare 适配器
 ├── cli/                # Typer 输入输出适配器
 ├── dashboard/          # FastAPI 路由、DTO 和查询视图
 └── bootstrap/          # 唯一组合根：CLI、Dashboard、Worker
@@ -39,7 +39,7 @@ bootstrap → cli / dashboard → application → capabilities
 关键边界：
 
 - `application`、业务能力包不得导入 CLI、Dashboard、bootstrap 或基础设施具体实现。
-- CLI 与 Dashboard 不得相互导入，也不得直接构造 SQLite、BaoStock 或文件系统适配器。
+- CLI 与 Dashboard 不得相互导入，也不得直接构造 SQLite、Tushare 或文件系统适配器。
 - 研究取数只经 `CanonicalResearchRepository`；策略只经绑定 `signal_date` 的 `DecisionData`。
 - `factor_studies` 只提供纯分析函数；生命周期统一归 `Experiment → Run → EXPERIMENT_RUN`。
 - `strategies` 生成整数股数 `OrderIntent`；回测引擎不消费目标权重，也不生成信号。

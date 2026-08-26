@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import date
 from enum import StrEnum
 from math import isfinite
@@ -22,7 +22,6 @@ FACTOR_LOG_RETURN_SCHEMA = pl.Schema(
         ("available_at", pl.Datetime("us", "UTC")),
     ]
 )
-_FORWARD_PRICE_COLUMNS = ("open", "high", "low", "close", "preclose")
 ADJUSTMENT_EVENT_COMPONENTS_DTYPE = pl.List(
     pl.Struct(
         {
@@ -53,21 +52,25 @@ class AdjustmentMode(StrEnum):
 class _PriceDataReader(Protocol):
     """约束私有复权引擎所需的最小研究数据读取能力。"""
 
-    def bars(
-        self,
-        instruments: Sequence[InstrumentId],
-        start: date,
-        end: date,
-    ) -> pl.LazyFrame: ...
-
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame: ...
 
 
 class _PriceAdjustmentEngine:
     """在 Repository 内部生成前复权行情和会话对数收益。"""
 
-    def __init__(self, repository: _PriceDataReader) -> None:
+    def __init__(
+        self,
+        repository: _PriceDataReader,
+        bar_reader: Callable[
+            [Sequence[InstrumentId], date, date], pl.LazyFrame
+        ],
+        factor_reader: Callable[
+            [Sequence[InstrumentId], date, date], pl.LazyFrame
+        ],
+    ) -> None:
         self._repository = repository
+        self._bar_reader = bar_reader
+        self._factor_reader = factor_reader
 
     def adjusted_bars(
         self,
@@ -77,21 +80,16 @@ class _PriceAdjustmentEngine:
     ) -> pl.LazyFrame:
         """返回以 ``end`` 为信息截止日的前复权行情。"""
         _PriceAdjustmentSupport._validate_range(start, end)
-        raw = self._repository.bars(instruments, start, end).collect()
-        adjusted, price_factors = _PriceAdjustmentSupport._forward_adjust(
-            self._without_untraded_placeholders(raw), end
+        raw = self._bar_reader(instruments, start, end).collect()
+        factors = self._factor_reader(instruments, start, end).collect()
+        adjusted, price_factors = _PriceAdjustmentSupport._factor_adjust(
+            self._without_untraded_placeholders(raw), factors, end
         )
         if adjusted.is_empty():
             return _PriceAdjustmentSupport._with_metadata(adjusted, end).lazy()
-        factor_column = pl.Series("_price_factor", price_factors, dtype=pl.Float64)
-        adjusted_prices = [
-            (pl.col(column) * factor_column).alias(column)
-            for column in _FORWARD_PRICE_COLUMNS
-        ]
-        result = adjusted.with_columns(adjusted_prices)
-        _PriceAdjustmentSupport._validate_forward_prices(result, adjusted=True)
+        _PriceAdjustmentSupport._validate_forward_prices(adjusted, adjusted=True)
         return _PriceAdjustmentSupport._with_metadata(
-            result,
+            adjusted,
             end,
             adjustment_factors=price_factors,
         ).lazy()
@@ -137,11 +135,12 @@ class _PriceAdjustmentEngine:
         if not sessions:
             return pl.DataFrame(schema=FACTOR_LOG_RETURN_SCHEMA).lazy()
         history_start = sessions[0]
-        raw = self._repository.bars(scope, history_start, end).collect()
+        raw = self._bar_reader(scope, history_start, end).collect()
+        factors = self._factor_reader(scope, history_start, end).collect()
         _PriceAdjustmentSupport._validate_session_bar_keys(raw)
         observed = raw.filter(pl.col("trade_date") <= end)
         traded = self._without_untraded_placeholders(raw)
-        adjusted, _ = _PriceAdjustmentSupport._forward_adjust(traded, end)
+        adjusted, _ = _PriceAdjustmentSupport._factor_adjust(traded, factors, end)
         return _PriceAdjustmentSupport._session_complete_returns(
             instrument_ids,
             sessions,
@@ -287,6 +286,99 @@ class _PriceAdjustmentSupport:
             pl.struct("instrument_id", "trade_date").is_duplicated().any()
         ).item():
             raise ValueError("duplicate daily bar key")
+
+    @staticmethod
+    def _factor_adjust(
+        frame: pl.DataFrame, factors: pl.DataFrame, end: date
+    ) -> tuple[pl.DataFrame, list[float]]:
+        """按 Tushare 复权因子生成以截止日归一化的前复权价格。"""
+        ordered = frame.sort("instrument_id", "trade_date")
+        _PriceAdjustmentSupport._validate_unique_bar_keys(ordered)
+        _PriceAdjustmentSupport._validate_forward_prices(ordered)
+        required = {"instrument_id", "trade_date", "adjustment_factor"}
+        missing = sorted(required - set(factors.columns))
+        if missing:
+            raise ValueError(f"adjustment factors missing columns: {', '.join(missing)}")
+        if factors.select(
+            pl.struct("instrument_id", "trade_date").is_duplicated().any()
+        ).item():
+            raise ValueError("duplicate adjustment factor key")
+        if ordered.is_empty():
+            return (
+                ordered.with_columns(
+                    pl.Series(FORWARD_LOG_RETURN_COLUMN, [], dtype=pl.Float64),
+                    pl.Series(FORWARD_RETURN_INDEX_COLUMN, [], dtype=pl.Float64),
+                ),
+                [],
+            )
+        normalized_factors = factors.sort("instrument_id", "trade_date").with_columns(
+            pl.col("adjustment_factor")
+            .last()
+            .over("instrument_id")
+            .alias("_end_factor"),
+            pl.col("adjustment_factor")
+            .shift(1)
+            .over("instrument_id")
+            .fill_null(pl.col("adjustment_factor"))
+            .alias("_previous_factor"),
+        )
+        calculated = (
+            ordered.join(
+                normalized_factors.select(
+                    "instrument_id",
+                    "trade_date",
+                    "adjustment_factor",
+                    "_end_factor",
+                    "_previous_factor",
+                ),
+                on=["instrument_id", "trade_date"],
+                how="left",
+                validate="1:1",
+            )
+        )
+        invalid = pl.col("adjustment_factor").is_null() | ~pl.col(
+            "adjustment_factor"
+        ).is_finite() | (pl.col("adjustment_factor") <= 0)
+        if _PriceAdjustmentSupport._has_any(calculated, invalid):
+            raise ValueError("adjustment factor must be finite and positive")
+        calculated = calculated.with_columns(
+            *[
+                (
+                    pl.col(column)
+                    * pl.col("adjustment_factor")
+                    / pl.col("_end_factor")
+                ).alias(column)
+                for column in ("open", "high", "low", "close")
+            ],
+            (
+                pl.col("preclose")
+                * pl.col("_previous_factor")
+                / pl.col("_end_factor")
+            ).alias("preclose"),
+            (pl.col("adjustment_factor") / pl.col("_end_factor")).alias(
+                "_price_factor"
+            ),
+            (pl.col("adjustment_factor") / pl.col("_previous_factor")).alias(
+                "_event_factor"
+            ),
+        ).with_columns(
+            (pl.col("close").log() - pl.col("preclose").log())
+            .cast(pl.Float64)
+            .alias(FORWARD_LOG_RETURN_COLUMN),
+            (pl.col("close") / pl.col("preclose") - 1.0)
+            .cast(pl.Float64)
+            .alias("pct_change"),
+            (pl.col("close") - pl.col("preclose")).cast(pl.Float64).alias("change"),
+            pl.col("close").alias(FORWARD_RETURN_INDEX_COLUMN),
+        )
+        filtered = calculated.filter(pl.col("trade_date") <= end)
+        price_factors = cast(list[float], filtered["_price_factor"].to_list())
+        return (
+            filtered.drop(
+                "_end_factor", "_previous_factor", "_price_factor", "_event_factor"
+            ),
+            price_factors,
+        )
 
     @staticmethod
     def _has_any(frame: pl.DataFrame, expression: pl.Expr) -> bool:

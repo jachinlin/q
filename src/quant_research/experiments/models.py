@@ -6,10 +6,18 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from quant_research.data.contracts import JsonValue
 from quant_research.domain.enums import MultipleTestingMethod
+from quant_research.domain.identifiers import IndexId
 
 
 class RunStatus(StrEnum):
@@ -190,7 +198,7 @@ class StrategyBacktestRunConfig(_FrozenModel):
     start_date: date
     end_date: date
     strategy: StrategyConfig
-    benchmark: str = Field(min_length=1)
+    benchmark: IndexId
     initial_cash_fen: int = Field(gt=0)
     execution: ExecutionSettings
 
@@ -198,6 +206,19 @@ class StrategyBacktestRunConfig(_FrozenModel):
     @classmethod
     def _date(cls, value: object) -> date:
         return _FrozenModel._parse_date(value)
+
+    @field_validator("benchmark", mode="before")
+    @classmethod
+    def _benchmark(cls, value: object) -> IndexId:
+        if isinstance(value, IndexId):
+            return value
+        if isinstance(value, str):
+            return IndexId.parse(value)
+        raise TypeError("benchmark must be an IndexId or canonical index code")
+
+    @field_serializer("benchmark")
+    def _serialize_benchmark(self, value: IndexId) -> str:
+        return value.canonical()
 
     @model_validator(mode="after")
     def _range(self) -> StrategyBacktestRunConfig:

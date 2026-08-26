@@ -115,10 +115,10 @@ def test_daily_bar_requires_finite_positive_traded_prices(
 ) -> None:
     frame = _daily_bar().with_columns(pl.lit(invalid).cast(pl.Float64).alias(column))
 
-    issues = daily_bar_value_issues({DatasetKind.DAILY_BAR: (frame,)})
+    issues = daily_bar_value_issues({DatasetKind.STOCK_DAILY_BAR: (frame,)})
     issue = next(item for item in issues if item.rule_id == "positive_finite_price")
 
-    assert issue.dataset is DatasetKind.DAILY_BAR
+    assert issue.dataset is DatasetKind.STOCK_DAILY_BAR
     assert issue.actual == 1
     assert issue.threshold == 0
 
@@ -126,7 +126,7 @@ def test_daily_bar_requires_finite_positive_traded_prices(
 def test_daily_bar_price_rule_ignores_untraded_placeholder() -> None:
     issues = daily_bar_value_issues(
         {
-            DatasetKind.DAILY_BAR: (
+            DatasetKind.STOCK_DAILY_BAR: (
                 _daily_bar(
                     open_price=0.0,
                     high=float("inf"),
@@ -144,7 +144,7 @@ def test_daily_bar_price_rule_ignores_untraded_placeholder() -> None:
 
 def test_quality_runner_fails_positive_finite_price_rule() -> None:
     evaluation = QualityRunner().evaluate(
-        {DatasetKind.DAILY_BAR: (_daily_bar(close=0.0),)}
+        {DatasetKind.STOCK_DAILY_BAR: (_daily_bar(close=0.0),)}
     )
     result = next(
         item
@@ -161,8 +161,8 @@ def test_quality_runner_fails_positive_finite_price_rule() -> None:
 def test_daily_basic_allows_missing_turnover_on_confirmed_suspension() -> None:
     issues = required_value_issues(
         {
-            DatasetKind.DAILY_BASIC: (_daily_basic(turnover=None),),
-            DatasetKind.SECURITY_STATUS: (_security_status(suspended=True),),
+            DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),),
+            DatasetKind.STOCK_SUSPENSION: (_security_status(suspended=True),),
         }
     )
 
@@ -172,19 +172,19 @@ def test_daily_basic_allows_missing_turnover_on_confirmed_suspension() -> None:
 def test_daily_basic_requires_turnover_when_security_is_not_suspended() -> None:
     (issue,) = required_value_issues(
         {
-            DatasetKind.DAILY_BASIC: (_daily_basic(turnover=None),),
-            DatasetKind.SECURITY_STATUS: (_security_status(suspended=False),),
+            DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),),
+            DatasetKind.STOCK_SUSPENSION: (_security_status(suspended=False),),
         }
     )
 
     assert issue.rule_id == "required_value_null"
-    assert issue.dataset is DatasetKind.DAILY_BASIC
+    assert issue.dataset is DatasetKind.STOCK_DAILY_BASIC
     assert issue.actual == 1
 
 
 def test_daily_basic_requires_turnover_when_security_status_is_missing() -> None:
     (issue,) = required_value_issues(
-        {DatasetKind.DAILY_BASIC: (_daily_basic(turnover=None),)}
+        {DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),)}
     )
 
     assert issue.actual == 1
@@ -193,7 +193,7 @@ def test_daily_basic_requires_turnover_when_security_status_is_missing() -> None
 def test_daily_bar_coverage_ignores_calendar_dates_after_latest_bar() -> None:
     issues = coverage_issues(
         {
-            DatasetKind.DAILY_BAR: (
+            DatasetKind.STOCK_DAILY_BAR: (
                 pl.DataFrame(
                     {
                         "instrument_id": ["600000.SH", "600000.SH"],
@@ -222,7 +222,7 @@ def test_daily_bar_coverage_ignores_calendar_dates_after_latest_bar() -> None:
 def test_daily_bar_coverage_reports_missing_date_before_latest_bar() -> None:
     (issue,) = coverage_issues(
         {
-            DatasetKind.DAILY_BAR: (
+            DatasetKind.STOCK_DAILY_BAR: (
                 pl.DataFrame(
                     {
                         "instrument_id": ["600000.SH", "600000.SH"],
@@ -247,7 +247,7 @@ def test_daily_bar_coverage_reports_missing_date_before_latest_bar() -> None:
     )
 
     assert issue.rule_id == "trading_day_coverage"
-    assert issue.dataset is DatasetKind.DAILY_BAR
+    assert issue.dataset is DatasetKind.STOCK_DAILY_BAR
     assert issue.actual == 1
 
 

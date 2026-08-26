@@ -43,7 +43,7 @@ from quant_research.data.contracts import (
 )
 from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.domain.enums import Board, MultipleTestingMethod
-from quant_research.domain.identifiers import InstrumentId
+from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.experiments.models import (
     RunRecord,
     RunStage,
@@ -189,6 +189,26 @@ class CanonicalCatalogGuard:
             raise ValueError("EXPERIMENT_DATA_DRIFT")
 
 
+class _StockPriceService:
+    """把股票专用研究接口适配为内置股票因子的收益端口。"""
+
+    def __init__(self, repository: CanonicalResearchRepository) -> None:
+        self._repository = repository
+
+    def log_returns(
+        self,
+        instruments: Sequence[InstrumentId],
+        start: date,
+        end: date,
+        *,
+        lookback_sessions: int,
+    ) -> pl.LazyFrame:
+        """读取股票前复权对数收益。"""
+        return self._repository.stock_log_returns(
+            instruments, start, end, lookback_sessions=lookback_sessions
+        )
+
+
 class CanonicalRunData:
     """将只读 Canonical Repository 适配为回测行情和 PIT 决策工厂。
 
@@ -205,7 +225,16 @@ class CanonicalRunData:
     ) -> None:
         self._repository = repository
         self._catalog_hash = catalog_hash
-        self._instruments = repository.instruments().collect().sort("instrument_id")
+        stocks = repository.stocks().collect().with_columns(
+            pl.lit("STOCK").alias("instrument_type")
+        )
+        funds = repository.funds().collect().with_columns(
+            pl.lit("FUND").alias("instrument_type"),
+            pl.lit("MAIN").alias("board"),
+        )
+        self._instruments = pl.concat(
+            [stocks, funds], how="diagonal_relaxed"
+        ).sort("instrument_id")
         self._metadata = {
             cast(str, row["instrument_id"]): row for row in self._instruments.to_dicts()
         }
@@ -214,6 +243,11 @@ class CanonicalRunData:
             for identifier, row in sorted(self._metadata.items())
             if row.get("instrument_type") == "STOCK"
         )
+        self._fund_ids = tuple(
+            InstrumentId.parse(identifier)
+            for identifier, row in sorted(self._metadata.items())
+            if row.get("instrument_type") == "FUND"
+        )
         registry = FactorRegistry()
         if self._stock_ids:
             register_stock_factors(
@@ -221,7 +255,7 @@ class CanonicalRunData:
                 repository,
                 repository,
                 self._stock_ids,
-                price_service=repository,
+                price_service=_StockPriceService(repository),
             )
         self._factor_engine = FactorEngine(
             registry, capabilities=ProviderCapabilities.complete()
@@ -256,37 +290,61 @@ class CanonicalRunData:
         异常：
             Canonical 数据缺失、Schema 不一致或 PIT 查询失败时传播数据异常。
         """
-        identifiers = tuple(InstrumentId.parse(value) for value in self._metadata)
-        bars = self._repository.bars(identifiers, trade_date, trade_date).collect()
-        indexes = tuple(
-            InstrumentId.parse(value)
-            for value, row in sorted(self._metadata.items())
-            if row.get("instrument_type") == "INDEX"
+        bar_frames = []
+        if self._stock_ids:
+            bar_frames.append(
+                self._repository.stock_bars(
+                    self._stock_ids, trade_date, trade_date
+                ).collect()
+            )
+        if self._fund_ids:
+            bar_frames.append(
+                self._repository.fund_bars(
+                    self._fund_ids, trade_date, trade_date
+                ).collect()
+            )
+        bars = (
+            pl.concat(bar_frames, how="diagonal_relaxed")
+            if bar_frames
+            else pl.DataFrame()
         )
-        if indexes:
-            index_bars = self._repository.index_bars(
-                indexes, trade_date, trade_date
-            ).collect()
-            if not index_bars.is_empty():
-                bars = pl.concat(
-                    [bars, index_bars.rename({"index_id": "instrument_id"})],
-                    how="diagonal_relaxed",
-                )
-        statuses = self._repository.security_status(trade_date).collect()
-        status_map = {
-            cast(str, row["instrument_id"]): row for row in statuses.to_dicts()
-        }
+        suspended = set(
+            self._repository.stock_suspensions(
+                trade_date, trade_date, self._stock_ids
+            ).collect()["instrument_id"].to_list()
+        )
+        warned = set(
+            self._repository.stock_risk_warnings(
+                trade_date, trade_date, self._stock_ids
+            ).collect()["instrument_id"].to_list()
+        )
+        listing_dates = [
+            cast(date, row["list_date"])
+            for row in self._metadata.values()
+            if row.get("instrument_type") == "STOCK"
+            and isinstance(row.get("list_date"), date)
+            and row["list_date"] <= trade_date
+        ]
+        trading_sessions = (
+            self._sessions(min(listing_dates), trade_date) if listing_dates else ()
+        )
         rows: list[dict[str, object]] = []
         for row in bars.to_dicts():
             identifier = cast(str, row["instrument_id"])
             metadata = self._metadata.get(identifier)
             if metadata is None:
                 continue
-            status = status_map.get(identifier, {})
             board = str(metadata.get("board") or "MAIN")
-            if board not in {"MAIN", "CHINEXT", "STAR"}:
+            if board not in {"MAIN", "CHINEXT", "STAR", "BSE"}:
                 board = "MAIN"
             raw_volume = row.get("volume")
+            listing = metadata.get("list_date")
+            no_limit = (
+                metadata.get("instrument_type") == "STOCK"
+                and isinstance(listing, date)
+                and sum(listing <= session <= trade_date for session in trading_sessions)
+                <= 5
+            )
             rows.append(
                 {
                     "instrument_id": identifier,
@@ -295,10 +353,14 @@ class CanonicalRunData:
                         for name in ("open", "high", "low", "close", "preclose")
                     },
                     "volume": int(raw_volume) if raw_volume is not None else None,
-                    "is_suspended": bool(status.get("is_suspended", False)),
-                    "security_status": "ST"
-                    if status.get("is_st") is True
-                    else "NORMAL",
+                    "is_suspended": identifier in suspended,
+                    "security_status": (
+                        SecurityStatus.NO_LIMIT.value
+                        if no_limit
+                        else SecurityStatus.ST.value
+                        if identifier in warned
+                        else SecurityStatus.NORMAL.value
+                    ),
                     "instrument_type": str(metadata.get("instrument_type") or "STOCK"),
                     "board": board,
                 }
@@ -307,6 +369,18 @@ class CanonicalRunData:
             "instrument_id"
         )
         return BoundMarketSlice(MarketSlice(trade_date, frame))
+
+    def benchmark_close(self, benchmark: IndexId, trade_date: date) -> float:
+        """读取基准。入参：指数和交易日。返回值：收盘价。异常：缺失或非法时抛出。"""
+        frame = self._repository.index_bars(
+            (benchmark,), trade_date, trade_date
+        ).collect()
+        if frame.height != 1 or frame["close"][0] is None:
+            raise ValueError("benchmark close is missing from index bars")
+        close = float(frame["close"][0])
+        if not isfinite(close) or close <= 0:
+            raise ValueError("benchmark close must be finite and positive")
+        return close
 
     def bind(self, signal_date: date) -> DecisionData:
         """创建无法接受其他 as-of 日期的决策数据视图。
@@ -346,21 +420,22 @@ class CanonicalRunData:
         异常：
             证券状态无法按 PIT 读取时传播 Canonical 数据异常。
         """
-        statuses = self._repository.security_status(
-            signal_date, self._stock_ids
-        ).collect()
-        status_map = {
-            cast(str, row["instrument_id"]): row for row in statuses.to_dicts()
-        }
+        suspended = set(
+            self._repository.stock_suspensions(
+                signal_date, signal_date, self._stock_ids
+            ).collect()["instrument_id"].to_list()
+        )
+        warned = set(
+            self._repository.stock_risk_warnings(
+                signal_date, signal_date, self._stock_ids
+            ).collect()["instrument_id"].to_list()
+        )
         rows: list[dict[str, object]] = []
         for instrument in self._stock_ids:
-            status = status_map.get(instrument.canonical())
             reasons: list[str] = []
-            if status is None:
-                reasons.append("STATUS_MISSING")
-            elif status.get("is_st") is True:
+            if instrument.canonical() in warned:
                 reasons.append("RISK_WARNING")
-            elif status.get("is_suspended") is True:
+            if instrument.canonical() in suspended:
                 reasons.append("SUSPENDED")
             rows.append(
                 {
@@ -406,6 +481,19 @@ class CanonicalRunData:
             .lazy()
         )
 
+    def asset_type(self, instruments: Sequence[InstrumentId]) -> str:
+        """判定资产类型。入参：证券集合。返回值：股票或基金。异常：混合或未知时抛出。"""
+        identifiers = {item.canonical() for item in instruments}
+        if not identifiers:
+            raise ValueError("instrument scope must not be empty")
+        stock_ids = {item.canonical() for item in self._stock_ids}
+        fund_ids = {item.canonical() for item in self._fund_ids}
+        if identifiers <= stock_ids:
+            return "STOCK"
+        if identifiers <= fund_ids:
+            return "FUND"
+        raise ValueError("instrument scope must contain only stocks or only funds")
+
 
 class _BoundDecisionData:
     """绑定一个 signal_date 并封闭所有显式日期参数。"""
@@ -426,27 +514,36 @@ class _BoundDecisionData:
         self, instruments: Sequence[InstrumentId], lookback_sessions: int
     ) -> pl.LazyFrame:
         """读取截至信号日的未复权窗口。"""
-        return self._repository.bars(
-            instruments,
-            self._source._lookback_start(self._signal_date, lookback_sessions),
-            self._signal_date,
-        )
+        start = self._source._lookback_start(self._signal_date, lookback_sessions)
+        if self._source.asset_type(instruments) == "STOCK":
+            return self._repository.stock_bars(instruments, start, self._signal_date)
+        return self._repository.fund_bars(instruments, start, self._signal_date)
 
     def adjusted_bars(
         self, instruments: Sequence[InstrumentId], lookback_sessions: int
     ) -> pl.LazyFrame:
         """读取截至信号日的前复权窗口。"""
-        return self._repository.adjusted_bars(
-            instruments,
-            self._source._lookback_start(self._signal_date, lookback_sessions),
-            self._signal_date,
+        start = self._source._lookback_start(self._signal_date, lookback_sessions)
+        if self._source.asset_type(instruments) == "STOCK":
+            return self._repository.adjusted_stock_bars(
+                instruments, start, self._signal_date
+            )
+        return self._repository.adjusted_fund_bars(
+            instruments, start, self._signal_date
         )
 
     def log_returns(
         self, instruments: Sequence[InstrumentId], lookback_sessions: int
     ) -> pl.LazyFrame:
         """读取截至信号日的对数收益窗口。"""
-        return self._repository.log_returns(
+        if self._source.asset_type(instruments) == "STOCK":
+            return self._repository.stock_log_returns(
+                instruments,
+                self._signal_date,
+                self._signal_date,
+                lookback_sessions=lookback_sessions,
+            )
+        return self._repository.fund_log_returns(
             instruments,
             self._signal_date,
             self._signal_date,
@@ -457,7 +554,9 @@ class _BoundDecisionData:
         self, instruments: Sequence[InstrumentId], lookback_sessions: int
     ) -> pl.LazyFrame:
         """读取截至信号日的每日基础指标窗口。"""
-        return self._repository.daily_basics(
+        if self._source.asset_type(instruments) != "STOCK":
+            raise ValueError("daily basics are available only for stocks")
+        return self._repository.stock_daily_basics(
             instruments,
             self._source._lookback_start(self._signal_date, lookback_sessions),
             self._signal_date,
@@ -471,13 +570,41 @@ class _BoundDecisionData:
 
     def industry(self, instruments: Sequence[InstrumentId]) -> pl.LazyFrame:
         """读取信号日可见的行业状态。"""
-        return self._repository.industry_classifications_as_of(
-            instruments, self._signal_date
+        return (
+            self._repository.industry_memberships_on_dates(
+                instruments, (self._signal_date,)
+            )
+            .select(
+                "instrument_id",
+                pl.col("level1_code").alias("industry_code"),
+                pl.lit("SW2021").alias("taxonomy"),
+                pl.lit(True).alias("is_classified"),
+            )
+            .sort("instrument_id")
         )
 
     def security_status(self, instruments: Sequence[InstrumentId]) -> pl.LazyFrame:
         """读取信号日交易状态。"""
-        return self._repository.security_status(self._signal_date, instruments)
+        if self._source.asset_type(instruments) != "STOCK":
+            raise ValueError("security status is available only for stocks")
+        identifiers = [item.canonical() for item in instruments]
+        suspended = self._repository.stock_suspensions(
+            self._signal_date, self._signal_date, instruments
+        ).select("instrument_id").unique()
+        warned = self._repository.stock_risk_warnings(
+            self._signal_date, self._signal_date, instruments
+        ).select("instrument_id").unique()
+        return (
+            pl.DataFrame({"instrument_id": identifiers})
+            .lazy()
+            .join(suspended.with_columns(pl.lit(True).alias("is_suspended")), on="instrument_id", how="left")
+            .join(warned.with_columns(pl.lit(True).alias("is_st")), on="instrument_id", how="left")
+            .with_columns(
+                pl.col("is_suspended").fill_null(False),
+                pl.col("is_st").fill_null(False),
+            )
+            .sort("instrument_id")
+        )
 
     def stock_universe(self) -> pl.LazyFrame:
         """返回信号日动态股票池。"""
@@ -627,7 +754,7 @@ class _StrategyRunSession:
                 self._run.catalog_hash,
                 config.start_date,
                 config.end_date,
-                InstrumentId.parse(config.benchmark),
+                config.benchmark,
                 config.initial_cash_fen,
                 self._rulebook.content_hash,
                 ExecutionConfig(
@@ -941,16 +1068,15 @@ class _FactorStudySession:
                 }
             )
         state = (
-            self._repository.industry_classifications_on_dates(
+            self._repository.industry_memberships_on_dates(
                 universe_ids, sessions
             )
             .collect()
-            .filter(pl.col("taxonomy") == industry.taxonomy)
             .select(
                 pl.col("query_date").alias("signal_date"),
                 "instrument_id",
-                "industry_code",
-                "is_classified",
+                pl.col("level1_code").alias("industry_code"),
+                pl.lit(True).alias("is_classified"),
             )
             .with_columns(pl.lit(True).alias("_state_present"))
         )
@@ -1056,31 +1182,56 @@ class _FactorStudySession:
         end: date,
     ) -> pl.DataFrame:
         """使用未复权行情和规则簿向量化判定可执行标签入场涨停。"""
-        metadata = self._repository.instruments().collect().filter(
+        metadata = self._repository.stocks().collect().filter(
             pl.col("instrument_id").is_in(
                 [item.canonical() for item in universe_ids]
             )
-        ).select("instrument_id", "instrument_type", "board")
-        raw_bars = self._repository.bars(universe_ids, start, end).collect().select(
+        ).select("instrument_id", "list_date", "delist_date", "board").with_columns(
+            pl.lit("STOCK").alias("instrument_type")
+        )
+        raw_bars = self._repository.stock_bars(
+            universe_ids, start, end
+        ).collect().select(
             "instrument_id", "trade_date", "low", "preclose"
         )
-        statuses = self._repository.security_status_range(
+        suspensions = self._repository.stock_suspensions(
             start, end, universe_ids
-        ).collect().select(
-            "instrument_id",
-            "trade_date",
-            "is_listed",
-            "is_suspended",
-            "is_st",
+        ).collect().select("instrument_id", "trade_date").unique().with_columns(
+            pl.lit(True).alias("is_suspended")
         )
+        warnings = self._repository.stock_risk_warnings(
+            start, end, universe_ids
+        ).collect().select("instrument_id", "trade_date").unique().with_columns(
+            pl.lit(True).alias("is_st")
+        )
+        sessions = self._repository.trade_calendar(start, end).collect().filter(
+            pl.col("is_trading_day")
+        ).select("trade_date").unique()
         base = (
-            statuses.join(metadata, on="instrument_id", how="left")
+            metadata.join(sessions, how="cross")
             .join(raw_bars, on=["instrument_id", "trade_date"], how="left")
+            .join(suspensions, on=["instrument_id", "trade_date"], how="left")
+            .join(warnings, on=["instrument_id", "trade_date"], how="left")
             .with_columns(
-                pl.when(pl.col("board").is_in(["MAIN", "CHINEXT", "STAR"]))
+                (
+                    (pl.col("list_date") <= pl.col("trade_date"))
+                    & (
+                        pl.col("delist_date").is_null()
+                        | (pl.col("delist_date") > pl.col("trade_date"))
+                    )
+                ).fill_null(False).alias("is_listed"),
+                pl.col("is_suspended").fill_null(False),
+                pl.col("is_st").fill_null(False),
+                pl.when(pl.col("board").is_in(["MAIN", "CHINEXT", "STAR", "BSE"]))
                 .then(pl.col("board"))
                 .otherwise(pl.lit("MAIN"))
                 .alias("board")
+            )
+            .sort("instrument_id", "trade_date")
+            .with_columns(
+                pl.int_range(1, pl.len() + 1)
+                .over("instrument_id")
+                .alias("_listing_session")
             )
         )
         if base.is_empty():
@@ -1144,6 +1295,8 @@ class _FactorStudySession:
                 "is_listed",
                 "is_suspended",
                 (
+                    (pl.col("_listing_session") > 5)
+                    &
                     pl.col("low").is_not_null()
                     & pl.col("preclose").is_not_null()
                     & (pl.col("low") >= upper - 1e-9)
@@ -1227,7 +1380,7 @@ class _FactorStudySession:
             config.end_date + timedelta(days=horizon_tail * 3 + 30),
         )
         all_sessions = sessions + later[:horizon_tail]
-        bars = self._repository.adjusted_bars(
+        bars = self._repository.adjusted_stock_bars(
             universe_ids, config.start_date, all_sessions[-1]
         ).collect()
         executable_state = self._executable_state(

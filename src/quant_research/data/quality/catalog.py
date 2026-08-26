@@ -8,6 +8,11 @@ from quant_research.data.quality.rules import FOUNDATION_REQUIRED_DATASETS
 from quant_research.domain.enums import DatasetKind, Severity
 
 _ALL_DATASETS = tuple(sorted(FOUNDATION_REQUIRED_DATASETS, key=lambda item: item.value))
+_BAR_DATASETS = (
+    DatasetKind.STOCK_DAILY_BAR,
+    DatasetKind.FUND_DAILY_BAR,
+    DatasetKind.INDEX_DAILY_BAR,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +107,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查已交易日行情的开盘、最高、最低和收盘价格是否有限且严格大于零。",
         "非法交易价格记录数为 0。",
         Severity.SEVERE,
-        (DatasetKind.DAILY_BAR,),
+        _BAR_DATASETS,
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(
@@ -111,7 +116,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查最高价和最低价是否包络开盘价与收盘价。",
         "违反 OHLC 关系的记录数为 0。",
         Severity.SEVERE,
-        (DatasetKind.DAILY_BAR,),
+        _BAR_DATASETS,
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(
@@ -120,7 +125,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查已交易日行情的成交量是否出现负值。",
         "负成交量记录数为 0。",
         Severity.SEVERE,
-        (DatasetKind.DAILY_BAR,),
+        _BAR_DATASETS,
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(
@@ -129,7 +134,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "比较日行情日期与交易日历，识别行情最新日期之前缺失的开市日。",
         "缺失开市日数量为 0。",
         Severity.SEVERE,
-        (DatasetKind.DAILY_BAR,),
+        (DatasetKind.STOCK_DAILY_BAR,),
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
         prerequisite_datasets=(DatasetKind.TRADE_CALENDAR,),
     ),
@@ -139,9 +144,9 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查日行情中的证券代码是否都存在于证券主数据。",
         "未知证券代码数量为 0。",
         Severity.SEVERE,
-        (DatasetKind.DAILY_BAR,),
+        (DatasetKind.STOCK_DAILY_BAR,),
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
-        prerequisite_datasets=(DatasetKind.INSTRUMENT,),
+        prerequisite_datasets=(DatasetKind.STOCK_MASTER,),
     ),
     QualityRuleDefinition(
         "financial_availability",
@@ -149,7 +154,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查可用于 PIT 研究的财务观测是否具有有效公告与可用时间。",
         "可用时间证据非法的记录数为 0。",
         Severity.SEVERE,
-        (DatasetKind.FINANCIAL_OBSERVATION,),
+        (DatasetKind.STOCK_FINANCIAL_INDICATOR,),
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(
@@ -158,7 +163,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查行业事件日期、tombstone 与供应商重建可用性证据。",
         "非法行业事件数为 0。",
         Severity.FATAL,
-        (DatasetKind.INDUSTRY_CLASSIFICATION,),
+        (DatasetKind.INDUSTRY_MEMBERSHIP,),
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
 )

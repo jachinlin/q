@@ -34,6 +34,7 @@ class SecurityStatus(StrEnum):
 
     NORMAL = "NORMAL"
     ST = "ST"
+    NO_LIMIT = "NO_LIMIT"
 
 
 class Side(StrEnum):
@@ -580,6 +581,8 @@ class AShareRuleBook:
         _RulebookSupport.validate_profile_and_date(profile, trade_date)
         if not isinstance(status, SecurityStatus):
             raise TypeError("status must be a SecurityStatus")
+        if status is SecurityStatus.NO_LIMIT:
+            return None
         try:
             rules = self._price_limits[(profile.price_limit_group, status)]
         except KeyError as error:

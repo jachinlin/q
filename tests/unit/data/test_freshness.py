@@ -61,24 +61,24 @@ def _evaluate(
 def test_trading_session_policy_handles_1800_cutoff_evidence() -> None:
     statuses = _evaluate(
         canonical=(
-            _canonical(DatasetKind.DAILY_BAR, date(2026, 8, 14)),
-            _canonical(DatasetKind.DAILY_BASIC, date(2026, 8, 13)),
+            _canonical(DatasetKind.STOCK_DAILY_BAR, date(2026, 8, 14)),
+            _canonical(DatasetKind.STOCK_DAILY_BASIC, date(2026, 8, 13)),
         ),
         evaluated_at=datetime(2026, 8, 14, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
         session=date(2026, 8, 14),
     )
-    assert statuses[DatasetKind.DAILY_BAR] is FreshnessStatus.CURRENT
-    assert statuses[DatasetKind.DAILY_BASIC] is FreshnessStatus.STALE
+    assert statuses[DatasetKind.STOCK_DAILY_BAR] is FreshnessStatus.CURRENT
+    assert statuses[DatasetKind.STOCK_DAILY_BASIC] is FreshnessStatus.STALE
 
 
-def test_industry_freshness_uses_as_of_watermark_not_supplier_update_date() -> None:
+def test_industry_freshness_requires_successful_refresh_evidence() -> None:
     statuses = _evaluate(
-        canonical=(_canonical(DatasetKind.INDUSTRY_CLASSIFICATION, date(2026, 8, 14)),),
+        canonical=(_canonical(DatasetKind.INDUSTRY_MEMBERSHIP, date(2026, 8, 14)),),
         evaluated_at=datetime(2026, 8, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
         session=date(2026, 8, 14),
     )
 
-    assert statuses[DatasetKind.INDUSTRY_CLASSIFICATION] is FreshnessStatus.CURRENT
+    assert statuses[DatasetKind.INDUSTRY_MEMBERSHIP] is FreshnessStatus.UNKNOWN
 
 
 def test_calendar_horizon_changes_at_beijing_1800() -> None:
@@ -102,17 +102,17 @@ def test_calendar_refresh_and_missing_evidence_cover_all_states() -> None:
     statuses = _evaluate(
         canonical=(
             _canonical(DatasetKind.TRADE_CALENDAR, date(2026, 9, 14)),
-            _canonical(DatasetKind.INSTRUMENT, date(2026, 8, 14)),
-            _canonical(DatasetKind.FINANCIAL_OBSERVATION, date(2026, 6, 30)),
+            _canonical(DatasetKind.STOCK_MASTER, date(2026, 8, 14)),
+            _canonical(DatasetKind.STOCK_FINANCIAL_INDICATOR, date(2026, 6, 30)),
         ),
         operational=(
             _operational(
-                DatasetKind.INSTRUMENT,
+                DatasetKind.STOCK_MASTER,
                 datetime(2026, 8, 14, 11, tzinfo=UTC),
                 date(2026, 8, 14),
             ),
             _operational(
-                DatasetKind.FINANCIAL_OBSERVATION,
+                DatasetKind.STOCK_FINANCIAL_INDICATOR,
                 datetime(2026, 8, 1, 11, tzinfo=UTC),
             ),
         ),
@@ -120,18 +120,18 @@ def test_calendar_refresh_and_missing_evidence_cover_all_states() -> None:
         session=date(2026, 8, 14),
     )
     assert statuses[DatasetKind.TRADE_CALENDAR] is FreshnessStatus.CURRENT
-    assert statuses[DatasetKind.INSTRUMENT] is FreshnessStatus.CURRENT
-    assert statuses[DatasetKind.FINANCIAL_OBSERVATION] is FreshnessStatus.CURRENT
-    assert statuses[DatasetKind.INDUSTRY_CLASSIFICATION] is FreshnessStatus.MISSING
+    assert statuses[DatasetKind.STOCK_MASTER] is FreshnessStatus.CURRENT
+    assert statuses[DatasetKind.STOCK_FINANCIAL_INDICATOR] is FreshnessStatus.CURRENT
+    assert statuses[DatasetKind.INDUSTRY_MEMBERSHIP] is FreshnessStatus.MISSING
 
 
 def test_calendar_shortage_marks_dependent_datasets_unknown() -> None:
     statuses = _evaluate(
-        canonical=(_canonical(DatasetKind.INDEX_BAR, date(2026, 8, 14)),),
+        canonical=(_canonical(DatasetKind.INDEX_DAILY_BAR, date(2026, 8, 14)),),
         evaluated_at=datetime(2026, 8, 15, 20, tzinfo=ZoneInfo("Asia/Shanghai")),
         session=None,
     )
-    assert statuses[DatasetKind.INDEX_BAR] is FreshnessStatus.UNKNOWN
+    assert statuses[DatasetKind.INDEX_DAILY_BAR] is FreshnessStatus.UNKNOWN
 
 
 def test_financial_freshness_turns_stale_only_after_disclosure_deadline() -> None:
@@ -140,10 +140,10 @@ def test_financial_freshness_turns_stale_only_after_disclosure_deadline() -> Non
         timezone=ZoneInfo("Asia/Shanghai"),
     )
     result = evaluator.evaluate(
-        canonical=(_canonical(DatasetKind.FINANCIAL_OBSERVATION, date(2026, 6, 30)),),
+        canonical=(_canonical(DatasetKind.STOCK_FINANCIAL_INDICATOR, date(2026, 6, 30)),),
         operational=(
             _operational(
-                DatasetKind.FINANCIAL_OBSERVATION,
+                DatasetKind.STOCK_FINANCIAL_INDICATOR,
                 datetime(2026, 8, 1, tzinfo=UTC),
             ),
         ),
@@ -151,7 +151,7 @@ def test_financial_freshness_turns_stale_only_after_disclosure_deadline() -> Non
         latest_complete_session=date(2026, 8, 31),
     )
     financial = next(
-        item for item in result if item.dataset is DatasetKind.FINANCIAL_OBSERVATION
+        item for item in result if item.dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR
     )
 
     assert financial.status is FreshnessStatus.STALE

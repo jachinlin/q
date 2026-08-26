@@ -39,7 +39,7 @@ class _MarketReviewHarness:
             self._batches(),
             previous_datasets={},
             run_id="market-review-integration",
-            source="test",
+            source="tushare",
             start=_DAY,
             end=_DAY,
             repository=self.catalog,
@@ -122,7 +122,7 @@ class _MarketReviewHarness:
                     for identifier in indexes
                 ),
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.INSTRUMENT].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_MASTER].columns,
         )
         calendar = pl.DataFrame(
             [{"trade_date": _DAY, "is_trading_day": True, **audits}],
@@ -145,7 +145,7 @@ class _MarketReviewHarness:
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.DAILY_BAR].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BAR].columns,
         )
         basic = pl.DataFrame(
             [
@@ -159,7 +159,7 @@ class _MarketReviewHarness:
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.DAILY_BASIC].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BASIC].columns,
         )
         status = pl.DataFrame(
             [
@@ -175,7 +175,7 @@ class _MarketReviewHarness:
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.SECURITY_STATUS].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_SUSPENSION].columns,
         )
         industry = pl.DataFrame(
             [
@@ -190,7 +190,7 @@ class _MarketReviewHarness:
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_CLASSIFICATION].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_MEMBERSHIP].columns,
         )
         index_bar = pl.DataFrame(
             [
@@ -209,16 +209,16 @@ class _MarketReviewHarness:
                 }
                 for identifier in indexes
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDEX_BAR].columns,
+            schema=CANONICAL_SCHEMAS[DatasetKind.INDEX_DAILY_BAR].columns,
         )
         frames = (
-            (DatasetKind.INSTRUMENT, instruments),
+            (DatasetKind.STOCK_MASTER, instruments),
             (DatasetKind.TRADE_CALENDAR, calendar),
-            (DatasetKind.DAILY_BAR, bar),
-            (DatasetKind.DAILY_BASIC, basic),
-            (DatasetKind.SECURITY_STATUS, status),
-            (DatasetKind.INDUSTRY_CLASSIFICATION, industry),
-            (DatasetKind.INDEX_BAR, index_bar),
+            (DatasetKind.STOCK_DAILY_BAR, bar),
+            (DatasetKind.STOCK_DAILY_BASIC, basic),
+            (DatasetKind.STOCK_SUSPENSION, status),
+            (DatasetKind.INDUSTRY_MEMBERSHIP, industry),
+            (DatasetKind.INDEX_DAILY_BAR, index_bar),
         )
         return tuple(
             CanonicalBatch(dataset, frame, (str(index + 1) * 64,)[:1])

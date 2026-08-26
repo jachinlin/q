@@ -68,7 +68,7 @@ class UniverseBuilder:
             ValueError：仓储返回重复主键、非法证券代码、越界日期或其他不符合
             Canonical 查询契约的数据时抛出；仓储读取异常按原类型传播。
         """
-        instruments = self._repository.instruments().collect()
+        instruments = self._repository.stocks().collect()
         instruments = _BuilderSupport._validated_instruments(instruments)
         calendar_start = date.min
         calendar = self._repository.trade_calendar(calendar_start, as_of).collect()
@@ -84,19 +84,39 @@ class UniverseBuilder:
         if not identifiers:
             return _BuilderSupport._empty_universe()
 
-        statuses = self._repository.security_status(as_of).collect()
-        _BuilderSupport._validate_statuses(
-            statuses, {item.canonical() for item in identifiers}, as_of
+        suspensions = self._repository.stock_suspensions(
+            as_of, as_of, identifiers
+        ).collect()
+        warnings = self._repository.stock_risk_warnings(
+            as_of, as_of, identifiers
+        ).collect()
+        _BuilderSupport._validate_events(
+            suspensions, {item.canonical() for item in identifiers}, as_of
         )
-        statuses = _BuilderSupport._known_by_as_of(statuses.lazy(), as_of).collect()
+        _BuilderSupport._validate_events(
+            warnings, {item.canonical() for item in identifiers}, as_of
+        )
         bar_start = liquidity_window[0] if liquidity_window else as_of
-        bars = self._repository.bars(identifiers, bar_start, as_of).collect()
+        bars = self._repository.stock_bars(identifiers, bar_start, as_of).collect()
         _BuilderSupport._validate_bars(
             bars, {item.canonical() for item in identifiers}, liquidity_window
         )
         bars = _BuilderSupport._known_by_as_of(bars.lazy(), as_of).collect()
+        suspended_ids = set(suspensions["instrument_id"].to_list())
+        warning_ids = set(warnings["instrument_id"].to_list())
         status_by_instrument = {
-            row["instrument_id"]: row for row in statuses.to_dicts()
+            cast(str, row["instrument_id"]): {
+                "is_listed": isinstance(row.get("list_date"), date)
+                and row["list_date"] <= as_of
+                and (
+                    not isinstance(row.get("delist_date"), date)
+                    or row["delist_date"] > as_of
+                ),
+                "is_st": row["instrument_id"] in warning_ids,
+                "is_suspended": row["instrument_id"] in suspended_ids,
+                "board": row.get("board"),
+            }
+            for row in instruments.to_dicts()
         }
         amounts_by_instrument = _BuilderSupport._amounts_by_instrument(bars)
         rows = [
@@ -148,17 +168,12 @@ class _BuilderSupport:
         return calendar.sort("trade_date")
 
     @staticmethod
-    def _validate_statuses(
-        statuses: pl.DataFrame, identifiers: set[str], as_of: date
+    def _validate_events(
+        events: pl.DataFrame, identifiers: set[str], as_of: date
     ) -> None:
-        keys: set[tuple[object, object]] = set()
-        for row in statuses.select("instrument_id", "trade_date").to_dicts():
-            key = (row["instrument_id"], row["trade_date"])
-            if key in keys:
-                _BuilderSupport._invalid("duplicate status primary key")
-            keys.add(key)
-            if key[0] not in identifiers or key[1] != as_of:
-                _BuilderSupport._invalid("unexpected status observation")
+        for row in events.select("instrument_id", "trade_date").to_dicts():
+            if row["instrument_id"] not in identifiers or row["trade_date"] != as_of:
+                _BuilderSupport._invalid("unexpected stock event")
 
     @staticmethod
     def _validate_bars(
@@ -256,8 +271,6 @@ class _BuilderSupport:
         reasons: set[str] = set()
         list_date = instrument["list_date"]
         delist_date = instrument["delist_date"]
-        if instrument["instrument_type"] != "STOCK":
-            reasons.add("INSTRUMENT_TYPE_NOT_ALLOWED")
         if not isinstance(list_date, date):
             reasons.add("INSTRUMENT_HISTORY_MISSING")
         elif list_date > as_of:

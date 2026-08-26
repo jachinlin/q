@@ -9,7 +9,6 @@ description = "Foundation data platform for quantitative research"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic",
-    "baostock",
     "duckdb",
     "fastapi",
     "numpy",
@@ -20,6 +19,7 @@ dependencies = [
     "pyyaml",
     "sqlalchemy",
     "typer",
+    "tushare",
     "uvicorn",
 ]
 

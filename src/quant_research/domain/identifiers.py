@@ -1,5 +1,6 @@
 """提供领域基础与标识符相关的公开模型、协议与处理流程。"""
 
+import re
 from dataclasses import dataclass
 from typing import Self
 from uuid import UUID, uuid4
@@ -50,7 +51,11 @@ class InstrumentId:
         symbol, separator, suffix = value.partition(".")
         if separator != "." or "." in suffix:
             raise ValueError("instrument identifier must be SYMBOL.EXCHANGE")
-        exchange_by_suffix = {"SH": Exchange.SSE, "SZ": Exchange.SZSE}
+        exchange_by_suffix = {
+            "SH": Exchange.SSE,
+            "SZ": Exchange.SZSE,
+            "BJ": Exchange.BSE,
+        }
         try:
             exchange = exchange_by_suffix[suffix]
         except KeyError as error:
@@ -68,8 +73,49 @@ class InstrumentId:
             无。
         Return the identifier in canonical ``SYMBOL.EXCHANGE`` form.
         """
-        suffix = {Exchange.SSE: "SH", Exchange.SZSE: "SZ"}[self.exchange]
+        suffix = {
+            Exchange.SSE: "SH",
+            Exchange.SZSE: "SZ",
+            Exchange.BSE: "BJ",
+        }[self.exchange]
         return f"{self.symbol}.{suffix}"
+
+
+@dataclass(frozen=True, slots=True)
+class IndexId:
+    """表示不可直接交易的指数标识。
+
+    入参：``value`` 为 Tushare 规范的指数代码。返回值：不可变指数标识。
+    异常：代码不满足 ``CODE.SUFFIX`` 约束时抛出 ``ValueError``。
+    """
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, str):
+            raise TypeError("index identifier must be a string")
+        if re.fullmatch(r"[0-9A-Z]{1,16}\.[A-Z]{2,8}", self.value) is None:
+            raise ValueError("index identifier must be an uppercase CODE.SUFFIX")
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        """解析 Tushare 指数代码。
+
+        入参：待解析字符串。返回值：``IndexId``。异常：格式非法时抛出
+        ``TypeError`` 或 ``ValueError``。
+        """
+        return cls(value)
+
+    def canonical(self) -> str:
+        """返回规范指数代码。
+
+        入参：无。返回值：``CODE.SUFFIX`` 字符串。异常：无。
+        """
+        return self.value
+
+    def __str__(self) -> str:
+        """返回代码。入参：无。返回值：规范字符串。异常：无。"""
+        return self.value
 
 
 @dataclass(frozen=True, slots=True)

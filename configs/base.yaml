@@ -1,2 +1,6 @@
 timezone: Asia/Shanghai
 max_partition_size: 100
+tushare:
+  max_attempts: 5
+  retry_backoff_seconds: [1.0, 2.0, 4.0, 8.0]
+  benchmark_indexes: [399317.SZ, 000016.SH, 000300.SH, 000905.SH, 000852.SH]

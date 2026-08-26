@@ -138,7 +138,10 @@ class DualMATrendStrategy(WeightTargetStrategy):
         return StrategySpec(
             strategy_id="dual_ma_trend",
             frequency="DAILY",
-            data_dependencies=(DatasetKind.DAILY_BAR,),
+            data_dependencies=(
+                DatasetKind.FUND_DAILY_BAR,
+                DatasetKind.FUND_ADJUSTMENT_FACTOR,
+            ),
             factor_dependencies=(),
             parameters={
                 "instrument_id": self.config.instrument_id.canonical(),

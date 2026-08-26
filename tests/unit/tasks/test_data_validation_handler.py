@@ -79,7 +79,7 @@ def _task(payload: dict[str, str]) -> ClaimedTask:
         ({"scope": "ALL"}, None),
         (
             {"scope": "DATASET", "dataset": "daily_bar"},
-            DatasetKind.DAILY_BAR,
+            DatasetKind.STOCK_DAILY_BAR,
         ),
     ),
 )

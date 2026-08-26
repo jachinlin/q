@@ -5,8 +5,23 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class TushareSettings(BaseModel):
+    """定义不含凭据的 Tushare 调用配置。
+
+    入参：重试和基准指数配置。返回值：不可变配置。异常：Pydantic 校验异常。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_attempts: int = 5
+    retry_backoff_seconds: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    benchmark_indexes: tuple[str, ...] = (
+        "399317.SZ", "000016.SH", "000300.SH", "000905.SH", "000852.SH"
+    )
 
 
 class Settings(BaseSettings):
@@ -28,6 +43,7 @@ class Settings(BaseSettings):
     timezone: ZoneInfo
     data_root: Path
     max_partition_size: int = 100
+    tushare: TushareSettings = TushareSettings()
 
     @field_validator("timezone", mode="before")
     @classmethod
@@ -126,7 +142,7 @@ class Settings(BaseSettings):
 
         入参：
             config_path：应用 YAML 路径；省略时读取 ``QUANT_CONFIG``，否则使用项目默认配置。
-            data_root：运行数据根目录；省略时读取 ``QUANT_DATA_ROOT``，否则使用 ``~/.q-data``。
+            data_root：运行数据根目录；省略时读取 ``QUANT_DATA_ROOT``，否则使用 ``~/qlab-data``。
         返回值：
             返回加载并校验量化研究后的``load``（``'Settings'``）。
         异常：
@@ -151,7 +167,7 @@ class Settings(BaseSettings):
             else (
                 Path(configured_data_root)
                 if configured_data_root
-                else Path.home() / ".q-data"
+                else Path.home() / "qlab-data"
             )
         )
         resolved_data_root = effective_data_root.resolve()

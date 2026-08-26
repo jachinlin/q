@@ -61,6 +61,7 @@ def test_experiment_validation_returns_actionable_422(tmp_path: Path) -> None:
     app = create_dashboard_app(
         service=cast(Any, object()),
         commands=cast(Any, object()),
+        settings_service=cast(Any, object()),
         experiment_service=cast(Any, _RejectedExperimentService()),
         notebook_probe=cast(Any, object()),
         static_dir=tmp_path,

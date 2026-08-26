@@ -45,7 +45,7 @@ def _dataset(
     input_hash: str = "d" * 64,
 ) -> CanonicalDatasetSpec:
     return CanonicalDatasetSpec(
-        dataset=DatasetKind.DAILY_BAR,
+        dataset=DatasetKind.STOCK_DAILY_BAR,
         source="baostock",
         partitions=(
             CanonicalPartitionSpec(
@@ -123,7 +123,7 @@ def test_content_identity_ignores_path_and_pointer_change_invalidates_gate(
     state = repository.catalog_state()
     quality = repository.register_quality_run(
         QualityRunSpec(
-            dataset_hashes={DatasetKind.DAILY_BAR.value: initial_hash},
+            dataset_hashes={DatasetKind.STOCK_DAILY_BAR.value: initial_hash},
             input_hash=state.catalog_hash,
             scope="ALL",
             started_at=NOW,
@@ -162,10 +162,10 @@ def test_validate_all_rejects_catalog_change_during_validation(tmp_path: Path) -
         _dataset(tmp_path / "a.parquet"), updated_at=NOW
     )
     started_state = repository.catalog_state()
-    dataset_hash = repository.get_canonical_dataset(DatasetKind.DAILY_BAR).content_hash
+    dataset_hash = repository.get_canonical_dataset(DatasetKind.STOCK_DAILY_BAR).content_hash
     run = repository.register_quality_run(
         QualityRunSpec(
-            dataset_hashes={DatasetKind.DAILY_BAR.value: dataset_hash},
+            dataset_hashes={DatasetKind.STOCK_DAILY_BAR.value: dataset_hash},
             input_hash=started_state.catalog_hash,
             scope="ALL",
             started_at=NOW,
@@ -194,10 +194,10 @@ def test_blocking_quality_issue_never_opens_research_gate(tmp_path: Path) -> Non
         _dataset(tmp_path / "a.parquet"), updated_at=NOW
     )
     state = repository.catalog_state()
-    dataset_hash = repository.get_canonical_dataset(DatasetKind.DAILY_BAR).content_hash
+    dataset_hash = repository.get_canonical_dataset(DatasetKind.STOCK_DAILY_BAR).content_hash
     run = repository.register_quality_run(
         QualityRunSpec(
-            dataset_hashes={DatasetKind.DAILY_BAR.value: dataset_hash},
+            dataset_hashes={DatasetKind.STOCK_DAILY_BAR.value: dataset_hash},
             input_hash=state.catalog_hash,
             scope="ALL",
             started_at=NOW,
@@ -206,7 +206,7 @@ def test_blocking_quality_issue_never_opens_research_gate(tmp_path: Path) -> Non
                 QualityIssue(
                     rule_id="test_blocking",
                     severity=Severity.SEVERE,
-                    dataset=DatasetKind.DAILY_BAR,
+                    dataset=DatasetKind.STOCK_DAILY_BAR,
                     scope={},
                     actual=1,
                     threshold=0,
@@ -227,27 +227,39 @@ def test_blocking_quality_issue_never_opens_research_gate(tmp_path: Path) -> Non
 
 def _canonical_batch(dataset: DatasetKind) -> CanonicalBatch:
     common = {
-        "source": ["test"],
+        "source": ["tushare"],
         "available_at": [NOW],
         "availability_source": ["test"],
         "pit_usable": [True],
         "ingested_at": [NOW],
     }
-    if dataset is DatasetKind.INSTRUMENT:
+    if dataset is DatasetKind.STOCK_MASTER:
         values = {
             "instrument_id": ["600000.SH"],
-            "exchange": ["SSE"],
-            "board": ["MAIN"],
+            "symbol": ["600000"],
             "name": ["浦发银行"],
-            "instrument_type": ["STOCK"],
-            "listing_status": ["LISTED"],
+            "area": ["上海"],
+            "industry": ["银行"],
+            "fullname": ["上海浦东发展银行股份有限公司"],
+            "enname": ["SPDB"],
+            "cnspell": ["pfyh"],
+            "market": ["主板"],
+            "exchange": ["SSE"],
+            "curr_type": ["CNY"],
+            "list_status": ["L"],
             "list_date": [date(1999, 11, 10)],
             "delist_date": [None],
+            "is_hs": ["H"],
+            "act_name": [None],
+            "act_ent_type": [None],
+            "board": ["MAIN"],
         }
     elif dataset is DatasetKind.TRADE_CALENDAR:
         values = {
+            "exchange": ["SSE"],
             "trade_date": [date(2026, 8, 11)],
             "is_trading_day": [True],
+            "previous_trade_date": [date(2026, 8, 8)],
         }
     else:  # pragma: no cover - the helper intentionally supports two datasets
         raise AssertionError(dataset)
@@ -276,7 +288,7 @@ def _publish_batch(
             {batch.dataset.value: current} if current is not None else {}
         ),
         run_id="test-run",
-        source="test",
+        source="tushare",
         start=date(2026, 8, 11),
         end=date(2026, 8, 11),
         repository=repository,
@@ -293,9 +305,9 @@ def test_curate_cleanup_preserves_partitions_referenced_by_other_datasets(
     repository = MetadataRepository(engine)
     store = CuratedPartitionStore(tmp_path / "canonical")
 
-    _publish_batch(store, repository, _canonical_batch(DatasetKind.INSTRUMENT))
+    _publish_batch(store, repository, _canonical_batch(DatasetKind.STOCK_MASTER))
     instrument_path = (
-        repository.get_canonical_dataset(DatasetKind.INSTRUMENT).partitions[0].path
+        repository.get_canonical_dataset(DatasetKind.STOCK_MASTER).partitions[0].path
     )
     _publish_batch(store, repository, _canonical_batch(DatasetKind.TRADE_CALENDAR))
 
@@ -311,15 +323,15 @@ def test_curate_rebuilds_a_missing_current_partition_from_raw_batches(
     engine = create_sqlite_engine(database)
     repository = MetadataRepository(engine)
     store = CuratedPartitionStore(tmp_path / "canonical")
-    batch = _canonical_batch(DatasetKind.INSTRUMENT)
+    batch = _canonical_batch(DatasetKind.STOCK_MASTER)
     _publish_batch(store, repository, batch)
-    partition = repository.get_canonical_dataset(DatasetKind.INSTRUMENT).partitions[0]
+    partition = repository.get_canonical_dataset(DatasetKind.STOCK_MASTER).partitions[0]
     partition.path.unlink()
 
     _publish_batch(store, repository, batch, previous=True)
 
     assert partition.path.is_file()
-    store.verify_dataset(repository.get_canonical_dataset(DatasetKind.INSTRUMENT))
+    store.verify_dataset(repository.get_canonical_dataset(DatasetKind.STOCK_MASTER))
     engine.dispose()
 
 
@@ -331,7 +343,7 @@ def test_repository_accepts_the_exact_multi_chunk_hash_published_by_curate(
     engine = create_sqlite_engine(database)
     metadata = MetadataRepository(engine)
     store = CuratedPartitionStore(tmp_path / "canonical")
-    first = _canonical_batch(DatasetKind.INSTRUMENT)
+    first = _canonical_batch(DatasetKind.STOCK_MASTER)
     row_count = 140_000
     expanded = first.frame.select(pl.all().repeat_by(row_count).explode()).with_columns(
         (
@@ -344,10 +356,10 @@ def test_repository_accepts_the_exact_multi_chunk_hash_published_by_curate(
     )
     _publish_batch(store, metadata, combined)
     state = metadata.catalog_state()
-    record = metadata.get_canonical_dataset(DatasetKind.INSTRUMENT)
+    record = metadata.get_canonical_dataset(DatasetKind.STOCK_MASTER)
     quality = metadata.register_quality_run(
         QualityRunSpec(
-            dataset_hashes={DatasetKind.INSTRUMENT.value: record.content_hash},
+            dataset_hashes={DatasetKind.STOCK_MASTER.value: record.content_hash},
             input_hash=state.catalog_hash,
             scope="ALL",
             started_at=NOW,
@@ -361,7 +373,7 @@ def test_repository_accepts_the_exact_multi_chunk_hash_published_by_curate(
         metadata, trusted_curated_root=tmp_path / "canonical"
     )
 
-    assert repository.instruments().collect().height == row_count
+    assert repository.stocks().collect().height == row_count
     engine.dispose()
 
 
@@ -415,7 +427,7 @@ def test_canonical_commit_rejects_a_changed_raw_head_snapshot(tmp_path: Path) ->
         )
 
     assert caught.value.detail.code == "DATA_CURATE_INPUT_CHANGED"
-    assert repository.find_canonical_dataset(DatasetKind.DAILY_BAR) is None
+    assert repository.find_canonical_dataset(DatasetKind.STOCK_DAILY_BAR) is None
     engine.dispose()
 
 
@@ -432,7 +444,7 @@ def test_curate_partition_log_contains_committed_partition_business_data(
     _publish_batch(
         store,
         repository,
-        _canonical_batch(DatasetKind.INSTRUMENT),
+        _canonical_batch(DatasetKind.STOCK_MASTER),
         logger=StructuredLogger(stream),
     )
 
@@ -444,7 +456,7 @@ def test_curate_partition_log_contains_committed_partition_business_data(
     partition = context["partition"]
     assert completed["stage"] == "CURATE"
     assert "request" not in context
-    assert context["dataset"] == "instrument"
+    assert context["dataset"] == "stock_master"
     assert context["pointer_changed"] is True
     assert partition["partition_key"] == "all"
     assert partition["disposition"] == "file_written"
@@ -463,7 +475,7 @@ def test_curate_logs_ignore_large_raw_content_hash_collections(tmp_path: Path) -
     store = CuratedPartitionStore(tmp_path / "canonical")
     stream = StringIO()
     batch = replace(
-        _canonical_batch(DatasetKind.INSTRUMENT),
+        _canonical_batch(DatasetKind.STOCK_MASTER),
         source_content_hashes=tuple(f"{value:064x}" for value in range(1_000)),
     )
 

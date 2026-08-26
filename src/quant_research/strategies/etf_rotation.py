@@ -211,7 +211,7 @@ class EtfRotationStrategy(WeightTargetStrategy):
         return StrategySpec(
             "etf_rotation",
             self.config.pipeline.frequency,
-            (DatasetKind.DAILY_BAR,),
+            (DatasetKind.FUND_DAILY_BAR, DatasetKind.FUND_ADJUSTMENT_FACTOR),
             (),
             {"pipeline": self.config.pipeline.as_json()},
         )

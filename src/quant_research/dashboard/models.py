@@ -226,7 +226,7 @@ class MarketReviewValuationMetric(DashboardModel):
     异常：字段类型不合法时由 Pydantic 抛出校验异常。
     """
 
-    metric: Literal["pe_ttm", "pb_mrq", "ps_ttm"]
+    metric: Literal["pe_ttm", "pb", "ps_ttm"]
     median: float | None
     p25: float | None
     p75: float | None
@@ -349,6 +349,20 @@ class DataUpdateRequest(DataUpdatePlanRequest):
     """
 
     plan_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class DataBootstrapRequest(DashboardModel):
+    """提交首次 Canonical 基线初始化所需的历史覆盖年数。
+
+    入参：
+        years：从当前初始化窗口向前覆盖的正整数年数。
+    返回值：
+        构造冻结且严格校验的初始化请求。
+    异常：
+        年数小于一时由 Pydantic 抛出校验异常。
+    """
+
+    years: int = Field(ge=1)
 
 
 class QualityRunRequest(DashboardModel):
@@ -625,12 +639,27 @@ class WorkerHeartbeatResponse(DashboardModel):
     heartbeat_at: str | None
 
 
+class DataInitializationResponse(DashboardModel):
+    """返回首次 Canonical 基线初始化状态和冻结窗口。
+
+    入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
+    """
+
+    status: Literal["NOT_STARTED", "IN_PROGRESS", "COMPLETED"]
+    years: int | None
+    start_date: str | None
+    end_date: str | None
+    started_at: str | None
+    completed_at: str | None
+
+
 class DataSummaryResponse(DashboardModel):
     """返回数据中心顶部运营状态与研究门证据。
 
     入参：由字段声明给出。返回值：构造冻结响应对象。异常：字段非法时抛出校验异常。
     """
 
+    initialization: DataInitializationResponse
     gate: GateResponse
     freshness: FreshnessSummaryResponse
     gate_quality_run: QualityRunResponse | None
@@ -681,6 +710,80 @@ class OverviewResponse(DashboardModel):
     worker: WorkerHeartbeatResponse | None
     last_successful_update: TaskSummaryResponse | None
     tasks: OverviewTasksResponse
+
+
+class DataSourceTokenStatusResponse(DashboardModel):
+    """返回数据源 Token 的非敏感配置状态。
+
+    入参：是否已配置、解析来源和可选文件更新时间。
+    返回值：构造不包含 Token 明文或派生片段的冻结响应。
+    异常：来源或字段类型非法时由 Pydantic 抛出校验异常。
+    """
+
+    configured: bool
+    source: Literal["DATA_ROOT_ENV", "PROCESS_ENVIRONMENT", "NONE"]
+    updated_at: str | None
+
+
+class DashboardSettingsResponse(DashboardModel):
+    """返回 Dashboard 支持的通用设置安全投影。
+
+    入参：受控设置文件路径和数据源 Token 状态。
+    返回值：构造冻结响应，任何字段均不得包含 Token 内容。
+    异常：字段缺失或类型非法时由 Pydantic 抛出校验异常。
+    """
+
+    settings_path: str
+    data_source_token: DataSourceTokenStatusResponse
+
+
+class DataSourceTokenChangeRequest(DashboardModel):
+    """定义数据源 Token 的类型化设置或清除操作。
+
+    入参：操作名称和仅 ``SET`` 允许携带的明文值。
+    返回值：构造经过组合校验的冻结修改请求。
+    异常：操作和值组合不一致时抛出值错误。
+    """
+
+    operation: Literal["SET", "CLEAR"]
+    value: str | None = Field(default=None, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> DataSourceTokenChangeRequest:
+        """校验操作和值必须形成唯一有效组合。
+
+        入参：无。
+        返回值：校验后的当前请求对象。
+        异常：``SET`` 缺值或 ``CLEAR`` 携带值时抛出值错误。
+        """
+        if self.operation == "SET" and self.value is None:
+            raise ValueError("SET data source token operation requires value")
+        if self.operation == "CLEAR" and self.value is not None:
+            raise ValueError("CLEAR data source token operation must omit value")
+        return self
+
+
+class DashboardSettingsPatchRequest(DashboardModel):
+    """定义可逐字段扩展的通用 Dashboard 设置修改请求。
+
+    入参：当前仅支持可选的数据源 Token 类型化修改。
+    返回值：构造至少包含一个明确修改字段的冻结请求。
+    异常：请求未包含任何修改时抛出值错误。
+    """
+
+    data_source_token: DataSourceTokenChangeRequest | None = None
+
+    @model_validator(mode="after")
+    def require_change(self) -> DashboardSettingsPatchRequest:
+        """拒绝不会产生任何设置修改的空 PATCH。
+
+        入参：无。
+        返回值：包含至少一个修改的当前请求对象。
+        异常：所有设置字段均省略时抛出值错误。
+        """
+        if self.data_source_token is None:
+            raise ValueError("settings patch must contain at least one change")
+        return self
 
 
 class RetryRequest(DashboardModel):

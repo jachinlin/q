@@ -8,7 +8,6 @@ from quant_research.data.contracts import (
     PublishedPartition,
     RawBatch,
 )
-from quant_research.data.sources.contracts import SourceClient
 from quant_research.data.sources.routing import Route, RoutingTable
 from quant_research.data.storage.partitions import RawPartitionStore
 
@@ -24,5 +23,4 @@ __all__ = [
     "RawPartitionStore",
     "Route",
     "RoutingTable",
-    "SourceClient",
 ]

@@ -16,12 +16,19 @@ def test_catalog_assigns_dataset_specific_fetch_plans() -> None:
     assert {
         dataset: DATASET_CATALOG[dataset].fetch_plan for dataset in DatasetKind
     } == {
-        DatasetKind.DAILY_BAR: FetchPlan.DAILY_MARKET,
-        DatasetKind.DAILY_BASIC: FetchPlan.DAILY_MARKET,
-        DatasetKind.SECURITY_STATUS: FetchPlan.DAILY_MARKET,
+        DatasetKind.STOCK_MASTER: FetchPlan.MARKET_SNAPSHOT,
+        DatasetKind.FUND_MASTER: FetchPlan.MARKET_SNAPSHOT,
+        DatasetKind.INDEX_MASTER: FetchPlan.MARKET_SNAPSHOT,
         DatasetKind.TRADE_CALENDAR: FetchPlan.TRADE_CALENDAR_RANGE,
-        DatasetKind.INSTRUMENT: FetchPlan.INSTRUMENT_SNAPSHOT,
-        DatasetKind.FINANCIAL_OBSERVATION: FetchPlan.FINANCIAL_CELL,
-        DatasetKind.INDUSTRY_CLASSIFICATION: FetchPlan.INDUSTRY_AS_OF,
-        DatasetKind.INDEX_BAR: FetchPlan.INDEX_RANGE,
+        DatasetKind.STOCK_DAILY_BAR: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.STOCK_ADJUSTMENT_FACTOR: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.FUND_DAILY_BAR: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.FUND_ADJUSTMENT_FACTOR: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.STOCK_DAILY_BASIC: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.STOCK_SUSPENSION: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.STOCK_RISK_WARNING: FetchPlan.MARKET_TRADE_DATE,
+        DatasetKind.INDEX_DAILY_BAR: FetchPlan.INDEX_RANGE_EXCEPTION,
+        DatasetKind.STOCK_FINANCIAL_INDICATOR: FetchPlan.REPORT_PERIOD,
+        DatasetKind.INDUSTRY_CATALOG: FetchPlan.MARKET_SNAPSHOT,
+        DatasetKind.INDUSTRY_MEMBERSHIP: FetchPlan.INDUSTRY_L1,
     }

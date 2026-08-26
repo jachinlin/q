@@ -9,7 +9,6 @@ from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
 
-from quant_research.data.contracts import RawBatch
 from quant_research.data.pipeline.dataset import (
     DataPipeline,
     DataUpdatePlan,
@@ -19,12 +18,12 @@ from quant_research.data.pipeline.dataset import (
 )
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.identifiers import QualityRunId
-from quant_research.infrastructure.baostock.routing import BAOSTOCK_ROUTES
+from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 from quant_research.logging import StructuredLogger
 
 
 class _Source:
-    provider = "baostock"
+    provider = "tushare"
 
     def __init__(self) -> None:
         self.login_calls = 0
@@ -36,7 +35,10 @@ class _Source:
     def close(self) -> None:
         self.close_calls += 1
 
-    def fetch_instruments(self) -> tuple[RawBatch, ...]:
+    def requests(
+        self, endpoint: str, start: date, end: date
+    ) -> tuple[dict[str, object], ...]:
+        del endpoint, start, end
         return ()
 
 
@@ -81,7 +83,7 @@ def _partial_plan() -> DataUpdatePlan:
             overlap_days=4,
             current_watermark=date(2026, 8, 13),
         )
-        for dataset in (DatasetKind.DAILY_BAR, DatasetKind.DAILY_BASIC)
+        for dataset in (DatasetKind.STOCK_DAILY_BAR, DatasetKind.STOCK_DAILY_BASIC)
     )
     return DataUpdatePlan(
         window_mode="AUTO_INCREMENTAL",
@@ -107,7 +109,7 @@ def _pipeline(
         ),
         repository=_Repository(),  # type: ignore[arg-type]
         quality_runner=object(),  # type: ignore[arg-type]
-        routes=BAOSTOCK_ROUTES,
+        routes=TUSHARE_ROUTES,
         logger=logger,
     )
 
@@ -118,12 +120,12 @@ def test_localize_reuses_an_active_outer_source_session(tmp_path: Path) -> None:
     pipeline._source_session_active = True
 
     result = pipeline.localize(
-        DatasetKind.INSTRUMENT,
+        DatasetKind.STOCK_MASTER,
         start=date(2026, 8, 11),
         end=date(2026, 8, 11),
     )
 
-    assert result == LocalizeResult(DatasetKind.INSTRUMENT, 0, 0, 0)
+    assert result == LocalizeResult(DatasetKind.STOCK_MASTER, 0, 0, 0)
     assert source.login_calls == 0
     assert source.close_calls == 0
 
@@ -140,7 +142,7 @@ def test_localize_all_opens_one_session_around_every_dataset(tmp_path: Path) -> 
             end=date(2026, 8, 14),
             overlap_days=0,
         )
-        for dataset in sorted(BAOSTOCK_ROUTES, key=lambda item: item.value)
+        for dataset in sorted(TUSHARE_ROUTES, key=lambda item: item.value)
     )
 
     def localized(
@@ -160,7 +162,7 @@ def test_localize_all_opens_one_session_around_every_dataset(tmp_path: Path) -> 
     with patch.object(DataPipeline, "localize", autospec=True, side_effect=localized):
         results = pipeline.localize_all(windows=windows)
 
-    assert len(results) == len(observed) == 8
+    assert len(results) == len(observed) == len(DatasetKind)
     assert source.login_calls == 1
     assert source.close_calls == 1
     assert pipeline._source_session_active is False
@@ -189,12 +191,12 @@ def test_localize_plan_only_visits_the_frozen_dataset_subset(tmp_path: Path) -> 
         results = pipeline.localize_all(windows=plan.dataset_windows)
 
     assert tuple(item.dataset for item in results) == (
-        DatasetKind.DAILY_BAR,
-        DatasetKind.DAILY_BASIC,
+        DatasetKind.STOCK_DAILY_BAR,
+        DatasetKind.STOCK_DAILY_BASIC,
     )
     assert observed == [
-        (DatasetKind.DAILY_BAR, date(2026, 8, 10), date(2026, 8, 14)),
-        (DatasetKind.DAILY_BASIC, date(2026, 8, 10), date(2026, 8, 14)),
+        (DatasetKind.STOCK_DAILY_BAR, date(2026, 8, 10), date(2026, 8, 14)),
+        (DatasetKind.STOCK_DAILY_BASIC, date(2026, 8, 10), date(2026, 8, 14)),
     ]
     assert source.login_calls == source.close_calls == 1
 
@@ -228,11 +230,11 @@ def test_execute_partial_plan_curates_selection_then_validates_full_catalog(
     )
     curate_many.assert_called_once_with(
         pipeline,
-        (DatasetKind.DAILY_BAR, DatasetKind.DAILY_BASIC),
+        (DatasetKind.STOCK_DAILY_BAR, DatasetKind.STOCK_DAILY_BASIC),
         observer=observer,
     )
     validate.assert_called_once_with(pipeline)
-    assert ("VALIDATE", len(tuple(BAOSTOCK_ROUTES))) in observer.stages
+    assert ("VALIDATE", len(tuple(TUSHARE_ROUTES))) in observer.stages
     assert result.quality_run_id == quality_run_id
 
 

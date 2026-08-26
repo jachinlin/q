@@ -32,13 +32,13 @@ def test_migration_and_operational_stage_updates_preserve_prior_evidence(
     second = datetime(2026, 8, 14, 11, tzinfo=UTC)
 
     repository.record_dataset_stage(
-        DatasetKind.DAILY_BAR,
+        DatasetKind.STOCK_DAILY_BAR,
         "LOCALIZE",
         completed_at=first,
         localized_through=date(2026, 8, 13),
     )
     repository.record_dataset_stage(
-        DatasetKind.DAILY_BAR, "CURATE", completed_at=second
+        DatasetKind.STOCK_DAILY_BAR, "CURATE", completed_at=second
     )
 
     state = repository.list_dataset_operational_states()[0]
@@ -161,7 +161,7 @@ def test_complete_quality_rule_results_round_trip_atomically(tmp_path: Path) -> 
     now = datetime(2026, 8, 14, 10, tzinfo=UTC)
     result = QualityRuleResult(
         rule_id="canonical_schema",
-        dataset=DatasetKind.DAILY_BAR,
+        dataset=DatasetKind.STOCK_DAILY_BAR,
         status=QualityRuleStatus.PASS,
         severity=Severity.FATAL,
         title="Canonical Schema 一致",
@@ -174,7 +174,7 @@ def test_complete_quality_rule_results_round_trip_atomically(tmp_path: Path) -> 
 
     record = repository.register_quality_run(
         QualityRunSpec(
-            dataset_hashes={DatasetKind.DAILY_BAR.value: "b" * 64},
+            dataset_hashes={DatasetKind.STOCK_DAILY_BAR.value: "b" * 64},
             input_hash="a" * 64,
             scope="DATASET",
             started_at=now,

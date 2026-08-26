@@ -37,6 +37,7 @@ const freshnessLabel = {
   UNKNOWN: '未知',
 } as const
 const taskTypeLabel: Record<string, string> = {
+  DATA_BOOTSTRAP: '数据初始化',
   DATA_UPDATE: '数据更新',
   DATA_VALIDATION: '数据校验',
   EXPERIMENT_RUN: '实验运行',

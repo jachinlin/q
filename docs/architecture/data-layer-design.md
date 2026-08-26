@@ -1,486 +1,633 @@
-# 数据层设计
+# 数据层设计：从 Tushare 到可研究数据
 
-文档状态：设计草案，待用户书面审阅　·　日期：2026-08-20
+本文是本项目数据采集、清洗、校验和研究读取的权威设计，也是写给第一次接触量化研究和数据工程的读者的入门说明。
 
-本文是数据目录、Schema、LOCALIZE → CURATE → VALIDATE 流水线、PIT 研究读取和质量门的权威设计。平台定位、整体依赖方向与跨层约束见[总体设计](design.md)；行业分类特有的 PIT 语义见[行业分类 PIT 设计](industry-classification-pit-design.md)。
+读完本文后，你应该能回答以下问题：
 
-## 目录
+- 为什么不能把 Tushare 返回的数据直接交给策略？
+- Raw、Canonical、Parquet、分区和 Schema 分别是什么？
+- 股票、场内基金和指数为什么使用不同的标识与读取接口？
+- 什么是复权、`preclose`、PIT 和未来函数？
+- `LOCALIZE → CURATE → VALIDATE` 每一步做什么？
+- 一次更新怎样做到可重试、可审计，并且不会让研究读到半成品？
+- 数据发生变化时，实验为什么能够发现数据漂移？
 
-1. 设计取向
-2. 边界
-3. 三层与流水线
-4. Canonical 数据集
-5. 复权语义
-6. PIT 与研究读取
-7. 质量门
-8. 数据身份
-9. 存储与性能
-10. 数据源隔离
-11. 测试契约
-12. 明确不做
+## 1. 数据层解决什么问题
 
-## 1. 设计取向
+量化研究的输入不是“几个能下载的表格”，而是一套必须保持一致的数据事实。
 
-- **不为跨运行复现付费**：无数据快照版本、无历史 catalog 回放。数据层只维护“当前一份”
-  Canonical，重性能与去重（不重算），不为跨运行复现付费。Raw/Canonical 仍**内容寻址**
-  （`content_hash` / `request_hash` / `schema_fingerprint`），用于去重、增量和完整性，
-  不是为了回放旧数据；哈希边界见[总体设计](design.md) §3.4.2。
-- **PIT 是唯一不让步的红线**：时点正确与防未来函数保持全部严格性。
-- **公司行为一等公民**：分红、送转、除权除息作为 Canonical 事件数据集，服务复权与回测账务。
-- **数据源可插拔**：`SourceClient` + `CanonicalMapper` 隔离，上层零改动切换 TuShare。
+例如，我们想计算某只股票 2026-08-25 的收益率。仅有收盘价还不够，还需要知道：
 
-## 2. 边界
+- 代码是否正确，证券当时是否已经上市；
+- 当日是不是交易日，股票是否停牌；
+- 昨收价是否已经正确处理除权除息；
+- 涨跌幅字段是 `2.5` 还是 `0.025`；
+- 财务指标在当时是否已经公告；
+- 本次回测期间数据是否被后台更新过。
 
-### 2.1 输入
+外部供应商负责提供数据，数据层负责把这些数据变成项目内部稳定、可验证、可追踪的研究事实。它有四个核心目标：
 
-- 供应商原始响应（BaoStock/TuShare），经 `SourceClient.fetch(request)` 返回 `RawBatch`
-  （`source, endpoint, request: Mapping, retrieved_at, schema: tuple[str], rows: list[dict[str, str]]`，全 String）。
-- CLI 可以省略采集日期并调用计划器推导窗口；进入 Pipeline 的每个 LOCALIZE 调用必须携带明确的
-  `(start, end)`，底层不得把空日期解释为自动窗口。
-- 交易规则和费率与本层无关；数据层不消费策略配置。
+1. **统一语义**：供应商字段、日期、单位和代码转换为项目约定。
+2. **防止未来函数**：研究只能看到观察时点已经公开的数据。
+3. **保证一致性**：研究不会读到更新到一半或未经校验的数据。
+4. **记录身份**：每个文件和整套数据都有哈希，可以判断数据是否变化。
 
-### 2.2 输出
+## 2. 先认识几个基础概念
 
-下游唯一读取契约是总体设计中的 `ResearchDataRepository`，接口定义见
-[总体设计](design.md) §11.2：
+### 2.1 端点与数据集
 
-- 九个 Canonical 数据集（Parquet，强类型 + 五个审计列）：
-  `instrument / trade_calendar / daily_bar / daily_basic / security_status / corporate_action /
-  financial_observation / industry_classification / index_bar`。
-- 只读 PIT 接口返回 `pl.LazyFrame`，物理截断到 `available_at ≤ 截止 & pit_usable`：
-  `bars / adjusted_bars / log_returns / daily_basics / security_status_range / corporate_actions /
-  financials_as_of / financial_history / industry_as_of / trade_calendar / instruments`。
-- `catalog().require_validated_catalog()` 返回包含当前 `catalog_hash` 的只读目录状态，用于运行内一致性；
-  质量门关闭时 Repository 抛出 `DATA_NOT_VALIDATED`。
-- 副产物包括 SQLite 元数据（`raw_request / raw_object / canonical_dataset /
-  canonical_partition / data_catalog_state / quality_run …`）和质量运行报告。
+**端点（endpoint）**是供应商提供的查询接口，例如 Tushare 的 `daily_vip`。
 
-数据层不输出持久化复权价；复权因子在读取侧计算。数据层也不输出任何跨运行数据快照。
+**数据集（dataset）**是项目内部具有固定含义、字段和主键的一组数据，例如 `stock_daily_bar`。端点属于外部世界，Canonical 数据集属于本项目的领域模型。
 
-## 3. 三层与流水线
+本项目坚持“一端点一数据集”。这样可以避免把多个来源、不同发布时间和不同更新规律的数据强行拼成一张难以解释的大表。
 
-“三层”描述数据从证据到研究输入的稳定形态；“三阶段”描述生成和开放这些数据的执行过程。二者正交：
+### 2.2 行、列、Schema 与主键
+
+- **行**表示一条记录，例如某只股票某个交易日的行情。
+- **列**表示一个属性，例如 `close` 或 `volume`。
+- **Schema**规定列名、顺序和数据类型。
+- **主键**是一组能够唯一确定一行的列。
+
+例如，股票日行情的主键是：
 
 ```text
-数据形态：供应商响应 → Raw 证据层 → Canonical 事实层 → 研究视图与 Feature 派生层
-执行阶段：             LOCALIZE   →     CURATE      →       VALIDATE
+(instrument_id, trade_date)
 ```
 
-### 3.1 三层职责与禁止依赖
+同一只股票同一天出现两行，就是主键重复，通常意味着抓取或清洗存在错误。
 
-| 层 | 保存内容 | 身份与存储 | 允许的消费者 | 禁止行为 |
-| --- | --- | --- | --- | --- |
-| Raw 证据层 | 供应商原始字段、请求和抓取时间；业务列保持供应商字符串口径 | `request_hash` 定位请求，`content_hash` 定位不可变 Parquet；SQLite 保存当前头和历史对象元数据 | `CanonicalMapper`、完整性校验和采集诊断 | 研究代码直接读取；在 Raw 中改名、补值或做业务类型转换 |
-| Canonical 事实层 | 统一证券标识、强类型业务列、主键、排序键和 PIT 审计列 | 按数据集和业务分区保存内容寻址 Parquet；SQLite 只维护唯一当前指针 | `CanonicalResearchRepository`、质量规则和读取侧复权服务 | 暴露供应商字段；绕过 Mapper 写入；保存无法解释的隐式派生值 |
-| 研究视图与 Feature 派生层 | PIT 截断后的 LazyFrame、复权行情、收益、因子输入和运行内特征 | 绑定当前已验证 `catalog_hash`；默认按需计算，不形成第二套行情事实库 | Universe、Feature、Signal、Risk、回测和分析组件 | 绕过质量门；把未来可见数据返回给较早决策日；跨运行持久化未绑定目录身份的缓存 |
+### 2.3 快照、时间序列与事件
 
-第三层是逻辑层，不等于数据包内必须存在名为 `FeatureBuilder` 的固定实现。通用研究读取由
-`CanonicalResearchRepository` 提供，策略或研究组件在其上派生 Feature；Feature 不是 Raw 或
-Canonical 的替代品。
+- **快照**：某个时点看到的完整状态，例如全部股票基础信息。
+- **时间序列**：按时间持续追加的观察，例如每日行情。
+- **事件**：只在事情发生时出现的记录，例如停牌或风险警示。
 
-依赖方向固定为：
+事件表中“没有记录”通常表示事件没有发生，而不是应该人为补一行 `False`。
+
+### 2.4 Parquet、SQLite 与分区
+
+**Parquet**是适合分析型数据的列式文件格式。行情和财务数据存为 Parquet，便于 Polars、DuckDB 等工具只读取需要的列和分区。
+
+**SQLite**不保存大规模行情，而是保存控制信息，例如：
+
+- 哪些 Raw 请求已经成功；
+- 当前 Canonical 分区指向哪个文件；
+- 数据集和整套目录的哈希；
+- 质量运行是否通过。
+
+**分区**是把一个大数据集拆成多个文件。本项目的日行情按年分区，因此查询 2026 年数据时不必扫描所有历史年份。
+
+### 2.5 Instrument、Index 与 Security
+
+`security` 是金融语境中的上位概念，可以泛指股票、基金、债券和其他证券；它不等于“可以直接下单的资产”。
+
+本项目没有使用一个宽泛的 `SecurityId` 承担所有职责，而是明确区分：
+
+- `InstrumentId`：可直接交易的股票和场内基金，支持 `.SH`、`.SZ`、`.BJ`；
+- `IndexId`：不可直接交易的指数，只用于市场参考和 benchmark。
+
+例如：
 
 ```text
-研究组件 → CanonicalResearchRepository → Canonical 当前指针 → Canonical Parquet
-                                            ▲
-SourceClient → RawPartitionStore → CanonicalMapper → CuratedPartitionStore
-      ▲                                      │
-供应商适配器（infrastructure）                └→ QualityRunner
+600000.SH  -> InstrumentId，浦发银行，可以进入订单和持仓
+510300.SH  -> InstrumentId，场内 ETF，可以进入订单和持仓
+000300.SH  -> IndexId，沪深 300，只能作为指数或 benchmark
 ```
 
-- `SourceClient` 和 `CanonicalMapper` 是数据层定义的消费者侧协议；BaoStock、TuShare 适配器位于
-  `infrastructure`。
-- `pipeline` 可以依赖数据目录、存储协议、Mapper、质量规则和元数据端口；研究组件不能依赖 Pipeline。
-- SQLite 是 Raw 当前头、Canonical 当前指针、质量运行和门禁状态的元数据权威；Parquet 是大表内容载体。
+代码字符串可能长得相似，领域含义却不同。组合、订单和持仓只接受 `InstrumentId`，从类型上阻止把沪深 300 指数当成可买卖资产。
 
-### 3.2 可执行目录是流水线控制面
+## 3. 总体架构
 
-`DATASET_CATALOG` 是所有阶段共同使用的唯一可执行数据目录。每个 `DatasetSpec` 同时声明：
-
-- Canonical Schema、主键、排序键和 PIT 字段；
-- 物理分区方式：`year`、`report_year` 或 `all`；
-- 抓取粒度与 `FetchPlan`；
-- 增量回看天数、刷新频率和复用语义；
-- 供应商端点、字段映射以及一个 Raw 响应可 fan-out 的 Canonical 数据集；
-- 新鲜度判定依据和容忍范围。
-
-`RoutingTable` 只负责为数据集选择目录已声明的可用供应商。Pipeline 不以数据集名称编写第二套
-Schema、端点或分区分支；新增数据集必须先进入目录和 Canonical Schema，再由对应抓取计划及 Mapper
-实现能力。
-
-### 3.3 更新计划
-
-数据更新在入队前生成不可变 `DataUpdatePlan`，Worker 只执行持久化计划，不在执行时重新解释“更新到
-哪里”。计划按数据集保存 `DataUpdateWindow`：
-
-| `basis` | 生成条件 | 窗口语义 |
-| --- | --- | --- |
-| `EXPLICIT` | 用户同时提供开始日和结束日 | 使用显式闭区间，并按数据集日历边界修正 |
-| `INCREMENTAL` | 数据集已有当前水位 | 从 `min(current_watermark, latest_complete_day) - overlap_days` 开始，到目标业务日 |
-| `SNAPSHOT_REFRESH` | 数据集采用无历史窗口的全量快照 | 以计划日执行完整快照；不读取 Canonical 水位，不应用重叠窗口 |
-| `DISCLOSURE_TRIGGER` | 最近已结束财务报告期的披露截止日已被严格越过 | 仅包含该披露批次的报告期末范围；记录 `trigger_date`，不记录水位和重叠窗口 |
-
-`trade_calendar` 是日历前瞻覆盖数据集。自动计划的目标结束日固定扩展到计划业务日之后 90 个自然日，
-以便调度、开市日推算和研究区间校验；`canonical_dataset.end_date` 表示“日历覆盖末日”，不是市场数据
-已经更新到的业务水位。其 `overlap_days=30` 表示计划覆盖最近 30 个自然日，不是更新滞后；相同
-`request_hash` 的有效 Raw 当前头仍直接复用，不主动轮询同一请求的供应商修订。
-`dataset_operational_state.localized_through` 记录最近一次计划已检查到的业务日，不能用未来的
-日历覆盖末日替代。其他数据集不得借日历前瞻读取未来业务数据。计划中的数据集按 `dataset.value` 稳定
-排序，`plan_hash` 对不含生成时间的规范 JSON 求 SHA-256，用于提交幂等和“预览内容就是执行内容”的
-一致性校验。
-
-`instrument` 固定使用 `SNAPSHOT_REFRESH`。其 `list_date` 和 `delist_date` 是证券生命周期字段，
-不能作为数据更新水位；即使供应商返回未来上市证券，也不得把最大的 `list_date` 显示为当前水位。
-Canonical 的 `start_date/end_date` 对该数据集记录快照抓取业务日，自动计划和 Dashboard 均把
-`current_watermark`、`overlap_days` 展示为“不适用”。最近成功刷新证据来自
-`dataset_operational_state.last_localized_at/localized_through`。
-
-### 3.3.1 首次初始化
-
-`quant data bootstrap --years N` 是唯一首次初始化入口，`N` 为必填正整数。首次调用冻结
-`years/start/end` 并在 SQLite `data_initialization_state` 中登记为 `IN_PROGRESS`；中断后只能使用相同
-年数续跑原窗口，全部 Canonical 发布且 `validate-all` 成功后才转为 `COMPLETED`。完整目录禁止再次
-bootstrap。update 在空库、初始化中或任一可执行 Canonical 数据集缺失时返回
-`DATA_UPDATE_REQUIRES_BOOTSTRAP`，不再自动生成 BOOTSTRAP 数据集窗口。
-
-CLI 的 `localize` 和 `localize-all` 可以省略日期，此时先使用同一计划器推导窗口；Pipeline 的
-`localize(dataset, start, end)` 与 `localize_all(windows)` 只执行已解析日期，不读取水位或隐式扩大窗口。
-
-#### 3.3.2 `financial_observation` 的季度触发规则
-
-`financial_observation` 不使用 `canonical_dataset.end_date`、报告期最大值或 `overlap_days` 作为自动更新
-水位。财务报告不是逐日连续数据，自动更新只由季度最晚披露日触发。
-
-保守最晚披露日固定为：
-
-| 报告期 | 最晚披露日 |
-| --- | --- |
-| Q1（3 月 31 日） | 当年 4 月 30 日 |
-| Q2（6 月 30 日） | 当年 8 月 31 日 |
-| Q3（9 月 30 日） | 当年 10 月 31 日 |
-| Q4（12 月 31 日） | 次年 4 月 30 日 |
-
-自动计划以上海时区的 `planning_date` 判断：只有
-`planning_date > financial_disclosure_deadline(report_year, report_quarter)` 时，该报告期才进入抓取集合；
-披露截止日当天仍视为尚未完整结束，不抓取。
+数据从供应商到研究代码只沿着一条路径流动：
 
 ```text
-planning_date <= 最近已结束报告期的最晚披露日
-    → financial_observation 不进入本次自动更新计划
-    → skipped_datasets 记录 DISCLOSURE_DEADLINE_PENDING 和 trigger_date
-
-planning_date > 最近已结束报告期的最晚披露日
-    → 生成该披露批次的完整财务请求
-    → 每个有效证券 × 报告年 × 报告季度 × 财务端点
+Tushare
+   │
+   ▼
+LOCALIZE：保存供应商原始响应
+   │
+   ▼
+Raw Parquet ──────────────┐
+   │                      │ 请求、文件和哈希登记到 SQLite
+   ▼                      │
+CURATE：改名、转换、排序、分区
+   │                      │
+   ▼                      │
+Canonical Parquet ────────┘
+   │
+   ▼
+VALIDATE：Schema、主键、数值、覆盖和 PIT 校验
+   │
+   ▼
+全局研究读取门禁
+   │
+   ▼
+CanonicalResearchRepository
+   │
+   ├── 股票池与 ETF 池
+   ├── 因子与因子研究
+   ├── 策略与回测
+   └── Dashboard
 ```
 
-同一个最晚披露日可以对应多个报告期。例如 4 月 30 日同时对应“上一年度 Q4”和“本年度 Q1”，
-因此 5 月 1 日起的首个自动更新必须同时刷新这两个报告期，不能只取其中一个。
-
-该规则的具体含义是：
-
-- 自动计划不根据财务 Canonical 水位向前回看，也不生成连续日期窗口；
-- 未超过当前披露批次最晚发布日期时，不调用财务供应商端点；
-- 超过后只刷新最近到期披露批次，不因历史报告期较早而重复展开全部历史季度；
-- 同一季度再次运行时，规范请求身份不变，LOCALIZE 通过 Raw request 幂等检查直接复用；
-- 首次建库仍可按 bootstrap 范围补齐所有已经超过最晚披露日的历史报告期；显式更新可以按用户指定
-  报告期执行，不受自动触发规则限制；
-- 财务重述由同一请求后续取得的新 `content_hash` 和 CURATE revision 语义处理，不把重述检测伪装成
-  日期水位推进。
-
-Dashboard 必须直接展示后端计划证据，不在浏览器内重复推算截止日：
-
-- 数据资产表将财务证据显示为“季度披露 · `trigger_date` · 无需更新/待更新”，不得放入“实际/目标
-  水位”口径；
-- 自动计划预览把 `DISCLOSURE_DEADLINE_PENDING` 显示为跳过项，并在只有跳过项时禁用提交；
-- 越过截止日后，执行窗口依据显示为“季度披露”，当前水位和重叠天数显示“不适用”；
-- 运行中心按任务固化的 `trigger_date` 和跳过证据展示历史计划，不用当前日期重算历史结论。
-- `instrument` 显示“全量快照 · 最近刷新时间”；计划与运行详情显示“快照日期”，不得显示最大上市日
-  或数字 `0` 形式的重叠天数。
-- `trade_calendar` 的资产证据显示“日历覆盖至 / 已检查至”；计划与运行详情显示“覆盖至 / 修订回看
-  30 天 / 抓取开始日至结束日”，不得把未来覆盖末日标为“当前水位”。
+固定流水线为：
 
 ```text
-Dashboard / CLI
-      │ 请求预览或提交
-      ▼
-DataUpdatePlanner ──读取当前水位和供应商日历──> DataUpdatePlan
-      │                                               │
-      └──────────────规范 payload + plan_hash─────────┘
-                                                      ▼
-                                             DATA_UPDATE 任务
-                                                      ▼
-                                                   Worker
+LOCALIZE → CURATE → VALIDATE
 ```
 
-### 3.4 阶段总契约
+研究代码不得绕开 Repository 直接扫描 Raw 或 Canonical 目录。否则它可能读到未校验分区、旧文件、更新中间态或错误的 PIT 数据。
 
-流水线阶段固定为 `LOCALIZE → CURATE → VALIDATE`，不允许跳过前置阶段后直接开放研究读取门。
+## 4. Canonical 数据集目录
 
-| 阶段 | 主要输入 | 成功输出 | 可持久化检查点 | 是否允许开放研究门 |
-| --- | --- | --- | --- | --- |
-| `LOCALIZE` | 数据集窗口、路由、供应商会话、已有 Raw 当前头 | `PublishedPartition` 和 `LocalizeResult` | 每个规范请求完成后立即登记 Raw 对象和当前头 | 否 |
-| `CURATE` | 当前 Raw 头快照、Mapper、Canonical Schema、已有 Canonical 指针 | `DatasetCurateResult` 和新的数据集当前指针 | 每个 Canonical 数据集原子替换完成后登记 | 否；内容变化会使旧门禁失效 |
-| `VALIDATE` | 本次开始时的 `catalog_hash`、全部当前 Canonical 分区、质量规则 | 完整质量运行、规则结果、问题清单 | 质量运行整体登记 | 只有成功的 `validate-all` 可以开放 |
+Canonical 表示“项目内部唯一认可的标准形式”。以下 15 个数据集构成当前数据目录。
 
-完整更新返回 `PipelineResult(run_id, quality_run_id, data_hash)`；任务层另外保存各数据集的抓取数、跳过
-数、重建分区数、复用分区数、Raw 读取数和最终目录身份。
+| Canonical 数据集 | Tushare 端点 | 内容与量化用途 | 采集粒度 | Canonical 分区 |
+|---|---|---|---|---|
+| `stock_master` | `stock_basic` | 股票名称、上市状态、板块和上市日期；构建股票候选集合 | 按上市状态的全市场快照 | `all` |
+| `fund_master` | `fund_basic` | 全部场内基金基础信息；构建 ETF 等基金候选集合 | 全市场快照 | `all` |
+| `index_master` | `index_basic` | 指数名称、市场和基日；解释 benchmark | 按指数市场的全量快照 | `all` |
+| `trade_calendar` | `trade_cal` | 判断某天是否开市以及前一交易日 | 交易所日期区间 | `all` |
+| `stock_daily_bar` | `daily_vip` | 股票 OHLC、昨收、成交量和成交额 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `stock_adjustment_factor` | `adj_factor` | 股票本地复权所需因子 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `fund_daily_bar` | `fund_daily` | 场内基金每日行情 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `fund_adjustment_factor` | `fund_adj` | 场内基金本地复权所需因子 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `index_daily_bar` | `index_daily` | 配置的 benchmark 指数行情 | 按基准指数代码和日期区间 | `year=<YYYY>` |
+| `stock_daily_basic` | `daily_basic` | 估值、换手率、市值和股本等每日截面指标 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `stock_suspension` | `suspend_d` | 股票停牌事件 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `stock_risk_warning` | `stock_st` | ST 等风险警示事件 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `stock_financial_indicator` | `fina_indicator_vip` | ROE、利润率、偿债和成长等财务指标 | 每个报告期一次全市场请求 | `report_year=<YYYY>` |
+| `industry_catalog` | `index_classify` | 申万 2021 行业层级与代码目录 | 一级行业全量快照 | `all` |
+| `industry_membership` | `index_member_all` | 股票进入、退出各级行业的关系 | 按一级行业切片 | `all` |
 
-### 3.5 LOCALIZE：供应商响应本地化
+### 4.1 为什么优先使用全市场端点
 
-LOCALIZE 的职责仅限供应商 I/O、Raw 保真和请求级幂等：
+假设有 5,000 只股票。逐股票抓取会产生 5,000 次请求，失败恢复、限流和一致性处理都很复杂。逐交易日全市场抓取通常只需要一次请求，并具有三个优点：
 
-1. Pipeline 为本次 `localize-all` 建立一次供应商会话，按计划中的稳定数据集顺序执行。
-2. `FetchPlan` 把数据集窗口展开为规范请求单元，例如交易日、日期区间、完整证券快照或
-   “证券 × 报告年 × 季度 × 财务端点”。
-3. 每个请求先按规范 JSON 计算 `request_hash`，依次检查 SQLite 当前头和可信 Raw manifest。
-4. 已有、完整且允许复用的请求直接返回当前 `PublishedPartition`；否则调用供应商并取得 `RawBatch`。
-5. `RawPartitionStore` 把响应转换为全字符串 Arrow 表，计算内容身份，先写同目录临时文件，再原子安装
-   Parquet 和 `manifest.json`。
-6. 文件发布成功后登记 `raw_object`，并把 `raw_request.current_content_hash` 切换到该对象。
+- 请求数量更少，更新窗口容易重放；
+- 同一交易日的全市场截面来自一致的供应商查询；
+- 研究股票池不会反向决定我们保存哪些原始数据。
 
-物理布局为：
+因此，除 `index_daily` 外，采集请求不得携带 `ts_code`。行业成员可以因行数限制按一级行业切片，但不能按股票切片。
+
+ETF 策略池和股票池只在 Canonical 数据已经发布后过滤。例如策略只研究 20 只 ETF，也仍然采集全部场内基金行情。
+
+### 4.2 `index_daily` 为什么是例外
+
+指数不可交易，并且项目只需要少量 benchmark。配置文件中的基准指数为：
+
+```yaml
+tushare:
+  benchmark_indexes:
+    - 399317.SZ
+    - 000016.SH
+    - 000300.SH
+    - 000905.SH
+    - 000852.SH
+```
+
+`index_daily` 是唯一允许携带 `ts_code` 的请求。客户端在运行时也会拒绝其他端点包含该参数。
+
+## 5. LOCALIZE：保存原始事实
+
+LOCALIZE 的职责是“把供应商当时返回了什么”完整保存下来，不在这一阶段决定研究语义。
+
+以股票日行情为例，请求形态类似：
 
 ```text
-raw/
-└── source=<source>/
-    └── endpoint=<endpoint>/
-        └── <request_hash>/
-            ├── <content_hash>.parquet
-            └── manifest.json
+endpoint = daily_vip
+request  = {trade_date: 20260825}
 ```
 
-`manifest.json` 保存规范请求、当前内容哈希及该请求的内容历史。相同请求、相同内容重复发布必须幂等；
-相同请求返回不同内容时追加不可变 Raw 对象并切换当前头，不覆盖旧 Parquet。LOCALIZE 不执行
-Canonical 类型转换，也不修改研究读取门。
+其中没有股票代码。一次响应包含该交易日的全市场股票行情。
 
-### 3.6 CURATE：规范化、增量判定与发布
+### 5.1 Raw 为什么不能只保存最新文件
 
-CURATE 对计划选中的数据集检查全部当前业务分区，但只读取和重建生产输入身份变化的分区：
+供应商可能修订历史数据，同一个请求在不同日期返回的内容可能不同。Raw 层同时记录：
 
-1. 按数据集路由列出相关端点的 Raw 当前头，并冻结 `RawHeadSnapshot`。
-2. Mapper 根据请求业务范围计算候选 Canonical 分区键；Schema 不兼容的 Raw 不能静默进入转换。
-3. 为每个分区计算转换身份和 `input_hash`：
+- 请求内容；
+- 请求时间；
+- 请求哈希 `request_hash`；
+- 响应内容哈希 `content_hash`；
+- 字段列表、行数和发布文件。
 
-   ```text
-   transform_hash = hash(数据集 + Mapper/Schema + 分区及复用规则 + 发布语义)
-   input_hash     = hash(数据集 + 分区键 + transform_hash + 排序后的 Raw 输入身份)
-   ```
+相同请求和相同响应可以幂等复用；相同请求得到不同响应时，新内容会作为新的 Raw 对象保存，而不是覆盖旧文件。
 
-4. 旧分区满足“文件存在且旧 `input_hash == 新 input_hash`”时直接复用，不读取 Raw；以下情况进入重建：
-   `new_partition / canonical_file_missing / raw_input_changed`。Raw 输入消失且不是
-   Schema 阻断时，删除对应当前分区。
-5. 需要读取的 Raw 对象按稳定身份去重；一个 Raw 响应 fan-out 到多个 Canonical 数据集时只读取和
-   normalize 一次。
-6. Mapper 完成字段映射、强类型转换、证券标识统一、PIT 审计列生成和无效原因保留；随后按数据集
-   主键去重、按排序键稳定排序并形成完整分区。
-7. 发布前校验 Schema、主键唯一性和分区范围。Canonical Parquet 先写同文件系统临时文件，再按
-   `content_hash` 原子安装。
-8. 元数据事务在切换指针前再次比较当前 Raw 头与步骤 1 的快照；发生漂移时抛出
-   `DATA_CURATE_INPUT_CHANGED`，不得发布混合输入结果。
-
-物理布局为：
+### 5.2 Raw 路径
 
 ```text
-canonical/
-└── dataset=<dataset>/
-    └── <partition_key>/            # year=2026 / report_year=2025 / all
-        └── <content_hash>.parquet
+$QUANT_DATA_ROOT/
+└── raw/
+    └── source=tushare/
+        └── endpoint=daily_vip/
+            └── <request_hash>/
+                └── <content_hash>.parquet
 ```
 
-Canonical 数据集指针一次包含全部当前分区。替换某个分区时，未变化分区沿用旧指针，变化分区切换到
-新内容；只有 Canonical 内容真的变化才更新数据集身份和全局 `catalog_hash`，并使此前的全局质量门
-失效。失去引用的文件属于孤儿清理对象，不参与当前研究读取。
+路径方便人和工具定位文件，但身份来自文件内容和确定性元数据，不来自绝对路径。因此把整个数据根移动到另一块磁盘，不应改变数据身份。
 
-`input_hash` 描述“由哪些 Raw 输入和哪套转换语义生产”，`content_hash` 描述“最终分区内容是什么”；
-两者不能互相替代。输入身份变化但输出恰好相同时，可以重新计算后复用同一个内容寻址文件。
+## 6. CURATE：生成稳定的 Canonical 数据
 
-### 3.7 VALIDATE：质量运行与研究门
+CURATE 从 Raw 读取数据，并执行以下步骤：
 
-VALIDATE 分为两种范围：
+1. 检查端点和数据集的一对一映射；
+2. 验证供应商字段没有静默漂移；
+3. 重命名字段并转换日期、类型和单位；
+4. 添加审计列；
+5. 按稳定键排序；
+6. 按年、报告年或 `all` 生成分区；
+7. 计算输入和输出哈希；
+8. 在临时目录完成写入和校验后原子发布；
+9. 更新 SQLite 中唯一的当前分区指针。
 
-- `validate <dataset>`：诊断单个数据集并登记质量运行，不开放全局研究门。
-- `validate-all`：绑定全部可执行数据集的当前身份，只有它通过后才能开放研究读取门。
+“原子发布”可以理解为：读者只会看到旧版本或完整的新版本，不会看到写到一半的文件。
 
-`validate-all` 在开始时捕获 `catalog_hash`，解析并校验所有当前 Canonical 路径、Schema 和内容元数据，
-再执行“规则 × 数据集”矩阵。每条规则必须形成 `PASS / FAIL / SKIPPED` 结果；失败规则按严重级生成
-可执行 `QualityIssue`。质量运行完整登记后，元数据事务再次比较运行的 `input_hash` 与当前
-`catalog_hash`：
+### 6.1 字段标准化
+
+股票和基金使用：
 
 ```text
-质量通过且 catalog_hash 未漂移 → validated_catalog_hash = catalog_hash → 开门
-存在 SEVERE/FATAL 问题          → 记录 FAILED                  → 保持关门
-校验期间 catalog_hash 改变      → DATA_VALIDATE_INPUT_CHANGED  → 保持关门
+ts_code   → instrument_id
+pre_close → preclose
+pct_chg   → pct_change
+vol       → volume
 ```
 
-研究读取门的判定不是“最近有一个通过的质量运行”，而是
-`validated_catalog_hash == current catalog_hash`。因此任何 Canonical 内容变化都会自动关闭旧门禁，
-直到新的 `validate-all` 对当前目录通过。
-
-### 3.8 研究读取与 Feature 派生
-
-`CanonicalResearchRepository` 是研究侧唯一入口：
-
-1. 查询前要求当前目录已经通过 `validate-all`，并绑定该次读取使用的 `catalog_hash`。
-2. 只接受元数据当前指针中的受信任 Canonical 路径，不接受任意用户文件路径。
-3. 打开文件时验证路径仍位于可信根、文件类型和大小受限、Schema 与登记信息一致。
-4. 通过 Polars/DuckDB 下推数据集、日期、证券和字段过滤，返回 `pl.LazyFrame`。
-5. 在数据离开仓库前执行 `available_at` 和 `pit_usable` 物理截断；读取侧复权也只能使用截止日可见事件。
-
-Feature、Signal 和研究组件可以组合这些 LazyFrame，但必须携带或检查提交时捕获的 `catalog_hash`；
-运行阶段发现目录漂移立即失败，不能把两个目录状态的数据拼进同一个研究结果。
-
-### 3.9 原子性、恢复与并发
-
-- 同一数据根由进程级执行锁保护，同时只能有一个 LOCALIZE/CURATE/VALIDATE 写流程。
-- Raw 请求是最小恢复单元：任务失败或取消后，已经完整发布的 Raw 对象继续有效，重试按请求身份复用。
-- Canonical 数据集是 CURATE 的提交单元：单个数据集的当前指针只在全部目标分区写完并通过 Raw 头
-  快照检查后切换，不存在指向半文件的状态。
-- 完整更新不是跨所有数据集的大事务。若后续数据集失败，已成功切换的数据集可以保留，但目录门保持
-  关闭；重试利用 Raw 当前头和分区 `input_hash` 继续推进。
-- 取消在供应商请求、数据集和 Canonical 分区等安全边界生效；不删除已经发布的不可变证据。
-- `VALIDATE` 失败只登记诊断证据并保持关门，不回滚正确的 Raw 或 Canonical 内容。
-- 重试创建新的任务 attempt；不得覆盖旧 attempt 的状态、日志或结果。
-
-### 3.10 进度、日志与阶段结果
-
-Pipeline 通过 `PipelineObserver` 在阶段开始、数据集完成、请求完成和分区完成边界报告进度并检查取消。
-结构化日志至少覆盖：
-
-- LOCALIZE：供应商、端点、规范请求、请求/内容哈希、抓取或复用、行数和 Raw 路径；
-- CURATE：数据集、分区键、重建原因、Raw 输入数、输入/内容哈希、行数和指针是否变化；
-- VALIDATE：绑定的 `catalog_hash`、每条规则结果、问题严重级、质量运行 ID 和门禁结果；
-- Task/Worker：`task_id`、`attempt_id`、Worker、阶段进度、取消、失败或成功结果。
-
-端到端时序如下：
+指数使用：
 
 ```text
-提交端       Planner       Task/Worker       LOCALIZE        CURATE          VALIDATE       Repository
-  │             │               │                │               │                │               │
-  ├─更新请求───>│               │                │               │                │               │
-  │<─计划预览───┤               │                │               │                │               │
-  ├─提交 plan_hash─────────────>│                │               │                │               │
-  │             │               ├─执行固化计划──>│               │                │               │
-  │             │               │                ├─发布/复用 Raw─┤                │               │
-  │             │               │                │               ├─原子切换指针───>│               │
-  │             │               │                │               │                ├─登记质量运行──>│
-  │             │               │                │               │                ├─无漂移则开门──>│
-  │             │               │<────────────── PipelineResult ──────────────────┤               │
-  │<────────────任务状态与阶段结果───────────────┤               │                │               │
+ts_code → index_id
 ```
 
-上述时序中的每次指针切换和门禁开放都由 SQLite 事务完成；Parquet 发布使用同文件系统临时文件加原子
-重命名。数据库不得登记尚未完成写入和完整性校验的文件。
+字段不是运行时随意猜测的。每个端点的完整输出字段在代码中显式声明，Canonical Schema 也显式规定列顺序和类型。供应商突然增加、删除或改变字段时，流水线应失败并要求开发者检查，而不是悄悄生成含义未知的数据。
 
-## 4. Canonical 数据集
+### 6.2 单位标准化
 
-| 数据集 | 主键 | 说明 |
-| --- | --- | --- |
-| `instrument` | `instrument_id` | 证券主数据、板块、上市生命周期 |
-| `trade_calendar` | `trade_date` | 开市和休市状态 |
-| `daily_bar` | `instrument_id, trade_date` | 未复权 OHLCV 和成交额 |
-| `daily_basic` | `instrument_id, trade_date` | 估值和换手数据 |
-| `security_status` | `instrument_id, trade_date` | 上市、停牌、ST 和可交易状态 |
-| `corporate_action` | `instrument_id, ex_date, action_type` | 分红、送转和除权除息事件 |
-| `financial_observation` | `instrument_id, report_period, metric, revision` | PIT 财务及供应商重述 |
-| `industry_classification` | `as_of_date, instrument_id, taxonomy` | 按请求日期重建的行业状态 |
-| `index_bar` | `index_id, trade_date` | 指数行情，包括基准和全收益基准 |
+同一个数字在不同单位下可能相差几百或几万倍。Canonical 尽量使用可直接计算的基础单位：
 
-### 4.1 通用 PIT 审计列
+| 供应商语义 | Canonical 语义 | 示例 |
+|---|---|---|
+| 百分数 | 小数 | `2.5 → 0.025` |
+| 成交量“手” | 股 | `100 手 → 10,000 股` |
+| 成交额“千元” | 元 | `12 千元 → 12,000 元` |
+| 金额“万元” | 元 | `3 万元 → 30,000 元` |
+| 股本“万股” | 股 | `20 万股 → 200,000 股` |
 
-每个 Canonical 数据集尾部包含：
+策略和因子不得再次猜测或重复转换这些单位。
+
+### 6.3 五个统一审计列
+
+每个 Canonical 数据集都包含：
+
+| 列 | 含义 |
+|---|---|
+| `source` | 数据供应商，当前固定为 `tushare` |
+| `available_at` | 这条信息最早可被研究使用的时间 |
+| `availability_source` | `available_at` 的证据来源，例如公告日期或采集时间 |
+| `pit_usable` | 是否具备足够证据用于时点安全研究 |
+| `ingested_at` | 本系统实际接收到数据的时间 |
+
+`available_at` 和 `ingested_at` 不是同一个概念。供应商今天补发一条上周已经公告的数据时：业务上可能在上周就已公开，但本系统今天才采集到。系统必须根据端点能够提供的证据谨慎决定 `available_at`，证据不足时不能假装知道历史可用时间。
+
+### 6.4 Canonical 路径
 
 ```text
-source                # 供应商
-available_at          # 业务上最早可用于决策的时间，PIT 截断依据
-availability_source   # available_at 的确定依据
-pit_usable            # 是否足以支持 PIT；false 时保留供审计但不参与 PIT
-ingested_at           # 本地抓取时间，仅用于血缘，不替代 available_at
+$QUANT_DATA_ROOT/
+└── canonical/
+    └── source=tushare/
+        └── dataset=stock_daily_bar/
+            └── year=2026/
+                └── <content_hash>.parquet
 ```
 
-### 4.2 公司行为
-
-`corporate_action` 至少包含：
+其他示例：
 
 ```text
-instrument_id, ex_date, action_type(CASH_DIVIDEND|STOCK_DIVIDEND|SPLIT|...),
-cash_per_share, share_ratio, announced_at, available_at, pit_usable
+canonical/source=tushare/dataset=stock_master/all/<hash>.parquet
+canonical/source=tushare/dataset=stock_financial_indicator/report_year=2025/<hash>.parquet
+canonical/source=tushare/dataset=industry_membership/all/<hash>.parquet
 ```
 
-它有两个消费方向：
+旧路径 `canonical/dataset=...` 和其他供应商命名空间不会迁移。检测到旧布局时，系统要求使用新的 `QUANT_DATA_ROOT` 并重新 bootstrap，避免一套目录里存在两种语义。
 
-1. **复权计算**：Canonical 提供前复权、后复权和不复权入口，前复权因子由公司行为事件推导。
-2. **回测账务**：回测引擎按 `ex_date` 派发现金红利（`DIVIDEND` ledger 事件）并调整送转股数，
-   避免 NAV 在除权除息日因未复权价格跳变而失真。数据层首版即产出该数据集，回测侧消费属于 P3b-1。
+## 7. VALIDATE：在研究读取前做质量门禁
 
-## 5. 复权语义
+Canonical 文件成功写出不代表数据一定正确。VALIDATE 会检查数据契约和常见数据问题，例如：
 
-- Canonical `daily_bar` 存储**未复权**价格，保证撮合使用真实成交价格。
-- `AdjustmentService` 由 `corporate_action` 推导前复权因子，供因子和信号计算使用前复权序列。
-- **口径分离铁律**：回测撮合使用未复权价格和公司行为账务；因子信号使用前复权价格，二者不可混用。
+- 必需数据集或分区是否缺失、是否为空；
+- Schema、列顺序和类型是否符合声明；
+- 主键是否重复，关键字段是否为空；
+- OHLC 是否满足 `high ≥ open/close ≥ low`；
+- 价格是否为正且为有限数；
+- 成交量是否为负；
+- `pct_change` 是否与 `close / preclose - 1` 一致；
+- 股票和基金行情代码是否存在于相应 Master；
+- 财务公告日期和可用时间是否合理；
+- 行业进入、退出状态是否自洽。
 
-## 6. PIT 与研究读取
-
-- 研究代码只能通过 `CanonicalResearchRepository` 读取，禁止旁路扫描 Raw 或 Canonical 路径。
-- 读取按 `as_of / signal_date` 截断，物理上不返回 `available_at > 截断` 或 `pit_usable = false` 的行。
-- 财务：`financials_as_of` 选择信号日已知的最新 revision；`financial_history` 保留截止时点全部 revision，
-  不使用最终修订回填早期信号日。
-- 行业：按请求日期重建 as-of 状态，从首次出现该状态的 `as_of_date` 起可见，
-  不回写更早的 `supplier_update_date`。
-
-## 7. 质量门（VALIDATE）
-
-阻断规则如下：
+两个命令的作用不同：
 
 ```text
-FATAL : 必需数据集缺失或为空、交易日历无开市日、Canonical Schema 不符、
-        跨分区 Schema 不一致、主键重复
-SEVERE: 必填值为空、OHLC 关系错误、成交量为负、交易日覆盖缺口、证券未知、
-        财务可用时间缺失或倒置、公司行为除权日与行情跳变不一致
+quant data validate stock_daily_bar  # 诊断单个数据集
+quant data validate-all              # 校验完整目录并决定是否开放研究读取
 ```
 
-- 质量规则必须符合真实市场语义，例如停牌日 turnover 为空不能误报。
-- 结果按“规则 × 数据集”记录 `PASS / FAIL / SKIPPED`；只有全目录通过才能开放研究读取门。
+单数据集 `validate` 只用于诊断，不能打开研究门禁。只有完整 `validate-all` 通过，Repository 才允许研究代码读取当前目录。
 
-## 8. 数据身份
+这条规则避免出现“股票行情已更新，但复权因子或交易日历仍是旧数据”的混合状态。
 
-- 维护由全部当前 Canonical 数据集身份确定性汇总得到的 `catalog_hash`，仅表示当前 Canonical 状态。
-- `validated_catalog_hash` 记录最近一次通过 `validate-all` 的目录身份；它必须与当前 `catalog_hash`
-  相等，研究读取门才开放。
-- 目录身份只服务于实验运行的**运行内一致性门**：运行中数据变化时当前运行失败。
-- 不保存历史版本，不提供回放，也不把 `data_hash` 纳入跨运行实验复现身份。
+## 8. 行情与收益率
 
-## 9. 存储与性能
+### 8.1 OHLC 和昨收
 
-- Raw 和 Canonical 使用 Parquet；日频数据按 `year=` 分区，日更只重建输入发生变化的年度分区。
-- LOCALIZE 按 request 去重并支持断点续抓；CURATE 按分区输入身份变化增量重建。
-- 使用 DuckDB/Polars 向量化执行，进行投影下推并尽早过滤。
-- 年分区使日更成本随年内进度增长并在跨年后清零；如果年底日更成为瓶颈，可调整为月分区。
-  暂不实现复杂的 append-only 物理追加。
+日行情中常见字段为：
 
-## 10. 数据源隔离
+- `open`：开盘价；
+- `high`：最高价；
+- `low`：最低价；
+- `close`：收盘价；
+- `preclose`：用于当日涨跌幅计算的昨收价；
+- `volume`：成交量；
+- `amount`：成交额。
+
+简单收益率和对数收益率统一计算为：
 
 ```text
-SourceClient(Protocol): login/logout/fetch_* → RawBatch
-CanonicalMapper(Protocol): RawBatch → CanonicalBatch（供应商字段 → Canonical Schema）
+pct_change = close / preclose - 1
+log_return = log(close) - log(preclose)
 ```
 
-一期实现 BaoStock；后续增加 TuShare 适配器时不修改上层。ETF 行情、指数、行业和财务端点的
-供应商差异全部吸收在 Mapper 层。
+例如，`preclose=10.00`、`close=10.25`：
 
-## 11. 测试契约
+```text
+pct_change = 10.25 / 10.00 - 1 = 0.025
+```
 
-- **PIT**：财务和行业修订不回填旧信号日；`CanonicalResearchRepository` 物理截断有效；
-  公司行为可见性时点正确。
-- **质量**：每条规则具有字面量 oracle；合法市场异常不误报。
-- **复权和公司行为**：前复权因子由事件正确推导；除权日行情跳变与事件能够对账。
-- **确定性**：排序稳定，不依赖集合、文件系统或数据库未声明的顺序。
-- **隔离**：模拟 TuShare Mapper 产出与 BaoStock 一致的 Canonical Schema。
+Canonical 中保存的 `0.025` 表示 2.5%。Tushare 的 `pct_chg=2.5` 会转换为 `0.025`，但它只用于交叉校验，研究收益仍由价格公式计算，避免形成两套口径。
 
-## 12. 明确不做
+### 8.2 为什么要复权
 
-- 数据快照版本和历史 catalog 回放。
-- 跨运行数据复现，包括 source/env 指纹和旧数据回放；Raw/Canonical 内容寻址哈希继续保留，
-  因为它们服务于去重、增量和完整性。
-- 分钟、Tick、盘口和实时行情。
-- 北交所以外范围限制；市场范围按统一证券目录和能力契约控制，不再人为设限。
+公司分红、送股或拆股可能让价格在除权日机械下降，但投资者财富并没有同比例损失。如果直接用未复权收盘价计算跨日收益，会把公司行动误认为市场暴跌。
+
+本项目分别使用：
+
+- `stock_daily_bar + stock_adjustment_factor` 计算股票复权价；
+- `fund_daily_bar + fund_adjustment_factor` 计算基金复权价。
+
+前复权以查询结束日的因子为基准。OHLC 使用当日因子，`preclose` 使用前一交易日因子，使除权日收益能够连续。项目不会调用逐证券的 `pro_bar`。
+
+### 8.3 涨跌停
+
+核心公式为：
+
+```text
+upper = round_to_tick(preclose × (1 + limit_rate))
+lower = round_to_tick(preclose × (1 - limit_rate))
+```
+
+计算前还要确定股票当日交易画像：
+
+- 主板普通股票通常为 10%；
+- ST 等风险警示股票通常为 5%；
+- 创业板、科创板和北交所对应 20% 或 30% 规则组；
+- 上市初期等无涨跌幅限制日不计算上下限；
+- 停牌股票不能因为没有成交而被判断为涨停或跌停；
+- 指数不参与涨跌停判断。
+
+规则集中在 `MarketRuleBook` 和 `configs/rules/a_share.yaml`，策略不得各自复制一套公式。
+
+## 9. PIT：只使用当时已经知道的信息
+
+PIT 是 Point-in-Time 的缩写，意思是“站在某个历史时点看，当时能知道什么”。
+
+### 9.1 财务指标例子
+
+一家公司的 2025 年年报报告期是 2025-12-31，但可能到 2026-03-30 才公告。
+
+错误做法：在 2026-01-15 的回测中使用 2025 年年报数据。
+
+正确做法：只有公告和可用时间不晚于研究观察时点，数据才可见。
+
+`stock_financial_indicators(as_of=...)` 根据观察日过滤可见修订，而不是简单按报告期过滤。
+
+### 9.2 行业成员例子
+
+股票可能在历史上进入或退出某个行业。`industry_membership` 保存 `in_date`、`out_date` 及相应可用时间，`industry_memberships_on_dates(...)` 按查询日期重建当时有效的行业关系。
+
+如果供应商只提供今天看到的全量关系，而无法证明过去何时公开，系统不能凭空制造历史知识。这种记录需要以谨慎的 `available_at` 和 `pit_usable` 表达证据边界。
+
+## 10. 更新计划、新鲜度与增量重建
+
+不同数据集的更新方式不同：
+
+| 类别 | 更新频率 | 重用方式 | 回看窗口 |
+|---|---|---|---|
+| 股票、基金、指数 Master | 每日检查 | 全量刷新 | 0 天 |
+| 交易日历 | 每日 | 追加并允许尾部修订 | 30 天 |
+| 日行情、复权因子、每日指标和事件 | 每个交易日 | 追加并允许尾部修订 | 5 天 |
+| 财务指标 | 季度披露触发 | 追加并允许历史重述 | 按报告期 |
+| 行业目录和成员 | 每周 | 全量刷新 | 0 天 |
+
+“回看 5 天”表示更新时不仅抓最新一天，也重新抓最近几天，以吸收供应商对尾部数据的修订。
+
+CURATE 不会无条件重写全部历史。每个 Canonical 分区记录其 Raw 输入身份 `input_hash`：
+
+- Raw 输入未变化，分区可以复用；
+- Raw 输入变化，只重建受影响分区；
+- 数据集声明为全量刷新语义时，才重建全部目标分区。
+
+新鲜度不是简单比较电脑日期：
+
+- 行情按最近完整交易会话判断；
+- 交易日历需要覆盖未来规划窗口；
+- 财务数据按披露截止日判断是否应该更新；
+- 快照类数据按最近成功刷新时间判断。
+
+## 11. 数据身份与可重复性
+
+系统使用多层 SHA-256 身份回答“究竟什么发生了变化”：
+
+| 身份 | 回答的问题 |
+|---|---|
+| `request_hash` | 这是不是同一个供应商请求？ |
+| Raw `content_hash` | 供应商对该请求返回的内容是否变化？ |
+| Canonical `input_hash` | 生成该分区的 Raw 输入集合是否变化？ |
+| 分区 `content_hash` | 清洗后的分区内容是否变化？ |
+| 数据集 `data_hash` | 该数据集当前全部分区的组合是否变化？ |
+| `catalog_hash` | 15 个当前 Canonical 数据集的整体身份是否变化？ |
+
+绝对路径不参与这些哈希。相同内容从 `D:` 盘移动到 `E:` 盘不会变成不同数据。
+
+实验或因子运行提交时捕获当前 `catalog_hash`。运行阶段前后都会检查它：
+
+```text
+提交时 catalog_hash = A
+运行中后台完成数据更新，catalog_hash = B
+因为 A != B，本次运行以数据漂移错误失败
+```
+
+这比把更新前后的数据混在一次回测中更安全。项目没有可供选择的历史 Snapshot 或 `snapshot_id`；`catalog_hash` 是一致性身份，不是一个可回放版本仓库。
+
+## 12. 研究读取接口
+
+研究层通过 `CanonicalResearchRepository` 读取数据。基础实体接口为：
+
+```text
+stocks()
+funds()
+indexes()
+```
+
+行情接口为：
+
+```text
+stock_bars(InstrumentId, start, end)
+fund_bars(InstrumentId, start, end)
+index_bars(IndexId, start, end)
+```
+
+其他主要接口包括：
+
+```text
+adjusted_stock_bars(...)
+adjusted_fund_bars(...)
+stock_log_returns(...)
+fund_log_returns(...)
+stock_daily_basics(...)
+stock_financial_indicators(as_of, ...)
+stock_suspensions(...)
+stock_risk_warnings(...)
+industry_catalog()
+industry_memberships_on_dates(...)
+trade_calendar(...)
+```
+
+接口返回 Polars `LazyFrame`。可以把它理解为“尚未执行的查询计划”：Repository 先描述需要哪些列、日期和证券，调用 `.collect()` 时才真正读取 Parquet。这有助于减少不必要的磁盘扫描。
+
+不存在通用 `instruments()`、`bars()`、`adjusted_bars()` 或 `security_status()`。拆分接口让调用者明确自己处理的是股票、基金还是指数，也避免把停牌和 ST 两种不同事件混成一个来源不清的状态表。
+
+## 13. 各类消费者怎样组合数据
+
+### 13.1 股票池
+
+股票池不是供应商抓取过滤器。它在 Canonical 读取后显式组合：
+
+```text
+stock_master
+  + stock_daily_bar
+  + stock_suspension
+  + stock_risk_warning
+  + 规则与研究配置
+  = 某日可研究股票池
+```
+
+### 13.2 ETF 策略
+
+ETF 策略读取 `fund_master` 和 `fund_daily_bar`，再按策略配置过滤候选 ETF。ETF 属于可交易的场内基金，因此使用 `InstrumentId`。
+
+### 13.3 Benchmark
+
+实验配置中的 benchmark 在解析时转换为 `IndexId`。回测通过 `index_bars()` 单独读取指数收盘价，不把指数插入可交易 MarketSlice，也不允许进入订单或持仓。
+
+### 13.4 Dashboard
+
+Dashboard 分别读取股票、基金和指数。它可以在响应层组合展示结果，但不会把跨数据集拼接结果再次持久化为一张来源含混的大表。
+
+数据中心同时读取持久化的初始化状态。尚未开始时展示「初始化数据」，失败后处于
+`IN_PROGRESS` 时展示「继续初始化」并锁定首次冻结的历史年数；只有状态达到
+`COMPLETED` 后才展示日常更新和质量运行入口。Dashboard 只创建
+`DATA_BOOTSTRAP` 后台任务，真正的 `LOCALIZE → CURATE → VALIDATE` 仍由 Worker
+执行，因此关闭浏览器不会中断初始化。
+
+## 14. 日常操作
+
+首次运行前设置数据根和 Tushare Token。数据根必须位于源码目录之外；未设置
+`QUANT_DATA_ROOT` 时默认使用 `~/qlab-data`：
+
+```powershell
+$env:QUANT_DATA_ROOT = "D:\quant-data"
+```
+
+数据源 Token 通过 Dashboard「设置」页维护，或直接写入数据根下的明文
+`$QUANT_DATA_ROOT/.env`：
+
+```dotenv
+QUANT_TUSHARE_TOKEN=<your-token>
+```
+
+运行时优先读取数据根 `.env`，缺失时才回退到进程环境变量。源码树不提供
+`.env.example`，也不得在源码根保存 Token。
+
+首次构建最近五年数据：
+
+```powershell
+uv run quant data bootstrap --years 5
+```
+
+日常自动增量更新：
+
+```powershell
+uv run quant data update
+```
+
+开发或排障时，可以分阶段运行：
+
+```powershell
+uv run quant data localize stock_daily_bar --from 2026-08-01 --to 2026-08-25
+uv run quant data curate stock_daily_bar --from 2026-08-01 --to 2026-08-25
+uv run quant data validate stock_daily_bar
+uv run quant data validate-all
+```
+
+`bootstrap` 和 `update` 会编排完整流程。分阶段命令主要用于理解、测试和定位错误。
+
+生产假设是 Tushare 账户具有所需积分、VIP 和基金复权权限。Token 不得写入代码、配置文件、日志或测试数据。
+
+## 15. 常见故障与处理
+
+| 现象 | 常见原因 | 正确处理 |
+|---|---|---|
+| 提示旧 Canonical 布局 | 数据根仍有 `canonical/dataset=...` | 更换空的数据根并重新 bootstrap，不做混合迁移 |
+| Tushare 请求被拒绝 | Token 缺失、积分或接口权限不足 | 检查环境变量和账户权限 |
+| 端点返回行数达到上限 | 全市场结果可能被截断 | 让采集失败，调整合法的市场、日期或行业切片；不能静默接受 |
+| Schema 漂移 | Tushare 输出字段发生变化 | 对照官方端点检查并同步 Schema、Mapper、测试和文档 |
+| 单数据集 validate 通过但研究仍不能读 | 全局门禁尚未通过 | 运行 `validate-all` 并处理其他数据集问题 |
+| 实验提示数据漂移 | 运行期间 `catalog_hash` 变化 | 在数据更新完成并重新验证后重新提交运行 |
+| 某日没有股票行情 | 休市、停牌、抓取缺失或数据错误 | 结合交易日历和停牌事件判断，不能直接填零 |
+| 行业或财务数据不可用于历史日期 | 缺少可靠可用时间证据 | 保持 PIT 限制，不用当前状态回填历史 |
+
+## 16. 新增或修改数据集时的开发清单
+
+数据契约变化必须一次性同步，不能只改下载代码。通常需要检查：
+
+1. 在 `DatasetKind` 中确定最终数据集名称；
+2. 在 Canonical Schema 中声明完整列、类型、主键和排序键；
+3. 在数据集目录中声明端点、分区、抓取粒度、频率、重用和新鲜度；
+4. 在 Tushare 客户端中显式声明官方输出字段和合法请求；
+5. 在 Mapper 中实现字段、日期、单位、代码和审计列转换；
+6. 确认请求不违反“除 `index_daily` 外禁止 `ts_code`”；
+7. 增加质量规则和 Repository 读取接口；
+8. 更新股票池、因子、策略、回测或 Dashboard 消费者；
+9. 增加字面量测试，覆盖字段映射、单位、PIT、哈希和路径；
+10. 同步本文及相关架构文档。
+
+项目未发布，不保留旧数据集名称或旧接口兼容层。设计改变时应直接迁移到唯一最终语义。
+
+## 17. 必须始终成立的不变量
+
+- 唯一生产数据源是 Tushare。
+- 数据流水线固定为 `LOCALIZE → CURATE → VALIDATE`。
+- 除 `index_daily` 外，采集请求不得携带证券代码。
+- 股票池和 ETF 池不得控制上游采集范围。
+- 股票和基金使用 `InstrumentId`，指数使用 `IndexId`。
+- Canonical 只接受 `source=tushare` 命名空间。
+- 路径不参与内容、输入或目录哈希。
+- 供应商百分数进入 Canonical 时转换为小数。
+- 研究收益由 `close` 和 `preclose` 计算。
+- 股票和基金复权在本地使用各自复权因子完成。
+- 财务和行业研究必须遵守 PIT 可用时间。
+- 单数据集校验不开放研究读取；只有 `validate-all` 可以。
+- 研究代码只能通过 `CanonicalResearchRepository` 读取。
+- 实验运行期间 `catalog_hash` 不得漂移。
+- 组合、订单和持仓不得接受 `IndexId`。

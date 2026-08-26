@@ -31,7 +31,7 @@ from quant_research.dashboard.models import (
 from quant_research.data.repository import ResearchDataRepository
 from quant_research.domain.enums import Board, DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
-from quant_research.domain.identifiers import InstrumentId
+from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.infrastructure.persistence.repositories import DataCatalogState
 
 _INDEXES = (
@@ -42,10 +42,11 @@ _INDEXES = (
     ("000852.SH", "中证1000"),
 )
 _REQUIRED_DATED_DATASETS = (
-    DatasetKind.DAILY_BAR,
-    DatasetKind.DAILY_BASIC,
-    DatasetKind.SECURITY_STATUS,
-    DatasetKind.INDEX_BAR,
+    DatasetKind.STOCK_DAILY_BAR,
+    DatasetKind.STOCK_DAILY_BASIC,
+    DatasetKind.STOCK_SUSPENSION,
+    DatasetKind.STOCK_RISK_WARNING,
+    DatasetKind.INDEX_DAILY_BAR,
 )
 _LIMIT_NOTE = (
     "涨跌停按现有 A 股规则簿估算；上市前五个交易日和无法分类证券不纳入。"
@@ -206,10 +207,7 @@ class MarketReviewService:
             raise ValueError("market review history is empty")
         history_start = sessions[0]
 
-        instruments = self._repository.instruments().collect()
-        stock_rows = instruments.filter(pl.col("instrument_type") == "STOCK").rows(
-            named=True
-        )
+        stock_rows = self._repository.stocks().collect().rows(named=True)
         stock_ids = tuple(
             InstrumentId.parse(cast(str, row["instrument_id"])) for row in stock_rows
         )
@@ -217,33 +215,61 @@ class MarketReviewService:
             raise ValueError("market review stock universe is empty")
         metadata = {cast(str, row["instrument_id"]): row for row in stock_rows}
 
-        bars = self._repository.bars(stock_ids, history_start, selected).collect()
-        statuses = self._repository.security_status_range(
+        bars = self._repository.stock_bars(
+            stock_ids, history_start, selected
+        ).collect()
+        suspensions = self._repository.stock_suspensions(
             history_start, selected, stock_ids
         ).collect()
-        status_by_key = {
-            (cast(str, row["instrument_id"]), cast(date, row["trade_date"])): row
-            for row in statuses.rows(named=True)
+        warnings = self._repository.stock_risk_warnings(
+            history_start, selected, stock_ids
+        ).collect()
+        suspended_keys = {
+            (cast(str, row["instrument_id"]), cast(date, row["trade_date"]))
+            for row in suspensions.rows(named=True)
+        }
+        warning_keys = {
+            (cast(str, row["instrument_id"]), cast(date, row["trade_date"]))
+            for row in warnings.rows(named=True)
         }
         market_rows: dict[date, list[dict[str, object]]] = defaultdict(list)
         for bar in bars.rows(named=True):
             identifier = cast(str, bar["instrument_id"])
             session = cast(date, bar["trade_date"])
-            status = status_by_key.get((identifier, session))
-            if status is None or status.get("is_listed") is not True:
+            master = metadata[identifier]
+            listed = self._is_listed(master, session)
+            is_st = (identifier, session) in warning_keys
+            if not listed:
                 continue
-            if exclude_st and status.get("is_st") is True:
+            if exclude_st and is_st:
                 continue
-            market_rows[session].append({**bar, **status, **metadata[identifier]})
+            market_rows[session].append(
+                {
+                    **bar,
+                    **master,
+                    "is_listed": listed,
+                    "is_st": is_st,
+                    "is_suspended": (identifier, session) in suspended_keys,
+                    "instrument_type": "STOCK",
+                }
+            )
 
         current_statuses = [
-            row
-            for row in statuses.filter(pl.col("trade_date") == selected).rows(
-                named=True
+            {
+                **row,
+                "trade_date": selected,
+                "is_listed": True,
+                "is_st": (cast(str, row["instrument_id"]), selected) in warning_keys,
+                "is_suspended": (
+                    cast(str, row["instrument_id"]), selected
+                ) in suspended_keys,
+            }
+            for row in stock_rows
+            if self._is_listed(row, selected)
+            and (
+                not exclude_st
+                or (cast(str, row["instrument_id"]), selected) not in warning_keys
             )
-            if row.get("is_listed") is True
-            and (not exclude_st or row.get("is_st") is not True)
-            and cast(str, row["instrument_id"]) in metadata
         ]
         current = market_rows[selected]
         priced = [row for row in current if self._is_priced(row)]
@@ -264,7 +290,7 @@ class MarketReviewService:
             coverage_rate=(priced_count / denominator if denominator > 0 else None),
         )
 
-        returns = [cast(float, row["pct_change"]) / 100.0 for row in priced]
+        returns = [cast(float, row["pct_change"]) for row in priced]
         breadth = self._breadth(returns)
         liquidity = self._liquidity(sessions, market_rows)
         index_views = self._indexes(sessions, history_start, selected)
@@ -299,7 +325,7 @@ class MarketReviewService:
     def _indexes(
         self, sessions: tuple[date, ...], start: date, end: date
     ) -> tuple[MarketReviewIndex, ...]:
-        identifiers = tuple(InstrumentId.parse(item[0]) for item in _INDEXES)
+        identifiers = tuple(IndexId.parse(item[0]) for item in _INDEXES)
         frame = self._repository.index_bars(identifiers, start, end).collect()
         result: list[MarketReviewIndex] = []
         for identifier, name in _INDEXES:
@@ -312,7 +338,7 @@ class MarketReviewService:
             if selected_row.height:
                 row = selected_row.row(0, named=True)
                 pct = self._finite(row["pct_change"])
-                daily_return = None if pct is None else pct / 100.0
+                daily_return = pct
                 high = self._finite(row["high"])
                 low = self._finite(row["low"])
                 previous = self._finite(row["preclose"])
@@ -482,7 +508,7 @@ class MarketReviewService:
                     name=cast(str, row["name"]),
                     board=cast(str, row["board"]),
                     is_st=row.get("is_st") is True,
-                    pct_change=cast(float, row["pct_change"]) / 100.0,
+                    pct_change=cast(float, row["pct_change"]),
                     amount=amount,
                     event=cast(
                         Literal[
@@ -528,8 +554,8 @@ class MarketReviewService:
         selected: date,
         expected_count: int,
     ) -> MarketReviewIndustries:
-        frame = self._repository.industry_classifications_as_of(
-            None, selected
+        frame = self._repository.industry_memberships_on_dates(
+            None, (selected,)
         ).collect()
         if frame.is_empty():
             return MarketReviewIndustries(
@@ -539,13 +565,16 @@ class MarketReviewService:
                 unavailable_reason="所选日期之前没有可用的供应商重建快照",
                 items=(),
             )
-        taxonomies = sorted(cast(list[str], frame["taxonomy"].unique().to_list()))
-        taxonomy = taxonomies[0]
+        taxonomy = "SW2021"
         selected_ids = [item.canonical() for item in stock_ids]
         frame = frame.filter(
-            (pl.col("taxonomy") == taxonomy)
-            & pl.col("instrument_id").is_in(selected_ids)
-            & pl.col("is_classified")
+            pl.col("instrument_id").is_in(selected_ids)
+        ).with_columns(
+            pl.col("level1_code").alias("industry_code"),
+            pl.col("level1_name").alias("industry_name"),
+        ).filter(
+            pl.col("industry_code").is_not_null()
+            & pl.col("industry_name").is_not_null()
         )
         classification = {
             cast(str, row["instrument_id"]): row for row in frame.rows(named=True)
@@ -568,7 +597,7 @@ class MarketReviewService:
             industry = classification[identifiers[0]]
             valid_ids = [item for item in identifiers if item in priced_ids]
             returns = [
-                cast(float, current_by_id[item]["pct_change"]) / 100.0
+                cast(float, current_by_id[item]["pct_change"])
                 for item in valid_ids
             ]
             amount = sum(
@@ -632,14 +661,16 @@ class MarketReviewService:
         selected: date,
     ) -> MarketReviewValuation:
         allowed = {cast(str, row["instrument_id"]) for row in priced}
-        frame = self._repository.daily_basics(stock_ids, selected, selected).collect()
+        frame = self._repository.stock_daily_basics(
+            stock_ids, selected, selected
+        ).collect()
         rows = [
             row
             for row in frame.rows(named=True)
             if cast(str, row["instrument_id"]) in allowed
         ]
         metrics: list[MarketReviewValuationMetric] = []
-        for metric in ("pe_ttm", "pb_mrq", "ps_ttm"):
+        for metric in ("pe_ttm", "pb", "ps_ttm"):
             values = [
                 value
                 for row in rows
@@ -655,9 +686,10 @@ class MarketReviewService:
                 )
             )
         turnovers = [
-            value / 100.0
+            value
             for row in rows
-            if (value := self._finite(row.get("turnover"))) is not None and value >= 0.0
+            if (value := self._finite(row.get("turnover_rate"))) is not None
+            and value >= 0.0
         ]
         return MarketReviewValuation(
             metrics=tuple(metrics),
@@ -672,6 +704,16 @@ class MarketReviewService:
         return all(
             MarketReviewService._finite(row.get(field)) is not None
             for field in ("open", "high", "low", "close", "preclose", "pct_change")
+        )
+
+    @staticmethod
+    def _is_listed(row: Mapping[str, object], session: date) -> bool:
+        listing = row.get("list_date")
+        delisting = row.get("delist_date")
+        return (
+            isinstance(listing, date)
+            and listing <= session
+            and (not isinstance(delisting, date) or delisting > session)
         )
 
     @staticmethod

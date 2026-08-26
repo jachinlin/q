@@ -20,7 +20,7 @@ from quant_research.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext, Fac
 
 _RETURN_WINDOWS = frozenset({20, 60, 120})
 _HISTORY_CALENDAR_MULTIPLIER = 3
-_PRICE_BASIS = "baostock_forward_log_return"
+_PRICE_BASIS = "tushare_local_forward_log_return"
 _LOG_RETURN_FORMULA = "log_close_minus_log_preclose"
 _PATH_CONSTRUCTION = "window_forward_cumsum"
 

@@ -17,10 +17,10 @@ from quant_research.data.pipeline.publish import (
 )
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.errors import QuantError
-from quant_research.infrastructure.baostock.routing import BAOSTOCK_ROUTES
 from quant_research.infrastructure.persistence.repositories import (
     CanonicalDatasetRecord,
 )
+from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 
 
 class _Calendar:
@@ -67,7 +67,7 @@ def _planner(
     return DataUpdatePlanner(
         calendar=_Calendar(),
         repository=repository,
-        routes=BAOSTOCK_ROUTES,
+        routes=TUSHARE_ROUTES,
         clock=lambda: planned_at,
     )
 
@@ -82,16 +82,16 @@ def test_auto_plan_freezes_each_dataset_window_without_null_parameters() -> None
         sorted(
             item.value
             for item in DATASET_CATALOG
-            if BAOSTOCK_ROUTES[item] and item is not DatasetKind.FINANCIAL_OBSERVATION
+            if TUSHARE_ROUTES[item]
         )
     )
     assert tuple(item.dataset.value for item in plan.dataset_windows) == expected
     assert tuple(item.dataset for item in plan.skipped_datasets) == (
-        DatasetKind.FINANCIAL_OBSERVATION,
+        DatasetKind.STOCK_FINANCIAL_INDICATOR,
     )
     assert plan.skipped_datasets[0].trigger_date == date(2026, 8, 31)
     instrument = next(
-        item for item in plan.dataset_windows if item.dataset is DatasetKind.INSTRUMENT
+        item for item in plan.dataset_windows if item.dataset is DatasetKind.STOCK_MASTER
     )
     calendar = next(
         item
@@ -124,16 +124,16 @@ def test_plan_hash_excludes_generation_time_but_covers_resolved_windows() -> Non
 
 
 def test_partial_auto_plan_rejects_an_incomplete_global_baseline() -> None:
-    repository = _Repository(frozenset({DatasetKind.INSTRUMENT}))
+    repository = _Repository(frozenset({DatasetKind.STOCK_MASTER}))
     with pytest.raises(QuantError) as captured:
         _planner(repository).plan(
             start=None,
             end=None,
-            datasets=(DatasetKind.DAILY_BASIC, DatasetKind.DAILY_BAR),
+            datasets=(DatasetKind.STOCK_DAILY_BASIC, DatasetKind.STOCK_DAILY_BAR),
         )
 
     assert captured.value.detail.code == "DATA_UPDATE_REQUIRES_BOOTSTRAP"
-    assert DatasetKind.INSTRUMENT in repository.requested
+    assert DatasetKind.STOCK_MASTER in repository.requested
 
 
 def test_bootstrap_plan_uses_required_years_and_freezes_base_window() -> None:
@@ -145,7 +145,7 @@ def test_bootstrap_plan_uses_required_years_and_freezes_base_window() -> None:
     assert all(
         item.basis is DataUpdateWindowBasis.BOOTSTRAP
         for item in plan.dataset_windows
-        if item.dataset is not DatasetKind.INSTRUMENT
+        if item.dataset is not DatasetKind.STOCK_MASTER
     )
     assert DataUpdatePlan.from_payload(plan.to_payload()) == plan
 
@@ -153,7 +153,7 @@ def test_bootstrap_plan_uses_required_years_and_freezes_base_window() -> None:
 def test_partial_plan_rejects_empty_and_duplicate_dataset_selections() -> None:
     planner = _planner(_Repository())
 
-    for datasets in ((), (DatasetKind.DAILY_BAR, DatasetKind.DAILY_BAR)):
+    for datasets in ((), (DatasetKind.STOCK_DAILY_BAR, DatasetKind.STOCK_DAILY_BAR)):
         try:
             planner.plan(start=None, end=None, datasets=datasets)
         except ValueError:
@@ -173,10 +173,10 @@ def test_explicit_plan_records_request_and_normalized_dataset_windows() -> None:
     assert all(
         item.basis is DataUpdateWindowBasis.EXPLICIT
         for item in plan.dataset_windows
-        if item.dataset is not DatasetKind.INSTRUMENT
+        if item.dataset is not DatasetKind.STOCK_MASTER
     )
     instrument = next(
-        item for item in plan.dataset_windows if item.dataset is DatasetKind.INSTRUMENT
+        item for item in plan.dataset_windows if item.dataset is DatasetKind.STOCK_MASTER
     )
     assert instrument.basis is DataUpdateWindowBasis.SNAPSHOT_REFRESH
     assert instrument.current_watermark is None
@@ -190,7 +190,7 @@ def test_financial_auto_plan_uses_disclosure_batch_without_watermark() -> None:
     ).plan(
         start=None,
         end=None,
-        datasets=(DatasetKind.FINANCIAL_OBSERVATION,),
+        datasets=(DatasetKind.STOCK_FINANCIAL_INDICATOR,),
     )
 
     assert plan.skipped_datasets == ()
@@ -210,7 +210,7 @@ def test_financial_auto_plan_is_no_op_until_deadline_is_strictly_passed() -> Non
     ).plan(
         start=None,
         end=None,
-        datasets=(DatasetKind.FINANCIAL_OBSERVATION,),
+        datasets=(DatasetKind.STOCK_FINANCIAL_INDICATOR,),
     )
 
     assert plan.dataset_windows == ()
@@ -226,7 +226,7 @@ def test_instrument_snapshot_ignores_future_canonical_list_date_watermark() -> N
     ).plan(
         start=None,
         end=None,
-        datasets=(DatasetKind.INSTRUMENT,),
+        datasets=(DatasetKind.STOCK_MASTER,),
     )
 
     window = plan.dataset_windows[0]
@@ -247,7 +247,7 @@ def test_instrument_canonical_window_uses_snapshot_time_not_listing_lifecycle() 
         }
     )
     batch = CanonicalBatch(
-        DatasetKind.INSTRUMENT,
+        DatasetKind.STOCK_MASTER,
         frame,
         ("a" * 64,),
     )

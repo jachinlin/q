@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "quant_research"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _CHINESE = re.compile(r"[\u4e00-\u9fff]")
 _REQUIRED_SECTIONS = ("入参", "返回值", "异常")
 _MEANINGLESS_DOCSTRING_PHRASES = (
@@ -84,8 +85,6 @@ _MODULE_FUNCTION_ALLOWLIST: Mapping[str, str] = {
     "quant_research.data.quality.rules.financial_availability_issues": "stable_public_api",
     "quant_research.data.quality.rules.industry_state_issues": "stable_public_api",
     "quant_research.data.storage.verified_files.open_verified_file": "stable_public_api",
-    "quant_research.infrastructure.baostock.client.to_baostock_code": "stable_public_api",
-    "quant_research.infrastructure.baostock.client.from_baostock_code": "stable_public_api",
     "quant_research.data.storage.paths.resolved_storage_root": "stable_public_api",
     "quant_research.data.storage.paths.validate_storage_path": "stable_public_api",
     "quant_research.experiments.fingerprint.compute_fingerprint": "stable_public_api",
@@ -437,3 +436,13 @@ class Rules:
     assert "公开职责、状态与不变量" in message
     assert "调用所需的" in message
     assert "返回职责所述结果" in message
+
+
+def test_repository_root_does_not_offer_a_source_tree_env_example() -> None:
+    """验证运行凭据只能由数据根设置文件承载。
+
+    入参：无。
+    返回值：无。
+    异常：代码根重新出现 ``.env.example`` 时由断言阻断。
+    """
+    assert not (_REPOSITORY_ROOT / ".env.example").exists()

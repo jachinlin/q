@@ -35,6 +35,17 @@ trading_profiles:
     settlement_sessions: 1
     price_limit_group: STAR
     fee_group: STOCK
+  STOCK_BSE:
+    instrument_type: STOCK
+    price_tick: "0.01"
+    buy_minimum: 100
+    buy_increment: 1
+    sell_minimum: 100
+    sell_increment: 1
+    allow_full_odd_lot_sell: true
+    settlement_sessions: 1
+    price_limit_group: BSE
+    fee_group: STOCK
   ETF_STOCK_T1_10:
     instrument_type: ETF
     price_tick: "0.001"
@@ -72,6 +83,7 @@ automatic_profiles:
   STOCK:MAIN: STOCK_MAIN
   STOCK:CHINEXT: STOCK_CHINEXT
   STOCK:STAR: STOCK_STAR
+  STOCK:BSE: STOCK_BSE
 instrument_profiles:
   510001.SH: ETF_STOCK_T1_10
   510002.SH: ETF_STOCK_T1_10
@@ -93,6 +105,8 @@ price_limits:
   # IPO/relisting/delisting no-limit exceptions need lifecycle inputs and are not inferred.
   - {group: STAR, status: NORMAL, start: 2005-01-24, end: null, rate: "0.20"}
   - {group: STAR, status: ST, start: 2005-01-24, end: null, rate: "0.20"}
+  - {group: BSE, status: NORMAL, start: 2005-01-24, end: null, rate: "0.30"}
+  - {group: BSE, status: ST, start: 2005-01-24, end: null, rate: "0.30"}
   - {group: ETF_10, status: NORMAL, start: 2005-01-24, end: null, rate: "0.10"}
   - {group: ETF_20, status: NORMAL, start: 2005-01-24, end: null, rate: "0.20"}
 stamp_duty:
@@ -113,3 +127,5 @@ transfer_fee:
   - {exchange: SZSE, start: 2005-01-24, end: 2015-07-31, basis: turnover, rate: "0.0000255"}
   - {exchange: SZSE, start: 2015-08-01, end: 2022-04-28, basis: turnover, rate: "0.00002"}
   - {exchange: SZSE, start: 2022-04-29, end: null, basis: turnover, rate: "0.00001"}
+  - {exchange: BSE, start: 2005-01-24, end: 2022-04-28, basis: turnover, rate: "0.00002"}
+  - {exchange: BSE, start: 2022-04-29, end: null, basis: turnover, rate: "0.00001"}

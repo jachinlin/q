@@ -9,6 +9,7 @@ from quant_research.tasks.models import ClaimedTask, TaskOutcome, TaskProgress
 
 STANDARD_TASK_TYPES = frozenset(
     {
+        "DATA_BOOTSTRAP",
         "DATA_UPDATE",
         "DATA_VALIDATION",
         "EXPERIMENT_RUN",

@@ -37,6 +37,8 @@ const detailQualityStatus = ref('')
 const detailQualityRule = ref('')
 const selectedDataset = ref<string | null>(null)
 const selectedQualityRun = ref<string | null>(null)
+const bootstrapDialog = ref(false)
+const bootstrapYears = ref(5)
 const updateDialog = ref(false)
 const qualityRunDialog = ref(false)
 const qualityRunDataset = ref('ALL')
@@ -44,7 +46,7 @@ const updateMode = ref<'AUTO_INCREMENTAL' | 'EXPLICIT'>('AUTO_INCREMENTAL')
 const dateRange = ref<[string, string] | null>(null)
 const selectedUpdateDatasets = ref<string[]>([])
 const trackedTaskId = ref<string | null>(null)
-const trackedTaskKind = ref<'UPDATE' | 'QUALITY'>('UPDATE')
+const trackedTaskKind = ref<'BOOTSTRAP' | 'UPDATE' | 'QUALITY'>('UPDATE')
 const qualityResultStatuses = ['PASS', 'FAIL', 'SKIPPED', 'UNKNOWN'] as const
 
 const summary = useQuery({
@@ -129,6 +131,12 @@ const qualityDrawerOpen = computed({
 })
 const totalRows = computed(() => (datasets.data.value?.items ?? []).reduce((sum, item) => sum + item.row_count, 0))
 const gateRunId = computed(() => summary.data.value?.gate.quality_run_id)
+const initializationReady = computed(() => summary.data.value?.initialization.status === 'COMPLETED')
+const bootstrapTaskActive = computed(() => {
+  const task = summary.data.value?.active_update
+  return task?.task_type === 'DATA_BOOTSTRAP'
+    && ['QUEUED', 'RUNNING', 'CANCEL_REQUESTED'].includes(task.status)
+})
 const visibleQualityResults = computed(() => (qualityDetail.data.value?.rule_results ?? []).filter((item) => {
   const ruleFilter = detailQualityRule.value.trim().toLowerCase()
   return (!detailQualityDataset.value || item.dataset === detailQualityDataset.value)
@@ -192,6 +200,30 @@ const update = useMutation({
   },
 })
 
+const bootstrap = useMutation({
+  mutationFn: () => api.post<{
+    task_id: string
+    request_id: string
+    status: string
+    years: number
+  }>('/api/v1/data/bootstrap', { years: bootstrapYears.value }),
+  onSuccess: async (result) => {
+    trackedTaskId.value = result.task_id
+    trackedTaskKind.value = 'BOOTSTRAP'
+    bootstrapDialog.value = false
+    ElMessage.success(`初始化任务已提交 · ${result.task_id.slice(0, 8)}`)
+    await Promise.all([
+      client.invalidateQueries({ queryKey: ['data-summary'] }),
+      client.invalidateQueries({ queryKey: ['tasks'] }),
+    ])
+  },
+  onError: (error) => {
+    ElMessage.error(error instanceof DashboardApiError
+      ? (error.remediation ?? error.message)
+      : String(error))
+  },
+})
+
 const createQualityRun = useMutation({
   mutationFn: () => api.post<{
     task_id: string
@@ -224,6 +256,11 @@ function openUpdateDialog() {
   updateDialog.value = true
 }
 
+function openBootstrapDialog() {
+  bootstrapYears.value = summary.data.value?.initialization.years ?? 5
+  bootstrapDialog.value = true
+}
+
 function openQualityRunDialog() {
   qualityRunDataset.value = 'ALL'
   qualityRunDialog.value = true
@@ -238,7 +275,7 @@ function updateBasisLabel(basis: string) {
 }
 
 function freshnessEvidence(dataset: Dataset) {
-  if (dataset.dataset === 'instrument') {
+  if (['stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(dataset.dataset)) {
     return `全量快照 · 最近刷新 ${formatTime(dataset.operational.last_localized_at)}`
   }
   if (dataset.dataset === 'trade_calendar') {
@@ -252,14 +289,14 @@ function freshnessEvidence(dataset: Dataset) {
 }
 
 function coverageDate(dataset: Dataset, boundary: 'start' | 'end') {
-  if (dataset.dataset === 'instrument') {
+  if (['stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(dataset.dataset)) {
     return formatDate(dataset.operational.localized_through)
   }
   return formatDate(boundary === 'start' ? dataset.start_date : dataset.end_date)
 }
 
 function windowState(window: DataUpdateWindow) {
-  if (['financial_observation', 'instrument'].includes(window.dataset)) {
+  if (['stock_financial_indicator', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) {
     return '不适用'
   }
   if (window.dataset === 'trade_calendar') {
@@ -269,7 +306,7 @@ function windowState(window: DataUpdateWindow) {
 }
 
 function windowLookback(window: DataUpdateWindow) {
-  if (['financial_observation', 'instrument'].includes(window.dataset)) {
+  if (['stock_financial_indicator', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) {
     return '不适用'
   }
   return window.dataset === 'trade_calendar'
@@ -336,7 +373,7 @@ async function submitUpdate() {
       <section v-if="trackedTaskId" class="panel" data-testid="update-progress">
         <header class="panel-heading">
           <div>
-            <h2>{{ trackedTaskKind === 'QUALITY' ? '质量运行任务' : '更新任务' }} {{ trackedTaskId.slice(0, 8) }}</h2>
+            <h2>{{ trackedTaskKind === 'QUALITY' ? '质量运行任务' : trackedTaskKind === 'BOOTSTRAP' ? '初始化任务' : '更新任务' }} {{ trackedTaskId.slice(0, 8) }}</h2>
             <p>{{ trackedTask.data.value?.progress?.message ?? '等待 Worker 接收任务' }}</p>
           </div>
           <div style="display:flex;gap:10px;align-items:center">
@@ -347,12 +384,33 @@ async function submitUpdate() {
         <el-progress :percentage="Number(trackedTask.data.value?.progress?.percent ?? 0)" />
       </section>
 
+      <el-alert
+        v-if="summary.data.value && !initializationReady"
+        class="bootstrap-alert"
+        :title="summary.data.value.initialization.status === 'IN_PROGRESS' ? '数据初始化尚未完成' : '数据尚未初始化'"
+        :description="summary.data.value.initialization.status === 'IN_PROGRESS'
+          ? `请使用已冻结的 ${summary.data.value.initialization.years} 年窗口继续 Bootstrap。完成全市场采集、Canonical 清洗和全目录校验后，研究门才会开放。`
+          : '先执行 Bootstrap，建立 Tushare 全市场 Canonical 基线。完成后才会开放日常更新和质量运行入口。'"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
+
       <section class="panel table-panel">
         <header class="panel-heading">
           <div><h2>数据资产</h2><p>VALIDATED 表示研究门状态，新鲜度是独立的非阻断运营告警。</p></div>
           <div class="data-actions">
-            <el-button type="primary" @click="openUpdateDialog">创建更新任务</el-button>
-            <el-button @click="openQualityRunDialog">质量运行</el-button>
+            <el-button
+              v-if="!initializationReady"
+              data-testid="bootstrap-action"
+              type="primary"
+              :disabled="bootstrapTaskActive"
+              @click="openBootstrapDialog"
+            >{{ bootstrapTaskActive ? '初始化任务进行中' : summary.data.value?.initialization.status === 'IN_PROGRESS' ? '继续初始化' : '初始化数据' }}</el-button>
+            <template v-else>
+              <el-button type="primary" @click="openUpdateDialog">创建更新任务</el-button>
+              <el-button @click="openQualityRunDialog">质量运行</el-button>
+            </template>
           </div>
         </header>
         <div style="display:flex;gap:10px;margin-bottom:14px">
@@ -461,8 +519,56 @@ async function submitUpdate() {
       </template>
     </el-drawer>
 
+    <el-dialog v-model="bootstrapDialog" title="初始化 Tushare 数据" width="560">
+      <p class="dialog-description">
+        Bootstrap 会由 Worker 依次执行全市场采集、Canonical 清洗和全目录质量校验。首次执行可能耗时较长，可在运行中心查看进度和受控日志。
+      </p>
+      <el-form label-position="top">
+        <el-form-item label="历史覆盖年数">
+          <el-input-number
+            v-model="bootstrapYears"
+            data-testid="bootstrap-years"
+            :min="1"
+            :disabled="summary.data.value?.initialization.status === 'IN_PROGRESS'"
+            controls-position="right"
+            style="width:100%"
+          />
+        </el-form-item>
+      </el-form>
+      <el-alert
+        v-if="summary.data.value?.initialization.status === 'IN_PROGRESS'"
+        title="初始化窗口已经冻结；重试必须保持相同年数，已完成的 Raw 请求和 Canonical 输入会按内容身份复用。"
+        type="info"
+        :closable="false"
+        show-icon
+      />
+      <el-alert
+        v-else
+        title="提交后历史窗口将冻结。请先确认 Worker 正在运行，并已在设置页配置数据源 Token。"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
+      <el-button
+        v-if="summary.data.value?.initialization.status !== 'IN_PROGRESS'"
+        link
+        type="primary"
+        style="margin-top:10px"
+        @click="router.push('/settings')"
+      >打开设置</el-button>
+      <template #footer>
+        <el-button @click="bootstrapDialog = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="bootstrap.isPending.value"
+          :disabled="bootstrapYears < 1"
+          @click="bootstrap.mutate()"
+        >提交初始化任务</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="updateDialog" title="创建数据更新任务" width="780">
-      <p style="color:var(--muted);font-size:12px;line-height:1.8">提交前会根据实时交易日历、Canonical 水位和季度披露截止日固化各数据集计划。financial_observation 不使用水位；截止日尚未越过时自动判定为无需更新。</p>
+      <p style="color:var(--muted);font-size:12px;line-height:1.8">提交前会根据实时交易日历、Canonical 水位和季度披露截止日固化各数据集计划。stock_financial_indicator 不使用水位；截止日尚未越过时自动判定为无需更新。</p>
       <div class="dataset-selector">
         <div class="dataset-selector-heading">
           <strong>目标数据集</strong>
@@ -594,6 +700,10 @@ async function submitUpdate() {
 .data-actions {
   display: flex;
   align-items: center;
+}
+
+.bootstrap-alert {
+  margin-bottom: 16px;
 }
 
 .dialog-description {

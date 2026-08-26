@@ -86,6 +86,75 @@ class _DataUpdateObserver(PipelineObserver):
         return self._cancellation.is_cancelled()
 
 
+class DataBootstrapHandler:
+    """执行首次 Canonical 基线初始化后台任务。
+
+    入参：
+        pipeline：提供可恢复 ``bootstrap`` 流水线的数据服务。
+    返回值：
+        构造仅处理 ``DATA_BOOTSTRAP`` 严格载荷的 Worker 处理器。
+    异常：
+        载荷不是唯一正整数 ``years`` 时抛出 ``TypeError`` 或 ``ValueError``；
+        初始化状态冲突和流水线失败保持原错误语义。
+    """
+
+    task_type = "DATA_BOOTSTRAP"
+
+    def __init__(self, pipeline: DataPipeline) -> None:
+        self._pipeline = pipeline
+
+    def run(
+        self,
+        task: ClaimedTask,
+        progress: ProgressSink,
+        cancellation: CancellationToken,
+    ) -> TaskOutcome:
+        """按冻结年数完成首次采集、清洗和全目录校验。
+
+        入参：
+            task：载荷必须严格等于 ``{"years": 正整数}`` 的已认领任务。
+            progress：接收三个流水线阶段和完成事件的进度端口。
+            cancellation：在安全边界提供协作取消状态。
+        返回值：
+            完成时返回数据目录身份；取消时返回 ``CANCELLED``。
+        异常：
+            任务类型或载荷非法时抛出类型或值错误；数据流水线异常按原语义传播。
+        """
+        if task.task_type != self.task_type:
+            raise ValueError("data bootstrap handler requires DATA_BOOTSTRAP task")
+        if set(task.payload) != {"years"}:
+            raise ValueError("data bootstrap payload must contain only years")
+        years = task.payload["years"]
+        if type(years) is not int:
+            raise TypeError("data bootstrap years must be an integer")
+        if years <= 0:
+            raise ValueError("data bootstrap years must be positive")
+        observer = _DataUpdateObserver(progress, cancellation)
+        try:
+            result = self._pipeline.bootstrap(years=years, observer=observer)
+        except DataPipelineCancelled:
+            return TaskOutcome(status=TaskStatus.CANCELLED)
+        progress.update(
+            TaskProgress(
+                stage="COMPLETE",
+                completed=1,
+                total=1,
+                message="data bootstrap completed",
+                context={"data_hash": result.data_hash, "years": years},
+            )
+        )
+        return TaskOutcome(
+            status=TaskStatus.SUCCEEDED,
+            result={
+                "run_id": result.run_id,
+                "quality_run_id": str(result.quality_run_id),
+                "data_hash": result.data_hash,
+                "years": years,
+                "datasets": observer.results,
+            },
+        )
+
+
 class DataUpdateHandler:
     """处理一个已认领的应用用例任务并持久化结果。
 
