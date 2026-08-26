@@ -22,7 +22,7 @@ class _Repository:
         self._frame = frame
         self.calls = 0
 
-    def bars(
+    def stock_bars(
         self,
         instruments: tuple[InstrumentId, ...],
         start: date,
@@ -35,7 +35,7 @@ class _Repository:
             & pl.col("trade_date").is_between(start, end, closed="both")
         ).lazy()
 
-    def daily_basics(
+    def stock_daily_basics(
         self,
         instruments: tuple[InstrumentId, ...],
         start: date,

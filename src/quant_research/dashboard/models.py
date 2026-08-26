@@ -725,16 +725,44 @@ class DataSourceTokenStatusResponse(DashboardModel):
     updated_at: str | None
 
 
+class DataSourceRateLimitStatusResponse(DashboardModel):
+    """返回数据源每分钟请求上限及其配置来源。
+
+    入参：严格限流整数、解析来源和可选文件更新时间。
+    返回值：构造不含敏感信息的冻结响应。
+    异常：来源或字段范围非法时由 Pydantic 抛出校验异常。
+    """
+
+    requests_per_minute: int = Field(ge=1, le=10_000)
+    source: Literal["DATA_ROOT_ENV", "PROCESS_ENVIRONMENT", "DEFAULT"]
+    updated_at: str | None
+
+
+class DataSourceProxyStatusResponse(DashboardModel):
+    """返回 Tushare 代理 URL 及其配置来源。
+
+    入参：可选代理 URL、解析来源和可选文件更新时间。
+    返回值：构造可供设置页展示的冻结响应。
+    异常：字段类型或来源非法时由 Pydantic 抛出校验异常。
+    """
+
+    url: str | None
+    source: Literal["DATA_ROOT_ENV", "PROCESS_ENVIRONMENT", "NONE"]
+    updated_at: str | None
+
+
 class DashboardSettingsResponse(DashboardModel):
     """返回 Dashboard 支持的通用设置安全投影。
 
-    入参：受控设置文件路径和数据源 Token 状态。
+    入参：受控设置文件路径、数据源 Token、请求限流和代理状态。
     返回值：构造冻结响应，任何字段均不得包含 Token 内容。
     异常：字段缺失或类型非法时由 Pydantic 抛出校验异常。
     """
 
     settings_path: str
     data_source_token: DataSourceTokenStatusResponse
+    data_source_rate_limit: DataSourceRateLimitStatusResponse
+    data_source_proxy: DataSourceProxyStatusResponse
 
 
 class DataSourceTokenChangeRequest(DashboardModel):
@@ -763,15 +791,69 @@ class DataSourceTokenChangeRequest(DashboardModel):
         return self
 
 
+class DataSourceRateLimitChangeRequest(DashboardModel):
+    """定义数据源限流的设置或清除操作。
+
+    入参：操作名称和仅 ``SET`` 允许携带的每分钟请求数。
+    返回值：构造经过组合校验的冻结修改请求。
+    异常：操作和值组合不一致或数值越界时抛出值错误。
+    """
+
+    operation: Literal["SET", "CLEAR"]
+    requests_per_minute: int | None = Field(default=None, ge=1, le=10_000)
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> DataSourceRateLimitChangeRequest:
+        """校验 SET 必须带值且 CLEAR 必须省略值。
+
+        入参：无。
+        返回值：组合合法的当前请求模型。
+        异常：操作和值不形成唯一合法组合时抛出值错误。
+        """
+        if self.operation == "SET" and self.requests_per_minute is None:
+            raise ValueError("SET data source rate limit requires requests_per_minute")
+        if self.operation == "CLEAR" and self.requests_per_minute is not None:
+            raise ValueError("CLEAR data source rate limit must omit requests_per_minute")
+        return self
+
+
+class DataSourceProxyChangeRequest(DashboardModel):
+    """定义 Tushare 代理 URL 的设置或清除操作。
+
+    入参：操作名称和仅 ``SET`` 允许携带的 URL。
+    返回值：构造经过组合校验的冻结修改请求。
+    异常：操作和值组合不一致或 URL 过长时抛出值错误。
+    """
+
+    operation: Literal["SET", "CLEAR"]
+    url: str | None = Field(default=None, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> DataSourceProxyChangeRequest:
+        """校验 SET 必须带 URL 且 CLEAR 必须省略 URL。
+
+        入参：无。
+        返回值：组合合法的当前请求模型。
+        异常：操作和值不形成唯一合法组合时抛出值错误。
+        """
+        if self.operation == "SET" and self.url is None:
+            raise ValueError("SET data source proxy requires a URL")
+        if self.operation == "CLEAR" and self.url is not None:
+            raise ValueError("CLEAR data source proxy must omit URL")
+        return self
+
+
 class DashboardSettingsPatchRequest(DashboardModel):
     """定义可逐字段扩展的通用 Dashboard 设置修改请求。
 
-    入参：当前仅支持可选的数据源 Token 类型化修改。
+    入参：可选的数据源 Token、请求限流与代理类型化修改。
     返回值：构造至少包含一个明确修改字段的冻结请求。
     异常：请求未包含任何修改时抛出值错误。
     """
 
     data_source_token: DataSourceTokenChangeRequest | None = None
+    data_source_rate_limit: DataSourceRateLimitChangeRequest | None = None
+    data_source_proxy: DataSourceProxyChangeRequest | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> DashboardSettingsPatchRequest:
@@ -781,7 +863,11 @@ class DashboardSettingsPatchRequest(DashboardModel):
         返回值：包含至少一个修改的当前请求对象。
         异常：所有设置字段均省略时抛出值错误。
         """
-        if self.data_source_token is None:
+        if (
+            self.data_source_token is None
+            and self.data_source_rate_limit is None
+            and self.data_source_proxy is None
+        ):
             raise ValueError("settings patch must contain at least one change")
         return self
 

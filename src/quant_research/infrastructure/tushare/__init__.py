@@ -7,6 +7,7 @@ from quant_research.infrastructure.tushare.client import (
     TushareSdkGateway,
 )
 from quant_research.infrastructure.tushare.mapper import TushareMapper
+from quant_research.infrastructure.tushare.rate_limit import TushareRateLimiter
 from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "TushareClient",
     "TushareConfig",
     "TushareMapper",
+    "TushareRateLimiter",
     "TushareSdkGateway",
 ]

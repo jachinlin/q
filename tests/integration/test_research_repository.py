@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -18,7 +17,7 @@ from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.quality.models import QualityRunSpec
 from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.domain.enums import DatasetKind
-from quant_research.domain.identifiers import InstrumentId
+from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -31,6 +30,16 @@ from quant_research.infrastructure.persistence.repositories import (
 )
 
 _NOW = datetime(2026, 8, 11, tzinfo=UTC)
+
+
+def _canonical_frame(
+    dataset: DatasetKind,
+    rows: list[dict[str, object]],
+) -> pl.DataFrame:
+    """以当前 Canonical Schema 补齐测试未关注的可空字段。"""
+    schema = CANONICAL_SCHEMAS[dataset].columns
+    normalized = [dict.fromkeys(schema.names()) | row for row in rows]
+    return pl.DataFrame(normalized, schema=schema, strict=False)
 
 
 class _StaticCatalog:
@@ -82,6 +91,7 @@ class _ResearchRepositoryHarness:
             (
                 self._instrument_batch(),
                 self._daily_bar_batch(),
+                self._adjustment_factor_batch(),
                 self._index_bar_batch(),
                 self._trade_calendar_batch(),
                 self._industry_batch(),
@@ -123,136 +133,177 @@ class _ResearchRepositoryHarness:
 
     @staticmethod
     def _instrument_batch() -> CanonicalBatch:
-        frame = pl.DataFrame(
-            {
-                "instrument_id": ["600000.SH"],
-                "exchange": ["SSE"],
-                "board": ["MAIN"],
-                "name": ["浦发银行"],
-                "instrument_type": ["STOCK"],
-                "listing_status": ["LISTED"],
-                "list_date": [date(1999, 11, 10)],
-                "delist_date": [None],
-                "source": ["tushare"],
-                "available_at": [_NOW],
-                "availability_source": ["test"],
-                "pit_usable": [True],
-                "ingested_at": [_NOW],
-            },
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_MASTER].columns,
+        dataset = DatasetKind.STOCK_MASTER
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "instrument_id": "600000.SH",
+                    "symbol": "600000",
+                    "exchange": "SSE",
+                    "board": "MAIN",
+                    "name": "浦发银行",
+                    "list_status": "L",
+                    "list_date": date(1999, 11, 10),
+                    "source": "tushare",
+                    "available_at": _NOW,
+                    "availability_source": "test",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+            ],
         )
-        return CanonicalBatch(DatasetKind.STOCK_MASTER, frame, ("a" * 64,))
+        return CanonicalBatch(dataset, frame, ("a" * 64,))
 
     @staticmethod
     def _index_bar_batch() -> CanonicalBatch:
-        frame = pl.DataFrame(
-            {
-                "index_id": ["000300.SH"],
-                "trade_date": [date(2026, 8, 11)],
-                "open": [4100.0],
-                "high": [4120.0],
-                "low": [4090.0],
-                "close": [4110.0],
-                "preclose": [4080.0],
-                "volume": [1_000_000],
-                "amount": [10_000_000.0],
-                "pct_change": [0.735294],
-                "source": ["tushare"],
-                "available_at": [_NOW],
-                "availability_source": ["test"],
-                "pit_usable": [True],
-                "ingested_at": [_NOW],
-            },
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDEX_DAILY_BAR].columns,
+        dataset = DatasetKind.INDEX_DAILY_BAR
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "index_id": "000300.SH",
+                    "trade_date": date(2026, 8, 11),
+                    "open": 4100.0,
+                    "high": 4120.0,
+                    "low": 4090.0,
+                    "close": 4110.0,
+                    "preclose": 4080.0,
+                    "change": 30.0,
+                    "volume": 1_000_000,
+                    "amount": 10_000_000.0,
+                    "pct_change": 4110.0 / 4080.0 - 1.0,
+                    "source": "tushare",
+                    "available_at": _NOW,
+                    "availability_source": "test",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+            ],
         )
-        return CanonicalBatch(DatasetKind.INDEX_DAILY_BAR, frame, ("b" * 64,))
+        return CanonicalBatch(dataset, frame, ("b" * 64,))
 
     @staticmethod
     def _daily_bar_batch() -> CanonicalBatch:
         days = [date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 12)]
-        frame = pl.DataFrame(
-            {
-                "instrument_id": ["600000.SH"] * 3,
-                "trade_date": days,
-                "open": [10.0, 10.0, 11.0],
-                "high": [10.0, 11.0, 12.0],
-                "low": [10.0, 10.0, 11.0],
-                "close": [10.0, 11.0, 12.0],
-                "preclose": [10.0, 10.0, 11.0],
-                "volume": [1_000, 1_100, 1_200],
-                "amount": [10_000.0, 12_000.0, 14_000.0],
-                "adjustment_flag": ["3"] * 3,
-                "pct_change": [0.0, 10.0, 9.090909],
-                "source": ["tushare"] * 3,
-                "available_at": [
-                    datetime(2026, 8, day.day, tzinfo=UTC) for day in days
-                ],
-                "availability_source": ["test"] * 3,
-                "pit_usable": [True] * 3,
-                "ingested_at": [_NOW] * 3,
-            },
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BAR].columns,
-        )
-        return CanonicalBatch(DatasetKind.STOCK_DAILY_BAR, frame, ("c" * 64,))
-
-    @staticmethod
-    def _trade_calendar_batch() -> CanonicalBatch:
-        days = [date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 12)]
-        frame = pl.DataFrame(
-            {
-                "trade_date": days,
-                "is_trading_day": [True] * 3,
-                "source": ["tushare"] * 3,
-                "available_at": [
-                    datetime(2026, 8, day.day, tzinfo=UTC) for day in days
-                ],
-                "availability_source": ["exchange_calendar"] * 3,
-                "pit_usable": [True] * 3,
-                "ingested_at": [_NOW] * 3,
-            },
-            schema=CANONICAL_SCHEMAS[DatasetKind.TRADE_CALENDAR].columns,
-        )
-        return CanonicalBatch(DatasetKind.TRADE_CALENDAR, frame, ("d" * 64,))
-
-    @staticmethod
-    def _industry_batch() -> CanonicalBatch:
-        taxonomy = "证监会行业分类"
-        events = (
-            (date(2026, 1, 5), "600000.SH", "J66"),
-            (date(2026, 1, 5), "600001.SH", "C39"),
-            (date(2026, 1, 5), "600002.SH", None),
-            (date(2026, 1, 6), "600003.SH", "I65"),
-            (date(2026, 1, 12), "600000.SH", "C39"),
-            (date(2026, 1, 12), "600002.SH", "J66"),
-            (date(2026, 1, 13), "600001.SH", None),
-        )
+        dataset = DatasetKind.STOCK_DAILY_BAR
         rows = []
-        for as_of_date, instrument_id, industry in events:
+        for index, day in enumerate(days):
+            close = [10.0, 11.0, 12.0][index]
+            preclose = [10.0, 10.0, 11.0][index]
             rows.append(
                 {
-                    "as_of_date": as_of_date,
-                    "supplier_update_date": as_of_date,
-                    "instrument_id": instrument_id,
-                    "taxonomy": taxonomy,
-                    "industry_code": industry,
-                    "industry_name": industry,
-                    "is_classified": industry is not None,
-                    "source": "baostock",
-                    "available_at": datetime.combine(
-                        as_of_date,
-                        datetime.max.time(),
-                        tzinfo=ZoneInfo("Asia/Shanghai"),
-                    ).astimezone(UTC),
-                    "availability_source": "BAOSTOCK_AS_OF_DATE_RECONSTRUCTED",
+                    "instrument_id": "600000.SH",
+                    "trade_date": day,
+                    "open": [10.0, 10.0, 11.0][index],
+                    "high": [10.0, 11.0, 12.0][index],
+                    "low": [10.0, 10.0, 11.0][index],
+                    "close": close,
+                    "preclose": preclose,
+                    "change": close - preclose,
+                    "volume": [1_000, 1_100, 1_200][index],
+                    "amount": [10_000.0, 12_000.0, 14_000.0][index],
+                    "pct_change": close / preclose - 1.0,
+                    "source": "tushare",
+                    "available_at": datetime(2026, 8, day.day, tzinfo=UTC),
+                    "availability_source": "test",
                     "pit_usable": True,
                     "ingested_at": _NOW,
                 }
             )
-        frame = pl.DataFrame(
+        frame = _canonical_frame(
+            dataset,
             rows,
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_MEMBERSHIP].columns,
         )
-        return CanonicalBatch(DatasetKind.INDUSTRY_MEMBERSHIP, frame, ("e" * 64,))
+        return CanonicalBatch(dataset, frame, ("c" * 64,))
+
+    @staticmethod
+    def _adjustment_factor_batch() -> CanonicalBatch:
+        dataset = DatasetKind.STOCK_ADJUSTMENT_FACTOR
+        days = [date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 12)]
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "instrument_id": "600000.SH",
+                    "trade_date": day,
+                    "adjustment_factor": 1.0,
+                    "source": "tushare",
+                    "available_at": datetime(2026, 8, day.day, tzinfo=UTC),
+                    "availability_source": "test",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+                for day in days
+            ],
+        )
+        return CanonicalBatch(dataset, frame, ("f" * 64,))
+
+    @staticmethod
+    def _trade_calendar_batch() -> CanonicalBatch:
+        days = [date(2026, 8, 10), date(2026, 8, 11), date(2026, 8, 12)]
+        dataset = DatasetKind.TRADE_CALENDAR
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "exchange": "SSE",
+                    "trade_date": day,
+                    "is_trading_day": True,
+                    "previous_trade_date": days[max(0, index - 1)],
+                    "source": "tushare",
+                    "available_at": datetime(2026, 8, day.day, tzinfo=UTC),
+                    "availability_source": "exchange_calendar",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+                for index, day in enumerate(days)
+            ],
+        )
+        return CanonicalBatch(dataset, frame, ("d" * 64,))
+
+    @staticmethod
+    def _industry_batch() -> CanonicalBatch:
+        dataset = DatasetKind.INDUSTRY_MEMBERSHIP
+        memberships = (
+            ("600000.SH", "J66", date(2026, 1, 5), date(2026, 1, 12)),
+            ("600000.SH", "C39", date(2026, 1, 12), None),
+            ("600001.SH", "C39", date(2026, 1, 5), date(2026, 1, 13)),
+            ("600002.SH", "J66", date(2026, 1, 12), None),
+            ("600003.SH", "I65", date(2026, 1, 6), None),
+        )
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "level1_code": industry,
+                    "level1_name": industry,
+                    "instrument_id": instrument_id,
+                    "instrument_name": instrument_id,
+                    "in_date": in_date,
+                    "out_date": out_date,
+                    "is_current": out_date is None,
+                    "in_available_at": datetime(2026, 1, 5, tzinfo=UTC),
+                    "out_available_at": (
+                        datetime(
+                            out_date.year,
+                            out_date.month,
+                            out_date.day,
+                            tzinfo=UTC,
+                        )
+                        if out_date is not None
+                        else None
+                    ),
+                    "source": "tushare",
+                    "available_at": _NOW,
+                    "availability_source": "tushare_retrieved_at",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+                for instrument_id, industry, in_date, out_date in memberships
+            ],
+        )
+        return CanonicalBatch(dataset, frame, ("e" * 64,))
 
 
 class _FinancialRepositoryHarness:
@@ -305,23 +356,33 @@ class _FinancialRepositoryHarness:
             datetime(2026, 5, 2, tzinfo=UTC),
             datetime(2026, 4, 20, tzinfo=UTC),
         ]
-        frame = pl.DataFrame(
-            {
-                "instrument_id": ["600000.SH"] * 4,
-                "report_period": [date(2025, 12, 31)] * 4,
-                "metric": ["dupont_roe"] * 4,
-                "value": [0.10, 0.11, 0.12, 0.99],
-                "revision": [0, 1, 2, 3],
-                "announced_at": available,
-                "source": ["tushare"] * 4,
-                "available_at": available,
-                "availability_source": ["announcement"] * 4,
-                "pit_usable": [True, True, True, False],
-                "ingested_at": [_NOW] * 4,
-            },
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_FINANCIAL_INDICATOR].columns,
+        dataset = DatasetKind.STOCK_FINANCIAL_INDICATOR
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "instrument_id": "600000.SH",
+                    "announcement_date": timestamp.date(),
+                    "report_period": date(2025, 12, 31),
+                    "roe": value,
+                    "update_flag": str(revision),
+                    "revision": revision,
+                    "source": "tushare",
+                    "available_at": timestamp,
+                    "availability_source": "announcement",
+                    "pit_usable": usable,
+                    "ingested_at": _NOW,
+                }
+                for timestamp, value, revision, usable in zip(
+                    available,
+                    (0.10, 0.11, 0.12, 0.99),
+                    (0, 1, 2, 3),
+                    (True, True, True, False),
+                    strict=True,
+                )
+            ],
         )
-        return CanonicalBatch(DatasetKind.STOCK_FINANCIAL_INDICATOR, frame, ("b" * 64,))
+        return CanonicalBatch(dataset, frame, ("b" * 64,))
 
 
 def test_every_public_read_api_enters_internal_verification(
@@ -342,23 +403,42 @@ def test_every_public_read_api_enters_internal_verification(
     monkeypatch.setattr(repository, "_verify_current_dataset", reject)
     query_date = date(2026, 8, 11)
     calls = (
-        (DatasetKind.STOCK_MASTER, repository.instruments),
+        (DatasetKind.STOCK_MASTER, repository.stocks),
+        (DatasetKind.FUND_MASTER, repository.funds),
+        (DatasetKind.INDEX_MASTER, repository.indexes),
         (
             DatasetKind.TRADE_CALENDAR,
             lambda: repository.trade_calendar(query_date, query_date),
         ),
         (
             DatasetKind.STOCK_DAILY_BAR,
-            lambda: repository.bars((), query_date, query_date),
+            lambda: repository.stock_bars((), query_date, query_date),
         ),
         (
             DatasetKind.STOCK_DAILY_BAR,
-            lambda: repository.adjusted_bars((), query_date, query_date),
+            lambda: repository.adjusted_stock_bars((), query_date, query_date),
+        ),
+        (
+            DatasetKind.FUND_DAILY_BAR,
+            lambda: repository.fund_bars((), query_date, query_date),
+        ),
+        (
+            DatasetKind.FUND_DAILY_BAR,
+            lambda: repository.adjusted_fund_bars((), query_date, query_date),
         ),
         (
             DatasetKind.TRADE_CALENDAR,
-            lambda: repository.log_returns(
+            lambda: repository.stock_log_returns(
                 (InstrumentId.parse("600000.SH"),),
+                query_date,
+                query_date,
+                lookback_sessions=0,
+            ),
+        ),
+        (
+            DatasetKind.TRADE_CALENDAR,
+            lambda: repository.fund_log_returns(
+                (InstrumentId.parse("510300.SH"),),
                 query_date,
                 query_date,
                 lookback_sessions=0,
@@ -370,27 +450,27 @@ def test_every_public_read_api_enters_internal_verification(
         ),
         (
             DatasetKind.STOCK_DAILY_BASIC,
-            lambda: repository.daily_basics((), query_date, query_date),
+            lambda: repository.stock_daily_basics((), query_date, query_date),
         ),
         (
             DatasetKind.STOCK_FINANCIAL_INDICATOR,
-            lambda: repository.financials_as_of((), query_date),
+            lambda: repository.stock_financial_indicators(query_date, ()),
         ),
         (
-            DatasetKind.STOCK_FINANCIAL_INDICATOR,
-            lambda: repository.financial_history((), query_date),
-        ),
-        (
-            DatasetKind.INDUSTRY_MEMBERSHIP,
-            lambda: repository.industry_classifications_as_of(None, query_date),
+            DatasetKind.INDUSTRY_CATALOG,
+            repository.industry_catalog,
         ),
         (
             DatasetKind.INDUSTRY_MEMBERSHIP,
-            lambda: repository.industry_classifications_on_dates(None, (query_date,)),
+            lambda: repository.industry_memberships_on_dates(None, (query_date,)),
         ),
         (
             DatasetKind.STOCK_SUSPENSION,
-            lambda: repository.security_status(query_date),
+            lambda: repository.stock_suspensions(query_date, query_date),
+        ),
+        (
+            DatasetKind.STOCK_RISK_WARNING,
+            lambda: repository.stock_risk_warnings(query_date, query_date),
         ),
     )
 
@@ -412,11 +492,12 @@ def test_from_sqlite_exposes_bound_read_only_catalog(tmp_path: Path) -> None:
         assert {record.dataset for record in catalog.list_canonical_datasets()} == {
             DatasetKind.STOCK_MASTER,
             DatasetKind.STOCK_DAILY_BAR,
+            DatasetKind.STOCK_ADJUSTMENT_FACTOR,
             DatasetKind.INDEX_DAILY_BAR,
             DatasetKind.TRADE_CALENDAR,
             DatasetKind.INDUSTRY_MEMBERSHIP,
         }
-        assert harness.repository.instruments().collect().height == 1
+        assert harness.repository.stocks().collect().height == 1
     finally:
         harness.close()
 
@@ -439,44 +520,32 @@ def test_industry_single_and_batch_queries_rebuild_identical_tombstone_state(
             date(2026, 1, 13),
         )
 
-        batch = harness.repository.industry_classifications_on_dates(
+        batch = harness.repository.industry_memberships_on_dates(
             instruments, query_dates
         ).collect()
 
         assert {
-            (row["query_date"], row["instrument_id"]): row["industry_code"]
+            (row["query_date"], row["instrument_id"]): row["level1_code"]
             for row in batch.iter_rows(named=True)
         } == {
             (date(2026, 1, 5), "600000.SH"): "J66",
             (date(2026, 1, 5), "600001.SH"): "C39",
-            (date(2026, 1, 5), "600002.SH"): None,
             (date(2026, 1, 6), "600000.SH"): "J66",
             (date(2026, 1, 6), "600001.SH"): "C39",
-            (date(2026, 1, 6), "600002.SH"): None,
             (date(2026, 1, 6), "600003.SH"): "I65",
             (date(2026, 1, 11), "600000.SH"): "J66",
             (date(2026, 1, 11), "600001.SH"): "C39",
-            (date(2026, 1, 11), "600002.SH"): None,
             (date(2026, 1, 11), "600003.SH"): "I65",
             (date(2026, 1, 12), "600000.SH"): "C39",
             (date(2026, 1, 12), "600001.SH"): "C39",
             (date(2026, 1, 12), "600002.SH"): "J66",
             (date(2026, 1, 12), "600003.SH"): "I65",
             (date(2026, 1, 13), "600000.SH"): "C39",
-            (date(2026, 1, 13), "600001.SH"): None,
             (date(2026, 1, 13), "600002.SH"): "J66",
             (date(2026, 1, 13), "600003.SH"): "I65",
         }
-        for query_date in query_dates:
-            single = harness.repository.industry_classifications_as_of(
-                instruments, query_date
-            ).collect()
-            from_batch = batch.filter(pl.col("query_date") == query_date).drop(
-                "query_date"
-            )
-            assert single.equals(from_batch)
 
-        empty = harness.repository.industry_classifications_on_dates(
+        empty = harness.repository.industry_memberships_on_dates(
             instruments, ()
         ).collect()
         assert empty.is_empty()
@@ -493,8 +562,10 @@ def test_derived_price_queries_use_end_as_information_cutoff(tmp_path: Path) -> 
         start = date(2026, 8, 10)
         end = date(2026, 8, 11)
 
-        adjusted = harness.repository.adjusted_bars(instrument, start, end).collect()
-        returns = harness.repository.log_returns(
+        adjusted = harness.repository.adjusted_stock_bars(
+            instrument, start, end
+        ).collect()
+        returns = harness.repository.stock_log_returns(
             instrument,
             end,
             end,
@@ -517,7 +588,7 @@ def test_index_bars_reads_only_requested_canonical_index(tmp_path: Path) -> None
     harness = _ResearchRepositoryHarness(tmp_path)
     try:
         frame = harness.repository.index_bars(
-            (InstrumentId.parse("000300.SH"),),
+            (IndexId.parse("000300.SH"),),
             date(2026, 8, 11),
             date(2026, 8, 11),
         ).collect()
@@ -529,26 +600,19 @@ def test_index_bars_reads_only_requested_canonical_index(tmp_path: Path) -> None
         harness.close()
 
 
-def test_financial_history_keeps_visible_revisions_without_pit_collapse(
+def test_financial_indicators_select_latest_visible_revision(
     tmp_path: Path,
 ) -> None:
-    """历史读取保留全部可见修订，而 as-of 读取只返回最新修订。"""
+    """财务读取按报告期返回观察日可见的最新修订。"""
     harness = _FinancialRepositoryHarness(tmp_path)
     try:
         instrument = (InstrumentId.parse("600000.SH"),)
 
-        history = harness.repository.financial_history(
-            ("dupont_roe",), date(2026, 4, 30), instrument
-        ).collect()
-        latest = harness.repository.financials_as_of(
-            ("dupont_roe",), date(2026, 4, 30), instrument
+        latest = harness.repository.stock_financial_indicators(
+            date(2026, 4, 30), instrument
         ).collect()
 
-        assert history.select("revision", "value").rows() == [
-            (0, 0.10),
-            (1, 0.11),
-        ]
-        assert latest.select("revision", "value").rows() == [(1, 0.11)]
+        assert latest.select("revision", "roe").rows() == [(1, 0.11)]
     finally:
         harness.close()
 
@@ -560,7 +624,7 @@ def test_first_read_rejects_corrupted_partition(tmp_path: Path) -> None:
         harness.record.partitions[0].path.write_bytes(b"not parquet")
 
         with pytest.raises(ValueError, match="canonical partition is unavailable"):
-            harness.repository.instruments()
+            harness.repository.stocks()
     finally:
         harness.close()
 
@@ -583,7 +647,7 @@ def test_first_read_rejects_catalog_integrity_mismatches(tmp_path: Path) -> None
             )
 
             with pytest.raises(ValueError, match="canonical partition is unavailable"):
-                repository.instruments()
+                repository.stocks()
     finally:
         harness.close()
 
@@ -610,8 +674,8 @@ def test_repeated_read_reuses_verified_partition_lease(
 
         monkeypatch.setattr(verifier, "verify", counted_verify)
 
-        assert harness.repository.instruments().collect().height == 1
-        assert harness.repository.instruments().collect().height == 1
+        assert harness.repository.stocks().collect().height == 1
+        assert harness.repository.stocks().collect().height == 1
         assert calls == 1
     finally:
         harness.close()
@@ -632,7 +696,7 @@ def test_dataset_size_limit_applies_on_first_read(
         )
 
         with pytest.raises(ValueError, match="size limit"):
-            harness.repository.instruments()
+            harness.repository.stocks()
     finally:
         harness.close()
 
@@ -644,7 +708,7 @@ def test_dataset_size_limit_applies_to_cached_lease(
     """缓存命中的 Lease 也必须重新检查本次数据集大小额度。"""
     harness = _ResearchRepositoryHarness(tmp_path)
     try:
-        assert harness.repository.instruments().collect().height == 1
+        assert harness.repository.stocks().collect().height == 1
         file_size = harness.record.partitions[0].path.stat().st_size
         monkeypatch.setattr(
             repository_module,
@@ -653,6 +717,6 @@ def test_dataset_size_limit_applies_to_cached_lease(
         )
 
         with pytest.raises(ValueError, match="size limit"):
-            harness.repository.instruments()
+            harness.repository.stocks()
     finally:
         harness.close()

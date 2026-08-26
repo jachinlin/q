@@ -26,7 +26,7 @@ _ENDPOINT_DATASET: Mapping[str, DatasetKind] = {
     "fund_basic": DatasetKind.FUND_MASTER,
     "index_basic": DatasetKind.INDEX_MASTER,
     "trade_cal": DatasetKind.TRADE_CALENDAR,
-    "daily_vip": DatasetKind.STOCK_DAILY_BAR,
+    "daily": DatasetKind.STOCK_DAILY_BAR,
     "adj_factor": DatasetKind.STOCK_ADJUSTMENT_FACTOR,
     "fund_daily": DatasetKind.FUND_DAILY_BAR,
     "fund_adj": DatasetKind.FUND_ADJUSTMENT_FACTOR,
@@ -46,7 +46,7 @@ _RENAMES: Mapping[str, Mapping[str, str]] = {
         "cal_date": "trade_date", "is_open": "is_trading_day",
         "pretrade_date": "previous_trade_date",
     },
-    "daily_vip": {
+    "daily": {
         "ts_code": "instrument_id", "pre_close": "preclose",
         "pct_chg": "pct_change", "vol": "volume", "ah_vol": "after_hours_volume",
         "ah_amount": "after_hours_amount",

@@ -38,15 +38,25 @@ def required_dataset_issues(
     for dataset in sorted(required, key=lambda item: item.value):
         partitions = inputs.get(dataset, ())
         if not partitions:
-            issues.append(_Support.issue("required_dataset_missing", Severity.FATAL, dataset, 0, 1))
+            issues.append(
+                _Support.issue(
+                    "required_dataset_missing", Severity.FATAL, dataset, 0, 1
+                )
+            )
         elif _Support.rows(_Support.compatible(partitions)) == 0:
-            issues.append(_Support.issue("required_dataset_empty", Severity.FATAL, dataset, 0, 1))
+            issues.append(
+                _Support.issue("required_dataset_empty", Severity.FATAL, dataset, 0, 1)
+            )
     calendar = _Support.compatible(inputs.get(DatasetKind.TRADE_CALENDAR, ()))
     if calendar is not None and not bool(
-        calendar.select(pl.col("is_trading_day").fill_null(False).any()).collect().item()
+        calendar.select(pl.col("is_trading_day").fill_null(False).any())
+        .collect()
+        .item()
     ):
         issues.append(
-            _Support.issue("trading_window_empty", Severity.FATAL, DatasetKind.TRADE_CALENDAR, 0, 1)
+            _Support.issue(
+                "trading_window_empty", Severity.FATAL, DatasetKind.TRADE_CALENDAR, 0, 1
+            )
         )
     return issues
 
@@ -61,17 +71,27 @@ def canonical_schema_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         expected = CANONICAL_SCHEMAS[dataset].columns
         mismatches = sum(_Support.schema(item) != expected for item in partitions)
         if mismatches:
-            issues.append(_Support.issue("canonical_schema", Severity.FATAL, dataset, mismatches, 0))
+            issues.append(
+                _Support.issue(
+                    "canonical_schema", Severity.FATAL, dataset, mismatches, 0
+                )
+            )
     return issues
 
 
-def canonical_conforming_partitions(inputs: CanonicalPartitions) -> dict[DatasetKind, tuple[CanonicalFrame, ...]]:
+def canonical_conforming_partitions(
+    inputs: CanonicalPartitions,
+) -> dict[DatasetKind, tuple[CanonicalFrame, ...]]:
     """筛选合规分区；该函数作为稳定公开 API 或框架入口保留在模块级。
 
     入参：Canonical 分区。返回值：合规分区。异常：帧错误按原类型传播。
     """
     return {
-        dataset: tuple(item for item in partitions if _Support.schema(item) == CANONICAL_SCHEMAS[dataset].columns)
+        dataset: tuple(
+            item
+            for item in partitions
+            if _Support.schema(item) == CANONICAL_SCHEMAS[dataset].columns
+        )
         for dataset, partitions in inputs.items()
     }
 
@@ -88,7 +108,11 @@ def cross_partition_schema_issues(inputs: CanonicalPartitions) -> list[QualityIs
         first = _Support.schema(partitions[0])
         count = sum(_Support.schema(item) != first for item in partitions[1:])
         if count:
-            issues.append(_Support.issue("cross_partition_schema", Severity.FATAL, dataset, count, 0))
+            issues.append(
+                _Support.issue(
+                    "cross_partition_schema", Severity.FATAL, dataset, count, 0
+                )
+            )
     return issues
 
 
@@ -104,10 +128,19 @@ def primary_key_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
             continue
         keys = CANONICAL_SCHEMAS[dataset].primary_key
         duplicates = int(
-            frame.group_by(list(keys)).len().filter(pl.col("len") > 1).select(pl.len()).collect().item()
+            frame.group_by(list(keys))
+            .len()
+            .filter(pl.col("len") > 1)
+            .select(pl.len())
+            .collect()
+            .item()
         )
         if duplicates:
-            issues.append(_Support.issue("primary_key_duplicate", Severity.FATAL, dataset, duplicates, 0))
+            issues.append(
+                _Support.issue(
+                    "primary_key_duplicate", Severity.FATAL, dataset, duplicates, 0
+                )
+            )
     return issues
 
 
@@ -123,10 +156,19 @@ def required_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
             continue
         fields = _REQUIRED_COLUMNS[dataset]
         invalid = int(
-            frame.filter(pl.any_horizontal(*(pl.col(name).is_null() for name in fields))).select(pl.len()).collect().item()
+            frame.filter(
+                pl.any_horizontal(*(pl.col(name).is_null() for name in fields))
+            )
+            .select(pl.len())
+            .collect()
+            .item()
         )
         if invalid:
-            issues.append(_Support.issue("required_value_null", Severity.SEVERE, dataset, invalid, 0))
+            issues.append(
+                _Support.issue(
+                    "required_value_null", Severity.SEVERE, dataset, invalid, 0
+                )
+            )
     return issues
 
 
@@ -140,15 +182,39 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         frame = _Support.compatible(inputs.get(dataset, ()))
         if frame is None:
             continue
+        traded = frame.filter(
+            ~(pl.col("volume").is_null() & pl.col("amount").is_null())
+        )
         invalid_price = int(
-            frame.filter(pl.any_horizontal(*(pl.col(name).is_null() | ~pl.col(name).is_finite() | (pl.col(name) <= 0) for name in ("open", "high", "low", "close")))).select(pl.len()).collect().item()
+            traded.filter(
+                pl.any_horizontal(
+                    *(
+                        pl.col(name).is_null()
+                        | ~pl.col(name).is_finite()
+                        | (pl.col(name) <= 0)
+                        for name in ("open", "high", "low", "close")
+                    )
+                )
+            )
+            .select(pl.len())
+            .collect()
+            .item()
         )
         invalid_ohlc = int(
-            frame.filter((pl.col("high") < pl.max_horizontal("open", "close")) | (pl.col("low") > pl.min_horizontal("open", "close")) | (pl.col("high") < pl.col("low"))).select(pl.len()).collect().item()
+            traded.filter(
+                (pl.col("high") < pl.max_horizontal("open", "close"))
+                | (pl.col("low") > pl.min_horizontal("open", "close"))
+                | (pl.col("high") < pl.col("low"))
+            )
+            .select(pl.len())
+            .collect()
+            .item()
         )
-        negative_volume = int(frame.filter(pl.col("volume") < 0).select(pl.len()).collect().item())
+        negative_volume = int(
+            traded.filter(pl.col("volume") < 0).select(pl.len()).collect().item()
+        )
         invalid_pct_change = int(
-            frame.filter(
+            traded.filter(
                 pl.col("preclose").is_null()
                 | ~pl.col("preclose").is_finite()
                 | (pl.col("preclose") <= 0)
@@ -178,11 +244,38 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
 
 
 def coverage_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
-    """检查 Master 覆盖；该函数作为稳定公开 API 或框架入口保留在模块级。
+    """检查交易日与 Master 覆盖；该函数作为稳定公开 API 或框架入口保留在模块级。
 
     入参：Canonical 分区。返回值：质量问题。异常：帧错误按原类型传播。
     """
     issues: list[QualityIssue] = []
+    stock_bars = _Support.compatible(inputs.get(DatasetKind.STOCK_DAILY_BAR, ()))
+    calendar = _Support.compatible(inputs.get(DatasetKind.TRADE_CALENDAR, ()))
+    if stock_bars is not None and calendar is not None:
+        latest = stock_bars.select(pl.col("trade_date").max()).collect().item()
+        if latest is not None:
+            observed = stock_bars.select("trade_date").unique()
+            missing = int(
+                calendar.filter(
+                    pl.col("is_trading_day") & (pl.col("trade_date") <= latest)
+                )
+                .select("trade_date")
+                .unique()
+                .join(observed, on="trade_date", how="anti")
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+            if missing:
+                issues.append(
+                    _Support.issue(
+                        "trading_day_coverage",
+                        Severity.SEVERE,
+                        DatasetKind.STOCK_DAILY_BAR,
+                        missing,
+                        0,
+                    )
+                )
     for bars, master in (
         (DatasetKind.STOCK_DAILY_BAR, DatasetKind.STOCK_MASTER),
         (DatasetKind.FUND_DAILY_BAR, DatasetKind.FUND_MASTER),
@@ -192,12 +285,21 @@ def coverage_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         if bar_frame is None or master_frame is None:
             continue
         unknown = int(
-            bar_frame.select("instrument_id").unique().join(
-                master_frame.select("instrument_id").unique(), on="instrument_id", how="anti"
-            ).select(pl.len()).collect().item()
+            bar_frame.select("instrument_id")
+            .unique()
+            .join(
+                master_frame.select("instrument_id").unique(),
+                on="instrument_id",
+                how="anti",
+            )
+            .select(pl.len())
+            .collect()
+            .item()
         )
         if unknown:
-            issues.append(_Support.issue("instrument_coverage", Severity.SEVERE, bars, unknown, 0))
+            issues.append(
+                _Support.issue("instrument_coverage", Severity.SEVERE, bars, unknown, 0)
+            )
     return issues
 
 
@@ -215,9 +317,20 @@ def financial_availability_issues(inputs: CanonicalPartitions) -> list[QualityIs
             pl.col("announcement_date").is_null()
             | (pl.col("announcement_date") < pl.col("report_period"))
             | pl.col("available_at").is_null()
-        ).select(pl.len()).collect().item()
+        )
+        .select(pl.len())
+        .collect()
+        .item()
     )
-    return [] if not invalid else [_Support.issue("financial_availability", Severity.SEVERE, dataset, invalid, 0)]
+    return (
+        []
+        if not invalid
+        else [
+            _Support.issue(
+                "financial_availability", Severity.SEVERE, dataset, invalid, 0
+            )
+        ]
+    )
 
 
 def industry_state_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
@@ -233,11 +346,21 @@ def industry_state_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         frame.filter(
             pl.col("in_date").is_null()
             | pl.col("in_available_at").is_null()
-            | (pl.col("out_date").is_not_null() & (pl.col("out_date") < pl.col("in_date")))
+            | (
+                pl.col("out_date").is_not_null()
+                & (pl.col("out_date") < pl.col("in_date"))
+            )
             | (pl.col("out_date").is_not_null() & pl.col("out_available_at").is_null())
-        ).select(pl.len()).collect().item()
+        )
+        .select(pl.len())
+        .collect()
+        .item()
     )
-    return [] if not invalid else [_Support.issue("industry_state", Severity.FATAL, dataset, invalid, 0)]
+    return (
+        []
+        if not invalid
+        else [_Support.issue("industry_state", Severity.FATAL, dataset, invalid, 0)]
+    )
 
 
 class _Support:
@@ -249,7 +372,9 @@ class _Support:
 
     @staticmethod
     def schema(frame: CanonicalFrame) -> pl.Schema:
-        return frame.schema if isinstance(frame, pl.DataFrame) else frame.collect_schema()
+        return (
+            frame.schema if isinstance(frame, pl.DataFrame) else frame.collect_schema()
+        )
 
     @classmethod
     def compatible(cls, partitions: Sequence[CanonicalFrame]) -> pl.LazyFrame | None:
@@ -264,7 +389,9 @@ class _Support:
         return 0 if frame is None else int(frame.select(pl.len()).collect().item())
 
     @staticmethod
-    def issue(rule: str, severity: Severity, dataset: DatasetKind, actual: int, threshold: int) -> QualityIssue:
+    def issue(
+        rule: str, severity: Severity, dataset: DatasetKind, actual: int, threshold: int
+    ) -> QualityIssue:
         return QualityIssue(
             rule_id=rule,
             severity=severity,

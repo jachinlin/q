@@ -87,12 +87,20 @@ class _DashboardRoutes:
         def change_dashboard_settings(
             body: DashboardSettingsPatchRequest,
         ) -> dict[str, object]:
-            change = body.data_source_token
-            if change is None:
-                raise ValueError("settings patch must contain a data source token change")
-            return settings.change_data_source_token(
-                operation=change.operation,
-                value=change.value,
+            token = body.data_source_token
+            rate_limit = body.data_source_rate_limit
+            proxy = body.data_source_proxy
+            return settings.change(
+                token_operation=None if token is None else token.operation,
+                token_value=None if token is None else token.value,
+                rate_limit_operation=(
+                    None if rate_limit is None else rate_limit.operation
+                ),
+                requests_per_minute=(
+                    None if rate_limit is None else rate_limit.requests_per_minute
+                ),
+                proxy_operation=None if proxy is None else proxy.operation,
+                proxy_url=None if proxy is None else proxy.url,
             )
 
         @app.get("/api/v1/data/datasets", response_model=DatasetListResponse)

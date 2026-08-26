@@ -93,7 +93,7 @@ def test_localize_cli_derives_dates_before_calling_strict_pipeline() -> None:
                 SimpleNamespace(pipeline=pipeline, close=lambda: None),
             )
         ),
-        ["data", "localize", "daily_bar"],
+        ["data", "localize", "stock_daily_bar"],
     )
 
     assert result.exit_code == 0

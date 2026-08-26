@@ -12,8 +12,7 @@ from quant_research.factors.builtin.quality import RoePitFactor
 _FINANCIAL_SCHEMA = {
     "instrument_id": pl.String,
     "report_period": pl.Date,
-    "metric": pl.String,
-    "value": pl.Float64,
+    "roe": pl.Float64,
     "revision": pl.Int64,
     "available_at": pl.Datetime("us", "UTC"),
 }
@@ -34,14 +33,12 @@ class _Provider:
             schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
         ).lazy()
 
-    def financial_history(
+    def stock_financial_indicators(
         self,
-        field_ids: tuple[str, ...],
         as_of: date,
         instruments: tuple[InstrumentId, ...] | None = None,
     ) -> pl.LazyFrame:
         self.history_calls += 1
-        assert field_ids == ("dupont_roe",)
         assert instruments is not None
         instrument_ids = [instrument.canonical() for instrument in instruments]
         return self._history.filter(
@@ -61,8 +58,7 @@ def _row(
     return {
         "instrument_id": instrument,
         "report_period": period,
-        "metric": "dupont_roe",
-        "value": value,
+        "roe": value,
         "revision": revision,
         "available_at": datetime.combine(available, datetime.min.time(), tzinfo=UTC),
     }

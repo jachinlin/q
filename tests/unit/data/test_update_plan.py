@@ -22,6 +22,16 @@ from quant_research.infrastructure.persistence.repositories import (
 )
 from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 
+_SNAPSHOT_DATASETS = frozenset(
+    {
+        DatasetKind.STOCK_MASTER,
+        DatasetKind.FUND_MASTER,
+        DatasetKind.INDEX_MASTER,
+        DatasetKind.INDUSTRY_CATALOG,
+        DatasetKind.INDUSTRY_MEMBERSHIP,
+    }
+)
+
 
 class _Calendar:
     def bootstrap_window(self, years: int) -> tuple[date, date]:
@@ -50,7 +60,7 @@ class _Repository:
         return CanonicalDatasetRecord(
             dataset=dataset,
             content_hash="a" * 64,
-            source="baostock",
+            source="tushare",
             partitions=(),
             start_date=date(2020, 1, 1),
             end_date=date(2026, 8, 10),
@@ -83,6 +93,7 @@ def test_auto_plan_freezes_each_dataset_window_without_null_parameters() -> None
             item.value
             for item in DATASET_CATALOG
             if TUSHARE_ROUTES[item]
+            and item is not DatasetKind.STOCK_FINANCIAL_INDICATOR
         )
     )
     assert tuple(item.dataset.value for item in plan.dataset_windows) == expected
@@ -91,7 +102,9 @@ def test_auto_plan_freezes_each_dataset_window_without_null_parameters() -> None
     )
     assert plan.skipped_datasets[0].trigger_date == date(2026, 8, 31)
     instrument = next(
-        item for item in plan.dataset_windows if item.dataset is DatasetKind.STOCK_MASTER
+        item
+        for item in plan.dataset_windows
+        if item.dataset is DatasetKind.STOCK_MASTER
     )
     calendar = next(
         item
@@ -145,7 +158,7 @@ def test_bootstrap_plan_uses_required_years_and_freezes_base_window() -> None:
     assert all(
         item.basis is DataUpdateWindowBasis.BOOTSTRAP
         for item in plan.dataset_windows
-        if item.dataset is not DatasetKind.STOCK_MASTER
+        if item.dataset not in _SNAPSHOT_DATASETS
     )
     assert DataUpdatePlan.from_payload(plan.to_payload()) == plan
 
@@ -173,10 +186,12 @@ def test_explicit_plan_records_request_and_normalized_dataset_windows() -> None:
     assert all(
         item.basis is DataUpdateWindowBasis.EXPLICIT
         for item in plan.dataset_windows
-        if item.dataset is not DatasetKind.STOCK_MASTER
+        if item.dataset not in _SNAPSHOT_DATASETS
     )
     instrument = next(
-        item for item in plan.dataset_windows if item.dataset is DatasetKind.STOCK_MASTER
+        item
+        for item in plan.dataset_windows
+        if item.dataset is DatasetKind.STOCK_MASTER
     )
     assert instrument.basis is DataUpdateWindowBasis.SNAPSHOT_REFRESH
     assert instrument.current_watermark is None

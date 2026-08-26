@@ -20,7 +20,7 @@ vi.mock('vue-echarts', () => ({ default: { name: 'VChart', props: ['option'], te
 const definition = {
   name: '价值动量研究', description: '候选诊断', tags: ['factor'], start_date: '2018-01-01', end_date: '2022-12-31',
   correction: 'BH_FDR', factor_ids: ['book_to_price_mrq'], universe: { name: 'CN_STOCK_STANDARD' }, horizons: [5], quantiles: 5,
-  industry: { taxonomy: '证监会行业分类', unclassified_policy: 'EXCLUDE' }, cost_bps_scenarios: [5, 10, 20],
+  industry: { taxonomy: 'SW2021', unclassified_policy: 'EXCLUDE' }, cost_bps_scenarios: [5, 10, 20],
 }
 const study = {
   id: 'study-1', definition, config_hash: 'a'.repeat(64), catalog_hash: 'b'.repeat(64), status: 'SUCCEEDED', stage: 'PUBLISH', task_id: 'task-1',

@@ -25,7 +25,7 @@ const review = {
   liquidity: { amount: 1_100_000_000_000, change_vs_previous: 0.08, average_5d: 1_000_000_000_000, average_20d: 900_000_000_000, percentile_20d: 0.85, series: [{ trade_date: '2026-08-14', value: 1_100_000_000_000, auxiliary: 1_000_000_000_000 }] },
   breadth: { up_count: 3200, down_count: 1700, flat_count: 80, advance_rate: 0.642, net_advance_count: 1500, equal_weight_return: 0.01, median_return: 0.008, p10_return: -0.03, p25_return: -0.01, p75_return: 0.02, p90_return: 0.04, buckets: [{ label: '<-5%', count: 30 }, { label: '>5%', count: 60 }] },
   sentiment: { limit_up_count: 80, limit_down_count: 4, broken_limit_up_count: 15, one_price_limit_up_count: 3, eligible_count: 4900, unresolved_count: 10, coverage_rate: 0.998, note: '规则估算', events: [{ instrument_id: '600000.SH', name: '浦发银行', board: 'MAIN', is_st: false, pct_change: 0.1, amount: 1_000_000_000, event: 'LIMIT_UP' }] },
-  industries: { available: true, taxonomy: '证监会行业分类', coverage_rate: 0.95, unavailable_reason: null, items: [{ industry_code: 'BANK', industry_name: '银行', equal_weight_return: 0.02, advance_rate: 0.8, amount_share: 0.1, instrument_count: 40, priced_count: 40, limit_up_count: 1, limit_down_count: 0 }] },
+  industries: { available: true, taxonomy: 'SW2021', coverage_rate: 0.95, unavailable_reason: null, items: [{ industry_code: 'BANK', industry_name: '银行', equal_weight_return: 0.02, advance_rate: 0.8, amount_share: 0.1, instrument_count: 40, priced_count: 40, limit_up_count: 1, limit_down_count: 0 }] },
   valuation: { metrics: [{ metric: 'pe_ttm', median: 18, p25: 12, p75: 30, valid_count: 4000 }], turnover_median: 0.025, turnover_valid_count: 4800 },
 }
 

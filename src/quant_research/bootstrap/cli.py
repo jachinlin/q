@@ -55,6 +55,7 @@ from quant_research.infrastructure.tushare import (
     TushareClient,
     TushareConfig,
     TushareMapper,
+    TushareRateLimiter,
     TushareSdkGateway,
 )
 from quant_research.logging import (
@@ -103,9 +104,18 @@ class CliBootstrap:
                 max_attempts=settings.tushare.max_attempts,
                 retry_backoff_seconds=settings.tushare.retry_backoff_seconds,
                 token_provider=lambda: runtime_settings.read_data_source_token().value,
+                rate_limit_provider=lambda: runtime_settings.read_data_source_rate_limit().requests_per_minute,
+                proxy_provider=lambda: runtime_settings.read_data_source_proxy().value,
             )
-            source = TushareClient(TushareSdkGateway(), source_config)
-            calendar_client = TushareClient(TushareSdkGateway(), source_config)
+            rate_limiter = TushareRateLimiter(
+                source_config.resolved_requests_per_minute
+            )
+            source = TushareClient(
+                TushareSdkGateway(), source_config, rate_limiter=rate_limiter
+            )
+            calendar_client = TushareClient(
+                TushareSdkGateway(), source_config, rate_limiter=rate_limiter
+            )
             pipeline_logger, pipeline_stream = cls._pipeline_logger(settings.data_root)
             pipeline = DataPipeline(
                 source=source,

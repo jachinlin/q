@@ -98,7 +98,7 @@ def test_factor_spec_can_explicitly_declare_industry_dataset_dependency() -> Non
         dependencies=(),
         direction=1,
         parameters={
-            "taxonomy": "证监会行业分类",
+            "taxonomy": "SW2021",
             "unclassified_policy": "EXCLUDE",
         },
         required_datasets=(DatasetKind.INDUSTRY_MEMBERSHIP,),

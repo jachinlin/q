@@ -42,6 +42,7 @@ from quant_research.infrastructure.tushare import (
     TushareCalendarPolicy,
     TushareClient,
     TushareConfig,
+    TushareRateLimiter,
     TushareSdkGateway,
 )
 from quant_research.strategies.registry import StrategyRegistry
@@ -140,8 +141,15 @@ class DashboardBootstrap:
                 max_attempts=settings.tushare.max_attempts,
                 retry_backoff_seconds=settings.tushare.retry_backoff_seconds,
                 token_provider=lambda: runtime_settings.read_data_source_token().value,
+                rate_limit_provider=lambda: runtime_settings.read_data_source_rate_limit().requests_per_minute,
+                proxy_provider=lambda: runtime_settings.read_data_source_proxy().value,
             )
-            calendar_client = TushareClient(TushareSdkGateway(), source_config)
+            rate_limiter = TushareRateLimiter(
+                source_config.resolved_requests_per_minute
+            )
+            calendar_client = TushareClient(
+                TushareSdkGateway(), source_config, rate_limiter=rate_limiter
+            )
             service = DashboardViewService(
                 engine,
                 settings,

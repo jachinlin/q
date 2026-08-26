@@ -31,14 +31,12 @@ class _Artifact:
 
 
 class _IndustryRepository:
-    """返回包含分类、tombstone 和缺失状态的固定 PIT 行业表。"""
+    """返回固定的申万 PIT 行业成员表。"""
 
     def __init__(self, frame: pl.DataFrame) -> None:
         self._frame = frame
 
-    def industry_classifications_on_dates(
-        self, _: object, __: object
-    ) -> pl.LazyFrame:
+    def industry_memberships_on_dates(self, _: object, __: object) -> pl.LazyFrame:
         """返回固定行业状态。
 
         入参：
@@ -54,17 +52,18 @@ class _IndustryRepository:
 class _EmptyExecutableRepository:
     """提供缺失证券状态时仍具固定 Schema 的研究输入。"""
 
-    def instruments(self) -> pl.LazyFrame:
+    def stocks(self) -> pl.LazyFrame:
         """返回一个合法证券元数据行。"""
         return pl.DataFrame(
             {
                 "instrument_id": ["000001.SZ"],
-                "instrument_type": ["STOCK"],
                 "board": ["MAIN"],
+                "list_date": [date(2000, 1, 1)],
+                "delist_date": pl.Series([None], dtype=pl.Date),
             }
         ).lazy()
 
-    def bars(self, _: object, __: date, ___: date) -> pl.LazyFrame:
+    def stock_bars(self, _: object, __: date, ___: date) -> pl.LazyFrame:
         """返回固定未复权行情 Schema。"""
         return pl.DataFrame(
             schema={
@@ -75,19 +74,34 @@ class _EmptyExecutableRepository:
             }
         ).lazy()
 
-    def security_status_range(
-        self, _: date, __: date, ___: object
-    ) -> pl.LazyFrame:
-        """返回固定空证券状态 Schema。"""
+    def stock_suspensions(self, _: date, __: date, ___: object) -> pl.LazyFrame:
+        """返回固定空停牌事件 Schema。"""
         return pl.DataFrame(
             schema={
                 "instrument_id": pl.String,
                 "trade_date": pl.Date,
-                "is_listed": pl.Boolean,
-                "is_suspended": pl.Boolean,
-                "is_st": pl.Boolean,
             }
         ).lazy()
+
+    def stock_risk_warnings(self, _: date, __: date, ___: object) -> pl.LazyFrame:
+        """返回固定空风险警示事件 Schema。"""
+        return pl.DataFrame(
+            schema={"instrument_id": pl.String, "trade_date": pl.Date}
+        ).lazy()
+
+    def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
+        """返回请求区间内的固定开市日。"""
+        return (
+            pl.DataFrame(
+                {
+                    "trade_date": [start, end],
+                    "is_trading_day": [True, True],
+                },
+                schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
+            )
+            .unique()
+            .lazy()
+        )
 
 
 def test_factor_study_maps_date_applies_direction_and_pit_scope() -> None:
@@ -136,11 +150,9 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
     instruments = [f"00000{index}.SZ" for index in range(1, 6)]
     state = pl.DataFrame(
         {
-            "query_date": [day] * 4,
-            "instrument_id": instruments[:4],
-            "taxonomy": ["证监会行业分类"] * 4,
-            "industry_code": ["A", "A", "B", None],
-            "is_classified": [True, True, True, False],
+            "query_date": [day] * 3,
+            "instrument_id": instruments[:3],
+            "level1_code": ["A", "A", "B"],
         }
     )
     session = _FactorStudySession(
@@ -182,7 +194,7 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
             horizons=(1,),
             quantiles=5,
             industry=FactorIndustrySettings(
-                taxonomy="证监会行业分类",
+                taxonomy="SW2021",
                 unclassified_policy=policy,
             ),
             cost_bps_scenarios=(5, 10, 20),
@@ -211,7 +223,7 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
         "usable_count",
         "classified_coverage",
         "usable_coverage",
-    ).row(0) == (5, 3, 1, 1, 3, 0.6, 0.6)
+    ).row(0) == (5, 3, 0, 2, 3, 0.6, 0.6)
     assert unclassified_coverage["usable_count"].item() == 5
     exclude_neutral = excluded.filter(
         pl.col("signal_variant") == "INDUSTRY_NEUTRALIZED"
@@ -245,13 +257,9 @@ def test_factor_metrics_keep_rank_and_spread_corrections_in_separate_families() 
         "ic": pl.DataFrame({"pair_coverage": [0.6, 0.8]}),
     }
 
-    metrics = _FactorPublisher.metrics(
-        tables, MultipleTestingMethod.BONFERRONI
-    )
+    metrics = _FactorPublisher.metrics(tables, MultipleTestingMethod.BONFERRONI)
 
-    rank_names = sorted(
-        name for name in metrics if name.startswith("rank_ic_mean/")
-    )
+    rank_names = sorted(name for name in metrics if name.startswith("rank_ic_mean/"))
     spread_names = sorted(
         name for name in metrics if name.startswith("long_short_mean/")
     )
@@ -272,9 +280,7 @@ def test_empty_security_status_keeps_executable_state_fixed_schema() -> None:
         Path("."),
     )
 
-    state = session._executable_state(
-        (), date(2026, 1, 5), date(2026, 1, 6)
-    )
+    state = session._executable_state((), date(2026, 1, 5), date(2026, 1, 6))
 
     assert state.is_empty()
     assert state.schema == {

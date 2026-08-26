@@ -9,6 +9,7 @@ def test_production_source_has_no_legacy_provider_or_per_instrument_api() -> Non
     forbidden = (
         "baostock",
         "pro_bar",
+        "daily_vip",
         "query_profit_data",
         "query_dupont_data",
         "DatasetKind.INSTRUMENT",

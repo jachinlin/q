@@ -35,7 +35,7 @@ function definitionFromForm(): FactorStudyDefinition {
     start_date: form.start_date, end_date: form.end_date, correction: form.correction,
     factor_ids: [...form.factor_ids], universe: { name: 'CN_STOCK_STANDARD' },
     horizons: [...form.horizons].sort((a, b) => a - b), quantiles: form.quantiles,
-    industry: form.industry_enabled ? { taxonomy: '证监会行业分类', unclassified_policy: form.industry_policy } : null,
+    industry: form.industry_enabled ? { taxonomy: 'SW2021', unclassified_policy: form.industry_policy } : null,
     cost_bps_scenarios: [...form.cost_bps_scenarios].sort((a, b) => a - b),
   }
 }

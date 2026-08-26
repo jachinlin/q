@@ -17,7 +17,7 @@ _SCHEMA = {
     "trade_date": pl.Date,
     "instrument_id": pl.String,
     "pe_ttm": pl.Float64,
-    "pb_mrq": pl.Float64,
+    "pb": pl.Float64,
     "available_at": pl.Datetime("us", "UTC"),
 }
 
@@ -27,7 +27,7 @@ class _Repository:
         self._frame = frame
         self.calls = 0
 
-    def daily_basics(
+    def stock_daily_basics(
         self,
         instruments: tuple[InstrumentId, ...],
         start: date,
@@ -40,7 +40,7 @@ class _Repository:
             & pl.col("trade_date").is_between(start, end, closed="both")
         ).lazy()
 
-    def bars(
+    def stock_bars(
         self,
         instruments: tuple[InstrumentId, ...],
         start: date,
@@ -60,7 +60,7 @@ def test_signed_valuation_reciprocals_share_one_input_read() -> None:
             "trade_date": days,
             "instrument_id": ["000001.SZ"] * 3,
             "pe_ttm": [10.0, -5.0, 0.0],
-            "pb_mrq": [2.0, -4.0, float("inf")],
+            "pb": [2.0, -4.0, float("inf")],
             "available_at": [_available(day) for day in days],
         },
         schema=_SCHEMA,
@@ -89,7 +89,7 @@ def test_valuation_rejects_nonfinite_and_future_availability() -> None:
             "trade_date": days,
             "instrument_id": ["000001.SZ"] * 2,
             "pe_ttm": [float("nan"), 10.0],
-            "pb_mrq": [1.0, 1.0],
+            "pb": [1.0, 1.0],
             "available_at": [_available(days[0]), _available(date(2026, 4, 29))],
         },
         schema=_SCHEMA,
@@ -113,7 +113,7 @@ def test_valuation_cache_rejects_duplicate_keys() -> None:
             "trade_date": [day, day],
             "instrument_id": ["000001.SZ", "000001.SZ"],
             "pe_ttm": [10.0, 11.0],
-            "pb_mrq": [2.0, 2.0],
+            "pb": [2.0, 2.0],
             "available_at": [_available(day), _available(day)],
         },
         schema=_SCHEMA,

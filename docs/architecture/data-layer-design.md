@@ -36,7 +36,7 @@
 
 ### 2.1 端点与数据集
 
-**端点（endpoint）**是供应商提供的查询接口，例如 Tushare 的 `daily_vip`。
+**端点（endpoint）**是供应商提供的查询接口，例如 Tushare 的 `daily`。
 
 **数据集（dataset）**是项目内部具有固定含义、字段和主键的一组数据，例如 `stock_daily_bar`。端点属于外部世界，Canonical 数据集属于本项目的领域模型。
 
@@ -149,7 +149,7 @@ Canonical 表示“项目内部唯一认可的标准形式”。以下 15 个数
 | `fund_master` | `fund_basic` | 全部场内基金基础信息；构建 ETF 等基金候选集合 | 全市场快照 | `all` |
 | `index_master` | `index_basic` | 指数名称、市场和基日；解释 benchmark | 按指数市场的全量快照 | `all` |
 | `trade_calendar` | `trade_cal` | 判断某天是否开市以及前一交易日 | 交易所日期区间 | `all` |
-| `stock_daily_bar` | `daily_vip` | 股票 OHLC、昨收、成交量和成交额 | 每个交易日一次全市场请求 | `year=<YYYY>` |
+| `stock_daily_bar` | `daily` | 股票 OHLC、昨收、成交量和成交额 | 每个交易日一次全市场请求 | `year=<YYYY>` |
 | `stock_adjustment_factor` | `adj_factor` | 股票本地复权所需因子 | 每个交易日一次全市场请求 | `year=<YYYY>` |
 | `fund_daily_bar` | `fund_daily` | 场内基金每日行情 | 每个交易日一次全市场请求 | `year=<YYYY>` |
 | `fund_adjustment_factor` | `fund_adj` | 场内基金本地复权所需因子 | 每个交易日一次全市场请求 | `year=<YYYY>` |
@@ -172,6 +172,21 @@ Canonical 表示“项目内部唯一认可的标准形式”。以下 15 个数
 因此，除 `index_daily` 外，采集请求不得携带 `ts_code`。行业成员可以因行数限制按一级行业切片，但不能按股票切片。
 
 ETF 策略池和股票池只在 Canonical 数据已经发布后过滤。例如策略只研究 20 只 ETF，也仍然采集全部场内基金行情。
+
+代理与官方端点的单页上限并不完全一致。`fund_daily` 使用 `limit=5000`，
+`fund_adj` 使用 `limit=2000`；两者都从 `offset=0` 开始，持续翻页到返回行数小于
+单页上限。分页发生在一个逻辑 Raw 请求内部，最终合并为该交易日的一份完整 Raw
+响应；每个真实页面仍独立经过限流和重试。合并时若发现空主键或跨页重复的
+`(ts_code, trade_date)`，采集失败关闭，避免静默保存截断或漂移数据。
+
+`index_member_all` 使用完整的申万一级行业代码（例如 `801010.SI`），并为每个行业
+分别采集 `is_new=Y` 的当前成员与 `is_new=N` 的历史退出成员。这样
+`industry_membership` 才能支持按任意历史日期重建行业归属。
+
+当前代理的 `daily_basic` 不返回官方字段 `limit_status`。Raw 请求因此只声明代理实际
+提供的 18 个字段；Canonical 仍保留可空的 `limit_status`，映射值为 `null`，以便未来
+数据源恢复该字段时维持稳定研究 Schema。涨跌停判断继续只使用行情 `preclose`、交易
+画像、ST 状态和 `MarketRuleBook`，不依赖 `limit_status` 形成第二套口径。
 
 ### 4.2 `index_daily` 为什么是例外
 
@@ -196,11 +211,12 @@ LOCALIZE 的职责是“把供应商当时返回了什么”完整保存下来�
 以股票日行情为例，请求形态类似：
 
 ```text
-endpoint = daily_vip
+endpoint = daily
 request  = {trade_date: 20260825}
 ```
 
-其中没有股票代码。一次响应包含该交易日的全市场股票行情。
+其中没有股票代码。一次响应包含该交易日的全市场股票行情。`daily` 单次最多返回
+6,000 行；响应达到 6,000 行时系统必须按“可能被截断”失败，不能发布不完整数据。
 
 ### 5.1 Raw 为什么不能只保存最新文件
 
@@ -220,7 +236,7 @@ request  = {trade_date: 20260825}
 $QUANT_DATA_ROOT/
 └── raw/
     └── source=tushare/
-        └── endpoint=daily_vip/
+        └── endpoint=daily/
             └── <request_hash>/
                 └── <content_hash>.parquet
 ```
@@ -554,10 +570,25 @@ $env:QUANT_DATA_ROOT = "D:\quant-data"
 
 ```dotenv
 QUANT_TUSHARE_TOKEN=<your-token>
+QUANT_TUSHARE_REQUESTS_PER_MINUTE=480
+QUANT_TUSHARE_PROXY_URL=https://proxy.example.com
 ```
 
 运行时优先读取数据根 `.env`，缺失时才回退到进程环境变量。源码树不提供
 `.env.example`，也不得在源码根保存 Token。
+
+Tushare 请求限流同样可在 Dashboard「设置」页动态修改，合法范围为每分钟 1–10000
+次，未配置时默认 480 次。限流器使用单调时钟把真实 API 调用均匀分布到时间轴；
+首次请求立即执行，重试请求也占用额度，请求规划和本地 Raw 复用不占用额度。
+采集客户端和交易日历客户端在同一进程内共享限流器，但不同 Dashboard、Worker 或
+CLI 进程分别计数；并行启动多个进程时，账户总频率可能高于单个进程的设置值。
+内置默认值始终是 480；`.env` 或进程环境可以覆盖为 1–10000。配置值只是本地发送上限，
+不能提高 Tushare 账户或代理服务本身的额度，设置过高可能收到上游限频错误。
+
+代理 URL 也可在设置页动态修改。系统仅接受不含凭据、查询参数或片段的 HTTP/HTTPS
+入口，保存时移除末尾斜杠，并在下一次真实请求前重建 Tushare Pro 客户端。清除数据根
+设置后会回退到进程环境变量；两处都没有配置时使用官方入口。代理设置不改变端点设计，
+仍禁止 `pro_bar` 和除基准指数外的逐证券采集。
 
 首次构建最近五年数据：
 
@@ -589,7 +620,7 @@ uv run quant data validate-all
 | 现象 | 常见原因 | 正确处理 |
 |---|---|---|
 | 提示旧 Canonical 布局 | 数据根仍有 `canonical/dataset=...` | 更换空的数据根并重新 bootstrap，不做混合迁移 |
-| Tushare 请求被拒绝 | Token 缺失、积分或接口权限不足 | 检查环境变量和账户权限 |
+| Tushare 请求被拒绝 | Token 缺失、积分、接口权限或频率设置不匹配 | 检查设置页、账户权限，并把每分钟请求数调到该账户最低适用额度 |
 | 端点返回行数达到上限 | 全市场结果可能被截断 | 让采集失败，调整合法的市场、日期或行业切片；不能静默接受 |
 | Schema 漂移 | Tushare 输出字段发生变化 | 对照官方端点检查并同步 Schema、Mapper、测试和文档 |
 | 单数据集 validate 通过但研究仍不能读 | 全局门禁尚未通过 | 运行 `validate-all` 并处理其他数据集问题 |

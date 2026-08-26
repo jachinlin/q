@@ -119,7 +119,7 @@ describe('data center core loop', () => {
         ],
         issues: [],
       })
-      if (path === '/api/v1/data/datasets/stock_daily_bar') return Promise.resolve({ ...dataset, contract: { partitioning: 'year', fetch_granularity: 'trading_day', cadence: 'daily', reuse: 'append_only', overlap_days: 0, primary_key: ['trade_date', 'instrument_id'], sort_key: ['trade_date'], pit_fields: [], schema: [{ name: 'trade_date', type: 'Date' }], sources: [{ source: 'tushare', endpoints: ['daily_vip'] }] }, partitions: [] })
+      if (path === '/api/v1/data/datasets/stock_daily_bar') return Promise.resolve({ ...dataset, contract: { partitioning: 'year', fetch_granularity: 'trading_day', cadence: 'daily', reuse: 'append_only', overlap_days: 0, primary_key: ['trade_date', 'instrument_id'], sort_key: ['trade_date'], pit_fields: [], schema: [{ name: 'trade_date', type: 'Date' }], sources: [{ source: 'tushare', endpoints: ['daily'] }] }, partitions: [] })
       return Promise.reject(new Error(`unexpected API path: ${path}`))
     })
   })

@@ -26,6 +26,19 @@ _AVAILABLE = datetime(2026, 8, 14, 7, tzinfo=UTC)
 _INGESTED = datetime(2026, 8, 14, 8, tzinfo=UTC)
 
 
+def _canonical_frame(
+    dataset: DatasetKind,
+    rows: list[dict[str, object]],
+) -> pl.DataFrame:
+    """以当前 Schema 补齐场景未关注的可空字段。"""
+    schema = CANONICAL_SCHEMAS[dataset].columns
+    return pl.DataFrame(
+        [dict.fromkeys(schema.names()) | row for row in rows],
+        schema=schema,
+        strict=False,
+    )
+
+
 class _MarketReviewHarness:
     """发布最小完整 Canonical 目录并组装真实市场全景服务。"""
 
@@ -94,41 +107,35 @@ class _MarketReviewHarness:
             "000905.SH",
             "000852.SH",
         )
-        instruments = pl.DataFrame(
+        instruments = _canonical_frame(
+            DatasetKind.STOCK_MASTER,
             [
                 {
                     "instrument_id": "600000.SH",
+                    "symbol": "600000",
                     "exchange": "SSE",
                     "board": "MAIN",
                     "name": "浦发银行",
-                    "instrument_type": "STOCK",
-                    "listing_status": "LISTED",
+                    "list_status": "L",
                     "list_date": date(1999, 11, 10),
-                    "delist_date": None,
                     **audits,
                 },
-                *(
-                    {
-                        "instrument_id": identifier,
-                        "exchange": ("SZSE" if identifier.endswith(".SZ") else "SSE"),
-                        "board": "MAIN",
-                        "name": identifier,
-                        "instrument_type": "INDEX",
-                        "listing_status": "LISTED",
-                        "list_date": date(2005, 1, 1),
-                        "delist_date": None,
-                        **audits,
-                    }
-                    for identifier in indexes
-                ),
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_MASTER].columns,
         )
-        calendar = pl.DataFrame(
-            [{"trade_date": _DAY, "is_trading_day": True, **audits}],
-            schema=CANONICAL_SCHEMAS[DatasetKind.TRADE_CALENDAR].columns,
+        calendar = _canonical_frame(
+            DatasetKind.TRADE_CALENDAR,
+            [
+                {
+                    "exchange": "SSE",
+                    "trade_date": _DAY,
+                    "is_trading_day": True,
+                    "previous_trade_date": date(2026, 8, 13),
+                    **audits,
+                }
+            ],
         )
-        bar = pl.DataFrame(
+        bar = _canonical_frame(
+            DatasetKind.STOCK_DAILY_BAR,
             [
                 {
                     "instrument_id": "600000.SH",
@@ -138,61 +145,67 @@ class _MarketReviewHarness:
                     "low": 10.0,
                     "close": 11.0,
                     "preclose": 10.0,
+                    "change": 1.0,
                     "volume": 1_000_000,
                     "amount": 10_000_000.0,
-                    "adjustment_flag": "3",
-                    "pct_change": 10.0,
+                    "pct_change": 0.1,
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BAR].columns,
         )
-        basic = pl.DataFrame(
+        basic = _canonical_frame(
+            DatasetKind.STOCK_DAILY_BASIC,
             [
                 {
                     "instrument_id": "600000.SH",
                     "trade_date": _DAY,
                     "pe_ttm": 10.0,
-                    "pb_mrq": 1.0,
+                    "pb": 1.0,
                     "ps_ttm": 2.0,
-                    "turnover": 3.0,
+                    "turnover_rate": 0.03,
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BASIC].columns,
         )
-        status = pl.DataFrame(
+        suspension = _canonical_frame(
+            DatasetKind.STOCK_SUSPENSION,
             [
                 {
-                    "instrument_id": "600000.SH",
+                    "instrument_id": "600001.SH",
                     "trade_date": _DAY,
-                    "is_listed": True,
-                    "is_suspended": False,
-                    "is_st": False,
-                    "board": "MAIN",
-                    "price_limit_rule_id": "UNRESOLVED",
-                    "tradable_reason": "NORMAL",
+                    "suspend_type": "S",
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.STOCK_SUSPENSION].columns,
         )
-        industry = pl.DataFrame(
+        warning = _canonical_frame(
+            DatasetKind.STOCK_RISK_WARNING,
             [
                 {
-                    "as_of_date": _DAY,
-                    "supplier_update_date": date(2026, 8, 10),
-                    "instrument_id": "600000.SH",
-                    "taxonomy": "证监会行业分类",
-                    "industry_code": "金融",
-                    "industry_name": "金融",
-                    "is_classified": True,
+                    "instrument_id": "600001.SH",
+                    "trade_date": _DAY,
+                    "risk_type": "S",
                     **audits,
                 }
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_MEMBERSHIP].columns,
         )
-        index_bar = pl.DataFrame(
+        industry = _canonical_frame(
+            DatasetKind.INDUSTRY_MEMBERSHIP,
+            [
+                {
+                    "level1_code": "801780.SI",
+                    "level1_name": "银行",
+                    "instrument_id": "600000.SH",
+                    "instrument_name": "浦发银行",
+                    "in_date": date(1999, 11, 10),
+                    "is_current": True,
+                    "in_available_at": _AVAILABLE,
+                    **audits,
+                }
+            ],
+        )
+        index_bar = _canonical_frame(
+            DatasetKind.INDEX_DAILY_BAR,
             [
                 {
                     "index_id": identifier,
@@ -202,21 +215,22 @@ class _MarketReviewHarness:
                     "low": 99.0,
                     "close": 101.0,
                     "preclose": 100.0,
+                    "change": 1.0,
                     "volume": 1_000_000,
                     "amount": 10_000_000.0,
-                    "pct_change": 1.0,
+                    "pct_change": 0.01,
                     **audits,
                 }
                 for identifier in indexes
             ],
-            schema=CANONICAL_SCHEMAS[DatasetKind.INDEX_DAILY_BAR].columns,
         )
         frames = (
             (DatasetKind.STOCK_MASTER, instruments),
             (DatasetKind.TRADE_CALENDAR, calendar),
             (DatasetKind.STOCK_DAILY_BAR, bar),
             (DatasetKind.STOCK_DAILY_BASIC, basic),
-            (DatasetKind.STOCK_SUSPENSION, status),
+            (DatasetKind.STOCK_SUSPENSION, suspension),
+            (DatasetKind.STOCK_RISK_WARNING, warning),
             (DatasetKind.INDUSTRY_MEMBERSHIP, industry),
             (DatasetKind.INDEX_DAILY_BAR, index_bar),
         )
@@ -237,7 +251,7 @@ def test_market_review_uses_verified_repository_and_strict_pit_industry(
         assert result.data_quality.coverage_rate == 1.0
         assert result.breadth.median_return == 0.1
         assert result.sentiment.limit_up_count == 1
-        assert result.industries.taxonomy == "证监会行业分类"
+        assert result.industries.taxonomy == "SW2021"
         assert result.valuation.turnover_median == 0.03
         assert tuple(item.index_id for item in result.indexes) == (
             "399317.SZ",

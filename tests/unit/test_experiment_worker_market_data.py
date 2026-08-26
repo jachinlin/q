@@ -6,12 +6,13 @@ from typing import Any, cast
 import polars as pl
 
 from quant_research.bootstrap.worker import CanonicalRunData
+from quant_research.domain.identifiers import InstrumentId
 
 
 class _SuspendedRepository:
     """返回一条 Canonical 全空停牌占位行情。"""
 
-    def bars(self, *_args: object) -> pl.LazyFrame:
+    def stock_bars(self, *_args: object) -> pl.LazyFrame:
         """返回退市日全空行情及其规范类型。"""
         return pl.DataFrame(
             {
@@ -36,19 +37,23 @@ class _SuspendedRepository:
             },
         ).lazy()
 
-    def security_status(self, *_args: object) -> pl.LazyFrame:
-        """返回与占位行情同日的权威停牌状态。"""
+    def stock_suspensions(self, *_args: object) -> pl.LazyFrame:
+        """返回与占位行情同日的权威停牌事件。"""
         return pl.DataFrame(
             {
                 "instrument_id": ["300114.SZ"],
-                "is_suspended": [True],
-                "is_st": [False],
+                "trade_date": [date(2025, 2, 17)],
             },
             schema={
                 "instrument_id": pl.String,
-                "is_suspended": pl.Boolean,
-                "is_st": pl.Boolean,
+                "trade_date": pl.Date,
             },
+        ).lazy()
+
+    def stock_risk_warnings(self, *_args: object) -> pl.LazyFrame:
+        """返回固定空风险警示事件。"""
+        return pl.DataFrame(
+            schema={"instrument_id": pl.String, "trade_date": pl.Date}
         ).lazy()
 
 
@@ -63,6 +68,8 @@ def test_market_slice_preserves_null_volume_for_suspended_placeholder() -> None:
             "board": "CHINEXT",
         }
     }
+    source._stock_ids = (InstrumentId.parse("300114.SZ"),)
+    source._fund_ids = ()
 
     market = source.market_slice(date(2025, 2, 17)).market
 

@@ -78,7 +78,7 @@ def _task(payload: dict[str, str]) -> ClaimedTask:
     (
         ({"scope": "ALL"}, None),
         (
-            {"scope": "DATASET", "dataset": "daily_bar"},
+            {"scope": "DATASET", "dataset": "stock_daily_bar"},
             DatasetKind.STOCK_DAILY_BAR,
         ),
     ),
@@ -145,7 +145,7 @@ def test_all_scope_propagates_blocking_quality_failure_to_worker() -> None:
     (
         {},
         {"scope": "DATASET"},
-        {"scope": "ALL", "dataset": "daily_bar"},
+        {"scope": "ALL", "dataset": "stock_daily_bar"},
         {"scope": "DATASET", "dataset": "not-a-dataset"},
     ),
 )

@@ -9,7 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from quant_research.application.settings import DataSourceTokenSetting
+from quant_research.application.settings import (
+    DataSourceProxySetting,
+    DataSourceRateLimitSetting,
+    DataSourceTokenSetting,
+)
 
 
 class DataRootEnvSettingsStore:
@@ -21,7 +25,9 @@ class DataRootEnvSettingsStore:
     """
 
     _TOKEN_KEY = "QUANT_TUSHARE_TOKEN"
-    _SUPPORTED_KEYS = frozenset({_TOKEN_KEY})
+    _RATE_LIMIT_KEY = "QUANT_TUSHARE_REQUESTS_PER_MINUTE"
+    _PROXY_KEY = "QUANT_TUSHARE_PROXY_URL"
+    _SUPPORTED_KEYS = frozenset({_TOKEN_KEY, _RATE_LIMIT_KEY, _PROXY_KEY})
     _MAX_BYTES = 64 * 1024
 
     def __init__(
@@ -67,6 +73,52 @@ class DataRootEnvSettingsStore:
             return DataSourceTokenSetting(validated, "PROCESS_ENVIRONMENT", None)
         return DataSourceTokenSetting(None, "NONE", None)
 
+    def read_data_source_rate_limit(self) -> DataSourceRateLimitSetting:
+        """读取每分钟请求数，并依次回退到进程环境和内置默认值。
+
+        入参：无。
+        返回值：完成严格整数校验的限流设置及非敏感来源证据。
+        异常：dotenv、环境变量或数值范围非法时失败关闭。
+        """
+        path = self._validated_path(must_exist=False)
+        lines, indexes = self._read_lines(path)
+        rate_index = indexes.get(self._RATE_LIMIT_KEY)
+        if rate_index is not None:
+            value = self._rate_limit_value(self._line_value(lines[rate_index]))
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            return DataSourceRateLimitSetting(value, "DATA_ROOT_ENV", updated_at)
+        environment_value = self._environment.get(self._RATE_LIMIT_KEY)
+        if environment_value is not None:
+            value = self._rate_limit_value(environment_value)
+            return DataSourceRateLimitSetting(value, "PROCESS_ENVIRONMENT", None)
+        return DataSourceRateLimitSetting(
+            DataSourceRateLimitSetting.DEFAULT_REQUESTS_PER_MINUTE,
+            "DEFAULT",
+            None,
+        )
+
+    def read_data_source_proxy(self) -> DataSourceProxySetting:
+        """读取数据根优先、进程环境回退的 Tushare 代理 URL。
+
+        入参：无。
+        返回值：规范代理 URL 与来源；未配置时值为空。
+        异常：dotenv、环境变量或 URL 非法时失败关闭。
+        """
+        path = self._validated_path(must_exist=False)
+        lines, indexes = self._read_lines(path)
+        proxy_index = indexes.get(self._PROXY_KEY)
+        if proxy_index is not None:
+            value = DataSourceProxySetting.validated_value(
+                self._line_value(lines[proxy_index])
+            )
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            return DataSourceProxySetting(value, "DATA_ROOT_ENV", updated_at)
+        environment_value = self._environment.get(self._PROXY_KEY)
+        if environment_value is not None:
+            value = DataSourceProxySetting.validated_value(environment_value)
+            return DataSourceProxySetting(value, "PROCESS_ENVIRONMENT", None)
+        return DataSourceProxySetting(None, "NONE", None)
+
     def write_data_source_token(self, value: str) -> DataSourceTokenSetting:
         """原子新增或替换数据根中的数据源 Token。
 
@@ -74,21 +126,15 @@ class DataRootEnvSettingsStore:
         返回值：写入后重新解析的 Dashboard 优先状态。
         异常：路径、既有格式或文件系统操作失败时保持原语义。
         """
-        validated = DataSourceTokenSetting.validated_value(value)
-        self._prepare_root()
-        path = self._validated_path(must_exist=False)
-        lines, indexes = self._read_lines(path)
-        replacement = f"{self._TOKEN_KEY}={validated}\n"
-        index = indexes.get(self._TOKEN_KEY)
-        if index is None:
-            if lines and not lines[-1].endswith(("\n", "\r")):
-                lines[-1] += "\n"
-            lines.append(replacement)
-        else:
-            ending = "\r\n" if lines[index].endswith("\r\n") else "\n"
-            lines[index] = f"{self._TOKEN_KEY}={validated}{ending}"
-        self._atomic_write(path, "".join(lines))
-        return self.read_data_source_token()
+        token, _, _ = self.apply_changes(
+            token_operation="SET",
+            token_value=DataSourceTokenSetting.validated_value(value),
+            rate_limit_operation=None,
+            requests_per_minute=None,
+            proxy_operation=None,
+            proxy_url=None,
+        )
+        return token
 
     def clear_data_source_token(self) -> DataSourceTokenSetting:
         """清除 Dashboard 管理 Token，保留注释并回退进程环境变量。
@@ -97,18 +143,112 @@ class DataRootEnvSettingsStore:
         返回值：删除后的最新解析状态。
         异常：路径、既有格式或文件系统删除失败时保持原语义。
         """
+        token, _, _ = self.apply_changes(
+            token_operation="CLEAR",
+            token_value=None,
+            rate_limit_operation=None,
+            requests_per_minute=None,
+            proxy_operation=None,
+            proxy_url=None,
+        )
+        return token
+
+    def apply_changes(
+        self,
+        *,
+        token_operation: str | None,
+        token_value: str | None,
+        rate_limit_operation: str | None,
+        requests_per_minute: int | None,
+        proxy_operation: str | None = None,
+        proxy_url: str | None = None,
+    ) -> tuple[
+        DataSourceTokenSetting,
+        DataSourceRateLimitSetting,
+        DataSourceProxySetting,
+    ]:
+        """通过一次原子替换应用 Token、限流和/或代理修改。
+
+        入参：三个设置各自可选的 ``SET``/``CLEAR`` 操作及对应值。
+        返回值：写入后按完整优先级重新解析的 Token、限流与代理设置。
+        异常：组合非法、既有文件损坏或发布失败时保持原语义且不部分写入。
+        """
+        if (
+            token_operation is None
+            and rate_limit_operation is None
+            and proxy_operation is None
+        ):
+            raise ValueError("runtime settings change must not be empty")
+        if token_operation == "SET":
+            token_value = DataSourceTokenSetting.validated_value(token_value)
+        elif token_operation == "CLEAR":
+            if token_value is not None:
+                raise ValueError("CLEAR data source token operation must omit value")
+        elif token_operation is not None:
+            raise ValueError("unsupported data source token operation")
+        if rate_limit_operation == "SET":
+            requests_per_minute = DataSourceRateLimitSetting.validated_value(
+                requests_per_minute
+            )
+        elif rate_limit_operation == "CLEAR":
+            if requests_per_minute is not None:
+                raise ValueError("CLEAR data source rate limit must omit a value")
+        elif rate_limit_operation is not None:
+            raise ValueError("unsupported data source rate limit operation")
+        if proxy_operation == "SET":
+            proxy_url = DataSourceProxySetting.validated_value(proxy_url)
+        elif proxy_operation == "CLEAR":
+            if proxy_url is not None:
+                raise ValueError("CLEAR data source proxy must omit a URL")
+        elif proxy_operation is not None:
+            raise ValueError("unsupported data source proxy operation")
+
+        self._prepare_root()
         path = self._validated_path(must_exist=False)
         lines, indexes = self._read_lines(path)
-        index = indexes.get(self._TOKEN_KEY)
-        if index is None:
-            return self.read_data_source_token()
-        del lines[index]
+        replacements: dict[str, str | None] = {}
+        if token_operation is not None:
+            replacements[self._TOKEN_KEY] = (
+                None if token_operation == "CLEAR" else token_value
+            )
+        if rate_limit_operation is not None:
+            replacements[self._RATE_LIMIT_KEY] = (
+                None
+                if rate_limit_operation == "CLEAR"
+                else str(requests_per_minute)
+            )
+        if proxy_operation is not None:
+            replacements[self._PROXY_KEY] = (
+                None if proxy_operation == "CLEAR" else proxy_url
+            )
+        for key in sorted(replacements):
+            value = replacements[key]
+            index = indexes.get(key)
+            if value is None:
+                if index is not None:
+                    del lines[index]
+                    lines, indexes = self._read_content_lines("".join(lines))
+                continue
+            replacement = f"{key}={value}\n"
+            if index is None:
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    lines[-1] += "\n"
+                lines.append(replacement)
+                indexes[key] = len(lines) - 1
+            else:
+                ending = "\r\n" if lines[index].endswith("\r\n") else "\n"
+                lines[index] = f"{key}={value}{ending}"
+        self._validate_resolved_settings(lines, indexes)
         content = "".join(lines)
         if content.strip():
             self._atomic_write(path, content)
-        else:
+        elif path.exists():
             path.unlink()
-        return self.read_data_source_token()
+        return (
+            self.read_data_source_token(),
+            self.read_data_source_rate_limit(),
+            self.read_data_source_proxy(),
+        )
 
     def _prepare_root(self) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
@@ -135,6 +275,10 @@ class DataRootEnvSettingsStore:
         if size > self._MAX_BYTES:
             raise ValueError("runtime settings file exceeds the size limit")
         text = path.read_text(encoding="utf-8")
+        return self._read_content_lines(text)
+
+    def _read_content_lines(self, text: str) -> tuple[list[str], dict[str, int]]:
+        """解析内存中的 dotenv 内容并返回行及受支持键位置。"""
         lines = text.splitlines(keepends=True)
         indexes: dict[str, int] = {}
         for index, line in enumerate(lines):
@@ -149,6 +293,13 @@ class DataRootEnvSettingsStore:
                 raise ValueError("runtime settings file contains an unsupported key")
             if key in indexes:
                 raise ValueError("runtime settings file contains a duplicate key")
+            value = content.split("=", 1)[1]
+            if key == self._TOKEN_KEY:
+                DataSourceTokenSetting.validated_value(value)
+            elif key == self._RATE_LIMIT_KEY:
+                self._rate_limit_value(value)
+            elif key == self._PROXY_KEY:
+                DataSourceProxySetting.validated_value(value)
             indexes[key] = index
         return lines, indexes
 
@@ -156,6 +307,39 @@ class DataRootEnvSettingsStore:
     def _line_value(line: str) -> str:
         """提取已完成结构校验的 dotenv 行值。"""
         return line.rstrip("\r\n").split("=", 1)[1]
+
+    @staticmethod
+    def _rate_limit_value(value: str) -> int:
+        """把 dotenv 单行值解析为严格十进制限流整数。"""
+        if not value or not value.isascii() or not value.isdecimal():
+            raise ValueError("data source requests per minute must be a decimal integer")
+        return DataSourceRateLimitSetting.validated_value(int(value))
+
+    def _validate_resolved_settings(
+        self,
+        lines: list[str],
+        indexes: Mapping[str, int],
+    ) -> None:
+        """在发布前校验修改后文件及其进程环境回退值。"""
+        token_index = indexes.get(self._TOKEN_KEY)
+        if token_index is not None:
+            DataSourceTokenSetting.validated_value(
+                self._line_value(lines[token_index])
+            )
+        elif (token := self._environment.get(self._TOKEN_KEY)) is not None:
+            DataSourceTokenSetting.validated_value(token)
+        rate_index = indexes.get(self._RATE_LIMIT_KEY)
+        if rate_index is not None:
+            self._rate_limit_value(self._line_value(lines[rate_index]))
+        elif (rate := self._environment.get(self._RATE_LIMIT_KEY)) is not None:
+            self._rate_limit_value(rate)
+        proxy_index = indexes.get(self._PROXY_KEY)
+        if proxy_index is not None:
+            DataSourceProxySetting.validated_value(
+                self._line_value(lines[proxy_index])
+            )
+        elif (proxy := self._environment.get(self._PROXY_KEY)) is not None:
+            DataSourceProxySetting.validated_value(proxy)
 
     def _atomic_write(self, path: Path, content: str) -> None:
         temporary = self._root / f".env.tmp-{uuid4().hex}"

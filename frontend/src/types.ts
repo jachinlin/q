@@ -280,7 +280,7 @@ export type FactorStudyDefinition = {
   universe: { name: 'CN_STOCK_STANDARD' }
   horizons: number[]
   quantiles: number
-  industry: { taxonomy: '证监会行业分类'; unclassified_policy: 'EXCLUDE' | 'UNCLASSIFIED' } | null
+  industry: { taxonomy: 'SW2021'; unclassified_policy: 'EXCLUDE' | 'UNCLASSIFIED' } | null
   cost_bps_scenarios: number[]
 }
 
@@ -588,6 +588,16 @@ export type DashboardSettings = {
   settings_path: string
   data_source_token: {
     configured: boolean
+    source: 'DATA_ROOT_ENV' | 'PROCESS_ENVIRONMENT' | 'NONE'
+    updated_at: string | null
+  }
+  data_source_rate_limit: {
+    requests_per_minute: number
+    source: 'DATA_ROOT_ENV' | 'PROCESS_ENVIRONMENT' | 'DEFAULT'
+    updated_at: string | null
+  }
+  data_source_proxy: {
+    url: string | null
     source: 'DATA_ROOT_ENV' | 'PROCESS_ENVIRONMENT' | 'NONE'
     updated_at: string | null
   }

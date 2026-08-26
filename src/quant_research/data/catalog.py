@@ -378,7 +378,7 @@ DATASET_CATALOG = DatasetCatalog(
              "pretrade_date": "previous_trade_date"},
         ),
         _DatasetSpecFactory.spec(
-            DatasetKind.STOCK_DAILY_BAR, "daily_vip", Partitioning.YEAR,
+            DatasetKind.STOCK_DAILY_BAR, "daily", Partitioning.YEAR,
             FetchGranularity.MARKET_TRADE_DATE, FetchPlan.MARKET_TRADE_DATE,
             UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_TAIL_REVISION, 5,
             FreshnessPolicy(FreshnessBasis.TRADING_SESSION, "trade_date", 0),

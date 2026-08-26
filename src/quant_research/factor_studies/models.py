@@ -72,7 +72,7 @@ class FactorStudyUniverse(_FrozenModel):
 class FactorIndustrySettings(_FrozenModel):
     """定义 PIT 行业口径。入参：分类法和缺失策略。返回值：冻结设置。异常：字段非法时校验失败。"""
 
-    taxonomy: Literal["证监会行业分类"]
+    taxonomy: Literal["SW2021"]
     unclassified_policy: IndustryUnclassifiedPolicy
 
 

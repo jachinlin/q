@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 import polars as pl
 import pytest
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.quality.models import QualityRuleStatus
 from quant_research.data.quality.rules import (
     coverage_issues,
@@ -17,42 +18,21 @@ from quant_research.domain.enums import DatasetKind, Severity
 
 def _daily_basic(*, turnover: float | None) -> pl.DataFrame:
     now = datetime(2026, 8, 13, tzinfo=UTC)
+    dataset = DatasetKind.STOCK_DAILY_BASIC
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["600000.SH"],
+        "trade_date": [date(2026, 8, 13)],
+        "turnover_rate": [turnover],
+        "source": ["tushare"],
+        "available_at": [now],
+        "availability_source": ["trade_date"],
+        "pit_usable": [True],
+        "ingested_at": [now],
+    }
     return pl.DataFrame(
-        {
-            "instrument_id": ["600000.SH"],
-            "trade_date": [date(2026, 8, 13)],
-            "turnover": [turnover],
-            "source": ["baostock"],
-            "available_at": [now],
-            "availability_source": ["trade_date"],
-            "pit_usable": [True],
-            "ingested_at": [now],
-        },
-        schema={
-            "instrument_id": pl.String,
-            "trade_date": pl.Date,
-            "turnover": pl.Float64,
-            "source": pl.String,
-            "available_at": pl.Datetime("us", "UTC"),
-            "availability_source": pl.String,
-            "pit_usable": pl.Boolean,
-            "ingested_at": pl.Datetime("us", "UTC"),
-        },
-    )
-
-
-def _security_status(*, suspended: bool) -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "instrument_id": ["600000.SH"],
-            "trade_date": [date(2026, 8, 13)],
-            "is_suspended": [suspended],
-        },
-        schema={
-            "instrument_id": pl.String,
-            "trade_date": pl.Date,
-            "is_suspended": pl.Boolean,
-        },
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
     )
 
 
@@ -66,6 +46,7 @@ def _daily_bar(
     amount: float | None = 1_000.0,
 ) -> pl.DataFrame:
     now = datetime(2026, 8, 13, tzinfo=UTC)
+    dataset = DatasetKind.STOCK_DAILY_BAR
     return pl.DataFrame(
         {
             "instrument_id": ["600000.SH"],
@@ -75,34 +56,20 @@ def _daily_bar(
             "low": [low],
             "close": [close],
             "preclose": [10.0],
+            "change": [0.5],
             "volume": [volume],
             "amount": [amount],
-            "adjustment_flag": ["2"],
-            "pct_change": [5.0],
-            "source": ["baostock"],
+            "after_hours_volume": [None],
+            "after_hours_amount": [None],
+            "pct_change": [0.05],
+            "source": ["tushare"],
             "available_at": [now],
             "availability_source": ["trade_date"],
             "pit_usable": [True],
             "ingested_at": [now],
         },
-        schema={
-            "instrument_id": pl.String,
-            "trade_date": pl.Date,
-            "open": pl.Float64,
-            "high": pl.Float64,
-            "low": pl.Float64,
-            "close": pl.Float64,
-            "preclose": pl.Float64,
-            "volume": pl.Int64,
-            "amount": pl.Float64,
-            "adjustment_flag": pl.String,
-            "pct_change": pl.Float64,
-            "source": pl.String,
-            "available_at": pl.Datetime("us", "UTC"),
-            "availability_source": pl.String,
-            "pit_usable": pl.Boolean,
-            "ingested_at": pl.Datetime("us", "UTC"),
-        },
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
     )
 
 
@@ -158,34 +125,30 @@ def test_quality_runner_fails_positive_finite_price_rule() -> None:
     assert result.threshold == 0
 
 
-def test_daily_basic_allows_missing_turnover_on_confirmed_suspension() -> None:
+def test_daily_basic_allows_nullable_optional_values() -> None:
     issues = required_value_issues(
-        {
-            DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),),
-            DatasetKind.STOCK_SUSPENSION: (_security_status(suspended=True),),
-        }
+        {DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),)}
     )
 
     assert issues == []
 
 
-def test_daily_basic_requires_turnover_when_security_is_not_suspended() -> None:
-    (issue,) = required_value_issues(
-        {
-            DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),),
-            DatasetKind.STOCK_SUSPENSION: (_security_status(suspended=False),),
-        }
+def test_daily_basic_requires_non_null_primary_key() -> None:
+    frame = _daily_basic(turnover=None).with_columns(
+        pl.lit(None, dtype=pl.String).alias("instrument_id")
     )
+    (issue,) = required_value_issues({DatasetKind.STOCK_DAILY_BASIC: (frame,)})
 
     assert issue.rule_id == "required_value_null"
     assert issue.dataset is DatasetKind.STOCK_DAILY_BASIC
     assert issue.actual == 1
 
 
-def test_daily_basic_requires_turnover_when_security_status_is_missing() -> None:
-    (issue,) = required_value_issues(
-        {DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),)}
+def test_daily_basic_requires_non_null_audit_evidence() -> None:
+    frame = _daily_basic(turnover=None).with_columns(
+        pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias("available_at")
     )
+    (issue,) = required_value_issues({DatasetKind.STOCK_DAILY_BASIC: (frame,)})
 
     assert issue.actual == 1
 
@@ -257,8 +220,10 @@ def _trade_calendar(
     now = datetime(2026, 8, 13, tzinfo=UTC)
     dates = [date(2026, 8, 13), date(2026, 8, 13)] if duplicate else [date(2026, 8, 13)]
     values: dict[str, object] = {
+        "exchange": ["SSE"] * len(dates),
         "trade_date": dates,
         "is_trading_day": [True] * len(dates),
+        "previous_trade_date": [date(2026, 8, 12)] * len(dates),
     }
     if conforming:
         values.update(
@@ -270,7 +235,13 @@ def _trade_calendar(
                 "ingested_at": [now] * len(dates),
             }
         )
-    return pl.DataFrame(values)
+    if not conforming:
+        return pl.DataFrame(values)
+    return pl.DataFrame(
+        values,
+        schema=CANONICAL_SCHEMAS[DatasetKind.TRADE_CALENDAR].columns,
+        strict=False,
+    )
 
 
 def test_quality_runner_records_every_applicable_rule_as_pass() -> None:
