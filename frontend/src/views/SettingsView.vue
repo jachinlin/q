@@ -3,12 +3,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
-import { computed, ref, watch } from 'vue'
+import { ref, watch } from 'vue'
 
 import { api, DashboardApiError } from '../api'
 import ErrorState from '../components/ErrorState.vue'
-import StatusBadge from '../components/StatusBadge.vue'
-import { formatTime } from '../format'
 import type { DashboardSettings } from '../types'
 
 const client = useQueryClient()
@@ -20,34 +18,6 @@ const maxConcurrentRequests = ref(4)
 const settings = useQuery({
   queryKey: ['settings'],
   queryFn: () => api.get<DashboardSettings>('/api/v1/settings'),
-})
-
-const sourceLabel = computed(() => {
-  const source = settings.data.value?.data_source_token.source
-  if (source === 'DATA_ROOT_ENV') return '数据根 .env'
-  if (source === 'PROCESS_ENVIRONMENT') return '进程环境变量'
-  return '未配置'
-})
-
-const rateLimitSourceLabel = computed(() => {
-  const source = settings.data.value?.data_source_rate_limit.source
-  if (source === 'DATA_ROOT_ENV') return '数据根 .env'
-  if (source === 'PROCESS_ENVIRONMENT') return '进程环境变量'
-  return '内置默认值'
-})
-
-const proxySourceLabel = computed(() => {
-  const source = settings.data.value?.data_source_proxy.source
-  if (source === 'DATA_ROOT_ENV') return '数据根 .env'
-  if (source === 'PROCESS_ENVIRONMENT') return '进程环境变量'
-  return '未配置（Tushare 官方入口）'
-})
-
-const concurrencySourceLabel = computed(() => {
-  const source = settings.data.value?.data_source_concurrency.source
-  if (source === 'DATA_ROOT_ENV') return '数据根 .env'
-  if (source === 'PROCESS_ENVIRONMENT') return '进程环境变量'
-  return '内置默认值'
 })
 
 watch(
@@ -97,10 +67,7 @@ const clearToken = useMutation({
   onSuccess: async (result) => {
     token.value = ''
     client.setQueryData(['settings'], result)
-    const fallback = result.data_source_token.source === 'PROCESS_ENVIRONMENT'
-      ? '，已回退到进程环境变量'
-      : ''
-    ElMessage.success(`Dashboard Token 已清除${fallback}`)
+    ElMessage.success('数据源 Token 已清除')
   },
   onError: showError,
 })
@@ -125,10 +92,7 @@ const clearRateLimit = useMutation({
   }),
   onSuccess: result => {
     client.setQueryData(['settings'], result)
-    const fallback = result.data_source_rate_limit.source === 'PROCESS_ENVIRONMENT'
-      ? '进程环境变量'
-      : '内置默认值'
-    ElMessage.success(`Dashboard 限流设置已清除，已回退到${fallback}`)
+    ElMessage.success('Tushare 请求限流已清除')
   },
   onError: showError,
 })
@@ -150,10 +114,7 @@ const clearProxy = useMutation({
   }),
   onSuccess: result => {
     client.setQueryData(['settings'], result)
-    const fallback = result.data_source_proxy.source === 'PROCESS_ENVIRONMENT'
-      ? '进程环境变量'
-      : 'Tushare 官方入口'
-    ElMessage.success(`Dashboard 代理设置已清除，已回退到${fallback}`)
+    ElMessage.success('Tushare 代理地址已清除')
   },
   onError: showError,
 })
@@ -178,17 +139,14 @@ const clearConcurrency = useMutation({
   }),
   onSuccess: result => {
     client.setQueryData(['settings'], result)
-    const fallback = result.data_source_concurrency.source === 'PROCESS_ENVIRONMENT'
-      ? '进程环境变量'
-      : '内置默认值 4'
-    ElMessage.success(`Dashboard 并发设置已清除，已回退到${fallback}`)
+    ElMessage.success('LOCALIZE 并发设置已清除')
   },
   onError: showError,
 })
 
 async function confirmClear() {
   await ElMessageBox.confirm(
-    '将从数据根 .env 删除 Dashboard 管理的 Token。若进程环境变量仍有 Token，它会重新生效。',
+    '将清除当前 Token 设置，是否继续？',
     '确认清除数据源 Token',
     { type: 'warning', confirmButtonText: '确认清除' },
   )
@@ -197,7 +155,7 @@ async function confirmClear() {
 
 async function confirmClearRateLimit() {
   await ElMessageBox.confirm(
-    '将从数据根 .env 删除 Dashboard 管理的请求限流。清除后会回退到进程环境变量或内置默认值 480 次/分钟。',
+    '将清除当前请求限流设置，是否继续？',
     '确认清除请求限流',
     { type: 'warning', confirmButtonText: '确认清除' },
   )
@@ -206,7 +164,7 @@ async function confirmClearRateLimit() {
 
 async function confirmClearProxy() {
   await ElMessageBox.confirm(
-    '将从数据根 .env 删除 Dashboard 管理的代理地址。清除后会回退到进程环境变量或 Tushare 官方入口。',
+    '将清除当前代理设置，是否继续？',
     '确认清除 Tushare 代理',
     { type: 'warning', confirmButtonText: '确认清除' },
   )
@@ -215,7 +173,7 @@ async function confirmClearProxy() {
 
 async function confirmClearConcurrency() {
   await ElMessageBox.confirm(
-    '将从数据根 .env 删除 Dashboard 管理的并发数。清除后会回退到进程环境变量或内置默认值 4。',
+    '将清除当前采集并发设置，是否继续？',
     '确认清除 LOCALIZE 并发设置',
     { type: 'warning', confirmButtonText: '确认清除' },
   )
@@ -231,256 +189,191 @@ async function confirmClearConcurrency() {
       message="无法读取 Dashboard 设置。"
     />
     <template v-else>
-      <section class="panel settings-panel">
-        <header class="panel-heading">
-          <div>
-            <h2>数据源</h2>
-            <p>Tushare 全市场数据采集凭据。</p>
-          </div>
-          <StatusBadge :status="settings.data.value?.data_source_token.configured ? 'READY' : 'MISSING'" />
-        </header>
-
-        <div class="settings-status-grid">
-          <div><small>当前状态</small><strong>{{ settings.data.value?.data_source_token.configured ? '已配置' : '未配置' }}</strong></div>
-          <div><small>配置来源</small><strong>{{ sourceLabel }}</strong></div>
-          <div><small>文件更新时间</small><strong>{{ formatTime(settings.data.value?.data_source_token.updated_at) }}</strong></div>
-        </div>
-
+      <section class="settings-page">
         <el-alert
-          title="Token 将以明文写入数据根 .env。本机可读取该文件的进程和备份工具都可能获得 Token。"
+          class="settings-warning"
+          :title="`Token 明文保存在 ${settings.data.value?.settings_path ?? '设置文件'}；已保存的值不会在页面回显。`"
           type="warning"
           :closable="false"
           show-icon
         />
 
-        <el-form class="token-form" label-position="top" @submit.prevent="saveToken.mutate()">
-          <el-form-item label="新的数据源 Token">
-            <el-input
-              v-model="token"
-              data-testid="data-source-token"
-              type="password"
-              show-password
-              autocomplete="new-password"
-              placeholder="输入 Token；已保存的值不会回显"
-            />
-          </el-form-item>
-          <div class="settings-actions">
-            <el-button
-              type="primary"
-              native-type="submit"
-              :loading="saveToken.isPending.value"
-              :disabled="!token"
-            >保存并立即生效</el-button>
-            <el-button
-              type="danger"
-              plain
-              :loading="clearToken.isPending.value"
-              :disabled="settings.data.value?.data_source_token.source !== 'DATA_ROOT_ENV'"
-              @click="confirmClear"
-            >清除 Dashboard Token</el-button>
+        <div class="panel settings-list">
+          <div class="setting-row">
+            <div class="setting-label">
+              <h3>访问 Token</h3>
+              <p>{{ settings.data.value?.data_source_token.configured ? '已配置' : '未配置' }}</p>
+            </div>
+            <el-form class="inline-form" @submit.prevent="saveToken.mutate()">
+              <el-input
+                v-model="token"
+                data-testid="data-source-token"
+                type="password"
+                show-password
+                autocomplete="new-password"
+                aria-label="新 Token"
+                placeholder="输入后覆盖现有 Token"
+              />
+              <el-button type="primary" native-type="submit" :loading="saveToken.isPending.value" :disabled="!token">保存</el-button>
+              <el-button
+                data-testid="clear-data-source-token"
+                type="danger"
+                text
+                :loading="clearToken.isPending.value"
+                :disabled="settings.data.value?.data_source_token.source !== 'DATA_ROOT_ENV'"
+                @click="confirmClear"
+              >清除</el-button>
+            </el-form>
           </div>
-        </el-form>
 
-        <div class="settings-path">
-          <small>设置文件</small>
-          <code>{{ settings.data.value?.settings_path ?? '—' }}</code>
-        </div>
-
-        <el-divider />
-
-        <div class="rate-limit-heading">
-          <h3>请求限流</h3>
-          <p>同一进程内的 Tushare 请求均匀发送；不同进程分别计算额度。</p>
-        </div>
-        <div class="settings-status-grid">
-          <div><small>每分钟请求数</small><strong>{{ settings.data.value?.data_source_rate_limit.requests_per_minute ?? 480 }}</strong></div>
-          <div><small>配置来源</small><strong>{{ rateLimitSourceLabel }}</strong></div>
-          <div><small>文件更新时间</small><strong>{{ formatTime(settings.data.value?.data_source_rate_limit.updated_at) }}</strong></div>
-        </div>
-        <el-alert
-          title="默认 480 次/分钟。重试请求同样计入额度；多个 Worker 或 CLI 进程不会共享计数。"
-          type="info"
-          :closable="false"
-          show-icon
-        />
-        <el-form class="token-form" label-position="top" @submit.prevent="saveRateLimit.mutate()">
-          <el-form-item label="每分钟最大请求数">
-            <el-input-number
-              v-model="requestsPerMinute"
-              data-testid="data-source-rate-limit"
-              :min="1"
-              :max="10000"
-              controls-position="right"
-              style="width:100%"
-            />
-          </el-form-item>
-          <div class="settings-actions">
-            <el-button
-              type="primary"
-              native-type="submit"
-              :loading="saveRateLimit.isPending.value"
-            >保存并立即生效</el-button>
-            <el-button
-              type="danger"
-              plain
-              :loading="clearRateLimit.isPending.value"
-              :disabled="settings.data.value?.data_source_rate_limit.source !== 'DATA_ROOT_ENV'"
-              @click="confirmClearRateLimit"
-            >清除 Dashboard 限流设置</el-button>
+          <div class="setting-row">
+            <div class="setting-label">
+              <h3>请求限流</h3>
+              <p>每分钟请求数</p>
+            </div>
+            <el-form class="inline-form" @submit.prevent="saveRateLimit.mutate()">
+              <el-input-number
+                v-model="requestsPerMinute"
+                data-testid="data-source-rate-limit"
+                aria-label="每分钟请求数"
+                :min="1"
+                :max="10000"
+                controls-position="right"
+              />
+              <el-button type="primary" native-type="submit" :loading="saveRateLimit.isPending.value">保存</el-button>
+              <el-button
+                data-testid="clear-data-source-rate-limit"
+                type="danger"
+                text
+                :loading="clearRateLimit.isPending.value"
+                :disabled="settings.data.value?.data_source_rate_limit.source !== 'DATA_ROOT_ENV'"
+                @click="confirmClearRateLimit"
+              >清除</el-button>
+            </el-form>
           </div>
-        </el-form>
 
-        <el-divider />
-
-        <div class="rate-limit-heading">
-          <h3>Tushare 代理</h3>
-          <p>代理地址会写入 Tushare Pro 对象，并在下一次请求前检测变更。</p>
-        </div>
-        <div class="settings-status-grid proxy-status-grid">
-          <div><small>当前代理</small><strong>{{ settings.data.value?.data_source_proxy.url ?? '官方入口' }}</strong></div>
-          <div><small>配置来源</small><strong>{{ proxySourceLabel }}</strong></div>
-          <div><small>文件更新时间</small><strong>{{ formatTime(settings.data.value?.data_source_proxy.updated_at) }}</strong></div>
-        </div>
-        <el-form class="token-form" label-position="top" @submit.prevent="saveProxy.mutate()">
-          <el-form-item label="代理 URL">
-            <el-input
-              v-model="proxyUrl"
-              data-testid="data-source-proxy"
-              autocomplete="url"
-              placeholder="例如 https://proxy.example.com/"
-            />
-          </el-form-item>
-          <div class="settings-actions">
-            <el-button
-              type="primary"
-              native-type="submit"
-              :loading="saveProxy.isPending.value"
-              :disabled="!proxyUrl"
-            >保存并立即生效</el-button>
-            <el-button
-              type="danger"
-              plain
-              :loading="clearProxy.isPending.value"
-              :disabled="settings.data.value?.data_source_proxy.source !== 'DATA_ROOT_ENV'"
-              @click="confirmClearProxy"
-            >清除 Dashboard 代理</el-button>
+          <div class="setting-row">
+            <div class="setting-label">
+              <h3>Tushare 代理</h3>
+              <p>留空使用官方入口</p>
+            </div>
+            <el-form class="inline-form" @submit.prevent="saveProxy.mutate()">
+              <el-input
+                v-model="proxyUrl"
+                data-testid="data-source-proxy"
+                autocomplete="url"
+                aria-label="代理 URL"
+                placeholder="留空使用官方入口"
+              />
+              <el-button type="primary" native-type="submit" :loading="saveProxy.isPending.value" :disabled="!proxyUrl">保存</el-button>
+              <el-button
+                data-testid="clear-data-source-proxy"
+                type="danger"
+                text
+                :loading="clearProxy.isPending.value"
+                :disabled="settings.data.value?.data_source_proxy.source !== 'DATA_ROOT_ENV'"
+                @click="confirmClearProxy"
+              >清除</el-button>
+            </el-form>
           </div>
-        </el-form>
 
-        <el-divider />
-
-        <div class="rate-limit-heading">
-          <h3>LOCALIZE 并发</h3>
-          <p>只并发网络抓取；Raw 发布、元数据登记和数据集顺序仍保持串行、确定。</p>
-        </div>
-        <div class="settings-status-grid">
-          <div><small>最大并发请求数</small><strong>{{ settings.data.value?.data_source_concurrency.max_concurrent_requests ?? 4 }}</strong></div>
-          <div><small>配置来源</small><strong>{{ concurrencySourceLabel }}</strong></div>
-          <div><small>文件更新时间</small><strong>{{ formatTime(settings.data.value?.data_source_concurrency.updated_at) }}</strong></div>
-        </div>
-        <el-alert
-          title="范围 1–32，默认 4。修改在下一个数据集请求批次生效；已运行的线程池不会中途扩缩容。"
-          type="info"
-          :closable="false"
-          show-icon
-        />
-        <el-form class="token-form" label-position="top" @submit.prevent="saveConcurrency.mutate()">
-          <el-form-item label="最大并发请求数">
-            <el-input-number
-              v-model="maxConcurrentRequests"
-              data-testid="data-source-concurrency"
-              :min="1"
-              :max="32"
-              controls-position="right"
-              style="width:100%"
-            />
-          </el-form-item>
-          <div class="settings-actions">
-            <el-button
-              type="primary"
-              native-type="submit"
-              :loading="saveConcurrency.isPending.value"
-            >保存并在下个批次生效</el-button>
-            <el-button
-              type="danger"
-              plain
-              :loading="clearConcurrency.isPending.value"
-              :disabled="settings.data.value?.data_source_concurrency.source !== 'DATA_ROOT_ENV'"
-              @click="confirmClearConcurrency"
-            >清除 Dashboard 并发设置</el-button>
+          <div class="setting-row">
+            <div class="setting-label">
+              <h3>采集并发</h3>
+              <p>1–32 路</p>
+            </div>
+            <el-form class="inline-form" @submit.prevent="saveConcurrency.mutate()">
+              <el-input-number
+                v-model="maxConcurrentRequests"
+                data-testid="data-source-concurrency"
+                aria-label="最大并发请求数"
+                :min="1"
+                :max="32"
+                controls-position="right"
+              />
+              <el-button type="primary" native-type="submit" :loading="saveConcurrency.isPending.value">保存</el-button>
+              <el-button
+                data-testid="clear-data-source-concurrency"
+                type="danger"
+                text
+                :loading="clearConcurrency.isPending.value"
+                :disabled="settings.data.value?.data_source_concurrency.source !== 'DATA_ROOT_ENV'"
+                @click="confirmClearConcurrency"
+              >清除</el-button>
+            </el-form>
           </div>
-        </el-form>
+        </div>
       </section>
     </template>
   </div>
 </template>
 
 <style scoped>
-.settings-panel {
-  max-width: 820px;
+.settings-page {
+  width: min(100%, 980px);
 }
 
-.settings-status-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 18px;
-}
-
-.settings-status-grid div,
-.settings-path {
-  display: grid;
-  gap: 6px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-raised);
-}
-
-.settings-status-grid small,
-.settings-path small {
-  color: var(--muted);
-}
-
-.token-form {
-  margin-top: 20px;
-}
-
-.settings-actions {
-  display: flex;
-  gap: 10px;
-}
-
-.settings-path {
-  margin-top: 20px;
-}
-
-.settings-path code {
-  overflow-wrap: anywhere;
-}
-
-.rate-limit-heading {
-  margin: 22px 0 14px;
-}
-
-.rate-limit-heading h3,
-.rate-limit-heading p {
+.setting-label h3,
+.setting-label p {
   margin: 0;
 }
 
-.proxy-status-grid strong {
-  overflow-wrap: anywhere;
-}
-
-.rate-limit-heading p {
-  margin-top: 6px;
+.setting-label p {
   color: var(--muted);
-  font-size: 12px;
 }
 
-@media (max-width: 760px) {
-  .settings-status-grid {
+.settings-warning {
+  margin-top: 0;
+}
+
+.settings-list {
+  padding: 0 20px;
+  margin-top: 14px;
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 24px;
+  align-items: center;
+  padding: 17px 0;
+}
+
+.setting-row + .setting-row {
+  border-top: 1px solid var(--border);
+}
+
+.setting-label h3 {
+  font-size: 14px;
+}
+
+.setting-label p {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.inline-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+
+.inline-form :deep(.el-input-number) {
+  width: 100%;
+}
+
+@media (max-width: 820px) {
+  .setting-row {
     grid-template-columns: 1fr;
+    gap: 10px;
+  }
+}
+
+@media (max-width: 560px) {
+  .settings-list {
+    padding: 0 16px;
   }
 }
 </style>

@@ -62,8 +62,9 @@ describe('dashboard settings', () => {
     })
     await flushPromises()
 
-    expect(wrapper.text()).toContain('数据根 .env')
-    expect(wrapper.text()).toContain('明文写入')
+    expect(wrapper.text()).not.toContain('本地设置')
+    expect(wrapper.text()).not.toContain('数据根 .env')
+    expect(wrapper.text()).toContain('明文保存在')
     expect(wrapper.text()).toContain('C:\\Users\\tester\\qlab-data\\.env')
     expect(wrapper.text()).not.toContain('existing-token')
 
@@ -104,16 +105,14 @@ describe('dashboard settings', () => {
     })
     await flushPromises()
 
-    const clear = wrapper.findAll('button')
-      .find((item) => item.text().includes('清除 Dashboard Token'))
-    await clear?.trigger('click')
+    await wrapper.get('[data-testid="clear-data-source-token"]').trigger('click')
     await flushPromises()
 
     expect(ElMessageBox.confirm).toHaveBeenCalled()
     expect(apiPatch).toHaveBeenCalledWith('/api/v1/settings', {
       data_source_token: { operation: 'CLEAR' },
     })
-    expect(wrapper.text()).toContain('进程环境变量')
+    expect(wrapper.text()).not.toContain('进程环境变量')
     wrapper.unmount()
   })
 
@@ -167,17 +166,16 @@ describe('dashboard settings', () => {
     expect(apiPatch).toHaveBeenCalledWith('/api/v1/settings', {
       data_source_rate_limit: { operation: 'SET', requests_per_minute: 240 },
     })
-    expect(wrapper.text()).toContain('240')
+    expect((limiter.get('input').element as HTMLInputElement).value).toBe('240')
 
-    const clear = wrapper.findAll('button')
-      .find(item => item.text().includes('清除 Dashboard 限流设置'))
-    await clear?.trigger('click')
+    await wrapper.get('[data-testid="clear-data-source-rate-limit"]').trigger('click')
     await flushPromises()
 
     expect(apiPatch).toHaveBeenLastCalledWith('/api/v1/settings', {
       data_source_rate_limit: { operation: 'CLEAR' },
     })
-    expect(wrapper.text()).toContain('内置默认值')
+    expect((limiter.get('input').element as HTMLInputElement).value).toBe('480')
+    expect(wrapper.text()).not.toContain('内置默认值')
     wrapper.unmount()
   })
 
@@ -236,17 +234,16 @@ describe('dashboard settings', () => {
         url: 'https://proxy.example.test/',
       },
     })
-    expect(wrapper.text()).toContain('https://proxy.example.test')
+    expect((input.element as HTMLInputElement).value).toBe('https://proxy.example.test')
 
-    const clear = wrapper.findAll('button')
-      .find(item => item.text().includes('清除 Dashboard 代理'))
-    await clear?.trigger('click')
+    await wrapper.get('[data-testid="clear-data-source-proxy"]').trigger('click')
     await flushPromises()
 
     expect(apiPatch).toHaveBeenLastCalledWith('/api/v1/settings', {
       data_source_proxy: { operation: 'CLEAR' },
     })
-    expect(wrapper.text()).toContain('Tushare 官方入口')
+    expect((input.element as HTMLInputElement).value).toBe('')
+    expect(wrapper.text()).not.toContain('Tushare 官方入口')
     wrapper.unmount()
   })
 
@@ -293,15 +290,14 @@ describe('dashboard settings', () => {
         max_concurrent_requests: 8,
       },
     })
-    const clear = wrapper.findAll('button')
-      .find(item => item.text().includes('清除 Dashboard 并发设置'))
-    await clear?.trigger('click')
+    await wrapper.get('[data-testid="clear-data-source-concurrency"]').trigger('click')
     await flushPromises()
 
     expect(apiPatch).toHaveBeenLastCalledWith('/api/v1/settings', {
       data_source_concurrency: { operation: 'CLEAR' },
     })
-    expect(wrapper.text()).toContain('内置默认值')
+    expect((input.get('input').element as HTMLInputElement).value).toBe('4')
+    expect(wrapper.text()).not.toContain('内置默认值')
     wrapper.unmount()
   })
 })
