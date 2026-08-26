@@ -174,11 +174,6 @@ function taskName(task: Task) {
             <span>Catalog <strong class="hash">{{ shortHash(data.gate.catalog_hash) }}</strong></span>
           </div>
         </div>
-        <div class="overview-actions" aria-label="研究工作台快捷入口">
-          <RouterLink to="/data"><el-button :type="data.gate.status === 'BLOCKED' ? 'danger' : 'primary'">进入数据中心</el-button></RouterLink>
-          <RouterLink to="/experiments"><el-button>进入实验中心</el-button></RouterLink>
-          <RouterLink to="/notebook"><el-button text>打开 Notebook</el-button></RouterLink>
-        </div>
       </section>
 
       <div class="metrics-grid overview-metrics">

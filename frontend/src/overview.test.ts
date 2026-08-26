@@ -95,17 +95,16 @@ describe('research workbench overview', () => {
   beforeEach(() => apiGet.mockReset())
   afterEach(() => vi.restoreAllMocks())
 
-  it('renders a healthy readiness state and read-only entry points', async () => {
+  it('renders a healthy readiness state without hero shortcuts', async () => {
     const { wrapper, queryClient } = await mountOverview(overviewFixture())
 
     expect(wrapper.text()).toContain('研究环境已就绪')
     expect(wrapper.text()).toContain('当前没有阻断事项')
     expect(wrapper.text()).toContain('当前没有活动任务')
-    expect(wrapper.find('a[href="/data"]').exists()).toBe(true)
-    expect(wrapper.find('a[href="/experiments"]').exists()).toBe(true)
-    const notebook = wrapper.get('a[href="/notebook"]')
-    expect(notebook.attributes('target')).toBeUndefined()
-    expect(notebook.text()).toBe('打开 Notebook')
+    expect(wrapper.find('[aria-label="研究工作台快捷入口"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('进入数据中心')
+    expect(wrapper.text()).not.toContain('进入实验中心')
+    expect(wrapper.text()).not.toContain('打开 Notebook')
     expect(wrapper.find('.chart').exists()).toBe(false)
 
     wrapper.unmount()
