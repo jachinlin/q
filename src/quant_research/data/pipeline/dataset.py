@@ -1283,6 +1283,9 @@ class DataPipeline:
         fetched = 0
         skipped = 0
         visible: list[PublishedPartition] = []
+        request_plan = "dependency"
+        request_completed = 0
+        request_total = 0
 
         def validate_batch(
             batch: RawBatch,
@@ -1323,17 +1326,6 @@ class DataPipeline:
                 data_path=str(partition.data_path),
                 manifest_path=str(partition.manifest_path),
             )
-            progress.boundary(
-                "LOCALIZE",
-                dataset,
-                "raw_request",
-                {
-                    "endpoint": endpoint,
-                    "request_hash": partition.request_hash,
-                    "row_count": partition.row_count,
-                    "disposition": "fetched",
-                },
-            )
             return partition
 
         def publish_fetched(batch: RawBatch) -> PublishedPartition:
@@ -1354,9 +1346,63 @@ class DataPipeline:
             *,
             force_fetch: bool = False,
         ) -> PublishedPartition | None:
-            nonlocal fetched, skipped
+            nonlocal fetched, request_completed, skipped
             if progress.is_cancelled():
                 raise DataPipelineCancelled("data pipeline cancellation requested")
+            request_index = request_completed + 1
+            effective_total = max(request_total, request_index)
+            request_hash = hashlib.sha256(
+                canonical_json_bytes(dict(request))
+            ).hexdigest()
+            progress_context: dict[str, JsonValue] = {
+                "status": "STARTED",
+                "plan": request_plan,
+                "endpoint": endpoint,
+                "request": dict(request),
+                "request_hash": request_hash,
+                "request_index": request_index,
+                "request_total": effective_total,
+                "completed_requests": request_completed,
+            }
+            self._localize_log(
+                "localize.raw_started",
+                request=request,
+                dataset=dataset.value,
+                source=source_name,
+                endpoint=endpoint,
+                plan=request_plan,
+                request_index=request_index,
+                request_total=effective_total,
+                completed_requests=request_completed,
+                request_hash=request_hash,
+                force_fetch=force_fetch,
+            )
+            progress.boundary(
+                "LOCALIZE", dataset, "raw_request", progress_context
+            )
+
+            def complete_request(
+                *,
+                disposition: str,
+                row_count: int,
+                completed_hash: str = request_hash,
+            ) -> None:
+                nonlocal request_completed
+                request_completed += 1
+                progress.boundary(
+                    "LOCALIZE",
+                    dataset,
+                    "raw_request",
+                    {
+                        **progress_context,
+                        "status": "COMPLETED",
+                        "request_hash": completed_hash,
+                        "row_count": row_count,
+                        "disposition": disposition,
+                        "completed_requests": request_completed,
+                    },
+                )
+
             existing = None
             if not force_fetch:
                 existing = self._find_raw_checkpoint(
@@ -1398,19 +1444,15 @@ class DataPipeline:
                     data_path=str(partition.data_path),
                     manifest_path=str(partition.manifest_path),
                 )
-                progress.boundary(
-                    "LOCALIZE",
-                    dataset,
-                    "raw_request",
-                    {
-                        "endpoint": endpoint,
-                        "request_hash": partition.request_hash,
-                        "row_count": partition.row_count,
-                        "disposition": "reused",
-                    },
+                complete_request(
+                    disposition="reused",
+                    row_count=partition.row_count,
+                    completed_hash=partition.request_hash,
                 )
                 return partition
             result: PublishedPartition | None = None
+            request_rows = 0
+            disposition = "fetched"
             try:
                 for batch in fetch():
                     if is_financial_cell and len(batch.rows) == 0:
@@ -1428,23 +1470,12 @@ class DataPipeline:
                             ).hexdigest(),
                             row_count=0,
                         )
-                        progress.boundary(
-                            "LOCALIZE",
-                            dataset,
-                            "raw_request",
-                            {
-                                "endpoint": endpoint,
-                                "request_hash": hashlib.sha256(
-                                    canonical_json_bytes(dict(request))
-                                ).hexdigest(),
-                                "row_count": 0,
-                                "disposition": "empty_discarded",
-                            },
-                        )
+                        disposition = "empty_discarded"
                         continue
                     result = publish_batch(batch, endpoint=endpoint, request=request)
                     visible.append(result)
                     fetched += 1
+                    request_rows += result.row_count
             except Exception as error:
                 error_code = (
                     error.detail.code if isinstance(error, QuantError) else None
@@ -1461,6 +1492,11 @@ class DataPipeline:
                     error_code=error_code,
                 )
                 raise
+            complete_request(
+                disposition=disposition if result is not None else "empty_discarded",
+                row_count=request_rows,
+                completed_hash=(request_hash if result is None else result.request_hash),
+            )
             return result
 
         def filter_completed_requests(
@@ -1469,7 +1505,7 @@ class DataPipeline:
             plan: str,
         ) -> tuple[tuple[str, Mapping[str, JsonValue], bool], ...]:
             """Resolve completed request heads with one query per endpoint."""
-            nonlocal skipped
+            nonlocal request_completed, request_plan, request_total, skipped
             endpoints = sorted({endpoint for endpoint, _ in units})
             raw_heads = {
                 (record.endpoint, record.request_hash): record
@@ -1505,6 +1541,9 @@ class DataPipeline:
                 )
                 skipped += 1
                 visible.append(partition)
+            request_plan = plan
+            request_total = len(units)
+            request_completed = len(units) - len(pending)
             self._localize_log(
                 "localize.requests_filtered",
                 request=command_request,
@@ -1519,6 +1558,19 @@ class DataPipeline:
                 incompatible_checkpoints_ignored=incompatible_checkpoints_ignored,
                 first_pending_request=(None if not pending else dict(pending[0][1])),
                 filter="sqlite_bulk",
+            )
+            progress.boundary(
+                "LOCALIZE",
+                dataset,
+                "request_plan",
+                {
+                    "status": "READY",
+                    "plan": plan,
+                    "endpoints": cast(list[JsonValue], list(endpoints)),
+                    "request_total": len(units),
+                    "completed_requests": request_completed,
+                    "pending_requests": len(pending),
+                },
             )
             return tuple(pending)
 
@@ -1711,6 +1763,32 @@ class DataPipeline:
                 if progress.is_cancelled():
                     raise DataPipelineCancelled("data pipeline cancellation requested")
                 window = window_by_dataset[dataset]
+                source = self._routes.source_for(dataset)
+                progress.boundary(
+                    "LOCALIZE",
+                    dataset,
+                    "dataset",
+                    {
+                        "status": "STARTED",
+                        "dataset_index": index,
+                        "dataset_total": len(datasets),
+                        "source": source,
+                        "from": window.start.isoformat(),
+                        "to": window.end.isoformat(),
+                    },
+                )
+                self._localize_log(
+                    "localize.dataset_started",
+                    request={
+                        "dataset": dataset.value,
+                        "from": window.start.isoformat(),
+                        "to": window.end.isoformat(),
+                    },
+                    dataset=dataset.value,
+                    source=source,
+                    dataset_index=index,
+                    dataset_total=len(datasets),
+                )
                 result = self.localize(
                     dataset,
                     start=window.start,
@@ -2164,8 +2242,31 @@ class DataPipeline:
                 item.request_hash,
             ),
         )
-        for record in ordered_to_read:
+        for raw_index, record in enumerate(ordered_to_read, start=1):
+            if progress.is_cancelled():
+                raise DataPipelineCancelled("data pipeline cancellation requested")
             raw_identity = _DatasetPipelineSupport._raw_object_identity_key(record)
+            affected_datasets = tuple(
+                sorted(raw_targets[raw_identity], key=lambda item: item.value)
+            )
+            progress_dataset = affected_datasets[0]
+            raw_context: dict[str, JsonValue] = {
+                "status": "STARTED",
+                "raw_index": raw_index,
+                "raw_total": len(ordered_to_read),
+                "endpoint": record.endpoint,
+                "request": dict(record.request),
+                "request_hash": record.request_hash,
+                "affected_datasets": [item.value for item in affected_datasets],
+            }
+            progress.boundary(
+                "CURATE", progress_dataset, "raw_input", raw_context
+            )
+            self._curate_log(
+                "curate.raw_input_started",
+                source=record.source,
+                activity=raw_context,
+            )
             partition = self._published_partition(record)
             self._raw_store.verify_managed_partition(partition)
             outputs = tuple(self._mapper.normalize(partition))
@@ -2208,11 +2309,47 @@ class DataPipeline:
                 for partition_key, frame in actual:
                     if partition_key in wanted:
                         frames[batch.dataset][partition_key].append(frame)
+            completed_raw_context = {
+                **raw_context,
+                "status": "COMPLETED",
+                "output_batches": len(outputs),
+            }
+            progress.boundary(
+                "CURATE", progress_dataset, "raw_input", completed_raw_context
+            )
+            self._curate_log(
+                "curate.raw_input_completed",
+                source=record.source,
+                activity=completed_raw_context,
+            )
 
         results: list[DatasetCurateResult] = []
-        for dataset in datasets:
+        for dataset_index, dataset in enumerate(datasets, start=1):
             source = self._routes.source_for(dataset)
             current = previous[dataset]
+            progress.boundary(
+                "CURATE",
+                dataset,
+                "dataset",
+                {
+                    "status": "STARTED",
+                    "dataset_index": dataset_index,
+                    "dataset_total": len(datasets),
+                    "source": source,
+                    "raw_partitions": len(records_by_dataset[dataset]),
+                    "target_partitions": len(target_keys[dataset]),
+                },
+            )
+            self._curate_log(
+                "curate.dataset_started",
+                dataset=dataset.value,
+                source=source,
+                run_id=run_id,
+                dataset_index=dataset_index,
+                dataset_total=len(datasets),
+                raw_partitions=len(records_by_dataset[dataset]),
+                target_partitions=len(target_keys[dataset]),
+            )
             if not target_keys[dataset] and not removed_keys[dataset]:
                 if current is None:
                     self._raise(
@@ -2248,10 +2385,33 @@ class DataPipeline:
                 continue
 
             replacements: list[CanonicalPartitionReplacement] = []
-            for partition_key in sorted(target_keys[dataset]):
+            ordered_partition_keys = tuple(sorted(target_keys[dataset]))
+            for partition_index, partition_key in enumerate(
+                ordered_partition_keys, start=1
+            ):
                 if progress.is_cancelled():
                     raise DataPipelineCancelled("data pipeline cancellation requested")
                 pieces = frames[dataset].get(partition_key, [])
+                partition_context: dict[str, JsonValue] = {
+                    "status": "STARTED",
+                    "partition_key": partition_key,
+                    "partition_index": partition_index,
+                    "partition_total": len(ordered_partition_keys),
+                    "raw_input_count": len(groups[dataset][partition_key]),
+                }
+                progress.boundary(
+                    "CURATE",
+                    dataset,
+                    "canonical_partition",
+                    partition_context,
+                )
+                self._curate_log(
+                    "curate.partition_started",
+                    dataset=dataset.value,
+                    source=source,
+                    run_id=run_id,
+                    activity=partition_context,
+                )
                 complete = self._mapper.consolidate_partition(dataset, pieces)
                 replacements.append(
                     CanonicalPartitionReplacement(
@@ -2267,6 +2427,8 @@ class DataPipeline:
                     dataset,
                     "canonical_partition",
                     {
+                        **partition_context,
+                        "status": "COMPLETED",
                         "partition_key": partition_key,
                         "row_count": complete.height,
                         "raw_input_count": len(groups[dataset][partition_key]),
@@ -2388,12 +2550,14 @@ class DataPipeline:
         dataset: DatasetKind | None = None,
         *,
         heartbeat: Callable[[], None] = lambda: None,
+        observer: PipelineObserver | None = None,
     ) -> QualityRunId:
         """诊断指定范围的 Canonical 数据质量并记录运行结果。
 
         入参：
             dataset：目标 Canonical 数据集标识。
             heartbeat：在数据集和质量规则安全边界执行的心跳或取消检查。
+            observer：接收当前阶段、数据集与校验边界的进度观察器。
         返回值：
             返回校验Canonical 数据后的``validate``（``QualityRunId``）。
         异常：
@@ -2401,16 +2565,24 @@ class DataPipeline:
             ``DATA_PIPELINE_ALREADY_RUNNING``；其余质量或文件错误保持原错误码。
         """
         with self._execution_lock:
-            return self._validate(dataset, heartbeat=heartbeat)
+            return self._validate(dataset, heartbeat=heartbeat, observer=observer)
 
     def _validate(
         self,
         dataset: DatasetKind | None,
         *,
         heartbeat: Callable[[], None],
+        observer: PipelineObserver | None,
     ) -> QualityRunId:
         scope = "ALL" if dataset is None else "DATASET"
-        heartbeat()
+        progress = observer or _NullPipelineObserver()
+
+        def checkpoint() -> None:
+            heartbeat()
+            if progress.is_cancelled():
+                raise DataPipelineCancelled("data validation cancellation requested")
+
+        checkpoint()
         command_request: dict[str, object] = {
             "dataset": None if dataset is None else dataset.value,
             "scope": "all" if dataset is None else "dataset",
@@ -2420,6 +2592,7 @@ class DataPipeline:
             if dataset is not None
             else tuple(item for item in self._catalog if self._routes[item])
         )
+        progress.stage_started("VALIDATE", len(datasets))
         input_hash = self._repository.catalog_state().catalog_hash
         self._validate_log(
             "validate.started",
@@ -2429,8 +2602,19 @@ class DataPipeline:
             catalog_hash=input_hash,
         )
         records: dict[DatasetKind, CanonicalDatasetRecord] = {}
-        for item in datasets:
-            heartbeat()
+        for dataset_index, item in enumerate(datasets, start=1):
+            checkpoint()
+            progress.boundary(
+                "VALIDATE",
+                item,
+                "dataset",
+                {
+                    "status": "STARTED",
+                    "dataset_index": dataset_index,
+                    "dataset_total": len(datasets),
+                    "catalog_hash": input_hash,
+                },
+            )
             current = self._repository.find_canonical_dataset(item)
             if current is None:
                 self._raise(
@@ -2452,6 +2636,21 @@ class DataPipeline:
                     for partition in current.partitions
                 ],
             )
+            progress.boundary(
+                "VALIDATE",
+                item,
+                "canonical_dataset",
+                {
+                    "status": "LOADED",
+                    "dataset_index": dataset_index,
+                    "dataset_total": len(datasets),
+                    "content_hash": current.content_hash,
+                    "partition_count": len(current.partitions),
+                    "row_count": sum(
+                        partition.row_count for partition in current.partitions
+                    ),
+                },
+            )
         frames = {
             item: self._curated_store.scan_dataset(record)
             for item, record in records.items()
@@ -2465,8 +2664,8 @@ class DataPipeline:
             catalog_hash=input_hash,
             dataset_hashes=dataset_hashes,
         )
-        evaluation = self._quality_runner.evaluate(frames, heartbeat=heartbeat)
-        heartbeat()
+        evaluation = self._quality_runner.evaluate(frames, heartbeat=checkpoint)
+        checkpoint()
         issues = list(evaluation.issues)
         for result in evaluation.rule_results:
             self._validate_log(
@@ -2510,7 +2709,7 @@ class DataPipeline:
             dataset_hashes=dataset_hashes,
             issue_count=len(issues),
         )
-        heartbeat()
+        checkpoint()
         quality = self._repository.register_quality_run(
             QualityRunSpec(
                 dataset_hashes=dataset_hashes,
@@ -2555,9 +2754,20 @@ class DataPipeline:
             gate_opened=gate_opened,
         )
         validated_at = self._now()
-        for item in datasets:
+        for dataset_index, item in enumerate(datasets, start=1):
             self._repository.record_dataset_stage(
                 item, "VALIDATE", completed_at=validated_at
+            )
+            progress.dataset_completed(
+                "VALIDATE",
+                item,
+                dataset_index,
+                len(datasets),
+                {
+                    "quality_run_id": str(quality.id),
+                    "status": quality.status,
+                    "issue_count": sum(issue.dataset is item for issue in issues),
+                },
             )
         if dataset is None and quality.status != "PASSED":
             self._raise(
@@ -2661,17 +2871,7 @@ class DataPipeline:
         self.curate_all(observer=progress)
         if progress.is_cancelled():
             raise DataPipelineCancelled("data pipeline cancellation requested")
-        datasets = tuple(dataset for dataset in self._catalog if self._routes[dataset])
-        progress.stage_started("VALIDATE", len(datasets))
-        quality = self.validate()
-        for index, dataset in enumerate(datasets, start=1):
-            progress.dataset_completed(
-                "VALIDATE",
-                dataset,
-                index,
-                len(datasets),
-                {"quality_run_id": str(quality)},
-            )
+        quality = self.validate(observer=progress)
         state = self._repository.catalog_state()
         self._repository.complete_data_initialization(
             catalog_hash=state.catalog_hash,
@@ -2758,17 +2958,7 @@ class DataPipeline:
         self._curate_many(selected, observer=progress)
         if progress.is_cancelled():
             raise DataPipelineCancelled("data pipeline cancellation requested")
-        datasets = tuple(dataset for dataset in self._catalog if self._routes[dataset])
-        progress.stage_started("VALIDATE", len(datasets))
-        quality = self.validate()
-        for index, dataset in enumerate(datasets, start=1):
-            progress.dataset_completed(
-                "VALIDATE",
-                dataset,
-                index,
-                len(datasets),
-                {"quality_run_id": str(quality)},
-            )
+        quality = self.validate(observer=progress)
         return PipelineResult(
             run_id, quality, self._repository.catalog_state().catalog_hash
         )

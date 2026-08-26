@@ -613,6 +613,25 @@ uv run quant data validate-all
 
 `bootstrap` 和 `update` 会编排完整流程。分阶段命令主要用于理解、测试和定位错误。
 
+### 14.1 怎样观察流水线进度
+
+流水线同时发布持久化任务进度和 JSON Lines 结构化日志。Dashboard「数据中心」展示当前
+阶段、数据集以及内部活动；「任务 → 尝试与日志」保留 Worker 收到的每次进度事件。
+CLI 和独立流水线日志写入 `$QUANT_DATA_ROOT/logs/data_pipeline.log`。
+
+进度从粗到细分为三层：
+
+- 阶段：`LOCALIZE`、`CURATE` 或 `VALIDATE`，以及阶段中的数据集完成数；
+- 数据集：当前 `dataset`、目录序号、总数和执行窗口；
+- 内部活动：LOCALIZE 的端点、请求序号和 `trade_date`/市场/行业等请求切片，CURATE
+  的 Raw 输入和 Canonical 分区，VALIDATE 的 Canonical 数据集载入与质量运行结果。
+
+关键事件成对记录 `STARTED` 和 `COMPLETED`。例如 `localize.raw_started` 会在访问供应商
+前记录端点、完整受控请求、请求序号和总数，`localize.raw_completed` 再记录行数、
+request/content hash 与抓取或复用方式；失败时最后一个 `STARTED` 事件就是精确故障位置。
+请求规划和已存在的 Raw checkpoint 会单独汇总，因此断点续跑时也能区分“已经完成”与
+“仍待下载”。Token、代理凭据和其他敏感环境配置不得进入任务进度或日志。
+
 生产假设是 Tushare 账户具有所需积分、VIP 和基金复权权限。Token 不得写入代码、配置文件、日志或测试数据。
 
 ## 15. 常见故障与处理

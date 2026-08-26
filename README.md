@@ -106,6 +106,10 @@ uv run quant start
 LOCALIZE → CURATE → VALIDATE
 ```
 
+Dashboard 数据中心会显示当前阶段、数据集和正在处理的 Tushare 请求切片（例如交易日、
+市场或行业）；任务详情保留同样的结构化进度。完整 JSON Lines 流水线日志位于
+`$QUANT_DATA_ROOT/logs/data_pipeline.log`，可据最后一个 `STARTED` 事件定位中断位置。
+
 常用命令：
 
 ```powershell

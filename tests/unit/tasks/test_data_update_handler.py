@@ -8,7 +8,11 @@ from uuid import uuid4
 
 import pytest
 
-from quant_research.application.data import DataBootstrapHandler, DataUpdateHandler
+from quant_research.application.data import (
+    DataBootstrapHandler,
+    DataUpdateHandler,
+    _DataUpdateObserver,
+)
 from quant_research.data.contracts import JsonValue
 from quant_research.data.pipeline.publish import (
     DataPipeline,
@@ -126,6 +130,78 @@ def test_bootstrap_handler_executes_the_frozen_positive_year_count() -> None:
     assert outcome.result is not None
     assert outcome.result["years"] == 5
     assert progress.values[-1].message == "data bootstrap completed"
+
+
+def test_pipeline_observer_reports_dataset_and_request_slice_progress() -> None:
+    progress = _Progress()
+    observer = _DataUpdateObserver(
+        cast(ProgressSink, progress), cast(CancellationToken, _Cancellation())
+    )
+
+    observer.stage_started("LOCALIZE", 16)
+    observer.boundary(
+        "LOCALIZE",
+        DatasetKind.STOCK_DAILY_BAR,
+        "dataset",
+        {
+            "status": "STARTED",
+            "dataset_index": 5,
+            "dataset_total": 16,
+            "from": "2026-08-01",
+            "to": "2026-08-26",
+        },
+    )
+    observer.boundary(
+        "LOCALIZE",
+        DatasetKind.STOCK_DAILY_BAR,
+        "raw_request",
+        {
+            "status": "STARTED",
+            "endpoint": "daily",
+            "request": {"trade_date": "20260825", "fields": "ts_code,close"},
+            "request_index": 17,
+            "request_total": 20,
+            "completed_requests": 16,
+        },
+    )
+
+    current = progress.values[-1]
+    assert current.stage == "LOCALIZE"
+    assert current.completed == 16
+    assert current.total == 20
+    assert current.message == (
+        "正在下载 stock_daily_bar / daily · trade_date=20260825"
+    )
+    assert current.context["dataset_index"] == 5
+    assert current.context["dataset_total"] == 16
+    assert current.context["request"] == {
+        "trade_date": "20260825",
+        "fields": "ts_code,close",
+    }
+
+
+def test_pipeline_observer_reports_curate_partition_progress() -> None:
+    progress = _Progress()
+    observer = _DataUpdateObserver(
+        cast(ProgressSink, progress), cast(CancellationToken, _Cancellation())
+    )
+    observer.stage_started("CURATE", 2)
+    observer.boundary(
+        "CURATE",
+        DatasetKind.FUND_DAILY_BAR,
+        "canonical_partition",
+        {
+            "status": "COMPLETED",
+            "partition_key": "year=2026",
+            "partition_index": 2,
+            "partition_total": 5,
+            "row_count": 123,
+        },
+    )
+
+    current = progress.values[-1]
+    assert (current.completed, current.total) == (2, 5)
+    assert current.message == "已构建 fund_daily_bar / year=2026"
 
 
 @pytest.mark.parametrize(

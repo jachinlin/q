@@ -118,6 +118,27 @@ class _SuccessHandler:
         return TaskOutcome(status=TaskStatus.SUCCEEDED)
 
 
+class _DetailedProgressHandler:
+    task_type = "BACKTEST"
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, cancellation
+        progress.update(
+            TaskProgress(
+                stage="LOCALIZE",
+                completed=16,
+                total=20,
+                message="正在下载 stock_daily_bar / daily · trade_date=20260825",
+                context={
+                    "dataset": "stock_daily_bar",
+                    "endpoint": "daily",
+                    "request": {"trade_date": "20260825"},
+                },
+            )
+        )
+        return TaskOutcome(status=TaskStatus.SUCCEEDED)
+
+
 class _TypedSuccessHandler(_SuccessHandler):
     def __init__(self, task_type: str) -> None:
         super().__init__()
@@ -1441,6 +1462,44 @@ def test_task_diagnostic_log_records_complete_exception_without_redaction(
     assert failure["context"]["remediation"] == (
         "inspect the traceback and task inputs before retrying"
     )
+
+
+def test_task_diagnostic_log_keeps_structured_progress_details(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    logging_module = importlib.import_module("quant_research.logging")
+    diagnostic_root = tmp_path / "state" / "task-logs"
+    manager = logging_module.TaskLogManager(
+        diagnostic_root=diagnostic_root,
+        artifact_root=tmp_path / "artifacts",
+    )
+    queue = TaskQueue(engine, clock=lambda: NOW, task_log_root=diagnostic_root)
+    task_id = queue.enqueue("BACKTEST", {}, 0)
+    worker = _worker_type()(
+        queue,
+        worker_id="worker-1",
+        handlers=(_DetailedProgressHandler(),),
+        clock=lambda: NOW,
+        task_logs=manager,
+    )
+
+    assert worker.run_once() is True
+
+    _, attempt = _runtime_rows(engine, task_id)
+    records = [
+        json.loads(line)
+        for line in Path(attempt["log_path"]).read_text(encoding="utf-8").splitlines()
+    ]
+    event = next(item for item in records if item["event"] == "task.progress")
+    assert event["stage"] == "LOCALIZE"
+    assert event["context"]["completed"] == 16
+    assert event["context"]["total"] == 20
+    assert event["context"]["details"] == {
+        "dataset": "stock_daily_bar",
+        "endpoint": "daily",
+        "request": {"trade_date": "20260825"},
+    }
 
 
 def test_task_log_open_failure_does_not_block_the_task(

@@ -223,6 +223,7 @@ class _DurableProgressSink:
                     stage=progress.stage,
                     context={
                         "completed": progress.completed,
+                        "details": progress.context,
                         "message": progress.message,
                         "total": progress.total,
                     },

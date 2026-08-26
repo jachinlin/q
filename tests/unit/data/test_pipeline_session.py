@@ -1,5 +1,6 @@
 """Provider session ownership for dataset localization."""
 
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from io import StringIO
@@ -9,6 +10,11 @@ from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
 
+from quant_research.data.contracts import (
+    PublishedPartition,
+    RawBatch,
+    canonical_json_bytes,
+)
 from quant_research.data.pipeline.dataset import (
     DataPipeline,
     DataUpdatePlan,
@@ -41,6 +47,32 @@ class _Source:
         del endpoint, start, end
         return ()
 
+    def fetch(self, endpoint: str, request: dict[str, object]) -> tuple[RawBatch, ...]:
+        return (
+            RawBatch(
+                source=self.provider,
+                endpoint=endpoint,
+                request=request,
+                retrieved_at=datetime(2026, 8, 15, tzinfo=UTC),
+                schema=("ts_code",),
+                rows=({"ts_code": "600000.SH"},),
+            ),
+        )
+
+
+class _RequestSource(_Source):
+    def requests(
+        self, endpoint: str, start: date, end: date
+    ) -> tuple[dict[str, object], ...]:
+        del start, end
+        return (
+            {
+                "endpoint": endpoint,
+                "list_status": "L",
+                "fields": "ts_code",
+            },
+        )
+
 
 class _Calendar:
     def explicit_window(self, start: date, end: date) -> tuple[date, date]:
@@ -55,10 +87,45 @@ class _Repository:
         """返回执行结果所需的稳定目录身份。"""
         return SimpleNamespace(catalog_hash="a" * 64)
 
+    def find_raw_partition(self, *_: object, **__: object) -> None:
+        return None
+
+    def list_raw_partitions(self, *_: object, **__: object) -> tuple[()]:
+        return ()
+
+    def register_raw_partition(self, *_: object, **__: object) -> None:
+        """接收测试发布的 Raw 登记。"""
+
+
+class _RawStore:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def publish(self, batch: RawBatch) -> PublishedPartition:
+        request_hash = hashlib.sha256(
+            canonical_json_bytes(dict(batch.request))
+        ).hexdigest()
+        return PublishedPartition(
+            source=batch.source,
+            endpoint=batch.endpoint,
+            request=batch.request,
+            retrieved_at=batch.retrieved_at,
+            data_path=self.root / f"{request_hash}.parquet",
+            manifest_path=self.root / "request.json",
+            request_hash=request_hash,
+            content_hash="b" * 64,
+            schema_fingerprint="c" * 64,
+            row_count=len(batch.rows),
+        )
+
+    def find_metadata_by_request(self, *_: object, **__: object) -> None:
+        return None
+
 
 class _Observer:
     def __init__(self) -> None:
         self.stages: list[tuple[str, int]] = []
+        self.boundaries: list[tuple[str, DatasetKind, str, dict[str, object]]] = []
 
     def stage_started(self, stage: str, total: int) -> None:
         self.stages.append((stage, total))
@@ -66,8 +133,14 @@ class _Observer:
     def dataset_completed(self, *_: object, **__: object) -> None:
         """接收测试不关心的单数据集进度。"""
 
-    def boundary(self, *_: object, **__: object) -> None:
-        """接收测试不关心的安全取消边界。"""
+    def boundary(
+        self,
+        stage: str,
+        dataset: DatasetKind,
+        kind: str,
+        details: dict[str, object],
+    ) -> None:
+        self.boundaries.append((stage, dataset, kind, dict(details)))
 
     def is_cancelled(self) -> bool:
         return False
@@ -233,9 +306,60 @@ def test_execute_partial_plan_curates_selection_then_validates_full_catalog(
         (DatasetKind.STOCK_DAILY_BAR, DatasetKind.STOCK_DAILY_BASIC),
         observer=observer,
     )
-    validate.assert_called_once_with(pipeline)
-    assert ("VALIDATE", len(tuple(TUSHARE_ROUTES))) in observer.stages
+    validate.assert_called_once_with(pipeline, observer=observer)
     assert result.quality_run_id == quality_run_id
+
+
+def test_localize_logs_current_request_before_fetch_and_reports_its_slice(
+    tmp_path: Path,
+) -> None:
+    stream = StringIO()
+    observer = _Observer()
+    pipeline = DataPipeline(
+        source=_RequestSource(),  # type: ignore[arg-type]
+        mapper=object(),  # type: ignore[arg-type]
+        calendar=_Calendar(),  # type: ignore[arg-type]
+        raw_store=_RawStore(tmp_path / "raw"),  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+        repository=_Repository(),  # type: ignore[arg-type]
+        quality_runner=object(),  # type: ignore[arg-type]
+        routes=TUSHARE_ROUTES,
+        logger=StructuredLogger(stream),
+    )
+
+    result = pipeline.localize(
+        DatasetKind.STOCK_MASTER,
+        start=date(2026, 8, 15),
+        end=date(2026, 8, 15),
+        observer=observer,
+    )
+
+    assert result == LocalizeResult(DatasetKind.STOCK_MASTER, 1, 0, 1)
+    request_events = [
+        details
+        for _, _, kind, details in observer.boundaries
+        if kind == "raw_request"
+    ]
+    assert [item["status"] for item in request_events] == ["STARTED", "COMPLETED"]
+    assert request_events[0]["request"] == {
+        "endpoint": "stock_basic",
+        "list_status": "L",
+        "fields": "ts_code",
+    }
+    assert request_events[0]["request_index"] == 1
+    assert request_events[0]["request_total"] == 1
+    assert request_events[1]["completed_requests"] == 1
+    records = [json.loads(line) for line in stream.getvalue().splitlines()]
+    started_index = next(
+        index for index, item in enumerate(records) if item["event"] == "localize.raw_started"
+    )
+    completed_index = next(
+        index
+        for index, item in enumerate(records)
+        if item["event"] == "localize.raw_completed"
+    )
+    assert started_index < completed_index
+    assert records[started_index]["context"]["request"]["list_status"] == "L"
 
 
 def test_pipeline_stages_use_independent_business_log_contexts(

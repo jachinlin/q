@@ -29,7 +29,9 @@ class _Pipeline:
         dataset: DatasetKind | None = None,
         *,
         heartbeat: Callable[[], None] = lambda: None,
+        observer: object | None = None,
     ) -> QualityRunId:
+        assert observer is not None
         self.dataset = dataset
         heartbeat()
         if self.cancel_during_run:

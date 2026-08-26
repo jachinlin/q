@@ -27,16 +27,20 @@ class _DataUpdateObserver(PipelineObserver):
     def __init__(self, progress: ProgressSink, cancellation: CancellationToken) -> None:
         self._progress = progress
         self._cancellation = cancellation
+        self._stage_total = 0
+        self._dataset_index = 0
         self.results: dict[str, dict[str, JsonValue]] = {}
 
     def stage_started(self, stage: str, total: int) -> None:
+        self._stage_total = total
+        self._dataset_index = 0
         self._progress.update(
             TaskProgress(
                 stage=stage,
                 completed=0,
                 total=total,
-                message=f"{stage.lower()} started",
-                context={},
+                message=f"开始 {stage}，共 {total} 个数据集",
+                context={"dataset_total": total},
             )
         )
 
@@ -49,13 +53,14 @@ class _DataUpdateObserver(PipelineObserver):
         details: Mapping[str, JsonValue],
     ) -> None:
         name = dataset.value
+        self._dataset_index = completed
         self.results.setdefault(name, {})[stage.lower()] = dict(details)
         self._progress.update(
             TaskProgress(
                 stage=stage,
                 completed=completed,
                 total=total,
-                message=f"{stage.lower()} completed for {name}",
+                message=f"{stage} 已完成 {name}（{completed}/{total}）",
                 context={"dataset": name, **dict(details)},
             )
         )
@@ -68,19 +73,106 @@ class _DataUpdateObserver(PipelineObserver):
         details: Mapping[str, JsonValue],
     ) -> None:
         """在请求或分区安全边界发布细粒度进度。"""
+        values = dict(details)
+        if kind == "dataset":
+            raw_index = values.get("dataset_index", self._dataset_index + 1)
+            raw_total = values.get("dataset_total", self._stage_total)
+            completed = int(raw_index) - 1 if isinstance(raw_index, int) else 0
+            total = int(raw_total) if isinstance(raw_total, int) else self._stage_total
+            self._dataset_index = completed + 1
+            message = f"{stage} 正在处理 {dataset.value}（{completed + 1}/{total}）"
+        else:
+            completed, total = self._item_counts(kind, values)
+            message = self._activity_message(stage, dataset, kind, values)
         self._progress.update(
             TaskProgress(
                 stage=stage,
-                completed=0,
-                total=0,
-                message=f"{kind} completed for {dataset.value}",
+                completed=completed,
+                total=total,
+                message=message,
                 context={
                     "dataset": dataset.value,
                     "boundary": kind,
-                    **dict(details),
+                    "dataset_index": self._dataset_index,
+                    "dataset_total": self._stage_total,
+                    **values,
                 },
             )
         )
+
+    @staticmethod
+    def _item_counts(kind: str, details: Mapping[str, JsonValue]) -> tuple[int, int]:
+        """从不同活动详情中提取当前完成量和总量。"""
+        keys = {
+            "raw_request": ("completed_requests", "request_total"),
+            "request_plan": ("completed_requests", "request_total"),
+            "raw_input": ("raw_index", "raw_total"),
+            "canonical_partition": ("partition_index", "partition_total"),
+            "canonical_dataset": ("dataset_index", "dataset_total"),
+        }
+        completed_key, total_key = keys.get(kind, ("completed", "total"))
+        raw_completed = details.get(completed_key, 0)
+        raw_total = details.get(total_key, 0)
+        completed = raw_completed if isinstance(raw_completed, int) else 0
+        total = raw_total if isinstance(raw_total, int) else 0
+        if details.get("status") == "STARTED" and kind in {
+            "raw_input",
+            "canonical_partition",
+            "canonical_dataset",
+        }:
+            completed = max(0, completed - 1)
+        return min(completed, total), total
+
+    @staticmethod
+    def _activity_message(
+        stage: str,
+        dataset: DatasetKind,
+        kind: str,
+        details: Mapping[str, JsonValue],
+    ) -> str:
+        """把结构化进度压缩为适合 Dashboard 展示的短消息。"""
+        status = details.get("status")
+        if kind == "raw_request":
+            endpoint = details.get("endpoint", "unknown")
+            request = details.get("request")
+            scope = _DataUpdateObserver._request_scope(request)
+            verb = "正在下载" if status == "STARTED" else "已完成下载"
+            return f"{verb} {dataset.value} / {endpoint}{scope}"
+        if kind == "request_plan":
+            return (
+                f"{dataset.value} 请求计划就绪："
+                f"待下载 {details.get('pending_requests', 0)} / "
+                f"共 {details.get('request_total', 0)}"
+            )
+        if kind == "raw_input":
+            verb = "正在清洗" if status == "STARTED" else "已清洗"
+            return f"{verb} {dataset.value} Raw {details.get('raw_index', 0)}/{details.get('raw_total', 0)}"
+        if kind == "canonical_partition":
+            verb = "正在构建" if status == "STARTED" else "已构建"
+            return f"{verb} {dataset.value} / {details.get('partition_key', 'unknown')}"
+        if kind == "canonical_dataset":
+            return f"{stage} 已载入 {dataset.value}，准备执行质量规则"
+        return f"{stage} 正在处理 {dataset.value} / {kind}"
+
+    @staticmethod
+    def _request_scope(request: JsonValue | None) -> str:
+        """提取交易日、市场或行业等可读请求切片，不拼接敏感配置。"""
+        if not isinstance(request, dict):
+            return ""
+        keys = (
+            "trade_date",
+            "period",
+            "start_date",
+            "end_date",
+            "market",
+            "list_status",
+            "exchange",
+            "l1_code",
+            "is_new",
+            "ts_code",
+        )
+        parts = [f"{key}={request[key]}" for key in keys if key in request]
+        return " · " + ", ".join(parts) if parts else ""
 
     def is_cancelled(self) -> bool:
         return self._cancellation.is_cancelled()
@@ -268,9 +360,11 @@ class DataValidationHandler:
                 raise DataPipelineCancelled("data validation cancellation requested")
 
         try:
+            observer = _DataUpdateObserver(progress, cancellation)
             quality_run_id = self._pipeline.validate(
                 dataset,
                 heartbeat=heartbeat,
+                observer=observer,
             )
         except DataPipelineCancelled:
             return TaskOutcome(status=TaskStatus.CANCELLED)
