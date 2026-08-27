@@ -120,7 +120,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
     QualityRuleDefinition(
         "ohlc_relationship",
         "OHLC 价格关系有效",
-        "检查最高价和最低价是否包络开盘价与收盘价。",
+        "检查最高价和最低价是否包络开盘价与收盘价；北交所开市前的历史新三板记录不适用。",
         "违反 OHLC 关系的记录数为 0。",
         Severity.SEVERE,
         _BAR_DATASETS,
@@ -138,7 +138,7 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
     QualityRuleDefinition(
         "pct_change_cross_check",
         "涨跌幅计算一致",
-        "使用收盘价和前收盘价复核供应商涨跌幅。",
+        "对前收盘价和供应商涨跌幅都有效的记录，使用收盘价复核涨跌幅。",
         "涨跌幅绝对复核误差超过 0.001 的记录数为 0。",
         Severity.SEVERE,
         _BAR_DATASETS,

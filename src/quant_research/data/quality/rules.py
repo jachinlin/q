@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import date
 
 import polars as pl
 
@@ -15,6 +16,7 @@ type CanonicalPartitions = Mapping[DatasetKind, Sequence[CanonicalFrame]]
 
 FOUNDATION_REQUIRED_DATASETS = frozenset(DatasetKind)
 _AUDIT = ("source", "availability_source", "pit_usable", "ingested_at")
+_BSE_FIRST_TRADING_DAY = date(2021, 11, 15)
 _PCT_CHANGE_ABSOLUTE_TOLERANCE = 1e-3
 _REQUIRED_COLUMNS: Mapping[DatasetKind, tuple[str, ...]] = {
     dataset: (*schema.primary_key, *_AUDIT)
@@ -209,8 +211,16 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
             .collect()
             .item()
         )
+        ohlc_eligible = traded
+        if dataset is DatasetKind.STOCK_DAILY_BAR:
+            ohlc_eligible = ohlc_eligible.filter(
+                ~(
+                    pl.col("instrument_id").str.ends_with(".BJ")
+                    & (pl.col("trade_date") < _BSE_FIRST_TRADING_DAY)
+                )
+            )
         invalid_ohlc = int(
-            traded.filter(
+            ohlc_eligible.filter(
                 (pl.col("high") < pl.max_horizontal("open", "close"))
                 | (pl.col("low") > pl.min_horizontal("open", "close"))
                 | (pl.col("high") < pl.col("low"))
@@ -222,20 +232,20 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         negative_volume = int(
             traded.filter(pl.col("volume") < 0).select(pl.len()).collect().item()
         )
+        pct_change_eligible = traded.filter(
+            pl.col("preclose").is_not_null()
+            & pl.col("preclose").is_finite()
+            & (pl.col("preclose") > 0)
+            & pl.col("pct_change").is_not_null()
+            & pl.col("pct_change").is_finite()
+        )
         invalid_pct_change = int(
-            traded.filter(
-                pl.col("preclose").is_null()
-                | ~pl.col("preclose").is_finite()
-                | (pl.col("preclose") <= 0)
-                | pl.col("pct_change").is_null()
-                | ~pl.col("pct_change").is_finite()
-                | (
-                    (
-                        pl.col("pct_change")
-                        - (pl.col("close") / pl.col("preclose") - 1.0)
-                    ).abs()
-                    > _PCT_CHANGE_ABSOLUTE_TOLERANCE
-                )
+            pct_change_eligible.filter(
+                (
+                    pl.col("pct_change")
+                    - (pl.col("close") / pl.col("preclose") - 1.0)
+                ).abs()
+                > _PCT_CHANGE_ABSOLUTE_TOLERANCE
             )
             .select(pl.len())
             .collect()

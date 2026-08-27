@@ -159,6 +159,56 @@ def test_daily_bar_pct_change_allows_supplier_rounding() -> None:
     assert not any(item.rule_id == "pct_change_cross_check" for item in issues)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"preclose": None, "pct_change": None},
+        {"preclose": 10.0, "pct_change": None},
+    ),
+)
+def test_daily_bar_pct_change_skips_rows_without_supplier_comparison(
+    overrides: dict[str, float | None],
+) -> None:
+    frame = _daily_bar().with_columns(
+        *(pl.lit(value).cast(pl.Float64).alias(name) for name, value in overrides.items())
+    )
+
+    issues = daily_bar_value_issues({DatasetKind.STOCK_DAILY_BAR: (frame,)})
+
+    assert not any(item.rule_id == "pct_change_cross_check" for item in issues)
+
+
+def test_daily_bar_ohlc_skips_pre_bse_legacy_neeq_record() -> None:
+    frame = _daily_bar(open_price=10.88, high=10.88, low=10.88, close=10.81).with_columns(
+        pl.lit("920489.BJ").alias("instrument_id"),
+        pl.lit(date(2014, 6, 18)).alias("trade_date"),
+    )
+
+    issues = daily_bar_value_issues({DatasetKind.STOCK_DAILY_BAR: (frame,)})
+
+    assert not any(item.rule_id == "ohlc_relationship" for item in issues)
+
+
+def test_daily_bar_ohlc_checks_bse_record_after_market_opened() -> None:
+    frame = _daily_bar(open_price=10.88, high=10.88, low=10.88, close=10.81).with_columns(
+        pl.lit("920489.BJ").alias("instrument_id"),
+        pl.lit(date(2021, 11, 15)).alias("trade_date"),
+    )
+
+    issues = daily_bar_value_issues({DatasetKind.STOCK_DAILY_BAR: (frame,)})
+    issue = next(item for item in issues if item.rule_id == "ohlc_relationship")
+
+    assert issue.actual == 1
+
+
+def test_index_daily_bar_ohlc_does_not_require_instrument_id() -> None:
+    frame = _daily_bar().rename({"instrument_id": "index_id"})
+
+    issues = daily_bar_value_issues({DatasetKind.INDEX_DAILY_BAR: (frame,)})
+
+    assert issues == []
+
+
 def test_quality_runner_records_fund_instrument_coverage_failure() -> None:
     now = datetime(2026, 8, 13, tzinfo=UTC)
     bar_dataset = DatasetKind.FUND_DAILY_BAR

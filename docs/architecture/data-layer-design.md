@@ -421,6 +421,11 @@ pct_change = close / preclose - 1
 log_return = log(close) - log(preclose)
 ```
 
+质量复核只对 `preclose` 和供应商 `pct_change` 均有效的记录比较计算结果；
+上市首日等供应商未提供比较基准的记录不伪造昨收价。由于 Tushare 将部分
+历史新三板证券映射为 `.BJ` 代码，北交所 2021-11-15 开市前的这类记录
+不套用连续竞价 OHLC 包络关系；北交所开市后仍严格校验。
+
 例如，`preclose=10.00`、`close=10.25`：
 
 ```text
