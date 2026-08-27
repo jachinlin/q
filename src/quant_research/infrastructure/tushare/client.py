@@ -80,6 +80,9 @@ _PAGINATED_PAGE_LIMITS: Mapping[str, int] = {
     "fund_adj": 2000,
 }
 _EMPTY_SCHEMA_ALLOWED_ENDPOINTS = frozenset({"index_member_all"})
+_OPTIONAL_RESPONSE_FIELDS: Mapping[str, frozenset[str]] = {
+    "daily": frozenset({"ah_vol", "ah_amount"}),
+}
 _MAX_PAGES = 100
 
 _FIELDS: Mapping[str, tuple[str, ...]] = {
@@ -633,12 +636,25 @@ class TushareClient:
             and not records
         ):
             return []
-        if observed_columns != fields:
+        if not self._response_schema_matches(endpoint, fields, observed_columns):
             raise ValueError(
                 f"Tushare {endpoint} schema drift: expected={fields}, "
                 f"observed={observed_columns}"
             )
         return records
+
+    @staticmethod
+    def _response_schema_matches(
+        endpoint: str,
+        expected: tuple[str, ...],
+        observed: tuple[str, ...],
+    ) -> bool:
+        """仅允许供应商省略端点契约明确声明的可选响应字段。"""
+        optional = _OPTIONAL_RESPONSE_FIELDS.get(endpoint, frozenset())
+        permitted = tuple(
+            field for field in expected if field not in optional or field in observed
+        )
+        return observed == permitted
 
     @staticmethod
     def _validate_paginated_keys(

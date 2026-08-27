@@ -336,6 +336,78 @@ def test_industry_membership_accepts_empty_provider_frame_without_columns() -> N
     assert batch.rows == ()
 
 
+def test_daily_fills_missing_optional_after_hours_fields_with_null() -> None:
+    class _HistoricalDailyGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, params
+            assert endpoint == "daily"
+            observed = tuple(
+                field for field in fields if field not in {"ah_vol", "ah_amount"}
+            )
+            record = {field: field for field in observed}
+            return _Frame(observed, [record])
+
+    client = TushareClient(
+        _HistoricalDailyGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = client.requests(
+        "daily",
+        date(2006, 8, 29),
+        date(2006, 8, 29),
+    )[0]
+
+    batch = next(iter(client.fetch("daily", request)))
+
+    assert batch.schema == tuple(str(request["fields"]).split(","))
+    assert batch.rows[0]["ts_code"] == "ts_code"
+    assert batch.rows[0]["ah_vol"] is None
+    assert batch.rows[0]["ah_amount"] is None
+
+
+def test_daily_still_rejects_a_missing_required_response_field() -> None:
+    class _MissingRequiredFieldGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, params
+            assert endpoint == "daily"
+            return _Frame(tuple(field for field in fields if field != "amount"))
+
+    client = TushareClient(
+        _MissingRequiredFieldGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = client.requests(
+        "daily",
+        date(2006, 8, 29),
+        date(2006, 8, 29),
+    )[0]
+
+    with pytest.raises(ValueError, match="schema drift"):
+        tuple(client.fetch("daily", request))
+
+
 @pytest.mark.parametrize(
     ("endpoint", "observed_columns"),
     (("daily", ()), ("index_member_all", ("l1_code",))),
