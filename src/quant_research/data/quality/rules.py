@@ -380,16 +380,21 @@ def dividend_event_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
                 for field in nonnegative[dataset]
             )
         )
-        date_conflict = (
-            pl.col("implementation_announcement_date").is_not_null()
-            & (
-                pl.col("implementation_announcement_date")
-                < pl.col("announcement_date")
+        ordered_dates = (
+            "announcement_date",
+            "implementation_announcement_date",
+            "record_date",
+            "ex_date",
+            "pay_date",
+        )
+        date_conflict = pl.any_horizontal(
+            *(
+                pl.col(earlier).is_not_null()
+                & pl.col(later).is_not_null()
+                & (pl.col(later) < pl.col(earlier))
+                for index, earlier in enumerate(ordered_dates)
+                for later in ordered_dates[index + 1 :]
             )
-        ) | (
-            pl.col("pay_date").is_not_null()
-            & pl.col("ex_date").is_not_null()
-            & (pl.col("pay_date") < pl.col("ex_date"))
         )
         invalid_suffix = ~pl.any_horizontal(
             *(

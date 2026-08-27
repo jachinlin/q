@@ -356,7 +356,9 @@ class TushareMapper:
                 "ingested_at",
             }:
                 continue
-            result[field] = self._convert(field, dtype, renamed.get(field))
+            result[field] = self._convert(
+                dataset, field, dtype, renamed.get(field)
+            )
         if dataset is DatasetKind.STOCK_MASTER:
             result["board"] = self._board(
                 str(result.get("market") or ""), str(result["instrument_id"])
@@ -384,7 +386,13 @@ class TushareMapper:
         )
         return result
 
-    def _convert(self, field: str, dtype: pl.DataType, value: object) -> object | None:
+    def _convert(
+        self,
+        dataset: DatasetKind,
+        field: str,
+        dtype: pl.DataType,
+        value: object,
+    ) -> object | None:
         if value is None or str(value).strip() in {"", "None", "nan", "NaN"}:
             return None
         text = str(value).strip()
@@ -401,7 +409,10 @@ class TushareMapper:
             return round(number)
         if dtype == pl.Float64:
             number = float(text)
-            if field in _PERCENT_FIELDS or self._financial_percent_field(field):
+            if field in _PERCENT_FIELDS or (
+                dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR
+                and self._financial_percent_field(field)
+            ):
                 number /= 100.0
             if field in {"amount", "after_hours_amount"}:
                 number *= 1000.0
@@ -526,6 +537,7 @@ class TushareMapper:
                 cls._revision_key(dataset, item),
                 str(item.get("available_at") or ""),
                 str(item.get("announcement_date") or ""),
+                str(item.get("ingested_at") or ""),
                 json.dumps(
                     {
                         key: value

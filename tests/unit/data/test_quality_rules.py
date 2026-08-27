@@ -155,15 +155,25 @@ def test_daily_basic_requires_non_null_audit_evidence() -> None:
     assert issue.actual == 1
 
 
-def test_statement_quality_rejects_non_quarter_and_non_consolidated_report() -> None:
+@pytest.mark.parametrize(
+    ("report_period", "report_type"),
+    (
+        (date(2026, 3, 30), "1"),
+        (date(2026, 3, 31), "2"),
+    ),
+)
+def test_statement_quality_rejects_each_report_contract_violation(
+    report_period: date,
+    report_type: str,
+) -> None:
     dataset = DatasetKind.STOCK_INCOME_STATEMENT
     observed_at = datetime(2026, 8, 13, tzinfo=UTC)
     row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
         "instrument_id": ["600000.SH"],
         "announcement_date": [date(2026, 4, 30)],
         "actual_announcement_date": [date(2026, 4, 30)],
-        "report_period": [date(2026, 3, 30)],
-        "report_type": ["2"],
+        "report_period": [report_period],
+        "report_type": [report_type],
         "revision": [0],
         "source": ["tushare"],
         "available_at": [observed_at],
@@ -183,18 +193,35 @@ def test_statement_quality_rejects_non_quarter_and_non_consolidated_report() -> 
     assert issue.actual == 1
 
 
-def test_dividend_quality_rejects_negative_value_date_order_and_off_market_code() -> None:
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"cash_dividend_per_unit": -0.1},
+        {"instrument_id": "000001.OF"},
+        {"implementation_announcement_date": date(2026, 8, 7)},
+        {"record_date": date(2026, 8, 12)},
+        {"pay_date": date(2026, 8, 10)},
+    ),
+)
+def test_dividend_quality_rejects_each_value_date_and_market_violation(
+    overrides: dict[str, object],
+) -> None:
     dataset = DatasetKind.FUND_DIVIDEND
     observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    values = {
+        "instrument_id": "510300.SH",
+        "announcement_date": date(2026, 8, 8),
+        "implementation_announcement_date": date(2026, 8, 9),
+        "base_date": date(2026, 8, 8),
+        "status": "实施",
+        "record_date": date(2026, 8, 10),
+        "ex_date": date(2026, 8, 11),
+        "pay_date": date(2026, 8, 12),
+        "cash_dividend_per_unit": 0.1,
+    } | overrides
     row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
-        "instrument_id": ["000001.OF"],
-        "announcement_date": [date(2026, 8, 10)],
-        "implementation_announcement_date": [date(2026, 8, 9)],
-        "base_date": [date(2026, 8, 8)],
-        "status": ["实施"],
-        "ex_date": [date(2026, 8, 12)],
-        "pay_date": [date(2026, 8, 11)],
-        "cash_dividend_per_unit": [-0.1],
+        key: [value] for key, value in values.items()
+    } | {
         "revision": [0],
         "source": ["tushare"],
         "available_at": [observed_at],
@@ -212,6 +239,30 @@ def test_dividend_quality_rejects_negative_value_date_order_and_off_market_code(
 
     assert issue.rule_id == "dividend_event"
     assert issue.actual == 1
+
+
+def test_cancelled_dividend_allows_missing_later_event_dates() -> None:
+    dataset = DatasetKind.FUND_DIVIDEND
+    observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["510300.SH"],
+        "announcement_date": [date(2026, 8, 8)],
+        "base_date": [date(2026, 8, 8)],
+        "status": ["取消"],
+        "revision": [0],
+        "source": ["tushare"],
+        "available_at": [observed_at],
+        "availability_source": ["announcement_date_eod"],
+        "pit_usable": [True],
+        "ingested_at": [observed_at],
+    }
+    frame = pl.DataFrame(
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    assert dividend_event_issues({dataset: (frame,)}) == []
 
 
 def test_daily_bar_coverage_ignores_calendar_dates_after_latest_bar() -> None:

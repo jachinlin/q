@@ -2404,7 +2404,7 @@ class DataPipeline:
                 partition_key
                 for partition_key in set(previous_by_key) | set(groups[dataset])
                 if _DatasetPipelineSupport._partition_selected(
-                    partition_key, start, end
+                    dataset, partition_key, start, end
                 )
             }
             for partition_key in selected:
@@ -3395,8 +3395,13 @@ class _DatasetPipelineSupport:
 
     @staticmethod
     def _partition_selected(
-        partition_key: str, start: date | None, end: date | None
+        dataset: DatasetKind,
+        partition_key: str,
+        start: date | None,
+        end: date | None,
     ) -> bool:
+        if dataset in _EVENT_DATE_DATASETS:
+            return True
         if start is None or end is None or partition_key == "all":
             return True
         try:

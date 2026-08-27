@@ -209,6 +209,61 @@ def test_statement_maps_common_fields_and_actual_announcement_pit(
     assert canonical["revision"] == 0
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "dataset", "amount_field"),
+    (
+        (
+            "balancesheet_vip",
+            DatasetKind.STOCK_BALANCE_SHEET,
+            "payable_to_reinsurer",
+        ),
+        (
+            "cashflow_vip",
+            DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+            "c_paid_to_for_empl",
+        ),
+    ),
+)
+def test_statement_amount_names_containing_to_keep_supplier_units(
+    tmp_path: Path,
+    endpoint: str,
+    dataset: DatasetKind,
+    amount_field: str,
+) -> None:
+    fields = _FIELDS[endpoint]
+    row = dict.fromkeys(fields, None) | {
+        "ts_code": "600000.SH",
+        "ann_date": "20260428",
+        "f_ann_date": "20260429",
+        "end_date": "20260331",
+        "report_type": "1",
+        "comp_type": "2",
+        "end_type": "1",
+        amount_field: "12345.67",
+        "update_flag": "1",
+    }
+    raw = RawPartitionStore(tmp_path).publish(
+        RawBatch(
+            source="tushare",
+            endpoint=endpoint,
+            request={
+                "endpoint": endpoint,
+                "period": "20260331",
+                "report_type": "1",
+                "fields": ",".join(fields),
+            },
+            retrieved_at=datetime(2026, 4, 30, tzinfo=UTC),
+            schema=fields,
+            rows=(row,),
+        )
+    )
+
+    canonical = TushareMapper().normalize(raw)[0]
+
+    assert canonical.dataset is dataset
+    assert canonical.frame.get_column(amount_field).item() == pytest.approx(12345.67)
+
+
 def test_stock_dividend_maps_units_and_implementation_availability(
     tmp_path: Path,
 ) -> None:
@@ -311,7 +366,7 @@ def test_revision_consolidation_deduplicates_supplier_content() -> None:
         "report_type": "1",
         "company_type": "2",
         "report_period_type": "1",
-        "total_revenue": 100.0,
+        "total_revenue": 200.0,
         "update_flag": "1",
         "revision": 0,
         "source": "tushare",
@@ -330,7 +385,7 @@ def test_revision_consolidation_deduplicates_supplier_content() -> None:
         [
             base
             | {
-                "total_revenue": 101.0,
+                "total_revenue": 100.0,
                 "update_flag": "1",
                 "ingested_at": datetime(2026, 5, 2, tzinfo=UTC),
             }
@@ -346,4 +401,4 @@ def test_revision_consolidation_deduplicates_supplier_content() -> None:
 
     assert consolidated.height == 2
     assert consolidated.get_column("revision").to_list() == [0, 1]
-    assert consolidated.get_column("total_revenue").to_list() == [100.0, 101.0]
+    assert consolidated.get_column("total_revenue").to_list() == [200.0, 100.0]

@@ -18,3 +18,21 @@ def test_non_calendar_window_is_not_extended() -> None:
         _DatasetPipelineSupport._calendar_horizon(DatasetKind.STOCK_DAILY_BAR, window)
         == window
     )
+
+
+def test_event_partition_from_an_older_announcement_year_is_selected() -> None:
+    assert _DatasetPipelineSupport._partition_selected(
+        DatasetKind.STOCK_DIVIDEND,
+        "announcement_year=2025",
+        date(2026, 1, 1),
+        date(2026, 1, 8),
+    )
+
+
+def test_non_event_partition_outside_the_window_is_not_selected() -> None:
+    assert not _DatasetPipelineSupport._partition_selected(
+        DatasetKind.STOCK_DAILY_BAR,
+        "year=2025",
+        date(2026, 1, 1),
+        date(2026, 1, 8),
+    )
