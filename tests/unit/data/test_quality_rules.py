@@ -127,6 +127,77 @@ def test_quality_runner_fails_positive_finite_price_rule() -> None:
     assert result.threshold == 0
 
 
+def test_quality_runner_records_pct_change_cross_check_failure() -> None:
+    frame = _daily_bar().with_columns(pl.lit(0.04).alias("pct_change"))
+
+    evaluation = QualityRunner().evaluate(
+        {DatasetKind.STOCK_DAILY_BAR: (frame,)}
+    )
+    result = next(
+        item
+        for item in evaluation.rule_results
+        if item.rule_id == "pct_change_cross_check"
+    )
+
+    assert result.status is QualityRuleStatus.FAIL
+    assert result.actual == 1
+    assert result.threshold == 0
+
+
+def test_quality_runner_records_fund_instrument_coverage_failure() -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    bar_dataset = DatasetKind.FUND_DAILY_BAR
+    master_dataset = DatasetKind.FUND_MASTER
+    audit = {
+        "source": "tushare",
+        "available_at": now,
+        "availability_source": "test",
+        "pit_usable": True,
+        "ingested_at": now,
+    }
+    bar_values = {
+        "instrument_id": "510300.SH",
+        "trade_date": date(2026, 8, 13),
+        **audit,
+    }
+    master_values = {
+        "instrument_id": "510500.SH",
+        **audit,
+    }
+    bar = pl.DataFrame(
+        {
+            name: [bar_values.get(name)]
+            for name in CANONICAL_SCHEMAS[bar_dataset].columns.names()
+        },
+        schema=CANONICAL_SCHEMAS[bar_dataset].columns,
+        strict=False,
+    )
+    master = pl.DataFrame(
+        {
+            name: [master_values.get(name)]
+            for name in CANONICAL_SCHEMAS[master_dataset].columns.names()
+        },
+        schema=CANONICAL_SCHEMAS[master_dataset].columns,
+        strict=False,
+    )
+
+    evaluation = QualityRunner().evaluate(
+        {
+            bar_dataset: (bar,),
+            master_dataset: (master,),
+        }
+    )
+    result = next(
+        item
+        for item in evaluation.rule_results
+        if item.dataset is bar_dataset and item.rule_id == "instrument_coverage"
+    )
+
+    assert result.status is QualityRuleStatus.FAIL
+    assert result.actual == 1
+    assert result.threshold == 0
+
+
 def test_daily_basic_allows_nullable_optional_values() -> None:
     issues = required_value_issues(
         {DatasetKind.STOCK_DAILY_BASIC: (_daily_basic(turnover=None),)}

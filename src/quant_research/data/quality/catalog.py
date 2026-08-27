@@ -136,6 +136,15 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(
+        "pct_change_cross_check",
+        "涨跌幅计算一致",
+        "使用收盘价和前收盘价复核供应商涨跌幅。",
+        "涨跌幅复核不一致记录数为 0。",
+        Severity.SEVERE,
+        _BAR_DATASETS,
+        prerequisite_rules=("canonical_schema", "required_dataset_empty"),
+    ),
+    QualityRuleDefinition(
         "trading_day_coverage",
         "交易日覆盖完整",
         "比较日行情日期与交易日历，识别行情最新日期之前缺失的开市日。",
@@ -154,6 +163,16 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         (DatasetKind.STOCK_DAILY_BAR,),
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
         prerequisite_datasets=(DatasetKind.STOCK_MASTER,),
+    ),
+    QualityRuleDefinition(
+        "instrument_coverage",
+        "基金主数据覆盖完整",
+        "检查基金日行情中的证券代码是否都存在于基金主数据。",
+        "未知基金代码数量为 0。",
+        Severity.SEVERE,
+        (DatasetKind.FUND_DAILY_BAR,),
+        prerequisite_rules=("canonical_schema", "required_dataset_empty"),
+        prerequisite_datasets=(DatasetKind.FUND_MASTER,),
     ),
     QualityRuleDefinition(
         "financial_availability",
