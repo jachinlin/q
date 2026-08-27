@@ -17,7 +17,7 @@ const activeTask = {
   task_type: 'EXPERIMENT_RUN',
   status: 'RUNNING',
   priority: 0,
-  progress: { stage: 'BACKTEST', completed: 3, total: 7 },
+  progress: { stage: 'BACKTEST', completed: 3, total: 7, message: '正在执行回测', context: {} },
   created_at: '2026-08-15T01:00:00Z',
   started_at: '2026-08-15T01:00:02Z',
   updated_at: '2026-08-15T01:03:00Z',

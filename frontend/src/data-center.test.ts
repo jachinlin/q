@@ -104,7 +104,7 @@ describe('data center core loop', () => {
       if (path.startsWith('/api/v1/data/quality-runs?')) return Promise.resolve({ items: [{ run_id: 'run-1', scope: 'all', input_hash: 'a'.repeat(64), status: 'PASSED', started_at: '2026-08-14T10:00:00Z', completed_at: '2026-08-14T10:02:00Z', issue_count: 1, blocking_issue_count: 0 }], page: 1, page_size: 50, total: 1 })
       if (path.startsWith('/api/v1/tasks/')) return Promise.resolve({
         id: path.split('/').at(-1), task_type: 'DATA_VALIDATION', status: 'SUCCEEDED',
-        progress: { stage: 'COMPLETE', completed: 1, total: 1, percent: 100, message: 'data validation completed' },
+        progress: { stage: 'COMPLETE', completed: 1, total: 1, message: 'data validation completed', context: {} },
       })
       if (path === '/api/v1/data/quality-runs/run-1') return Promise.resolve({
         run_id: 'run-1', scope: 'ALL', input_hash: 'a'.repeat(64), status: 'FAILED',
@@ -337,6 +337,8 @@ describe('data center core loop', () => {
     await flushPromises()
     await vi.waitFor(() => expect(apiPost).toHaveBeenCalledWith('/api/v1/data/quality-runs', {}))
     expect(wrapper.text()).toContain('质量运行任务 quality-')
+    expect(wrapper.find('[data-task-percentage="100"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('data validation completed')
     await vi.waitFor(() => expect(apiGet.mock.calls.filter(
       ([path]) => String(path).startsWith('/api/v1/data/quality-runs?'),
     ).length).toBeGreaterThan(1))

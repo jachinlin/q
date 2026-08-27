@@ -13,6 +13,14 @@ export type NotebookStatus = {
   status: 'READY' | 'UNAVAILABLE'
 }
 
+export type TaskProgress = {
+  stage: string
+  completed: number
+  total: number
+  message: string
+  context: Record<string, unknown>
+}
+
 export type Task = {
   id: string
   subject_kind: string | null
@@ -20,7 +28,7 @@ export type Task = {
   task_type: string
   status: string
   priority: number
-  progress: Record<string, unknown>
+  progress: TaskProgress
   created_at: string
   started_at: string | null
   updated_at: string
@@ -39,7 +47,7 @@ export type TaskAttempt = {
   started_at: string
   heartbeat_at: string | null
   completed_at: string | null
-  progress: Record<string, unknown>
+  progress: TaskProgress
   error: Record<string, unknown> | null
   has_log: boolean
 }

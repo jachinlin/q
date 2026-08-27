@@ -7,6 +7,7 @@ import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { api, DashboardApiError } from '../api'
+import DataTaskProgress from '../components/DataTaskProgress.vue'
 import ErrorState from '../components/ErrorState.vue'
 import MetricCard from '../components/MetricCard.vue'
 import StatusBadge from '../components/StatusBadge.vue'
@@ -86,7 +87,7 @@ const trackedTask = useQuery({
   enabled: computed(() => trackedTaskId.value !== null),
   refetchInterval: (query) => {
     const status = (query.state.data as Task | undefined)?.status
-    return status && ['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(status) ? false : 3_000
+    return status && ['SUCCEEDED', 'FAILED', 'CANCELLED', 'ORPHANED'].includes(status) ? false : 3_000
   },
 })
 const updateDatasetOptions = computed(() => (datasets.data.value?.items ?? [])
@@ -156,7 +157,7 @@ async function refreshDataCenter() {
 }
 
 watch(() => trackedTask.data.value?.status, async (status, previous) => {
-  if (status && status !== previous && ['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(status)) {
+  if (status && status !== previous && ['SUCCEEDED', 'FAILED', 'CANCELLED', 'ORPHANED'].includes(status)) {
     await refreshDataCenter()
   }
 })
@@ -374,14 +375,15 @@ async function submitUpdate() {
         <header class="panel-heading">
           <div>
             <h2>{{ trackedTaskKind === 'QUALITY' ? '质量运行任务' : trackedTaskKind === 'BOOTSTRAP' ? '初始化任务' : '更新任务' }} {{ trackedTaskId.slice(0, 8) }}</h2>
-            <p>{{ trackedTask.data.value?.progress?.message ?? '等待 Worker 接收任务' }}</p>
+            <p>任务活动进度每 3 秒自动刷新。</p>
           </div>
           <div style="display:flex;gap:10px;align-items:center">
             <StatusBadge :status="trackedTask.data.value?.status ?? 'QUEUED'" />
             <el-button @click="router.push(`/tasks?task=${trackedTaskId}`)">查看任务</el-button>
           </div>
         </header>
-        <el-progress :percentage="Number(trackedTask.data.value?.progress?.percent ?? 0)" />
+        <DataTaskProgress v-if="trackedTask.data.value" :task="trackedTask.data.value" mode="detail" />
+        <p v-else class="muted-value">等待 Worker 接收任务</p>
       </section>
 
       <el-alert

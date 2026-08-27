@@ -7,8 +7,10 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import { api, DashboardApiError } from '../api'
+import DataTaskProgress from '../components/DataTaskProgress.vue'
 import ErrorState from '../components/ErrorState.vue'
 import StatusBadge from '../components/StatusBadge.vue'
+import { isDataTask } from '../data-task-progress'
 import { formatDuration, formatTime } from '../format'
 import type { DataUpdatePlan, DataUpdateWindow, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
 
@@ -41,8 +43,13 @@ const query = useQuery({
 const detail = useQuery({
   queryKey: computed(() => ['task', detailId.value]),
   queryFn: () => api.get<TaskDetail>(`/api/v1/tasks/${detailId.value}`),
-  enabled: computed(() => Boolean(detailId.value)),
-  refetchInterval: 3000,
+  enabled: computed(() => Boolean(detailId.value) && detailOpen.value),
+  refetchInterval: (query) => {
+    const task = query.state.data as TaskDetail | undefined
+    return task && ['SUCCEEDED', 'FAILED', 'CANCELLED', 'ORPHANED'].includes(task.status)
+      ? false
+      : 3_000
+  },
 })
 const cancel = useMutation({
   mutationFn: (id: string) => api.post<{ task_id: string; status: string }>(`/api/v1/tasks/${id}/cancel`),
@@ -322,6 +329,19 @@ watch(
 )
 
 watch(
+  () => detail.data.value?.status,
+  async (next, previous) => {
+    if (!next || next === previous || !['SUCCEEDED', 'FAILED', 'CANCELLED', 'ORPHANED'].includes(next)) return
+    await Promise.all([
+      client.invalidateQueries({ queryKey: ['tasks'] }),
+      client.invalidateQueries({ queryKey: ['data-summary'] }),
+      client.invalidateQueries({ queryKey: ['data-datasets'] }),
+      client.invalidateQueries({ queryKey: ['data-quality-runs'] }),
+    ])
+  },
+)
+
+watch(
   () => route.query.task,
   (taskId) => {
     if (typeof taskId === 'string' && taskId) openTask(taskId)
@@ -400,7 +420,8 @@ onUnmounted(() => {
           </el-table-column>
           <el-table-column label="阶段与进度" min-width="190">
             <template #default="scope">
-              <div class="progress-cell">
+              <DataTaskProgress v-if="isDataTask(scope.row)" :task="scope.row" mode="compact" />
+              <div v-else class="progress-cell">
                 <span>{{ taskStage(scope.row) ?? '—' }}</span>
                 <el-progress :percentage="progress(scope.row)" :stroke-width="5" :show-text="false" />
               </div>
@@ -476,6 +497,7 @@ onUnmounted(() => {
 
         <el-tabs v-model="activeTab" class="runtime-tabs">
           <el-tab-pane label="运行概况" name="overview">
+            <DataTaskProgress v-if="isDataTask(detail.data.value)" :task="detail.data.value" mode="detail" />
             <el-descriptions :column="2" border size="small">
               <el-descriptions-item label="Worker">{{ detail.data.value.worker_id ?? '—' }}</el-descriptions-item>
               <el-descriptions-item label="当前阶段">{{ taskStage(detail.data.value) ?? '—' }}</el-descriptions-item>

@@ -28,7 +28,7 @@ const failedTask = {
   task_type: 'EXPERIMENT_RUN',
   status: 'FAILED',
   priority: 10,
-  progress: { stage: 'VALIDATE', completed: 1, total: 7 },
+  progress: { stage: 'VALIDATE', completed: 1, total: 7, message: '正在校验实验', context: {} },
   created_at: '2026-08-15T00:00:00Z',
   started_at: '2026-08-15T00:00:01Z',
   updated_at: '2026-08-15T00:00:03Z',
@@ -54,7 +54,8 @@ function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType 
       {
         id: 'attempt-2', attempt_no: 2, status: 'FAILED', worker_id: 'worker-1',
         started_at: '2026-08-15T00:00:01Z', heartbeat_at: '2026-08-15T00:00:02Z',
-        completed_at: '2026-08-15T00:00:03Z', progress: { stage: 'VALIDATE' },
+        completed_at: '2026-08-15T00:00:03Z',
+        progress: { stage: 'VALIDATE', completed: 1, total: 7, message: '正在校验实验', context: {} },
         error: { code: 'DATA_HASH_DRIFT', retryable: false }, has_log: true,
       },
       {
@@ -87,6 +88,7 @@ async function mountRuntimeCenter(
   payload: Record<string, unknown> = defaultPayload,
   taskType = 'EXPERIMENT_RUN',
   initialPath = '/tasks',
+  taskOverrides: Record<string, unknown> = {},
 ) {
   apiGet.mockImplementation((path?: string) => {
     if (path?.startsWith('/api/v1/tasks?page=')) {
@@ -94,11 +96,15 @@ async function mountRuntimeCenter(
         items: [{
           ...failedTask,
           task_type: taskType,
+          ...taskOverrides,
         }], page: 1, page_size: 25, total: 1,
         status_counts: { QUEUED: 2, RUNNING: 1, SUCCEEDED: 4, FAILED: 1, CANCEL_REQUESTED: 0, CANCELLED: 0, ORPHANED: 1 },
       })
     }
-    if (path === `/api/v1/tasks/${failedTask.id}`) return Promise.resolve(taskDetail(payload, taskType))
+    if (path === `/api/v1/tasks/${failedTask.id}`) return Promise.resolve({
+      ...taskDetail(payload, taskType),
+      ...taskOverrides,
+    })
     if (path?.includes('/attempts/attempt-2/log')) return Promise.resolve(taskLog(logAvailable))
     if (path === undefined) return Promise.resolve({ items: [], page: 1, page_size: 25, total: 0, status_counts: {} })
     return Promise.reject(new Error(`unexpected API path: ${path}`))
@@ -144,6 +150,80 @@ describe('runtime center', () => {
     expect(wrapper.find('.association-cell').text()).toContain('EXPERIMENT_RUN · research')
     wrapper.unmount()
   })
+
+  it('shows the same live DATA activity in the task list and detail', async () => {
+    const taskOverrides: Record<string, unknown> = {
+      status: 'RUNNING',
+      error: null,
+      completed_at: null,
+      progress: {
+        stage: 'LOCALIZE',
+        completed: 8,
+        total: 20,
+        message: '正在下载 stock_daily_bar / daily · trade_date=20260814',
+        context: {
+          dataset: 'stock_daily_bar',
+          dataset_index: 5,
+          dataset_total: 20,
+          boundary: 'raw_request',
+        },
+      },
+    }
+    const wrapper = await mountRuntimeCenter(
+      true,
+      { years: 5 },
+      'DATA_BOOTSTRAP',
+      '/tasks',
+      taskOverrides,
+    )
+
+    const compact = wrapper.find('.data-task-progress--compact')
+    expect(compact.attributes('data-task-stage')).toBe('LOCALIZE')
+    expect(compact.attributes('data-task-percentage')).toBe('40')
+    expect(compact.text()).toContain('stock_daily_bar')
+    expect(compact.text()).toContain('数据集 5/20')
+    expect(compact.text()).toContain('trade_date=20260814')
+
+    await wrapper.find('.task-link').trigger('click')
+    await flushPromises()
+    const detailProgress = document.body.querySelector('.data-task-progress--detail')
+    expect(detailProgress?.getAttribute('data-task-percentage')).toBe('40')
+    expect(detailProgress?.textContent).toContain('当前活动进度')
+    expect(detailProgress?.textContent).toContain('正在下载 stock_daily_bar')
+
+    taskOverrides.progress = {
+      stage: 'CURATE',
+      completed: 15,
+      total: 20,
+      message: '正在构建 stock_daily_bar / year=2026',
+      context: { dataset: 'stock_daily_bar', dataset_index: 6, dataset_total: 20 },
+    }
+    await vi.waitFor(
+      () => expect(wrapper.find('.data-task-progress--compact').attributes('data-task-percentage')).toBe('75'),
+      { timeout: 4_500 },
+    )
+    await vi.waitFor(
+      () => expect(document.body.querySelector('.data-task-progress--detail')?.textContent).toContain('year=2026'),
+      { timeout: 4_500 },
+    )
+
+    taskOverrides.status = 'SUCCEEDED'
+    taskOverrides.progress = {
+      stage: 'COMPLETE', completed: 1, total: 1, message: 'data bootstrap completed', context: {},
+    }
+    await vi.waitFor(
+      () => expect(document.body.querySelector('.data-task-progress--detail')?.getAttribute('data-task-percentage')).toBe('100'),
+      { timeout: 4_500 },
+    )
+    const terminalDetailCalls = apiGet.mock.calls.filter(
+      ([path]) => path === `/api/v1/tasks/${failedTask.id}`,
+    ).length
+    await new Promise((resolve) => window.setTimeout(resolve, 3_200))
+    expect(apiGet.mock.calls.filter(
+      ([path]) => path === `/api/v1/tasks/${failedTask.id}`,
+    )).toHaveLength(terminalDetailCalls)
+    wrapper.unmount()
+  }, 15_000)
 
   it('highlights failures and automatically diagnoses the latest failed attempt', async () => {
     const wrapper = await mountRuntimeCenter()

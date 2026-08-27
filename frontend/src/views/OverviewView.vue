@@ -134,8 +134,6 @@ const attentionItems = computed<AttentionItem[]>(() => {
 })
 
 function taskProgress(task: Task) {
-  const percent = Number(task.progress.percent)
-  if (Number.isFinite(percent)) return Math.max(0, Math.min(100, Math.round(percent)))
   const completed = Number(task.progress.completed ?? 0)
   const total = Number(task.progress.total ?? 0)
   return total > 0 ? Math.max(0, Math.min(100, Math.round(completed / total * 100))) : 0
