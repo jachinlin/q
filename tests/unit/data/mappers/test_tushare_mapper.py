@@ -14,6 +14,38 @@ from quant_research.infrastructure.tushare.client import _FIELDS
 from quant_research.infrastructure.tushare.mapper import TushareMapper
 
 
+def test_trade_calendar_range_maps_to_all_partition(tmp_path: Path) -> None:
+    fields = _FIELDS["trade_cal"]
+    raw = RawPartitionStore(tmp_path).publish(
+        RawBatch(
+            source="tushare",
+            endpoint="trade_cal",
+            request={
+                "endpoint": "trade_cal",
+                "exchange": "SSE",
+                "start_date": "20060826",
+                "end_date": "20260826",
+                "fields": ",".join(fields),
+            },
+            retrieved_at=datetime(2026, 8, 26, tzinfo=UTC),
+            schema=fields,
+            rows=(
+                {
+                    "exchange": "SSE",
+                    "cal_date": "20260826",
+                    "is_open": "1",
+                    "pretrade_date": "20260825",
+                },
+            ),
+        )
+    )
+
+    batch = TushareMapper().normalize(raw)[0]
+
+    assert batch.dataset is DatasetKind.TRADE_CALENDAR
+    assert TushareMapper().candidate_partition_keys(batch.dataset, raw) == ("all",)
+
+
 def test_daily_maps_preclose_percent_and_units(tmp_path: Path) -> None:
     request = {
         "endpoint": "daily",

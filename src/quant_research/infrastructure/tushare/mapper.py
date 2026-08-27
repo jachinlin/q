@@ -259,6 +259,8 @@ class TushareMapper:
         self, dataset: DatasetKind, raw_partition: PublishedPartition
     ) -> tuple[str, ...]:
         """推导分区键。入参：数据集和 Raw 分区。返回值：分区键。异常：请求非法时抛出。"""
+        if dataset is DatasetKind.TRADE_CALENDAR:
+            return ("all",)
         schema = CANONICAL_SCHEMAS[dataset]
         if "report_period" in schema.columns:
             value = raw_partition.request.get("period")
