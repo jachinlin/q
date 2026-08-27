@@ -197,6 +197,20 @@ _STATEMENT_DATASETS = frozenset(
     }
 )
 _DIVIDEND_DATASETS = frozenset({DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND})
+_EXCHANGE_INSTRUMENT_DATASETS = frozenset(
+    {
+        DatasetKind.STOCK_DAILY_BAR,
+        DatasetKind.STOCK_ADJUSTMENT_FACTOR,
+        DatasetKind.FUND_DAILY_BAR,
+        DatasetKind.FUND_ADJUSTMENT_FACTOR,
+        DatasetKind.STOCK_DAILY_BASIC,
+        DatasetKind.STOCK_SUSPENSION,
+        DatasetKind.STOCK_RISK_WARNING,
+        DatasetKind.STOCK_FINANCIAL_INDICATOR,
+        *_STATEMENT_DATASETS,
+        *_DIVIDEND_DATASETS,
+    }
+)
 _REVISION_DATASETS = frozenset(
     {DatasetKind.STOCK_FINANCIAL_INDICATOR, *_STATEMENT_DATASETS, *_DIVIDEND_DATASETS}
 )
@@ -249,14 +263,16 @@ class TushareMapper:
                 f"unsupported Tushare endpoint: {raw_partition.endpoint}"
             ) from error
         raw_frame = cast(pl.DataFrame, pl.from_arrow(raw_table, rechunk=False))
-        if dataset is DatasetKind.FUND_DIVIDEND and not raw_frame.is_empty():
+        if dataset in _EXCHANGE_INSTRUMENT_DATASETS and not raw_frame.is_empty():
             raw_frame = raw_frame.filter(
-                pl.col("ts_code").str.contains(r"\.(?:SH|SZ|BJ)$")
+                pl.col("ts_code").str.contains(r"^\d{6}\.(?:SH|SZ|BJ)$")
             )
         frame = self._normalize_frame(raw_partition, dataset, raw_frame)
         if dataset in _REVISION_DATASETS:
             invalid = frame.filter(
-                ~pl.col("instrument_id").str.contains(r"\.(?:SH|SZ|BJ)$")
+                ~pl.col("instrument_id").str.contains(
+                    r"^\d{6}\.(?:SH|SZ|BJ)$"
+                )
             )
             if invalid.height:
                 raise ValueError(
@@ -465,7 +481,7 @@ class TushareMapper:
             pl.lit("tushare").alias("source"),
             available_at.alias("available_at"),
             availability_source.alias("availability_source"),
-            available_at.is_not_null().alias("pit_usable"),
+            self._pit_usable_expression(dataset, available_at).alias("pit_usable"),
             retrieved_expression.alias("ingested_at"),
         )
         return frame.select(
@@ -577,12 +593,16 @@ class TushareMapper:
         if dataset in _DIVIDEND_DATASETS:
             implemented = pl.col("implementation_announcement_date")
             announced = pl.col("announcement_date")
+            effective = pl.max_horizontal(announced, implemented)
             return (
-                implemented.fill_null(announced)
+                effective
                 .dt.combine(time(18, 0))
                 .dt.replace_time_zone("Asia/Shanghai")
                 .dt.convert_time_zone("UTC"),
-                pl.when(implemented.is_not_null())
+                pl.when(
+                    implemented.is_not_null()
+                    & (announced.is_null() | (implemented >= announced))
+                )
                 .then(pl.lit("implementation_announcement_date_eod"))
                 .otherwise(pl.lit("announcement_date_eod")),
             )
@@ -591,6 +611,34 @@ class TushareMapper:
                 "retrieved_at_no_supplier_announcement"
             )
         return retrieved, pl.lit("retrieved_at")
+
+    @staticmethod
+    def _pit_usable_expression(dataset: DatasetKind, available_at: pl.Expr) -> pl.Expr:
+        """根据公告与报告期契约标记一行是否可安全用于 PIT 研究。"""
+        usable = available_at.is_not_null()
+        if dataset not in {
+            DatasetKind.STOCK_FINANCIAL_INDICATOR,
+            *_STATEMENT_DATASETS,
+        }:
+            return usable
+        report_period = pl.col("report_period")
+        quarter_end = pl.any_horizontal(
+            *(
+                (report_period.dt.month() == month)
+                & (report_period.dt.day() == day)
+                for month, day in ((3, 31), (6, 30), (9, 30), (12, 31))
+            )
+        )
+        announced = pl.col("announcement_date")
+        if dataset in _STATEMENT_DATASETS:
+            effective = pl.col("actual_announcement_date").fill_null(announced)
+            return (
+                usable
+                & quarter_end
+                & (pl.col("report_type") == "1")
+                & (effective >= report_period)
+            )
+        return usable & quarter_end & (announced >= report_period)
 
     @staticmethod
     def _market_time_expression(field: str, value: time) -> pl.Expr:

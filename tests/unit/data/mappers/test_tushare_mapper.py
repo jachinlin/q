@@ -99,6 +99,41 @@ def test_daily_maps_preclose_percent_and_units(tmp_path: Path) -> None:
     assert row["source"] == "tushare"
 
 
+def test_fund_daily_filters_non_canonical_exchange_code(tmp_path: Path) -> None:
+    fields = _FIELDS["fund_daily"]
+    common = dict.fromkeys(fields, None) | {
+        "trade_date": "20260825",
+        "open": "1",
+        "high": "1",
+        "low": "1",
+        "close": "1",
+        "pre_close": "1",
+        "vol": "1",
+        "amount": "1",
+    }
+    raw = RawPartitionStore(tmp_path).publish(
+        RawBatch(
+            source="tushare",
+            endpoint="fund_daily",
+            request={
+                "endpoint": "fund_daily",
+                "trade_date": "20260825",
+                "fields": ",".join(fields),
+            },
+            retrieved_at=datetime(2026, 8, 26, tzinfo=UTC),
+            schema=fields,
+            rows=(
+                common | {"ts_code": "510300.SH"},
+                common | {"ts_code": "161022A.SZ"},
+            ),
+        )
+    )
+
+    canonical = _normalize_raw(raw).frame
+
+    assert canonical.get_column("instrument_id").to_list() == ["510300.SH"]
+
+
 def test_stock_basic_adds_bse_board(tmp_path: Path) -> None:
     fields = (
         "ts_code",
@@ -249,6 +284,45 @@ def test_statement_maps_common_fields_and_actual_announcement_pit(
 
 
 @pytest.mark.parametrize(
+    ("endpoint", "announcement_field"),
+    (("fina_indicator_vip", "ann_date"), ("income_vip", "f_ann_date")),
+)
+def test_financial_row_before_report_period_is_not_pit_usable(
+    tmp_path: Path,
+    endpoint: str,
+    announcement_field: str,
+) -> None:
+    fields = _FIELDS[endpoint]
+    row = dict.fromkeys(fields, None) | {
+        "ts_code": "600000.SH",
+        "ann_date": "20260115",
+        announcement_field: "20260115",
+        "end_date": "20260331",
+    }
+    if "report_type" in fields:
+        row["report_type"] = "1"
+    raw = RawPartitionStore(tmp_path).publish(
+        RawBatch(
+            source="tushare",
+            endpoint=endpoint,
+            request={
+                "endpoint": endpoint,
+                "period": "20260331",
+                "report_type": "1",
+                "fields": ",".join(fields),
+            },
+            retrieved_at=datetime(2026, 4, 30, tzinfo=UTC),
+            schema=fields,
+            rows=(row,),
+        )
+    )
+
+    canonical = _normalize_raw(raw).frame.row(0, named=True)
+
+    assert canonical["pit_usable"] is False
+
+
+@pytest.mark.parametrize(
     ("endpoint", "dataset", "amount_field"),
     (
         (
@@ -348,6 +422,36 @@ def test_stock_dividend_maps_units_and_implementation_availability(
     )
 
 
+def test_dividend_availability_never_precedes_announcement(tmp_path: Path) -> None:
+    fields = _FIELDS["dividend"]
+    row = dict.fromkeys(fields, None) | {
+        "ts_code": "600000.SH",
+        "end_date": "20251231",
+        "ann_date": "20260920",
+        "imp_ann_date": "20260505",
+        "div_proc": "实施",
+    }
+    raw = RawPartitionStore(tmp_path).publish(
+        RawBatch(
+            source="tushare",
+            endpoint="dividend",
+            request={
+                "endpoint": "dividend",
+                "ann_date": "20260920",
+                "fields": ",".join(fields),
+            },
+            retrieved_at=datetime(2026, 9, 21, tzinfo=UTC),
+            schema=fields,
+            rows=(row,),
+        )
+    )
+
+    canonical = _normalize_raw(raw).frame.row(0, named=True)
+
+    assert canonical["available_at"] == datetime(2026, 9, 20, 10, tzinfo=UTC)
+    assert canonical["availability_source"] == "announcement_date_eod"
+
+
 def test_fund_dividend_filters_off_exchange_funds_and_converts_units(
     tmp_path: Path,
 ) -> None:
@@ -379,6 +483,7 @@ def test_fund_dividend_filters_off_exchange_funds_and_converts_units(
             rows=(
                 common | {"ts_code": "510300.SH"},
                 common | {"ts_code": "005068.OF"},
+                common | {"ts_code": "166007!1.SZ"},
             ),
         )
     )

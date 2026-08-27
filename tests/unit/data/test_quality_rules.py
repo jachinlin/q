@@ -92,7 +92,14 @@ def test_daily_bar_requires_finite_positive_traded_prices(
     assert issue.threshold == 0
 
 
-def test_daily_bar_price_rule_ignores_untraded_placeholder() -> None:
+@pytest.mark.parametrize(
+    ("volume", "amount"),
+    ((None, None), (0, 0.0)),
+)
+def test_daily_bar_price_rule_ignores_untraded_placeholder(
+    volume: int | None,
+    amount: float | None,
+) -> None:
     issues = daily_bar_value_issues(
         {
             DatasetKind.STOCK_DAILY_BAR: (
@@ -101,8 +108,8 @@ def test_daily_bar_price_rule_ignores_untraded_placeholder() -> None:
                     high=float("inf"),
                     low=-1.0,
                     close=float("nan"),
-                    volume=None,
-                    amount=None,
+                    volume=volume,
+                    amount=amount,
                 ),
             )
         }
@@ -142,6 +149,14 @@ def test_quality_runner_records_pct_change_cross_check_failure() -> None:
     assert result.status is QualityRuleStatus.FAIL
     assert result.actual == 1
     assert result.threshold == 0
+
+
+def test_daily_bar_pct_change_allows_supplier_rounding() -> None:
+    frame = _daily_bar().with_columns(pl.lit(0.0509).alias("pct_change"))
+
+    issues = daily_bar_value_issues({DatasetKind.STOCK_DAILY_BAR: (frame,)})
+
+    assert not any(item.rule_id == "pct_change_cross_check" for item in issues)
 
 
 def test_quality_runner_records_fund_instrument_coverage_failure() -> None:
@@ -194,6 +209,7 @@ def test_quality_runner_records_fund_instrument_coverage_failure() -> None:
     )
 
     assert result.status is QualityRuleStatus.FAIL
+    assert result.severity is Severity.WARNING
     assert result.actual == 1
     assert result.threshold == 0
 
@@ -224,6 +240,15 @@ def test_daily_basic_requires_non_null_audit_evidence() -> None:
     (issue,) = required_value_issues({DatasetKind.STOCK_DAILY_BASIC: (frame,)})
 
     assert issue.actual == 1
+
+
+def test_non_pit_row_allows_missing_available_at() -> None:
+    frame = _daily_basic(turnover=None).with_columns(
+        pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias("available_at"),
+        pl.lit(False).alias("pit_usable"),
+    )
+
+    assert required_value_issues({DatasetKind.STOCK_DAILY_BASIC: (frame,)}) == []
 
 
 @pytest.mark.parametrize(
@@ -264,13 +289,34 @@ def test_statement_quality_rejects_each_report_contract_violation(
     assert issue.actual == 1
 
 
+def test_financial_quality_ignores_row_explicitly_excluded_from_pit() -> None:
+    dataset = DatasetKind.STOCK_FINANCIAL_INDICATOR
+    observed_at = datetime(2026, 1, 15, tzinfo=UTC)
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["600000.SH"],
+        "announcement_date": [date(2026, 1, 15)],
+        "report_period": [date(2026, 3, 31)],
+        "revision": [0],
+        "source": ["tushare"],
+        "available_at": [observed_at],
+        "availability_source": ["announcement_date_eod"],
+        "pit_usable": [False],
+        "ingested_at": [observed_at],
+    }
+    frame = pl.DataFrame(
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    assert financial_availability_issues({dataset: (frame,)}) == []
+
+
 @pytest.mark.parametrize(
     "overrides",
     (
         {"cash_dividend_per_unit": -0.1},
         {"instrument_id": "000001.OF"},
-        {"implementation_announcement_date": date(2026, 8, 7)},
-        {"record_date": date(2026, 8, 12)},
         {"pay_date": date(2026, 8, 10)},
     ),
 )
@@ -310,6 +356,65 @@ def test_dividend_quality_rejects_each_value_date_and_market_violation(
 
     assert issue.rule_id == "dividend_event"
     assert issue.actual == 1
+
+
+def test_fund_dividend_quality_allows_negative_distributable_income() -> None:
+    dataset = DatasetKind.FUND_DIVIDEND
+    observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["510300.SH"],
+        "announcement_date": [date(2026, 8, 8)],
+        "implementation_announcement_date": [date(2026, 8, 9)],
+        "base_date": [date(2026, 8, 8)],
+        "status": ["实施"],
+        "record_date": [date(2026, 8, 10)],
+        "ex_date": [date(2026, 8, 11)],
+        "pay_date": [date(2026, 8, 12)],
+        "cash_dividend_per_unit": [0.1],
+        "distributable_income": [-1.0],
+        "revision": [0],
+        "source": ["tushare"],
+        "available_at": [observed_at],
+        "availability_source": ["implementation_announcement_date_eod"],
+        "pit_usable": [True],
+        "ingested_at": [observed_at],
+    }
+    frame = pl.DataFrame(
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    assert dividend_event_issues({dataset: (frame,)}) == []
+
+
+def test_stock_dividend_quality_allows_b_share_record_after_ex_date() -> None:
+    dataset = DatasetKind.STOCK_DIVIDEND
+    observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["200002.SZ"],
+        "report_period": [date(2025, 12, 31)],
+        "announcement_date": [date(2026, 8, 8)],
+        "implementation_announcement_date": [date(2026, 8, 9)],
+        "status": ["实施"],
+        "record_date": [date(2026, 8, 12)],
+        "ex_date": [date(2026, 8, 11)],
+        "pay_date": [date(2026, 8, 12)],
+        "cash_dividend_before_tax_per_share": [0.1],
+        "revision": [0],
+        "source": ["tushare"],
+        "available_at": [observed_at],
+        "availability_source": ["implementation_announcement_date_eod"],
+        "pit_usable": [True],
+        "ingested_at": [observed_at],
+    }
+    frame = pl.DataFrame(
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    assert dividend_event_issues({dataset: (frame,)}) == []
 
 
 def test_cancelled_dividend_allows_missing_later_event_dates() -> None:

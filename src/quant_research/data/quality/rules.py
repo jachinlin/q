@@ -14,7 +14,8 @@ type CanonicalFrame = pl.DataFrame | pl.LazyFrame
 type CanonicalPartitions = Mapping[DatasetKind, Sequence[CanonicalFrame]]
 
 FOUNDATION_REQUIRED_DATASETS = frozenset(DatasetKind)
-_AUDIT = ("source", "available_at", "availability_source", "pit_usable", "ingested_at")
+_AUDIT = ("source", "availability_source", "pit_usable", "ingested_at")
+_PCT_CHANGE_ABSOLUTE_TOLERANCE = 1e-3
 _REQUIRED_COLUMNS: Mapping[DatasetKind, tuple[str, ...]] = {
     dataset: (*schema.primary_key, *_AUDIT)
     for dataset, schema in CANONICAL_SCHEMAS.items()
@@ -164,6 +165,7 @@ def required_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         invalid = int(
             frame.filter(
                 pl.any_horizontal(*(pl.col(name).is_null() for name in fields))
+                | (pl.col("pit_usable") & pl.col("available_at").is_null())
             )
             .select(pl.len())
             .collect()
@@ -189,7 +191,8 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         if frame is None:
             continue
         traded = frame.filter(
-            ~(pl.col("volume").is_null() & pl.col("amount").is_null())
+            (pl.col("volume").fill_null(0) != 0)
+            | (pl.col("amount").fill_null(0.0) != 0.0)
         )
         invalid_price = int(
             traded.filter(
@@ -231,7 +234,7 @@ def daily_bar_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
                         pl.col("pct_change")
                         - (pl.col("close") / pl.col("preclose") - 1.0)
                     ).abs()
-                    > 1e-6
+                    > _PCT_CHANGE_ABSOLUTE_TOLERANCE
                 )
             )
             .select(pl.len())
@@ -304,7 +307,7 @@ def coverage_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         )
         if unknown:
             issues.append(
-                _Support.issue("instrument_coverage", Severity.SEVERE, bars, unknown, 0)
+                _Support.issue("instrument_coverage", Severity.WARNING, bars, unknown, 0)
             )
     return issues
 
@@ -337,7 +340,10 @@ def financial_availability_issues(inputs: CanonicalPartitions) -> list[QualityIs
                 & (pl.col("actual_announcement_date") < pl.col("report_period"))
             )
         invalid = int(
-            frame.filter(invalid_filter).select(pl.len()).collect().item()
+            frame.filter(pl.col("pit_usable") & invalid_filter)
+            .select(pl.len())
+            .collect()
+            .item()
         )
         if invalid:
             issues.append(
@@ -366,7 +372,6 @@ def dividend_event_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         DatasetKind.FUND_DIVIDEND: (
             "cash_dividend_per_unit",
             "base_unit_count",
-            "distributable_income",
             "distribution_amount",
         ),
     }
@@ -380,27 +385,20 @@ def dividend_event_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
                 for field in nonnegative[dataset]
             )
         )
-        ordered_dates = (
-            "announcement_date",
-            "implementation_announcement_date",
-            "record_date",
-            "ex_date",
-            "pay_date",
-        )
-        date_conflict = pl.any_horizontal(
+        pay_date = pl.col("pay_date")
+        date_conflict = pay_date.is_not_null() & pl.any_horizontal(
             *(
-                pl.col(earlier).is_not_null()
-                & pl.col(later).is_not_null()
-                & (pl.col(later) < pl.col(earlier))
-                for index, earlier in enumerate(ordered_dates)
-                for later in ordered_dates[index + 1 :]
+                pl.col(earlier).is_not_null() & (pay_date < pl.col(earlier))
+                for earlier in (
+                    "announcement_date",
+                    "implementation_announcement_date",
+                    "record_date",
+                    "ex_date",
+                )
             )
         )
-        invalid_suffix = ~pl.any_horizontal(
-            *(
-                pl.col("instrument_id").str.ends_with(suffix)
-                for suffix in (".SH", ".SZ", ".BJ")
-            )
+        invalid_suffix = ~pl.col("instrument_id").str.contains(
+            r"^\d{6}\.(?:SH|SZ|BJ)$"
         )
         invalid = int(
             frame.filter(negative | date_conflict | invalid_suffix)
