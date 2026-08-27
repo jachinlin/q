@@ -300,7 +300,7 @@ class TushareMapper:
             self._candidate_partition_keys(
                 dataset,
                 raw_partition,
-                dividend_years.get(str(raw_partition.data_path)),
+                dividend_years.get(raw_partition.data_path.resolve()),
             )
             for raw_partition in raw_partitions
         )
@@ -348,7 +348,8 @@ class TushareMapper:
     @staticmethod
     def _dividend_partition_years(
         raw_partitions: Sequence[PublishedPartition],
-    ) -> dict[str, tuple[str, ...]]:
+    ) -> dict[Path, tuple[str, ...]]:
+        """按规范绝对路径返回每个分红 Raw 的公告年集合。"""
         paths = [str(partition.data_path) for partition in raw_partitions]
         years = (
             pl.scan_parquet(
@@ -366,7 +367,9 @@ class TushareMapper:
             .collect()
         )
         return {
-            str(row["__raw_path"]): tuple(cast(list[str], row["__year"]))
+            Path(str(row["__raw_path"])).resolve(): tuple(
+                cast(list[str], row["__year"])
+            )
             for row in years.iter_rows(named=True)
         }
 

@@ -393,6 +393,36 @@ def test_fund_dividend_filters_off_exchange_funds_and_converts_units(
     assert canonical["distribution_amount"] == pytest.approx(250.0)
 
 
+def test_fund_dividend_candidate_partition_uses_raw_announcement_year(
+    tmp_path: Path,
+) -> None:
+    fields = _FIELDS["fund_div"]
+    row = dict.fromkeys(fields, None) | {
+        "ts_code": "510300.SH",
+        "ann_date": "20201231",
+        "ex_date": "20210104",
+    }
+    raw = RawPartitionStore(tmp_path).publish(
+        RawBatch(
+            source="tushare",
+            endpoint="fund_div",
+            request={
+                "endpoint": "fund_div",
+                "ex_date": "20210104",
+                "fields": ",".join(fields),
+            },
+            retrieved_at=datetime(2021, 1, 5, tzinfo=UTC),
+            schema=fields,
+            rows=(row,),
+        )
+    )
+
+    assert TushareMapper().candidate_partition_keys_many(
+        DatasetKind.FUND_DIVIDEND,
+        (raw,),
+    ) == (("announcement_year=2020",),)
+
+
 def test_revision_consolidation_deduplicates_supplier_content() -> None:
     schema = CANONICAL_SCHEMAS[DatasetKind.STOCK_INCOME_STATEMENT]
     base = {
