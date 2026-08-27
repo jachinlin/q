@@ -36,6 +36,7 @@ _MARKET_DATE_ENDPOINTS = frozenset(
 )
 _INDEX_MARKETS = ("MSCI", "CSI", "SSE", "SZSE", "CICC", "SW", "OTH")
 _STOCK_STATUSES = ("L", "D", "P", "G")
+_EMPTY_STOCK_STATUSES = frozenset({"P", "G"})
 _SW2021_L1_CODES = (
     "801010.SI",
     "801030.SI",
@@ -742,9 +743,9 @@ class TushareClient:
         observed_columns = tuple(str(item) for item in frame.columns)
         records = frame.to_dict("records")
         if (
-            endpoint in _EMPTY_SCHEMA_ALLOWED_ENDPOINTS
-            and not observed_columns
+            not observed_columns
             and not records
+            and self._empty_schema_allowed(endpoint, params)
         ):
             return []
         if not self._response_schema_matches(endpoint, fields, observed_columns):
@@ -753,6 +754,19 @@ class TushareClient:
                 f"observed={observed_columns}"
             )
         return records
+
+    @staticmethod
+    def _empty_schema_allowed(
+        endpoint: str,
+        params: Mapping[str, JsonValue],
+    ) -> bool:
+        """仅允许已知可合法为空的端点或请求切片返回零行零列。"""
+        if endpoint in _EMPTY_SCHEMA_ALLOWED_ENDPOINTS:
+            return True
+        return (
+            endpoint == "stock_basic"
+            and params.get("list_status") in _EMPTY_STOCK_STATUSES
+        )
 
     @staticmethod
     def _response_schema_matches(

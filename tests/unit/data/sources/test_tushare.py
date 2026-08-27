@@ -407,6 +407,88 @@ def test_industry_membership_accepts_empty_provider_frame_without_columns() -> N
     assert batch.rows == ()
 
 
+@pytest.mark.parametrize("list_status", ("P", "G"))
+def test_stock_master_accepts_empty_optional_status_slice(
+    list_status: str,
+) -> None:
+    class _EmptyStockStatusGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, fields
+            assert endpoint == "stock_basic"
+            assert params["list_status"] == list_status
+            return _Frame(())
+
+    client = TushareClient(
+        _EmptyStockStatusGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = next(
+        item
+        for item in client.requests(
+            "stock_basic",
+            date(2026, 8, 25),
+            date(2026, 8, 25),
+        )
+        if item["list_status"] == list_status
+    )
+
+    batch = next(iter(client.fetch("stock_basic", request)))
+
+    assert batch.schema == tuple(str(request["fields"]).split(","))
+    assert batch.rows == ()
+
+
+@pytest.mark.parametrize("list_status", ("L", "D"))
+def test_stock_master_rejects_empty_required_status_slice(
+    list_status: str,
+) -> None:
+    class _UnexpectedEmptyStockStatusGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, fields
+            assert endpoint == "stock_basic"
+            assert params["list_status"] == list_status
+            return _Frame(())
+
+    client = TushareClient(
+        _UnexpectedEmptyStockStatusGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = next(
+        item
+        for item in client.requests(
+            "stock_basic",
+            date(2026, 8, 25),
+            date(2026, 8, 25),
+        )
+        if item["list_status"] == list_status
+    )
+
+    with pytest.raises(ValueError, match="schema drift"):
+        tuple(client.fetch("stock_basic", request))
+
+
 def test_daily_fills_missing_optional_after_hours_fields_with_null() -> None:
     class _HistoricalDailyGateway(_Gateway):
         def call(
