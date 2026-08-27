@@ -711,8 +711,15 @@ class CuratedPartitionStore:
             DatasetKind.STOCK_RISK_WARNING,
         }:
             return re.fullmatch(r"year=\d{4}", key) is not None
-        if dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
+        if dataset in {
+            DatasetKind.STOCK_FINANCIAL_INDICATOR,
+            DatasetKind.STOCK_INCOME_STATEMENT,
+            DatasetKind.STOCK_BALANCE_SHEET,
+            DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+        }:
             return re.fullmatch(r"report_year=\d{4}", key) is not None
+        if dataset in {DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND}:
+            return re.fullmatch(r"announcement_year=\d{4}", key) is not None
         return key == "all"
 
     @staticmethod
@@ -732,8 +739,15 @@ class CuratedPartitionStore:
             DatasetKind.STOCK_RISK_WARNING,
         }:
             column, label = "trade_date", "year"
-        elif dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
+        elif dataset in {
+            DatasetKind.STOCK_FINANCIAL_INDICATOR,
+            DatasetKind.STOCK_INCOME_STATEMENT,
+            DatasetKind.STOCK_BALANCE_SHEET,
+            DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+        }:
             column, label = "report_period", "report_year"
+        elif dataset in {DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND}:
+            column, label = "announcement_date", "announcement_year"
         if column is None:
             return (("all", frame),)
         if frame.is_empty():

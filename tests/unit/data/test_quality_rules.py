@@ -10,6 +10,8 @@ from quant_research.data.quality.models import QualityRuleStatus
 from quant_research.data.quality.rules import (
     coverage_issues,
     daily_bar_value_issues,
+    dividend_event_issues,
+    financial_availability_issues,
     required_value_issues,
 )
 from quant_research.data.quality.runner import QualityRunner
@@ -150,6 +152,65 @@ def test_daily_basic_requires_non_null_audit_evidence() -> None:
     )
     (issue,) = required_value_issues({DatasetKind.STOCK_DAILY_BASIC: (frame,)})
 
+    assert issue.actual == 1
+
+
+def test_statement_quality_rejects_non_quarter_and_non_consolidated_report() -> None:
+    dataset = DatasetKind.STOCK_INCOME_STATEMENT
+    observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["600000.SH"],
+        "announcement_date": [date(2026, 4, 30)],
+        "actual_announcement_date": [date(2026, 4, 30)],
+        "report_period": [date(2026, 3, 30)],
+        "report_type": ["2"],
+        "revision": [0],
+        "source": ["tushare"],
+        "available_at": [observed_at],
+        "availability_source": ["actual_announcement_date_eod"],
+        "pit_usable": [True],
+        "ingested_at": [observed_at],
+    }
+    frame = pl.DataFrame(
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    (issue,) = financial_availability_issues({dataset: (frame,)})
+
+    assert issue.rule_id == "financial_availability"
+    assert issue.actual == 1
+
+
+def test_dividend_quality_rejects_negative_value_date_order_and_off_market_code() -> None:
+    dataset = DatasetKind.FUND_DIVIDEND
+    observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
+        "instrument_id": ["000001.OF"],
+        "announcement_date": [date(2026, 8, 10)],
+        "implementation_announcement_date": [date(2026, 8, 9)],
+        "base_date": [date(2026, 8, 8)],
+        "status": ["实施"],
+        "ex_date": [date(2026, 8, 12)],
+        "pay_date": [date(2026, 8, 11)],
+        "cash_dividend_per_unit": [-0.1],
+        "revision": [0],
+        "source": ["tushare"],
+        "available_at": [observed_at],
+        "availability_source": ["implementation_announcement_date_eod"],
+        "pit_usable": [True],
+        "ingested_at": [observed_at],
+    }
+    frame = pl.DataFrame(
+        row,
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    (issue,) = dividend_event_issues({dataset: (frame,)})
+
+    assert issue.rule_id == "dividend_event"
     assert issue.actual == 1
 
 

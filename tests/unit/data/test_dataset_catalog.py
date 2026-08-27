@@ -29,6 +29,11 @@ def test_catalog_assigns_dataset_specific_fetch_plans() -> None:
         DatasetKind.STOCK_RISK_WARNING: FetchPlan.MARKET_TRADE_DATE,
         DatasetKind.INDEX_DAILY_BAR: FetchPlan.INDEX_RANGE_EXCEPTION,
         DatasetKind.STOCK_FINANCIAL_INDICATOR: FetchPlan.REPORT_PERIOD,
+        DatasetKind.STOCK_INCOME_STATEMENT: FetchPlan.REPORT_PERIOD,
+        DatasetKind.STOCK_BALANCE_SHEET: FetchPlan.REPORT_PERIOD,
+        DatasetKind.STOCK_CASH_FLOW_STATEMENT: FetchPlan.REPORT_PERIOD,
+        DatasetKind.STOCK_DIVIDEND: FetchPlan.CALENDAR_EVENT_DATE,
+        DatasetKind.FUND_DIVIDEND: FetchPlan.CALENDAR_EVENT_DATE,
         DatasetKind.INDUSTRY_CATALOG: FetchPlan.MARKET_SNAPSHOT,
         DatasetKind.INDUSTRY_MEMBERSHIP: FetchPlan.INDUSTRY_L1,
     }

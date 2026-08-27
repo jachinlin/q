@@ -24,6 +24,7 @@ class Partitioning(StrEnum):
 
     YEAR = "year"
     REPORT_YEAR = "report_year"
+    ANNOUNCEMENT_YEAR = "announcement_year"
     ALL = "all"
 
 
@@ -42,6 +43,7 @@ class FetchGranularity(StrEnum):
     DATE_RANGE = "date_range"
     MARKET_SNAPSHOT = "market_snapshot"
     REPORT_PERIOD = "report_period"
+    CALENDAR_EVENT_DATE = "calendar_event_date"
     INDUSTRY_L1 = "industry_l1"
     INDEX_RANGE_EXCEPTION = "index_range_exception"
 
@@ -57,6 +59,7 @@ class FetchPlan(StrEnum):
     MARKET_TRADE_DATE = "market_trade_date"
     INDEX_RANGE_EXCEPTION = "index_range_exception"
     REPORT_PERIOD = "report_period"
+    CALENDAR_EVENT_DATE = "calendar_event_date"
     INDUSTRY_L1 = "industry_l1"
 
 
@@ -447,6 +450,75 @@ DATASET_CATALOG = DatasetCatalog(
             {"ts_code": "instrument_id", "ann_date": "announcement_date",
              "end_date": "report_period"},
             extra_pit_fields=("announcement_date",),
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_INCOME_STATEMENT, "income_vip",
+            Partitioning.REPORT_YEAR, FetchGranularity.REPORT_PERIOD,
+            FetchPlan.REPORT_PERIOD, UpdateCadence.QUARTERLY_DISCLOSURE,
+            ReuseSemantics.APPEND_WITH_RESTATEMENT, 0,
+            FreshnessPolicy(FreshnessBasis.DISCLOSURE_DEADLINE, None, 0),
+            {"ts_code": "instrument_id", "ann_date": "announcement_date",
+             "f_ann_date": "actual_announcement_date",
+             "end_date": "report_period", "comp_type": "company_type",
+             "end_type": "report_period_type"},
+            extra_pit_fields=("announcement_date", "actual_announcement_date"),
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_BALANCE_SHEET, "balancesheet_vip",
+            Partitioning.REPORT_YEAR, FetchGranularity.REPORT_PERIOD,
+            FetchPlan.REPORT_PERIOD, UpdateCadence.QUARTERLY_DISCLOSURE,
+            ReuseSemantics.APPEND_WITH_RESTATEMENT, 0,
+            FreshnessPolicy(FreshnessBasis.DISCLOSURE_DEADLINE, None, 0),
+            {"ts_code": "instrument_id", "ann_date": "announcement_date",
+             "f_ann_date": "actual_announcement_date",
+             "end_date": "report_period", "comp_type": "company_type",
+             "end_type": "report_period_type"},
+            extra_pit_fields=("announcement_date", "actual_announcement_date"),
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_CASH_FLOW_STATEMENT, "cashflow_vip",
+            Partitioning.REPORT_YEAR, FetchGranularity.REPORT_PERIOD,
+            FetchPlan.REPORT_PERIOD, UpdateCadence.QUARTERLY_DISCLOSURE,
+            ReuseSemantics.APPEND_WITH_RESTATEMENT, 0,
+            FreshnessPolicy(FreshnessBasis.DISCLOSURE_DEADLINE, None, 0),
+            {"ts_code": "instrument_id", "ann_date": "announcement_date",
+             "f_ann_date": "actual_announcement_date",
+             "end_date": "report_period", "comp_type": "company_type",
+             "end_type": "report_period_type"},
+            extra_pit_fields=("announcement_date", "actual_announcement_date"),
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.STOCK_DIVIDEND, "dividend", Partitioning.ANNOUNCEMENT_YEAR,
+            FetchGranularity.CALENDAR_EVENT_DATE, FetchPlan.CALENDAR_EVENT_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_RESTATEMENT, 7,
+            FreshnessPolicy(FreshnessBasis.CALENDAR_HORIZON, "announcement_date", 0),
+            {"ts_code": "instrument_id", "end_date": "report_period",
+             "ann_date": "announcement_date", "div_proc": "status",
+             "stk_div": "stock_dividend_per_share",
+             "stk_bo_rate": "stock_bonus_rate_per_share",
+             "stk_co_rate": "stock_conversion_rate_per_share",
+             "cash_div": "cash_dividend_after_tax_per_share",
+             "cash_div_tax": "cash_dividend_before_tax_per_share",
+             "div_listdate": "stock_listing_date",
+             "imp_ann_date": "implementation_announcement_date",
+             "base_share": "base_share_count"},
+            extra_pit_fields=("announcement_date", "implementation_announcement_date"),
+        ),
+        _DatasetSpecFactory.spec(
+            DatasetKind.FUND_DIVIDEND, "fund_div", Partitioning.ANNOUNCEMENT_YEAR,
+            FetchGranularity.CALENDAR_EVENT_DATE, FetchPlan.CALENDAR_EVENT_DATE,
+            UpdateCadence.DAILY, ReuseSemantics.APPEND_WITH_RESTATEMENT, 7,
+            FreshnessPolicy(FreshnessBasis.CALENDAR_HORIZON, "announcement_date", 0),
+            {"ts_code": "instrument_id", "ann_date": "announcement_date",
+             "imp_anndate": "implementation_announcement_date",
+             "div_proc": "status", "earpay_date": "earnings_payment_date",
+             "net_ex_date": "net_value_ex_date",
+             "div_cash": "cash_dividend_per_unit",
+             "base_unit": "base_unit_count",
+             "ear_distr": "distributable_income",
+             "ear_amount": "distribution_amount",
+             "account_date": "reinvestment_credit_date"},
+            extra_pit_fields=("announcement_date", "implementation_announcement_date"),
         ),
         _DatasetSpecFactory.spec(
             DatasetKind.INDUSTRY_CATALOG, "index_classify", Partitioning.ALL,

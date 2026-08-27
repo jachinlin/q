@@ -296,7 +296,7 @@ function coverageDate(dataset: Dataset, boundary: 'start' | 'end') {
 }
 
 function windowState(window: DataUpdateWindow) {
-  if (['stock_financial_indicator', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) {
+  if (['stock_financial_indicator', 'stock_income_statement', 'stock_balance_sheet', 'stock_cash_flow_statement', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) {
     return '不适用'
   }
   if (window.dataset === 'trade_calendar') {
@@ -306,7 +306,7 @@ function windowState(window: DataUpdateWindow) {
 }
 
 function windowLookback(window: DataUpdateWindow) {
-  if (['stock_financial_indicator', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) {
+  if (['stock_financial_indicator', 'stock_income_statement', 'stock_balance_sheet', 'stock_cash_flow_statement', 'stock_master', 'fund_master', 'index_master', 'industry_catalog'].includes(window.dataset)) {
     return '不适用'
   }
   return window.dataset === 'trade_calendar'
@@ -568,7 +568,7 @@ async function submitUpdate() {
     </el-dialog>
 
     <el-dialog v-model="updateDialog" title="创建数据更新任务" width="780">
-      <p style="color:var(--muted);font-size:12px;line-height:1.8">提交前会根据实时交易日历、Canonical 水位和季度披露截止日固化各数据集计划。stock_financial_indicator 不使用水位；截止日尚未越过时自动判定为无需更新。</p>
+      <p style="color:var(--muted);font-size:12px;line-height:1.8">提交前会根据实时交易日历、Canonical 水位和季度披露截止日固化各数据集计划。财务指标和三张财务报表不使用水位；截止日尚未越过时自动判定为无需更新。</p>
       <div class="dataset-selector">
         <div class="dataset-selector-heading">
           <strong>目标数据集</strong>

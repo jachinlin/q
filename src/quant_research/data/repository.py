@@ -159,6 +159,46 @@ class ResearchDataRepository(Protocol):
         """读取财务指标。入参：观察日和股票。返回值：指标帧。异常：门禁失败时抛出。"""
         ...
 
+    def stock_income_statements(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取利润表。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        ...
+
+    def stock_balance_sheets(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取资产负债表。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        ...
+
+    def stock_cash_flow_statements(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取现金流量表。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        ...
+
+    def stock_dividends(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取股票分红。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        ...
+
+    def fund_dividends(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取场内基金分红。入参：观察日和基金。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        ...
+
     def industry_catalog(self) -> pl.LazyFrame:
         """读取行业目录。入参：无。返回值：目录帧。异常：门禁失败时抛出。"""
         ...
@@ -631,6 +671,101 @@ class CanonicalResearchRepository:
         return self._read_query(
             DatasetKind.STOCK_FINANCIAL_INDICATOR, query, parameters
         )
+
+    def stock_income_statements(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取利润表。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        return self._latest_visible_revisions(
+            DatasetKind.STOCK_INCOME_STATEMENT,
+            as_of,
+            instruments,
+            ("instrument_id", "report_period", "report_type"),
+        )
+
+    def stock_balance_sheets(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取资产负债表。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        return self._latest_visible_revisions(
+            DatasetKind.STOCK_BALANCE_SHEET,
+            as_of,
+            instruments,
+            ("instrument_id", "report_period", "report_type"),
+        )
+
+    def stock_cash_flow_statements(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取现金流量表。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        return self._latest_visible_revisions(
+            DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+            as_of,
+            instruments,
+            ("instrument_id", "report_period", "report_type"),
+        )
+
+    def stock_dividends(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取股票分红。入参：观察日和股票。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        return self._latest_visible_revisions(
+            DatasetKind.STOCK_DIVIDEND,
+            as_of,
+            instruments,
+            ("instrument_id", "report_period", "announcement_date"),
+        )
+
+    def fund_dividends(
+        self,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取场内基金分红。入参：观察日和基金。返回值：最新可见修订。异常：门禁失败时抛出。"""
+        return self._latest_visible_revisions(
+            DatasetKind.FUND_DIVIDEND,
+            as_of,
+            instruments,
+            ("instrument_id", "announcement_date", "base_date"),
+        )
+
+    def _latest_visible_revisions(
+        self,
+        dataset: DatasetKind,
+        as_of: date,
+        instruments: Sequence[InstrumentId] | None,
+        business_key: tuple[str, ...],
+    ) -> pl.LazyFrame:
+        predicates, parameters = self._instrument_predicate(instruments)
+        predicates.extend(
+            ("pit_usable = TRUE", "available_at IS NOT NULL", "available_at <= ?")
+        )
+        parameters.append(self._shanghai_day_end_utc(as_of))
+        definition = CANONICAL_SCHEMAS[dataset]
+        columns = self._columns(definition)
+        partition = ", ".join(self._quoted(item) for item in business_key)
+        query = (
+            "SELECT "
+            + columns
+            + " FROM (SELECT "
+            + columns
+            + ", ROW_NUMBER() OVER (PARTITION BY "
+            + partition
+            + " ORDER BY available_at DESC, revision DESC) AS _pit_rank "
+            + "FROM data WHERE "
+            + " AND ".join(predicates)
+            + ") WHERE _pit_rank = 1 ORDER BY "
+            + self._order(definition)
+        )
+        return self._read_query(dataset, query, parameters)
 
     def industry_catalog(self) -> pl.LazyFrame:
         """读取行业目录。入参：无。返回值：目录帧。异常：门禁失败时抛出。"""

@@ -76,6 +76,17 @@ _SNAPSHOT_DATASETS = frozenset(
         DatasetKind.INDUSTRY_MEMBERSHIP,
     }
 )
+_DISCLOSURE_DATASETS = frozenset(
+    {
+        DatasetKind.STOCK_FINANCIAL_INDICATOR,
+        DatasetKind.STOCK_INCOME_STATEMENT,
+        DatasetKind.STOCK_BALANCE_SHEET,
+        DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+    }
+)
+_EVENT_DATE_DATASETS = frozenset(
+    {DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND}
+)
 
 
 class DatasetSource(Protocol):
@@ -488,7 +499,7 @@ class DataUpdateWindow:
             raise ValueError("DATA_UPDATE overlap_days must be non-negative")
         if self.basis is DataUpdateWindowBasis.DISCLOSURE_TRIGGER:
             if (
-                self.dataset is not DatasetKind.STOCK_FINANCIAL_INDICATOR
+                self.dataset not in _DISCLOSURE_DATASETS
                 or self.current_watermark is not None
                 or self.overlap_days != 0
                 or self.trigger_date is None
@@ -589,7 +600,7 @@ class DataUpdateSkip:
 
     def __post_init__(self) -> None:
         if (
-            self.dataset is not DatasetKind.STOCK_FINANCIAL_INDICATOR
+            self.dataset not in _DISCLOSURE_DATASETS
             or self.reason != "DISCLOSURE_DEADLINE_PENDING"
         ):
             raise ValueError("unsupported DATA_UPDATE skip decision")
@@ -876,6 +887,9 @@ class DataUpdatePlanner:
             if dataset in _SNAPSHOT_DATASETS:
                 actual = (planning_date, planning_date)
                 basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
+            elif dataset in _EVENT_DATE_DATASETS:
+                actual = (start, planning_date - timedelta(days=1))
+                basis = DataUpdateWindowBasis.BOOTSTRAP
             else:
                 actual = _DatasetPipelineSupport._calendar_horizon(
                     dataset, (start, end)
@@ -964,6 +978,20 @@ class DataUpdatePlanner:
             if record is None or record.end_date is None
         )
         if missing_baseline:
+            if initialization is not None and initialization.status == "COMPLETED":
+                raise QuantError(
+                    ErrorDetail(
+                        code="DATA_ROOT_SCHEMA_CHANGED",
+                        severity=Severity.FATAL,
+                        message="the completed data root uses an obsolete dataset catalog",
+                        context={"missing_datasets": list(missing_baseline)},
+                        remediation=(
+                            "choose a new QUANT_DATA_ROOT, configure its settings, "
+                            "and run quant data bootstrap"
+                        ),
+                        retryable=False,
+                    )
+                )
             raise QuantError(
                 ErrorDetail(
                     code="DATA_UPDATE_REQUIRES_BOOTSTRAP",
@@ -999,11 +1027,7 @@ class DataUpdatePlanner:
                         current_watermark=(
                             None
                             if record is None
-                            or dataset
-                            in {
-                                DatasetKind.STOCK_FINANCIAL_INDICATOR,
-                                *_SNAPSHOT_DATASETS,
-                            }
+                            or dataset in (_DISCLOSURE_DATASETS | _SNAPSHOT_DATASETS)
                             else record.end_date
                         ),
                     )
@@ -1021,7 +1045,7 @@ class DataUpdatePlanner:
                     basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
                     watermark = None
                     trigger_date = None
-                elif dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
+                elif dataset in _DISCLOSURE_DATASETS:
                     batch = FinancialDisclosureSchedule.latest_completed_batch(
                         planning_date
                     )
@@ -1039,13 +1063,21 @@ class DataUpdatePlanner:
                     watermark = None
                     trigger_date = batch.disclosure_deadline
                 else:
+                    latest_for_dataset = (
+                        planning_date - timedelta(days=1)
+                        if dataset in _EVENT_DATE_DATASETS
+                        else latest
+                    )
                     target_end = latest + (
                         timedelta(days=90)
                         if dataset is DatasetKind.TRADE_CALENDAR
                         else timedelta()
                     )
+                    if dataset in _EVENT_DATE_DATASETS:
+                        target_end = latest_for_dataset
                     actual = (
-                        min(record.end_date, latest) - timedelta(days=overlap),
+                        min(record.end_date, latest_for_dataset)
+                        - timedelta(days=overlap),
                         target_end,
                     )
                     basis = DataUpdateWindowBasis.INCREMENTAL
@@ -3019,9 +3051,36 @@ class DataPipeline:
             record.dataset for record in self._repository.list_canonical_datasets()
         }
         initialization = self._repository.find_data_initialization()
-        if (initialization is not None and initialization.status == "COMPLETED") or (
-            initialization is None and executable.issubset(existing)
-        ):
+        if initialization is not None and initialization.status == "COMPLETED":
+            if not executable.issubset(existing):
+                missing = sorted(item.value for item in executable - existing)
+                raise QuantError(
+                    ErrorDetail(
+                        code="DATA_ROOT_SCHEMA_CHANGED",
+                        severity=Severity.FATAL,
+                        message="the completed data root uses an obsolete dataset catalog",
+                        context={"missing_datasets": missing},
+                        remediation=(
+                            "choose a new QUANT_DATA_ROOT, configure its settings, "
+                            "and run quant data bootstrap"
+                        ),
+                        retryable=False,
+                    )
+                )
+            raise QuantError(
+                ErrorDetail(
+                    code="DATA_BOOTSTRAP_ALREADY_INITIALIZED",
+                    severity=Severity.SEVERE,
+                    message=(
+                        "bootstrap is only available before the canonical baseline "
+                        "is complete"
+                    ),
+                    context={},
+                    remediation="run quant data update for subsequent refreshes",
+                    retryable=False,
+                )
+            )
+        if initialization is None and executable.issubset(existing):
             raise QuantError(
                 ErrorDetail(
                     code="DATA_BOOTSTRAP_ALREADY_INITIALIZED",

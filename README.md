@@ -9,7 +9,7 @@ PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashbo
 
 ## 能力概览
 
-- BaoStock 数据采集，Raw 响应内容寻址和断点续抓；
+- Tushare 全市场数据采集，Raw 响应内容寻址和断点续抓；
 - Canonical 分区、质量校验和全局研究门禁；
 - PIT 股票池、七个股票因子和独立因子研究；
 - ETF 轮动与股票多因子策略；
@@ -230,7 +230,6 @@ Dashboard 写请求要求同源 JSON 和有效 `X-Request-ID`。界面不提供�
 |---|---|---|
 | `QUANT_DATA_ROOT` | `~/qlab-data` | Raw、Canonical、SQLite、日志和产物根目录。 |
 | `QUANT_CONFIG` | `configs/base.yaml` | 应用配置文件。 |
-| `QUANT_WORKER_PROFILE` | `baostock` | `baostock` 或 `offline-etf` Worker Profile。 |
 | `QUANT_DASHBOARD_DEV_ORIGIN` | 空 | 本地前端开发时允许的 Vite Origin。 |
 
 基础应用配置：
@@ -260,7 +259,7 @@ src/quant_research/
 ├── analytics/         # 分析与归因
 ├── experiments/       # 实验
 ├── tasks/             # 任务模型
-├── infrastructure/    # SQLite、Alembic、BaoStock
+├── infrastructure/    # SQLite、Alembic、Tushare
 ├── cli/               # Typer 适配器
 ├── dashboard/         # FastAPI 适配器
 └── bootstrap/         # 组合根

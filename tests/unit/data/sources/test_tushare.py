@@ -77,6 +77,11 @@ def test_only_index_daily_requests_may_contain_ts_code() -> None:
         "suspend_d",
         "stock_st",
         "fina_indicator_vip",
+        "income_vip",
+        "balancesheet_vip",
+        "cashflow_vip",
+        "dividend",
+        "fund_div",
         "index_classify",
         "index_member_all",
     )
@@ -85,6 +90,72 @@ def test_only_index_daily_requests_may_contain_ts_code() -> None:
             "ts_code" not in request for request in client.requests(endpoint, day, day)
         )
     assert client.requests("index_daily", day, day)[0]["ts_code"] == "000300.SH"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ("income_vip", "balancesheet_vip", "cashflow_vip"),
+)
+def test_financial_statement_requests_are_full_market_consolidated(
+    endpoint: str,
+) -> None:
+    requests = _client().requests(endpoint, date(2026, 3, 31), date(2026, 6, 30))
+
+    assert [item["period"] for item in requests] == ["20260331", "20260630"]
+    assert all(item["report_type"] == "1" for item in requests)
+    assert all("ts_code" not in item for item in requests)
+
+
+def test_dividend_requests_slice_each_calendar_event_date_without_ts_code() -> None:
+    client = _client()
+    stock = client.requests("dividend", date(2026, 8, 24), date(2026, 8, 25))
+    fund = client.requests("fund_div", date(2026, 8, 24), date(2026, 8, 25))
+
+    assert len(stock) == 4
+    assert len(fund) == 6
+    assert {key for item in stock for key in item if key.endswith("date")} == {
+        "ann_date",
+        "imp_ann_date",
+    }
+    assert {key for item in fund for key in item if key.endswith("date")} == {
+        "ann_date",
+        "ex_date",
+        "pay_date",
+    }
+    assert all("ts_code" not in item for item in (*stock, *fund))
+
+
+@pytest.mark.parametrize("endpoint", ("dividend", "fund_div"))
+def test_dividend_endpoints_accept_empty_provider_frame_without_columns(
+    endpoint: str,
+) -> None:
+    class _EmptyGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            called_endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, params, fields
+            assert called_endpoint == endpoint
+            return _Frame(())
+
+    client = TushareClient(
+        _EmptyGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = client.requests(endpoint, date(2026, 8, 25), date(2026, 8, 25))[0]
+
+    batch = next(iter(client.fetch(endpoint, request)))
+
+    assert batch.rows == ()
+    assert batch.schema == tuple(str(request["fields"]).split(","))
 
 
 def test_dynamic_token_provider_reconnects_when_dashboard_setting_changes() -> None:
@@ -374,6 +445,53 @@ def test_daily_fills_missing_optional_after_hours_fields_with_null() -> None:
     assert batch.rows[0]["ts_code"] == "ts_code"
     assert batch.rows[0]["ah_vol"] is None
     assert batch.rows[0]["ah_amount"] is None
+
+
+def test_income_vip_fills_proxy_omitted_optional_fields_with_null() -> None:
+    omitted = {
+        "net_after_nr_lp_correct",
+        "credit_impa_loss",
+        "net_expo_hedging_benefits",
+        "oth_impair_loss_assets",
+        "total_opcost",
+        "amodcost_fin_assets",
+        "oth_income",
+        "asset_disp_income",
+        "continued_net_profit",
+        "end_net_profit",
+    }
+
+    class _ProxyIncomeGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, params
+            assert endpoint == "income_vip"
+            observed = tuple(field for field in fields if field not in omitted)
+            record = {field: field for field in observed}
+            return _Frame(observed, [record])
+
+    client = TushareClient(
+        _ProxyIncomeGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = client.requests(
+        "income_vip", date(2026, 6, 30), date(2026, 6, 30)
+    )[0]
+
+    batch = next(iter(client.fetch("income_vip", request)))
+
+    assert batch.rows[0]["total_revenue"] == "total_revenue"
+    assert all(batch.rows[0][field] is None for field in omitted)
 
 
 def test_daily_still_rejects_a_missing_required_response_field() -> None:

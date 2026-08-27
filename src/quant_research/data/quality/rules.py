@@ -24,6 +24,12 @@ _BAR_DATASETS = (
     DatasetKind.FUND_DAILY_BAR,
     DatasetKind.INDEX_DAILY_BAR,
 )
+_STATEMENT_DATASETS = (
+    DatasetKind.STOCK_INCOME_STATEMENT,
+    DatasetKind.STOCK_BALANCE_SHEET,
+    DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+)
+_DIVIDEND_DATASETS = (DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND)
 
 
 def required_dataset_issues(
@@ -308,29 +314,100 @@ def financial_availability_issues(inputs: CanonicalPartitions) -> list[QualityIs
 
     入参：Canonical 分区。返回值：质量问题。异常：帧错误按原类型传播。
     """
-    dataset = DatasetKind.STOCK_FINANCIAL_INDICATOR
-    frame = _Support.compatible(inputs.get(dataset, ()))
-    if frame is None:
-        return []
-    invalid = int(
-        frame.filter(
+    issues: list[QualityIssue] = []
+    for dataset in (DatasetKind.STOCK_FINANCIAL_INDICATOR, *_STATEMENT_DATASETS):
+        frame = _Support.compatible(inputs.get(dataset, ()))
+        if frame is None:
+            continue
+        invalid_filter = (
             pl.col("announcement_date").is_null()
             | (pl.col("announcement_date") < pl.col("report_period"))
             | pl.col("available_at").is_null()
-        )
-        .select(pl.len())
-        .collect()
-        .item()
-    )
-    return (
-        []
-        if not invalid
-        else [
-            _Support.issue(
-                "financial_availability", Severity.SEVERE, dataset, invalid, 0
+            | ~pl.any_horizontal(
+                *(
+                    (pl.col("report_period").dt.month() == month)
+                    & (pl.col("report_period").dt.day() == day)
+                    for month, day in ((3, 31), (6, 30), (9, 30), (12, 31))
+                )
             )
-        ]
-    )
+        )
+        if dataset in _STATEMENT_DATASETS:
+            invalid_filter = invalid_filter | (pl.col("report_type") != "1") | (
+                pl.col("actual_announcement_date").is_not_null()
+                & (pl.col("actual_announcement_date") < pl.col("report_period"))
+            )
+        invalid = int(
+            frame.filter(invalid_filter).select(pl.len()).collect().item()
+        )
+        if invalid:
+            issues.append(
+                _Support.issue(
+                    "financial_availability", Severity.SEVERE, dataset, invalid, 0
+                )
+            )
+    return issues
+
+
+def dividend_event_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
+    """检查分红数值、日期与证券边界；该函数作为稳定公开 API 或框架入口保留在模块级。
+
+    入参：Canonical 分区。返回值：质量问题。异常：帧错误按原类型传播。
+    """
+    issues: list[QualityIssue] = []
+    nonnegative = {
+        DatasetKind.STOCK_DIVIDEND: (
+            "stock_dividend_per_share",
+            "stock_bonus_rate_per_share",
+            "stock_conversion_rate_per_share",
+            "cash_dividend_after_tax_per_share",
+            "cash_dividend_before_tax_per_share",
+            "base_share_count",
+        ),
+        DatasetKind.FUND_DIVIDEND: (
+            "cash_dividend_per_unit",
+            "base_unit_count",
+            "distributable_income",
+            "distribution_amount",
+        ),
+    }
+    for dataset in _DIVIDEND_DATASETS:
+        frame = _Support.compatible(inputs.get(dataset, ()))
+        if frame is None:
+            continue
+        negative = pl.any_horizontal(
+            *(
+                pl.col(field).is_not_null() & (pl.col(field) < 0)
+                for field in nonnegative[dataset]
+            )
+        )
+        date_conflict = (
+            pl.col("implementation_announcement_date").is_not_null()
+            & (
+                pl.col("implementation_announcement_date")
+                < pl.col("announcement_date")
+            )
+        ) | (
+            pl.col("pay_date").is_not_null()
+            & pl.col("ex_date").is_not_null()
+            & (pl.col("pay_date") < pl.col("ex_date"))
+        )
+        invalid_suffix = ~pl.any_horizontal(
+            *(
+                pl.col("instrument_id").str.ends_with(suffix)
+                for suffix in (".SH", ".SZ", ".BJ")
+            )
+        )
+        invalid = int(
+            frame.filter(negative | date_conflict | invalid_suffix)
+            .select(pl.len())
+            .collect()
+            .item()
+        )
+        if invalid:
+            issues.append(
+                _Support.issue("dividend_event", Severity.SEVERE, dataset, invalid, 0)
+            )
+    return issues
 
 
 def industry_state_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:

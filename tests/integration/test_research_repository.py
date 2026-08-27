@@ -457,6 +457,26 @@ def test_every_public_read_api_enters_internal_verification(
             lambda: repository.stock_financial_indicators(query_date, ()),
         ),
         (
+            DatasetKind.STOCK_INCOME_STATEMENT,
+            lambda: repository.stock_income_statements(query_date, ()),
+        ),
+        (
+            DatasetKind.STOCK_BALANCE_SHEET,
+            lambda: repository.stock_balance_sheets(query_date, ()),
+        ),
+        (
+            DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+            lambda: repository.stock_cash_flow_statements(query_date, ()),
+        ),
+        (
+            DatasetKind.STOCK_DIVIDEND,
+            lambda: repository.stock_dividends(query_date, ()),
+        ),
+        (
+            DatasetKind.FUND_DIVIDEND,
+            lambda: repository.fund_dividends(query_date, ()),
+        ),
+        (
             DatasetKind.INDUSTRY_CATALOG,
             repository.industry_catalog,
         ),
@@ -615,6 +635,85 @@ def test_financial_indicators_select_latest_visible_revision(
         assert latest.select("revision", "roe").rows() == [(1, 0.11)]
     finally:
         harness.close()
+
+
+def test_income_statements_select_latest_visible_revision(tmp_path: Path) -> None:
+    """利润表读取按股票、报告期和报表类型返回观察日可见的最新修订。"""
+    database = tmp_path / "income.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    metadata = MetadataRepository(engine)
+    store = CuratedPartitionStore(tmp_path / "income-canonical")
+    dataset = DatasetKind.STOCK_INCOME_STATEMENT
+    available = (
+        datetime(2026, 4, 1, tzinfo=UTC),
+        datetime(2026, 4, 10, tzinfo=UTC),
+        datetime(2026, 5, 2, tzinfo=UTC),
+    )
+    frame = _canonical_frame(
+        dataset,
+        [
+            {
+                "instrument_id": "600000.SH",
+                "announcement_date": timestamp.date(),
+                "actual_announcement_date": timestamp.date(),
+                "report_period": date(2025, 12, 31),
+                "report_type": "1",
+                "company_type": "2",
+                "report_period_type": "4",
+                "total_revenue": value,
+                "update_flag": "1",
+                "revision": revision,
+                "source": "tushare",
+                "available_at": timestamp,
+                "availability_source": "actual_announcement_date_eod",
+                "pit_usable": True,
+                "ingested_at": _NOW,
+            }
+            for timestamp, value, revision in zip(
+                available,
+                (100.0, 101.0, 102.0),
+                (0, 1, 2),
+                strict=True,
+            )
+        ],
+    )
+    try:
+        result = store.publish(
+            (CanonicalBatch(dataset, frame, ("c" * 64,)),),
+            previous_datasets={},
+            run_id="income-history-test",
+            source="tushare",
+            start=date(2025, 12, 31),
+            end=date(2025, 12, 31),
+            repository=metadata,
+        )
+        record = result.datasets[dataset.value]
+        state = metadata.catalog_state()
+        quality = metadata.register_quality_run(
+            QualityRunSpec(
+                dataset_hashes={dataset.value: record.content_hash},
+                input_hash=state.catalog_hash,
+                scope="ALL",
+                started_at=_NOW,
+                completed_at=_NOW,
+                issues=(),
+            )
+        )
+        metadata.mark_catalog_validated(quality.id, validated_at=_NOW)
+        repository = CanonicalResearchRepository(
+            metadata,
+            trusted_curated_root=store.root,
+        )
+
+        latest = repository.stock_income_statements(
+            date(2026, 4, 30),
+            (InstrumentId.parse("600000.SH"),),
+        ).collect()
+
+        assert latest.select("revision", "total_revenue").rows() == [(1, 101.0)]
+    finally:
+        engine.dispose()
 
 
 def test_first_read_rejects_corrupted_partition(tmp_path: Path) -> None:

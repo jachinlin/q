@@ -13,6 +13,13 @@ _BAR_DATASETS = (
     DatasetKind.FUND_DAILY_BAR,
     DatasetKind.INDEX_DAILY_BAR,
 )
+_FINANCIAL_DATASETS = (
+    DatasetKind.STOCK_FINANCIAL_INDICATOR,
+    DatasetKind.STOCK_INCOME_STATEMENT,
+    DatasetKind.STOCK_BALANCE_SHEET,
+    DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+)
+_DIVIDEND_DATASETS = (DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +161,16 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "检查可用于 PIT 研究的财务观测是否具有有效公告与可用时间。",
         "可用时间证据非法的记录数为 0。",
         Severity.SEVERE,
-        (DatasetKind.STOCK_FINANCIAL_INDICATOR,),
+        _FINANCIAL_DATASETS,
+        prerequisite_rules=("canonical_schema", "required_dataset_empty"),
+    ),
+    QualityRuleDefinition(
+        "dividend_event",
+        "分红事件有效",
+        "检查分红数值、公告与实施日期顺序，以及场内证券代码边界。",
+        "非法分红事件记录数为 0。",
+        Severity.SEVERE,
+        _DIVIDEND_DATASETS,
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(

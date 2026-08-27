@@ -14,8 +14,9 @@ from collections.abc import Sequence
 from datetime import date, timedelta
 
 import polars as pl
-from quant_research.data.adjustments import FORWARD_LOG_RETURN_COLUMN
 
+from quant_research.data.canonical.adjustments import FORWARD_LOG_RETURN_COLUMN
+from quant_research.data.contracts import ProviderCapabilities
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors import (
     FactorContext,
@@ -24,9 +25,6 @@ from quant_research.factors import (
     PartitionedFactorEngine,
 )
 from quant_research.factors.builtin import register_etf_factors
-from quant_research.infrastructure.baostock.client import (
-    BAOSTOCK_RESEARCH_CAPABILITIES,
-)
 
 _FACTOR_IDS = (
     "return_20d",
@@ -146,7 +144,7 @@ def run(
             register_etf_factors(registry, service, scope)
             return FactorEngine(
                 registry,
-                capabilities=BAOSTOCK_RESEARCH_CAPABILITIES,
+                capabilities=ProviderCapabilities.complete(),
             )
 
         universe_hash = hashlib.sha256(

@@ -74,14 +74,35 @@ _ROW_LIMITS: Mapping[str, int] = {
     "daily": 6000,
     "daily_basic": 6000,
     "index_member_all": 2000,
+    "income_vip": 10000,
+    "balancesheet_vip": 10000,
+    "cashflow_vip": 10000,
+    "dividend": 2000,
+    "fund_div": 2000,
 }
 _PAGINATED_PAGE_LIMITS: Mapping[str, int] = {
     "fund_daily": 5000,
     "fund_adj": 2000,
 }
-_EMPTY_SCHEMA_ALLOWED_ENDPOINTS = frozenset({"index_member_all"})
+_EMPTY_SCHEMA_ALLOWED_ENDPOINTS = frozenset(
+    {"index_member_all", "dividend", "fund_div"}
+)
 _OPTIONAL_RESPONSE_FIELDS: Mapping[str, frozenset[str]] = {
     "daily": frozenset({"ah_vol", "ah_amount"}),
+    "income_vip": frozenset(
+        {
+            "net_after_nr_lp_correct",
+            "credit_impa_loss",
+            "net_expo_hedging_benefits",
+            "oth_impair_loss_assets",
+            "total_opcost",
+            "amodcost_fin_assets",
+            "oth_income",
+            "asset_disp_income",
+            "continued_net_profit",
+            "end_net_profit",
+        }
+    ),
 }
 _MAX_PAGES = 100
 
@@ -235,6 +256,42 @@ _FIELDS: Mapping[str, tuple[str, ...]] = {
         "out_date",
         "is_new",
     ),
+    "dividend": (
+        "ts_code",
+        "end_date",
+        "ann_date",
+        "div_proc",
+        "stk_div",
+        "stk_bo_rate",
+        "stk_co_rate",
+        "cash_div",
+        "cash_div_tax",
+        "record_date",
+        "ex_date",
+        "pay_date",
+        "div_listdate",
+        "imp_ann_date",
+        "base_date",
+        "base_share",
+    ),
+    "fund_div": (
+        "ts_code",
+        "ann_date",
+        "imp_anndate",
+        "base_date",
+        "div_proc",
+        "record_date",
+        "ex_date",
+        "pay_date",
+        "earpay_date",
+        "net_ex_date",
+        "div_cash",
+        "base_unit",
+        "ear_distr",
+        "ear_amount",
+        "account_date",
+        "base_year",
+    ),
 }
 
 _FINANCIAL_RENAMES = {
@@ -257,6 +314,39 @@ _FINANCIAL_FIELDS = tuple(
     }
 )
 _FIELDS = {**_FIELDS, "fina_indicator_vip": _FINANCIAL_FIELDS}
+
+_STATEMENT_SOURCE_NAMES = {
+    "instrument_id": "ts_code",
+    "announcement_date": "ann_date",
+    "actual_announcement_date": "f_ann_date",
+    "report_period": "end_date",
+    "company_type": "comp_type",
+    "report_period_type": "end_type",
+}
+_STATEMENT_ENDPOINT_DATASETS: Mapping[str, DatasetKind] = {
+    "income_vip": DatasetKind.STOCK_INCOME_STATEMENT,
+    "balancesheet_vip": DatasetKind.STOCK_BALANCE_SHEET,
+    "cashflow_vip": DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+}
+_FIELDS = {
+    **_FIELDS,
+    **{
+        endpoint: tuple(
+            _STATEMENT_SOURCE_NAMES.get(name, name)
+            for name in CANONICAL_SCHEMAS[dataset].columns.names()
+            if name
+            not in {
+                "source",
+                "available_at",
+                "availability_source",
+                "pit_usable",
+                "ingested_at",
+                "revision",
+            }
+        )
+        for endpoint, dataset in _STATEMENT_ENDPOINT_DATASETS.items()
+    },
+}
 
 
 class TushareFrame(Protocol):
@@ -541,6 +631,27 @@ class TushareClient:
                 {**base, "period": period.strftime("%Y%m%d")}
                 for period in self._report_periods(start, end)
             )
+        if endpoint in _STATEMENT_ENDPOINT_DATASETS:
+            return tuple(
+                {
+                    **base,
+                    "period": period.strftime("%Y%m%d"),
+                    "report_type": "1",
+                }
+                for period in self._report_periods(start, end)
+            )
+        if endpoint == "dividend":
+            return tuple(
+                {**base, field: day.strftime("%Y%m%d")}
+                for day in self._calendar_days(start, end)
+                for field in ("ann_date", "imp_ann_date")
+            )
+        if endpoint == "fund_div":
+            return tuple(
+                {**base, field: day.strftime("%Y%m%d")}
+                for day in self._calendar_days(start, end)
+                for field in ("ann_date", "ex_date", "pay_date")
+            )
         if endpoint == "index_classify":
             return ({**base, "level": "L1", "src": "SW2021"},)
         if endpoint == "index_member_all":
@@ -726,6 +837,14 @@ class TushareClient:
                 if start <= candidate <= end:
                     periods.append(candidate)
         return tuple(periods)
+
+    @staticmethod
+    def _calendar_days(start: date, end: date) -> tuple[date, ...]:
+        """枚举闭区间内全部自然日。入参：边界日期。返回值：升序日期。异常：无。"""
+        return tuple(
+            start + timedelta(days=offset)
+            for offset in range((end - start).days + 1)
+        )
 
 
 class TushareCalendarPolicy:

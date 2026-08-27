@@ -83,6 +83,7 @@ _MODULE_FUNCTION_ALLOWLIST: Mapping[str, str] = {
     "quant_research.data.quality.rules.daily_bar_value_issues": "stable_public_api",
     "quant_research.data.quality.rules.coverage_issues": "stable_public_api",
     "quant_research.data.quality.rules.financial_availability_issues": "stable_public_api",
+    "quant_research.data.quality.rules.dividend_event_issues": "stable_public_api",
     "quant_research.data.quality.rules.industry_state_issues": "stable_public_api",
     "quant_research.data.storage.verified_files.open_verified_file": "stable_public_api",
     "quant_research.data.storage.paths.resolved_storage_root": "stable_public_api",

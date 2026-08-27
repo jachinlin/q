@@ -81,6 +81,11 @@ class DatasetKind(StrEnum):
     STOCK_SUSPENSION = "stock_suspension"
     STOCK_RISK_WARNING = "stock_risk_warning"
     STOCK_FINANCIAL_INDICATOR = "stock_financial_indicator"
+    STOCK_INCOME_STATEMENT = "stock_income_statement"
+    STOCK_BALANCE_SHEET = "stock_balance_sheet"
+    STOCK_CASH_FLOW_STATEMENT = "stock_cash_flow_statement"
+    STOCK_DIVIDEND = "stock_dividend"
+    FUND_DIVIDEND = "fund_dividend"
     INDUSTRY_CATALOG = "industry_catalog"
     INDUSTRY_MEMBERSHIP = "industry_membership"
 

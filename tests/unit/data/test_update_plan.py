@@ -19,6 +19,7 @@ from quant_research.domain.enums import DatasetKind
 from quant_research.domain.errors import QuantError
 from quant_research.infrastructure.persistence.repositories import (
     CanonicalDatasetRecord,
+    DataInitializationStateRecord,
 )
 from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 
@@ -29,6 +30,14 @@ _SNAPSHOT_DATASETS = frozenset(
         DatasetKind.INDEX_MASTER,
         DatasetKind.INDUSTRY_CATALOG,
         DatasetKind.INDUSTRY_MEMBERSHIP,
+    }
+)
+_DISCLOSURE_DATASETS = frozenset(
+    {
+        DatasetKind.STOCK_FINANCIAL_INDICATOR,
+        DatasetKind.STOCK_INCOME_STATEMENT,
+        DatasetKind.STOCK_BALANCE_SHEET,
+        DatasetKind.STOCK_CASH_FLOW_STATEMENT,
     }
 )
 
@@ -67,8 +76,22 @@ class _Repository:
             updated_at=datetime(2026, 8, 11, tzinfo=UTC),
         )
 
-    def find_data_initialization(self) -> None:
+    def find_data_initialization(self) -> DataInitializationStateRecord | None:
         return None
+
+
+class _CompletedOldRepository(_Repository):
+    def find_data_initialization(self) -> DataInitializationStateRecord:
+        return DataInitializationStateRecord(
+            status="COMPLETED",
+            years=5,
+            start_date=date(2021, 8, 14),
+            end_date=date(2026, 8, 14),
+            started_at=datetime(2026, 8, 15, tzinfo=UTC),
+            completed_at=datetime(2026, 8, 16, tzinfo=UTC),
+            catalog_hash="a" * 64,
+            quality_run_id=None,
+        )
 
 
 def _planner(
@@ -93,12 +116,12 @@ def test_auto_plan_freezes_each_dataset_window_without_null_parameters() -> None
             item.value
             for item in DATASET_CATALOG
             if TUSHARE_ROUTES[item]
-            and item is not DatasetKind.STOCK_FINANCIAL_INDICATOR
+            and item not in _DISCLOSURE_DATASETS
         )
     )
     assert tuple(item.dataset.value for item in plan.dataset_windows) == expected
-    assert tuple(item.dataset for item in plan.skipped_datasets) == (
-        DatasetKind.STOCK_FINANCIAL_INDICATOR,
+    assert tuple(item.dataset for item in plan.skipped_datasets) == tuple(
+        sorted(_DISCLOSURE_DATASETS, key=lambda item: item.value)
     )
     assert plan.skipped_datasets[0].trigger_date == date(2026, 8, 31)
     instrument = next(
@@ -147,6 +170,26 @@ def test_partial_auto_plan_rejects_an_incomplete_global_baseline() -> None:
 
     assert captured.value.detail.code == "DATA_UPDATE_REQUIRES_BOOTSTRAP"
     assert DatasetKind.STOCK_MASTER in repository.requested
+
+
+def test_completed_old_catalog_requires_a_new_data_root() -> None:
+    repository = _CompletedOldRepository(
+        frozenset(
+            {
+                DatasetKind.STOCK_INCOME_STATEMENT,
+                DatasetKind.STOCK_BALANCE_SHEET,
+                DatasetKind.STOCK_CASH_FLOW_STATEMENT,
+                DatasetKind.STOCK_DIVIDEND,
+                DatasetKind.FUND_DIVIDEND,
+            }
+        )
+    )
+
+    with pytest.raises(QuantError) as captured:
+        _planner(repository).plan(start=None, end=None)
+
+    assert captured.value.detail.code == "DATA_ROOT_SCHEMA_CHANGED"
+    assert "new QUANT_DATA_ROOT" in captured.value.detail.remediation
 
 
 def test_bootstrap_plan_uses_required_years_and_freezes_base_window() -> None:

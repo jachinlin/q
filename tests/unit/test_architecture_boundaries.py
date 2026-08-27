@@ -117,4 +117,5 @@ def test_data_layer_package_layout() -> None:
         "baostock" in path.name.lower()
         for path in (data_root / "sources").rglob("*.py")
     )
-    assert (_PACKAGE_ROOT / "infrastructure" / "baostock").is_dir()
+    assert (_PACKAGE_ROOT / "infrastructure" / "tushare").is_dir()
+    assert not (_PACKAGE_ROOT / "infrastructure" / "baostock").exists()

@@ -141,7 +141,7 @@ LOCALIZE → CURATE → VALIDATE
 
 ## 4. Canonical 数据集目录
 
-Canonical 表示“项目内部唯一认可的标准形式”。以下 15 个数据集构成当前数据目录。
+Canonical 表示“项目内部唯一认可的标准形式”。以下 20 个数据集构成当前数据目录。
 
 | Canonical 数据集 | Tushare 端点 | 内容与量化用途 | 采集粒度 | Canonical 分区 |
 |---|---|---|---|---|
@@ -158,6 +158,11 @@ Canonical 表示“项目内部唯一认可的标准形式”。以下 15 个数
 | `stock_suspension` | `suspend_d` | 股票停牌事件 | 每个交易日一次全市场请求 | `year=<YYYY>` |
 | `stock_risk_warning` | `stock_st` | ST 等风险警示事件 | 每个交易日一次全市场请求 | `year=<YYYY>` |
 | `stock_financial_indicator` | `fina_indicator_vip` | ROE、利润率、偿债和成长等财务指标 | 每个报告期一次全市场请求 | `report_year=<YYYY>` |
+| `stock_income_statement` | `income_vip` | 收入、成本和利润；回答“一段时间赚了多少钱” | 每个报告期一次全市场合并报表请求 | `report_year=<YYYY>` |
+| `stock_balance_sheet` | `balancesheet_vip` | 资产、负债和股东权益；回答“报告期末拥有什么、欠什么” | 每个报告期一次全市场合并报表请求 | `report_year=<YYYY>` |
+| `stock_cash_flow_statement` | `cashflow_vip` | 经营、投资和筹资现金流；回答“现金从哪里来、到哪里去” | 每个报告期一次全市场合并报表请求 | `report_year=<YYYY>` |
+| `stock_dividend` | `dividend` | 股票送转、现金分红及实施日期 | 按公告日和实施公告日逐自然日全市场请求 | `announcement_year=<YYYY>` |
+| `fund_dividend` | `fund_div` | 场内基金现金分红及支付日期 | 按公告日、除息日和支付日逐自然日全市场请求 | `announcement_year=<YYYY>` |
 | `industry_catalog` | `index_classify` | 申万 2021 行业层级与代码目录 | 一级行业全量快照 | `all` |
 | `industry_membership` | `index_member_all` | 股票进入、退出各级行业的关系 | 按一级行业切片 | `all` |
 
@@ -170,6 +175,10 @@ Canonical 表示“项目内部唯一认可的标准形式”。以下 15 个数
 - 研究股票池不会反向决定我们保存哪些原始数据。
 
 因此，除 `index_daily` 外，采集请求不得携带 `ts_code`。行业成员可以因行数限制按一级行业切片，但不能按股票切片。
+
+三张财务报表使用 VIP 全市场端点，并显式传递 `report_type=1`，只保存上市公司合并报表。股票分红按 `ann_date`、`imp_ann_date` 两种事件日期切片；基金分红按 `ann_date`、`ex_date`、`pay_date` 三种日期切片。不同切片可能返回同一业务记录，CURATE 会按业务内容去重。基金端点同时返回场内基金和以 `.OF` 结尾的场外基金；Raw 保留完整供应商响应，`fund_dividend` Canonical 只接纳 `.SH`、`.SZ`、`.BJ`。
+
+字段和参数以 Tushare 官方的[利润表](https://tushare.pro/document/2?doc_id=33)、[资产负债表](https://tushare.pro/document/2?doc_id=36)、[现金流量表](https://tushare.pro/document/2?doc_id=44)、[股票分红](https://tushare.pro/document/2?doc_id=103)和[基金分红](https://tushare.pro/document/2?doc_id=120)文档为准。当前代理会省略利润表中少量官方非默认字段；客户端把这组已确认字段补为 `null`，其他字段缺失仍按 Schema 漂移失败关闭。
 
 ETF 策略池和股票池只在 Canonical 数据已经发布后过滤。例如策略只研究 20 只 ETF，也仍然采集全部场内基金行情。
 
@@ -252,7 +261,7 @@ CURATE 从 Raw 读取数据，并执行以下步骤：
 3. 重命名字段并转换日期、类型和单位；
 4. 添加审计列；
 5. 按稳定键排序；
-6. 按年、报告年或 `all` 生成分区；
+6. 按交易年、报告年、公告年或 `all` 生成分区；
 7. 计算输入和输出哈希；
 8. 在临时目录完成写入和校验后原子发布；
 9. 更新 SQLite 中唯一的当前分区指针。
@@ -275,6 +284,19 @@ vol       → volume
 ```text
 ts_code → index_id
 ```
+
+财务报表的公共字段使用：
+
+```text
+ts_code    → instrument_id
+ann_date   → announcement_date
+f_ann_date → actual_announcement_date
+end_date   → report_period
+comp_type  → company_type
+end_type   → report_period_type
+```
+
+其余报表科目沿用 Tushare 官方字段名，金额保持官方的元单位。系统不把累计报表自动拆成单季度报表，避免把会计口径推导伪装成供应商事实。股票分红的 `base_share` 从万股转为股，基金分红的 `base_unit` 从万份转为份。
 
 字段不是运行时随意猜测的。每个端点的完整输出字段在代码中显式声明，Canonical Schema 也显式规定列顺序和类型。供应商突然增加、删除或改变字段时，流水线应失败并要求开发者检查，而不是悄悄生成含义未知的数据。
 
@@ -322,10 +344,13 @@ $QUANT_DATA_ROOT/
 ```text
 canonical/source=tushare/dataset=stock_master/all/<hash>.parquet
 canonical/source=tushare/dataset=stock_financial_indicator/report_year=2025/<hash>.parquet
+canonical/source=tushare/dataset=stock_income_statement/report_year=2025/<hash>.parquet
+canonical/source=tushare/dataset=stock_dividend/announcement_year=2026/<hash>.parquet
+canonical/source=tushare/dataset=fund_dividend/announcement_year=2026/<hash>.parquet
 canonical/source=tushare/dataset=industry_membership/all/<hash>.parquet
 ```
 
-旧路径 `canonical/dataset=...` 和其他供应商命名空间不会迁移。检测到旧布局时，系统要求使用新的 `QUANT_DATA_ROOT` 并重新 bootstrap，避免一套目录里存在两种语义。
+旧路径 `canonical/dataset=...` 和其他供应商命名空间不会迁移。已经完成 15 数据集 bootstrap 的旧数据根也不会原地补齐到 20 个数据集：系统会报告数据目录语义已经变化，要求选择新的 `QUANT_DATA_ROOT`、重新配置设置并完整 bootstrap。这样可以避免同一目录身份同时代表两套数据契约。
 
 ## 7. VALIDATE：在研究读取前做质量门禁
 
@@ -340,6 +365,8 @@ Canonical 文件成功写出不代表数据一定正确。VALIDATE 会检查数�
 - `pct_change` 是否与 `close / preclose - 1` 一致；
 - 股票和基金行情代码是否存在于相应 Master；
 - 财务公告日期和可用时间是否合理；
+- 三张报表是否为 `report_type=1`、报告期是否为合法季末；
+- 分红数值是否非负、事件日期顺序和场内证券后缀是否合理；
 - 行业进入、退出状态是否自洽。
 
 两个命令的作用不同：
@@ -417,7 +444,7 @@ lower = round_to_tick(preclose × (1 - limit_rate))
 
 PIT 是 Point-in-Time 的缩写，意思是“站在某个历史时点看，当时能知道什么”。
 
-### 9.1 财务指标例子
+### 9.1 财务报表与公告时间
 
 一家公司的 2025 年年报报告期是 2025-12-31，但可能到 2026-03-30 才公告。
 
@@ -425,9 +452,21 @@ PIT 是 Point-in-Time 的缩写，意思是“站在某个历史时点看，当�
 
 正确做法：只有公告和可用时间不晚于研究观察时点，数据才可见。
 
-`stock_financial_indicators(as_of=...)` 根据观察日过滤可见修订，而不是简单按报告期过滤。
+`report_period` 是报表描述的会计截止日，不是研究者获得信息的日期。`announcement_date` 是公告日期；供应商提供 `actual_announcement_date` 时，系统优先用它生成 `available_at`。`stock_financial_indicators(as_of=...)` 和三张报表接口都根据观察日过滤可见修订，而不是简单按报告期过滤。
 
-### 9.2 行业成员例子
+报表可能被更正。Raw 层保留同一请求的历史响应，CURATE 先消除业务内容完全相同的重复记录，再为同一股票、报告期和报表类型确定性编号 `revision`。研究接口只返回观察时点已经可见的最新 revision。
+
+### 9.2 分红日期怎样理解
+
+- 公告日：公司或基金首次公开方案，决定信息何时进入研究视野；
+- 股权/权益登记日：在该日登记在册的持有人获得权益；
+- 除权除息日：价格或净值开始反映权益已经分离；
+- 支付日：现金实际发放；
+- 实施公告日：方案进入实施阶段时的公告日期。
+
+分红 Canonical 优先用实施公告日作为该条实施信息的 `available_at`，没有实施公告日时回退到公告日。预案、取消或尚未实施的记录可以没有登记、除息或支付日期，不能因此伪造日期。
+
+### 9.3 行业成员例子
 
 股票可能在历史上进入或退出某个行业。`industry_membership` 保存 `in_date`、`out_date` 及相应可用时间，`industry_memberships_on_dates(...)` 按查询日期重建当时有效的行业关系。
 
@@ -442,7 +481,8 @@ PIT 是 Point-in-Time 的缩写，意思是“站在某个历史时点看，当�
 | 股票、基金、指数 Master | 每日检查 | 全量刷新 | 0 天 |
 | 交易日历 | 每日 | 追加并允许尾部修订 | 30 天 |
 | 日行情、复权因子、每日指标和事件 | 每个交易日 | 追加并允许尾部修订 | 5 天 |
-| 财务指标 | 季度披露触发 | 追加并允许历史重述 | 按报告期 |
+| 财务指标和三张财务报表 | 季度披露触发 | 追加并允许历史重述 | 按报告期 |
+| 股票和场内基金分红 | 每个自然日 | 追加并允许历史重述 | 7 天 |
 | 行业目录和成员 | 每周 | 全量刷新 | 0 天 |
 
 “回看 5 天”表示更新时不仅抓最新一天，也重新抓最近几天，以吸收供应商对尾部数据的修订。
@@ -458,6 +498,7 @@ CURATE 不会无条件重写全部历史。每个 Canonical 分区记录其 Raw 
 - 行情按最近完整交易会话判断；
 - 交易日历需要覆盖未来规划窗口；
 - 财务数据按披露截止日判断是否应该更新；
+- 分红更新到前一完整自然日，而不是只覆盖交易日；
 - 快照类数据按最近成功刷新时间判断。
 
 ## 11. 数据身份与可重复性
@@ -471,7 +512,7 @@ CURATE 不会无条件重写全部历史。每个 Canonical 分区记录其 Raw 
 | Canonical `input_hash` | 生成该分区的 Raw 输入集合是否变化？ |
 | 分区 `content_hash` | 清洗后的分区内容是否变化？ |
 | 数据集 `data_hash` | 该数据集当前全部分区的组合是否变化？ |
-| `catalog_hash` | 15 个当前 Canonical 数据集的整体身份是否变化？ |
+| `catalog_hash` | 20 个当前 Canonical 数据集的整体身份是否变化？ |
 
 绝对路径不参与这些哈希。相同内容从 `D:` 盘移动到 `E:` 盘不会变成不同数据。
 
@@ -512,6 +553,11 @@ stock_log_returns(...)
 fund_log_returns(...)
 stock_daily_basics(...)
 stock_financial_indicators(as_of, ...)
+stock_income_statements(as_of, ...)
+stock_balance_sheets(as_of, ...)
+stock_cash_flow_statements(as_of, ...)
+stock_dividends(as_of, ...)
+fund_dividends(as_of, ...)
 stock_suspensions(...)
 stock_risk_warnings(...)
 industry_catalog()

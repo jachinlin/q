@@ -47,7 +47,7 @@ class CanonicalMapper(Protocol):
     def candidate_partition_keys(
         self, dataset: DatasetKind, raw_partition: PublishedPartition
     ) -> tuple[str, ...]:
-        """在不读取 Raw 文件的情况下推导候选 Canonical 分区键。
+        """根据 Raw 发布信息推导候选 Canonical 分区键。
 
         入参：
             dataset：目标 Canonical 数据集标识。
@@ -55,7 +55,8 @@ class CanonicalMapper(Protocol):
         返回值：
             返回分区``keys``（``tuple[str, ...]``）。
         异常：
-            实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
+            实现可读取形成分区键所需的最小 Raw 字段，并传播参数校验、目录状态或
+            文件完整性异常。
         """
 
     def raw_head_is_usable(

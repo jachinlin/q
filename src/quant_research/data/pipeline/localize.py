@@ -159,6 +159,9 @@ class LocalizePlanExecutor:
             FetchPlan.REPORT_PERIOD: _EndpointRangePlan(
                 FetchPlan.REPORT_PERIOD.value
             ),
+            FetchPlan.CALENDAR_EVENT_DATE: _EndpointRangePlan(
+                FetchPlan.CALENDAR_EVENT_DATE.value
+            ),
             FetchPlan.INDUSTRY_L1: _EndpointRangePlan(FetchPlan.INDUSTRY_L1.value),
         }
     )

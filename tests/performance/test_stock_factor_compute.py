@@ -66,7 +66,7 @@ class _SyntheticInputs:
         self.market_reads += 1
         return self._market.lazy()
 
-    def daily_basics(
+    def stock_daily_basics(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
@@ -76,7 +76,7 @@ class _SyntheticInputs:
         self.basics_reads += 1
         return self._basics.lazy()
 
-    def bars(
+    def stock_bars(
         self,
         instruments: Sequence[InstrumentId],
         start: date,
@@ -100,13 +100,12 @@ class _SyntheticInputs:
             schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
         ).lazy()
 
-    def financial_history(
+    def stock_financial_indicators(
         self,
-        field_ids: Sequence[str],
         as_of: date,
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
-        del field_ids, as_of, instruments
+        del as_of, instruments
         self.financial_reads += 1
         return self._financials.lazy()
 
@@ -162,7 +161,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
         "trade_date",
         "instrument_id",
         pl.lit(10.0).alias("pe_ttm"),
-        pl.lit(2.0).alias("pb_mrq"),
+        pl.lit(2.0).alias("pb"),
         "available_at",
     )
     financial_rows = []
@@ -172,8 +171,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
                 {
                     "instrument_id": instrument.canonical(),
                     "report_period": session,
-                    "metric": "dupont_roe",
-                    "value": 0.10 + (revision % 5) / 100.0,
+                    "roe": 0.10 + (revision % 5) / 100.0,
                     "revision": revision,
                     "available_at": datetime(
                         session.year, session.month, session.day, 8, tzinfo=UTC
@@ -185,8 +183,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
         schema={
             "instrument_id": pl.String,
             "report_period": pl.Date,
-            "metric": pl.String,
-            "value": pl.Float64,
+            "roe": pl.Float64,
             "revision": pl.Int64,
             "available_at": pl.Datetime("us", "UTC"),
         },
