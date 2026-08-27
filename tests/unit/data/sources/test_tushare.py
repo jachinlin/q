@@ -125,8 +125,8 @@ def test_dividend_requests_slice_each_calendar_event_date_without_ts_code() -> N
     assert all("ts_code" not in item for item in (*stock, *fund))
 
 
-@pytest.mark.parametrize("endpoint", ("dividend", "fund_div"))
-def test_dividend_endpoints_accept_empty_provider_frame_without_columns(
+@pytest.mark.parametrize("endpoint", ("dividend", "fund_div", "stock_st"))
+def test_known_empty_endpoints_accept_provider_frame_without_columns(
     endpoint: str,
 ) -> None:
     class _EmptyGateway(_Gateway):
