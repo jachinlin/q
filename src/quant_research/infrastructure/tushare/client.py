@@ -79,6 +79,7 @@ _PAGINATED_PAGE_LIMITS: Mapping[str, int] = {
     "fund_daily": 5000,
     "fund_adj": 2000,
 }
+_EMPTY_SCHEMA_ALLOWED_ENDPOINTS = frozenset({"index_member_all"})
 _MAX_PAGES = 100
 
 _FIELDS: Mapping[str, tuple[str, ...]] = {
@@ -625,12 +626,19 @@ class TushareClient:
         """执行一个真实供应商页面并严格核对字段顺序。"""
         frame = self._call_with_retry(endpoint, params, fields)
         observed_columns = tuple(str(item) for item in frame.columns)
+        records = frame.to_dict("records")
+        if (
+            endpoint in _EMPTY_SCHEMA_ALLOWED_ENDPOINTS
+            and not observed_columns
+            and not records
+        ):
+            return []
         if observed_columns != fields:
             raise ValueError(
                 f"Tushare {endpoint} schema drift: expected={fields}, "
                 f"observed={observed_columns}"
             )
-        return frame.to_dict("records")
+        return records
 
     @staticmethod
     def _validate_paginated_keys(

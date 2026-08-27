@@ -298,6 +298,83 @@ def test_industry_membership_uses_complete_si_codes_and_both_history_slices() ->
     } >= {("801010.SI", "Y"), ("801010.SI", "N")}
 
 
+def test_industry_membership_accepts_empty_provider_frame_without_columns() -> None:
+    class _EmptyMembershipGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, params, fields
+            assert endpoint == "index_member_all"
+            return _Frame(())
+
+    client = TushareClient(
+        _EmptyMembershipGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = next(
+        item
+        for item in client.requests(
+            "index_member_all",
+            date(2026, 8, 25),
+            date(2026, 8, 25),
+        )
+        if item["l1_code"] == "801780.SI" and item["is_new"] == "N"
+    )
+
+    batch = next(iter(client.fetch("index_member_all", request)))
+
+    assert batch.schema == tuple(str(request["fields"]).split(","))
+    assert batch.rows == ()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "observed_columns"),
+    (("daily", ()), ("index_member_all", ("l1_code",))),
+)
+def test_empty_provider_frame_still_rejects_unapproved_schema(
+    endpoint: str,
+    observed_columns: tuple[str, ...],
+) -> None:
+    class _UnexpectedEmptyGateway(_Gateway):
+        def call(
+            self,
+            api: object,
+            actual_endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api, params, fields
+            assert actual_endpoint == endpoint
+            return _Frame(observed_columns)
+
+    client = TushareClient(
+        _UnexpectedEmptyGateway(),
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = client.requests(
+        endpoint,
+        date(2026, 8, 25),
+        date(2026, 8, 25),
+    )[0]
+
+    with pytest.raises(ValueError, match="schema drift"):
+        tuple(client.fetch(endpoint, request))
+
+
 def test_fund_adjustment_factor_paginates_and_rate_limits_every_page() -> None:
     class _PaginatedGateway(_Gateway):
         def __init__(self) -> None:
