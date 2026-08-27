@@ -145,6 +145,8 @@ describe('runtime center', () => {
     expect(headers).toContain('任务')
     expect(headers).toContain('关联')
     expect(headers).not.toContain('任务 / 关联')
+    expect(headers).not.toContain('Worker / 心跳')
+    expect(headers).not.toContain('失败原因')
     expect(wrapper.find('.task-link').element.closest('td'))
       .not.toBe(wrapper.find('.association-cell').element.closest('td'))
     expect(wrapper.find('.association-cell').text()).toContain('EXPERIMENT_RUN · research')
@@ -228,7 +230,6 @@ describe('runtime center', () => {
   it('highlights failures and automatically diagnoses the latest failed attempt', async () => {
     const wrapper = await mountRuntimeCenter()
     expect(wrapper.text()).toContain('任务运行与异常诊断')
-    expect(wrapper.text()).toContain('DATA_HASH_DRIFT')
     expect(wrapper.find('.runtime-row-failed').exists()).toBe(true)
 
     await wrapper.find('.task-link').trigger('click')
@@ -237,6 +238,7 @@ describe('runtime center', () => {
     ))
     await flushPromises()
 
+    expect(document.body.textContent).toContain('DATA_HASH_DRIFT')
     expect(document.body.textContent).toContain('validated catalog is stale')
     expect(document.body.textContent).toContain('run validate-all before retrying')
     const traceback = document.body.querySelector('.traceback-details')

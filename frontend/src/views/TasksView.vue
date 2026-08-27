@@ -204,10 +204,6 @@ function errorCode(task: { error: Record<string, unknown> | null }) {
   return textField(task.error, 'code')
 }
 
-function errorMessage(task: { error: Record<string, unknown> | null }) {
-  return textField(task.error, 'message')
-}
-
 function fallbackRemediation(task: Task) {
   return task.status === 'ORPHANED'
     ? '确认 Worker 已停止并检查临时产物，再执行孤儿任务重试。'
@@ -390,14 +386,14 @@ onUnmounted(() => {
         <header class="panel-heading">
           <div>
             <h2>任务运行与异常诊断</h2>
-            <p>状态每 3 秒刷新；失败原因来自安全摘要，完整证据在任务详情中查看</p>
+            <p>状态每 3 秒刷新；Worker、失败诊断和完整证据在任务详情中查看</p>
           </div>
           <el-select v-model="status" clearable placeholder="全部状态" style="width:170px" @change="page = 1">
             <el-option v-for="item in taskStatuses" :key="item" :label="item" :value="item" />
           </el-select>
         </header>
-        <el-table :data="query.data.value?.items ?? []" :row-class-name="rowClassName" height="600">
-          <el-table-column label="任务" min-width="135">
+        <el-table class="runtime-table" :data="query.data.value?.items ?? []" :row-class-name="rowClassName" height="600">
+          <el-table-column label="任务" width="170">
             <template #default="scope">
               <button class="task-link" type="button" @click="openDetail(scope.row)">
                 <strong>{{ scope.row.task_type }}</strong>
@@ -405,7 +401,7 @@ onUnmounted(() => {
               </button>
             </template>
           </el-table-column>
-          <el-table-column label="关联" min-width="135">
+          <el-table-column label="关联" width="135">
             <template #default="scope">
               <div class="association-cell">
                 <span v-if="scope.row.subject_kind" class="experiment-link">
@@ -415,10 +411,10 @@ onUnmounted(() => {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="状态" width="118">
+          <el-table-column label="状态" width="95" align="center">
             <template #default="scope"><StatusBadge :status="scope.row.status" /></template>
           </el-table-column>
-          <el-table-column label="阶段与进度" min-width="190">
+          <el-table-column label="阶段与进度" min-width="340">
             <template #default="scope">
               <DataTaskProgress v-if="isDataTask(scope.row)" :task="scope.row" mode="compact" />
               <div v-else class="progress-cell">
@@ -427,24 +423,10 @@ onUnmounted(() => {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="运行时长" width="112">
+          <el-table-column label="运行时长" width="88" align="center">
             <template #default="scope"><span class="tabular">{{ duration(scope.row.started_at, scope.row.completed_at) }}</span></template>
           </el-table-column>
-          <el-table-column label="Worker / 心跳" min-width="165">
-            <template #default="scope">
-              <div class="runtime-meta"><span>{{ scope.row.worker_id ?? '—' }}</span><small>{{ formatTime(scope.row.heartbeat_at) }}</small></div>
-            </template>
-          </el-table-column>
-          <el-table-column label="失败原因" min-width="235">
-            <template #default="scope">
-              <div v-if="errorCode(scope.row)" class="failure-cell">
-                <code>{{ errorCode(scope.row) }}</code>
-                <span>{{ errorMessage(scope.row) ?? (boolField(scope.row.error, 'retryable') ? '可安全重试' : '打开详情查看诊断') }}</span>
-              </div>
-              <span v-else class="muted-value">—</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="190" fixed="right">
+          <el-table-column label="操作" width="118" align="center">
             <template #default="scope">
               <el-button v-if="['QUEUED','RUNNING'].includes(scope.row.status)" text type="danger" @click="cancelTask(scope.row)">取消</el-button>
               <el-button v-if="['SUCCEEDED','FAILED','CANCELLED','ORPHANED'].includes(scope.row.status)" text type="primary" @click="retryTask(scope.row)">{{ scope.row.status === 'SUCCEEDED' ? '再次运行' : '重试' }}</el-button>
@@ -614,7 +596,7 @@ onUnmounted(() => {
 
 <style scoped>
 .runtime-overview{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}.runtime-stat{position:relative;min-height:92px;padding:16px 18px;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--muted);text-align:left;cursor:pointer;overflow:hidden}.runtime-stat::after{content:"";position:absolute;width:62px;height:62px;right:-18px;bottom:-24px;border-radius:50%;background:var(--accent,var(--dim));opacity:.11}.runtime-stat span{display:block;font-size:11px}.runtime-stat strong{display:block;margin-top:10px;color:var(--text);font-size:26px}.runtime-stat.active{border-color:var(--accent,var(--blue));box-shadow:0 0 0 2px color-mix(in srgb,var(--accent,var(--blue)) 12%,transparent)}.tone-blue{--accent:var(--blue)}.tone-cyan{--accent:var(--cyan)}.tone-danger{--accent:var(--danger)}.tone-warning{--accent:var(--warning)}
-.task-link{display:flex;flex-direction:column;gap:4px;padding:0;border:0;background:none;color:var(--text);text-align:left;cursor:pointer}.task-link span{color:var(--dim);font:10px ui-monospace,Consolas,monospace}.task-link:hover strong{color:var(--cyan)}.association-cell{display:flex;flex-direction:column;align-items:flex-start;gap:4px}.experiment-link{display:inline-block;color:var(--blue);font-size:10px;text-decoration:none}.progress-cell span{width:76px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);font-size:10px}.runtime-meta,.failure-cell{display:flex;flex-direction:column;gap:4px}.runtime-meta small,.failure-cell span{color:var(--dim);font-size:10px}.failure-cell code{color:var(--danger);font-size:10px;overflow-wrap:anywhere}.muted-value{color:var(--dim)}.pagination-row{display:flex;justify-content:flex-end;padding:14px 0}.runtime-center :deep(.runtime-row-failed td.el-table__cell){background:rgba(214,59,86,.045)}.runtime-center :deep(.runtime-row-orphaned td.el-table__cell){background:rgba(169,109,10,.06)}.runtime-center :deep(.runtime-row-running td.el-table__cell:first-child){box-shadow:inset 3px 0 var(--blue)}
+.task-link{display:flex;flex-direction:column;gap:4px;padding:0;border:0;background:none;color:var(--text);text-align:left;cursor:pointer}.task-link span{color:var(--dim);font:10px ui-monospace,Consolas,monospace}.task-link:hover strong{color:var(--cyan)}.association-cell{display:flex;flex-direction:column;align-items:flex-start;gap:4px}.experiment-link{display:inline-block;color:var(--blue);font-size:10px;text-decoration:none}.progress-cell span{width:76px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);font-size:10px}.muted-value{color:var(--dim)}.pagination-row{display:flex;justify-content:flex-end;padding:14px 0}.runtime-table :deep(.el-table__cell){padding-top:13px;padding-bottom:13px}.runtime-table :deep(.el-table__header .el-table__cell){padding-top:11px;padding-bottom:11px}.runtime-center :deep(.runtime-row-failed td.el-table__cell){background:rgba(214,59,86,.045)}.runtime-center :deep(.runtime-row-orphaned td.el-table__cell){background:rgba(169,109,10,.06)}.runtime-center :deep(.runtime-row-running td.el-table__cell:first-child){box-shadow:inset 3px 0 var(--blue)}
 .drawer-task{display:flex;justify-content:space-between;gap:18px;padding:18px;border:1px solid var(--border);border-radius:12px;background:var(--surface-raised)}.drawer-task h2{margin:6px 0 0;font:16px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.drawer-task p{margin:8px 0 0;color:var(--dim);font-size:11px}.drawer-task-actions{display:flex;flex-direction:column;align-items:flex-end;gap:12px}.drawer-task-actions a{text-decoration:none}.diagnostic-card{margin-top:14px;padding:18px;border:1px solid rgba(214,59,86,.28);border-radius:12px;background:rgba(214,59,86,.045)}.diagnostic-heading{display:flex;justify-content:space-between;gap:16px}.diagnostic-heading h3{margin:7px 0 0;font-size:15px;line-height:1.5}.diagnostic-grid{display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:12px;margin:16px 0 0}.diagnostic-grid div{min-width:0}.diagnostic-grid .wide{grid-column:1/-1}.diagnostic-grid dt{color:var(--dim);font-size:10px}.diagnostic-grid dd{margin:5px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.diagnostic-grid code{color:var(--danger)}.traceback-details{margin-top:14px;border-top:1px solid rgba(214,59,86,.18);padding-top:12px}.traceback-details summary{color:var(--blue);font-size:11px;cursor:pointer}.traceback-details pre{max-height:320px;overflow:auto;margin:12px 0 0;padding:12px;border-radius:8px;background:#fff;color:#3c4858;font:11px/1.65 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.runtime-tabs{margin-top:18px}.attempt-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:14px}.attempt-card{display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--muted);text-align:left;cursor:pointer}.attempt-card.selected{border-color:var(--blue);background:rgba(37,99,235,.045)}.attempt-card>span{display:flex;align-items:center;justify-content:space-between}.attempt-card small,.attempt-card em{color:var(--dim);font-size:10px;font-style:normal}.attempt-card code{color:var(--danger);font-size:10px}.log-section{display:flex;flex-direction:column;gap:10px}.log-toolbar{display:flex;align-items:center;justify-content:space-between}.log-toolbar>div{display:flex;flex-direction:column;gap:4px}.log-toolbar strong{font-size:12px}.log-toolbar span{color:var(--dim);font-size:10px}.log-empty{display:grid;min-height:120px;place-items:center;border:1px dashed var(--border);border-radius:9px;color:var(--dim);font-size:12px;background:var(--surface-raised)}
 .parameter-panel{margin-top:14px;padding:16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-raised)}.parameter-panel>header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.parameter-panel h3{margin:5px 0 0;font-size:14px}.readonly-pill{padding:5px 7px;border-radius:5px;color:#708198;background:#edf1f6;font-size:8px;letter-spacing:.1em}.parameter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:14px 0 0}.parameter-item{min-width:0;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.parameter-item dt{color:var(--dim);font-size:10px}.parameter-item dd{margin:6px 0 0;overflow:hidden;color:var(--muted);font-size:11px;overflow-wrap:anywhere}.parameter-item code{white-space:pre-wrap}.parameter-json{margin-top:12px;border-top:1px solid var(--border);padding-top:11px}.parameter-json summary{color:var(--blue);font-size:11px;cursor:pointer}.parameter-json pre{max-height:320px;overflow:auto;margin:10px 0 0;padding:12px;border-radius:8px;background:#fff;color:#3c4858;font:11px/1.65 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.parameter-empty{display:grid;min-height:92px;place-items:center;margin-top:12px;border:1px dashed var(--border);border-radius:8px;color:var(--dim);font-size:11px;background:var(--surface)}
 .update-parameter-summary{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.update-parameter-summary>div{padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.update-parameter-summary .wide{grid-column:1/-1}.update-parameter-summary dt{color:var(--dim);font-size:10px}.update-parameter-summary dd{margin:6px 0 0;color:var(--muted);font-size:11px}.update-window-table{margin-top:12px}
