@@ -706,6 +706,55 @@ def test_fund_adjustment_factor_paginates_and_rate_limits_every_page() -> None:
     assert limiter.calls == 2
 
 
+@pytest.mark.parametrize("endpoint", ("dividend", "fund_div"))
+def test_dividend_endpoints_paginate_without_changing_logical_request(
+    endpoint: str,
+) -> None:
+    class _PaginatedDividendGateway(_Gateway):
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def call(
+            self,
+            api: object,
+            called_endpoint: str,
+            params: Mapping[str, JsonValue],
+            fields: tuple[str, ...],
+        ) -> _Frame:
+            del api
+            assert called_endpoint == endpoint
+            limit = int(params["limit"])
+            offset = int(params["offset"])
+            self.calls.append((limit, offset))
+            count = 2000 if offset == 0 else 7
+            records = [
+                {"ts_code": f"ITEM{offset + index:06d}.SH"}
+                for index in range(count)
+            ]
+            return _Frame(fields, records)
+
+    gateway = _PaginatedDividendGateway()
+    client = TushareClient(
+        gateway,
+        TushareConfig(
+            token="token",
+            benchmark_indexes=("000300.SH",),
+            max_attempts=1,
+            retry_backoff_seconds=(),
+        ),
+    )
+    request = client.requests(endpoint, date(2026, 8, 25), date(2026, 8, 25))[0]
+    client.login()
+
+    batch = next(iter(client.fetch(endpoint, request)))
+
+    assert "limit" not in request
+    assert "offset" not in request
+    assert len(batch.rows) == 2007
+    assert batch.request == request
+    assert gateway.calls == [(2000, 0), (2000, 2000)]
+
+
 def test_fund_pagination_rejects_duplicate_cross_page_keys() -> None:
     class _DuplicateGateway(_Gateway):
         def call(

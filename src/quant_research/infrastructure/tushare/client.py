@@ -84,7 +84,10 @@ _ROW_LIMITS: Mapping[str, int] = {
 _PAGINATED_PAGE_LIMITS: Mapping[str, int] = {
     "fund_daily": 5000,
     "fund_adj": 2000,
+    "dividend": 2000,
+    "fund_div": 2000,
 }
+_IMPLICIT_PAGINATED_ENDPOINTS = frozenset({"dividend", "fund_div"})
 _EMPTY_SCHEMA_ALLOWED_ENDPOINTS = frozenset(
     {"index_member_all", "dividend", "fund_div"}
 )
@@ -715,7 +718,12 @@ class TushareClient:
                     f"Tushare {endpoint} response may be truncated at {limit}"
                 )
             return records
-        if params.get("limit") != page_limit or params.get("offset") != 0:
+        if endpoint in _IMPLICIT_PAGINATED_ENDPOINTS:
+            if "limit" in params or "offset" in params:
+                raise ValueError(
+                    f"Tushare {endpoint} logical request must omit pagination controls"
+                )
+        elif params.get("limit") != page_limit or params.get("offset") != 0:
             raise ValueError(
                 f"Tushare {endpoint} pagination must start at offset 0 "
                 f"with limit {page_limit}"
@@ -786,13 +794,29 @@ class TushareClient:
         endpoint: str,
         records: list[dict[str, object]],
     ) -> None:
-        """拒绝分页漂移造成的基金日期主键重复。"""
-        keys = [
-            (str(record.get("ts_code") or ""), str(record.get("trade_date") or ""))
-            for record in records
-        ]
-        if any(not code or not trade_date for code, trade_date in keys):
+        """拒绝分页漂移造成的空证券标识或跨页重复记录。"""
+        codes = [str(record.get("ts_code") or "") for record in records]
+        if any(not code for code in codes):
             raise ValueError(f"Tushare {endpoint} pagination returned an empty key")
+        keys: list[tuple[tuple[str, str], ...]]
+        if endpoint in {"fund_daily", "fund_adj"}:
+            trade_dates = [
+                str(record.get("trade_date") or "") for record in records
+            ]
+            if any(not trade_date for trade_date in trade_dates):
+                raise ValueError(f"Tushare {endpoint} pagination returned an empty key")
+            keys = [
+                (("ts_code", code), ("trade_date", trade_date))
+                for code, trade_date in zip(codes, trade_dates, strict=True)
+            ]
+        else:
+            keys = [
+                tuple(
+                    (field, str(value) if value is not None else "")
+                    for field, value in sorted(record.items())
+                )
+                for record in records
+            ]
         if len(keys) != len(set(keys)):
             raise ValueError(f"Tushare {endpoint} pagination returned duplicate keys")
 
