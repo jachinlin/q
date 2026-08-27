@@ -89,7 +89,7 @@ _PAGINATED_PAGE_LIMITS: Mapping[str, int] = {
 }
 _IMPLICIT_PAGINATED_ENDPOINTS = frozenset({"dividend", "fund_div"})
 _EMPTY_SCHEMA_ALLOWED_ENDPOINTS = frozenset(
-    {"index_member_all", "dividend", "fund_div", "stock_st"}
+    {"index_member_all", "dividend", "fund_div", "stock_st", "suspend_d"}
 )
 _OPTIONAL_RESPONSE_FIELDS: Mapping[str, frozenset[str]] = {
     "daily": frozenset({"ah_vol", "ah_amount"}),
