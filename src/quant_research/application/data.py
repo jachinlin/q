@@ -107,6 +107,14 @@ class _DataUpdateObserver(PipelineObserver):
     @staticmethod
     def _item_counts(kind: str, details: Mapping[str, JsonValue]) -> tuple[int, int]:
         """从不同活动详情中提取当前完成量和总量。"""
+        aggregate_completed = details.get("aggregate_completed")
+        aggregate_total = details.get("aggregate_total")
+        if (
+            kind == "raw_input"
+            and isinstance(aggregate_completed, int)
+            and isinstance(aggregate_total, int)
+        ):
+            return min(aggregate_completed, aggregate_total), aggregate_total
         keys = {
             "raw_request": ("completed_requests", "request_total"),
             "request_plan": ("completed_requests", "request_total"),
@@ -150,7 +158,21 @@ class _DataUpdateObserver(PipelineObserver):
             )
         if kind == "raw_input":
             verb = "正在清洗" if status == "STARTED" else "已清洗"
-            return f"{verb} {dataset.value} Raw {details.get('raw_index', 0)}/{details.get('raw_total', 0)}"
+            message = (
+                f"{verb} {dataset.value} Raw "
+                f"{details.get('raw_index', 0)}/{details.get('raw_total', 0)}"
+            )
+            aggregate_completed = details.get("aggregate_completed")
+            aggregate_total = details.get("aggregate_total")
+            active = details.get("active_concurrency")
+            maximum = details.get("max_concurrency")
+            if isinstance(aggregate_completed, int) and isinstance(
+                aggregate_total, int
+            ):
+                message += f" · 全局 {aggregate_completed}/{aggregate_total}"
+            if isinstance(active, int) and isinstance(maximum, int):
+                message += f" · 并发 {active}/{maximum}"
+            return message
         if kind == "canonical_partition":
             verb = "正在构建" if status == "STARTED" else "已构建"
             return f"{verb} {dataset.value} / {details.get('partition_key', 'unknown')}"

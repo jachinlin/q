@@ -7,7 +7,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
@@ -1194,6 +1194,154 @@ class _NullPipelineObserver:
         return False
 
 
+class _CurateProgressCoordinator:
+    """串行化并聚合并发数据集产生的 CURATE 观察事件。"""
+
+    def __init__(
+        self,
+        observer: PipelineObserver,
+        datasets: Sequence[DatasetKind],
+        *,
+        max_concurrency: int,
+        stop_event: threading.Event,
+    ) -> None:
+        self._observer = observer
+        self._ordinals = {
+            dataset: ordinal for ordinal, dataset in enumerate(datasets, start=1)
+        }
+        self._dataset_total = len(datasets)
+        self._raw_totals = dict.fromkeys(datasets, 0)
+        self._raw_completed = dict.fromkeys(datasets, 0)
+        self._max_concurrency = max_concurrency
+        self._stop_event = stop_event
+        self._active: set[DatasetKind] = set()
+        self._completed_datasets = 0
+        self._lock = threading.Lock()
+
+    def is_cancelled(self) -> bool:
+        """返回内部停止或调用方取消状态。"""
+        if self._stop_event.is_set():
+            return True
+        with self._lock:
+            return self._observer.is_cancelled()
+
+    def worker_started(self, dataset: DatasetKind) -> None:
+        """登记一个数据集线程已开始执行。"""
+        with self._lock:
+            self._active.add(dataset)
+
+    def worker_finished(self, dataset: DatasetKind) -> None:
+        """登记一个数据集线程已退出执行。"""
+        with self._lock:
+            self._active.discard(dataset)
+
+    def boundary(
+        self,
+        dataset: DatasetKind,
+        kind: str,
+        details: Mapping[str, JsonValue],
+    ) -> None:
+        """聚合并串行转发一个数据集的安全边界。"""
+        with self._lock:
+            values = dict(details)
+            if kind == "dataset" and values.get("status") == "STARTED":
+                values["dataset_index"] = self._ordinals[dataset]
+                values["dataset_total"] = self._dataset_total
+            if kind == "raw_input":
+                raw_total = values.get("raw_total")
+                raw_index = values.get("raw_index")
+                if isinstance(raw_total, int):
+                    self._raw_totals[dataset] = raw_total
+                if values.get("status") == "COMPLETED" and isinstance(raw_index, int):
+                    self._raw_completed[dataset] = raw_index
+                values["aggregate_completed"] = sum(self._raw_completed.values())
+                values["aggregate_total"] = sum(self._raw_totals.values())
+            values.update(self._concurrency_context())
+            self._observer.boundary(
+                "CURATE",
+                dataset,
+                kind,
+                values,
+            )
+
+    def dataset_completed(self, result: DatasetCurateResult) -> None:
+        """登记数据集完成并发布全局完成计数。"""
+        with self._lock:
+            self._active.discard(result.dataset)
+            self._completed_datasets += 1
+            self._observer.dataset_completed(
+                "CURATE",
+                result.dataset,
+                self._completed_datasets,
+                self._dataset_total,
+                {
+                    "content_hash": result.content_hash,
+                    "partitions": result.partitions,
+                    "rows": result.rows,
+                    "rebuilt_partitions": result.rebuilt_partitions,
+                    "reused_partitions": result.reused_partitions,
+                    "raw_inputs_read": result.raw_inputs_read,
+                    "aggregate_completed": sum(self._raw_completed.values()),
+                    "aggregate_total": sum(self._raw_totals.values()),
+                    **self._concurrency_context(),
+                },
+            )
+
+    def _concurrency_context(self) -> dict[str, JsonValue]:
+        active = sorted(dataset.value for dataset in self._active)
+        return {
+            "max_concurrency": self._max_concurrency,
+            "active_concurrency": len(active),
+            "active_datasets": cast(list[JsonValue], active),
+        }
+
+
+class _CurateWorkerObserver:
+    """把一个数据集线程的观察事件转交给全局 CURATE 协调器。"""
+
+    def __init__(
+        self,
+        dataset: DatasetKind,
+        coordinator: _CurateProgressCoordinator,
+    ) -> None:
+        self._dataset = dataset
+        self._coordinator = coordinator
+
+    def stage_started(self, stage: str, total: int) -> None:
+        del stage, total
+
+    def worker_started(self) -> None:
+        """通知协调器当前数据集线程已开始执行。"""
+        self._coordinator.worker_started(self._dataset)
+
+    def worker_finished(self) -> None:
+        """通知协调器当前数据集线程已退出执行。"""
+        self._coordinator.worker_finished(self._dataset)
+
+    def dataset_completed(
+        self,
+        stage: str,
+        dataset: DatasetKind,
+        completed: int,
+        total: int,
+        details: Mapping[str, JsonValue],
+    ) -> None:
+        del stage, dataset, completed, total, details
+
+    def boundary(
+        self,
+        stage: str,
+        dataset: DatasetKind,
+        kind: str,
+        details: Mapping[str, JsonValue],
+    ) -> None:
+        del stage, dataset
+        self._coordinator.boundary(self._dataset, kind, details)
+
+    def is_cancelled(self) -> bool:
+        return self._coordinator.is_cancelled()
+
+
 class DataPipeline:
     """编排可独立恢复的 LOCALIZE、CURATE 与 VALIDATE 阶段。
 
@@ -1210,6 +1358,7 @@ class DataPipeline:
         clock：生成带时区当前时间的可注入时钟。
         logger：记录各阶段请求、输入身份和发布结果的结构化日志器。
         max_concurrent_requests：在每个待下载请求批次开始时解析最大网络并发数。
+        max_concurrent_curate_datasets：最多同时清洗的数据集数量，取值为 1 至 8。
     返回值：
         构造并返回 ``DataPipeline`` 实例。
     异常：
@@ -1231,7 +1380,14 @@ class DataPipeline:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         logger: StructuredLogger | None = None,
         max_concurrent_requests: Callable[[], int] = lambda: 4,
+        max_concurrent_curate_datasets: int = 8,
     ) -> None:
+        if (
+            type(max_concurrent_curate_datasets) is not int
+            or max_concurrent_curate_datasets < 1
+            or max_concurrent_curate_datasets > 8
+        ):
+            raise ValueError("max concurrent CURATE datasets must be from 1 through 8")
         self._source = source
         self._mapper = mapper
         self._calendar = calendar
@@ -1244,6 +1400,7 @@ class DataPipeline:
         self._clock = clock
         self._logger = logger
         self._max_concurrent_requests = max_concurrent_requests
+        self._max_concurrent_curate_datasets = max_concurrent_curate_datasets
         self._source_session_active = False
         data_root = raw_store.root.parent
         if curated_store.root.parent != data_root:
@@ -2207,7 +2364,7 @@ class DataPipeline:
         *,
         observer: PipelineObserver | None = None,
     ) -> tuple[DatasetCurateResult, ...]:
-        """共享 Raw 读取并执行全部数据集的 CURATE 阶段。
+        """以数据集级有界并发执行全部数据集的 CURATE 阶段。
 
         入参：
         返回值：
@@ -2233,7 +2390,7 @@ class DataPipeline:
         *,
         observer: PipelineObserver | None,
     ) -> tuple[DatasetCurateResult, ...]:
-        """共享 Raw 读取并发布指定的非空数据集序列。"""
+        """并行构建并串行发布指定的非空数据集序列。"""
         if not datasets:
             self._raise(
                 "DATA_UPDATE_PLAN_INVALID",
@@ -2282,6 +2439,101 @@ class DataPipeline:
         windows: Mapping[DatasetKind, tuple[date | None, date | None]],
         observer: PipelineObserver | None,
     ) -> tuple[DatasetCurateResult, ...]:
+        """以数据集为工作单元执行有界并发 CURATE。"""
+        if not datasets:
+            return ()
+        progress = observer or _NullPipelineObserver()
+        concurrency = min(self._max_concurrent_curate_datasets, len(datasets))
+        stop_event = threading.Event()
+        publish_lock = threading.Lock()
+        coordinator = _CurateProgressCoordinator(
+            progress,
+            datasets,
+            max_concurrency=concurrency,
+            stop_event=stop_event,
+        )
+        results: dict[DatasetKind, DatasetCurateResult] = {}
+        failures: dict[DatasetKind, Exception] = {}
+        futures: dict[Future[tuple[DatasetCurateResult, ...]], DatasetKind] = {}
+        with ThreadPoolExecutor(
+            max_workers=concurrency,
+            thread_name_prefix="tushare-curate",
+        ) as executor:
+            for dataset in datasets:
+                futures[
+                    executor.submit(
+                        self._run_curate_dataset_worker,
+                        dataset,
+                        window=windows[dataset],
+                        coordinator=coordinator,
+                        publish_lock=publish_lock,
+                    )
+                ] = dataset
+            for future in as_completed(futures):
+                dataset = futures[future]
+                try:
+                    result = future.result()[0]
+                except CancelledError:
+                    continue
+                except Exception as error:  # noqa: BLE001 - preserve worker root cause.
+                    failures[dataset] = error
+                    stop_event.set()
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+                    continue
+                results[dataset] = result
+                coordinator.dataset_completed(result)
+        if failures:
+            ordered_failures = [
+                failures[dataset] for dataset in datasets if dataset in failures
+            ]
+            root = next(
+                (
+                    error
+                    for error in ordered_failures
+                    if not isinstance(error, DataPipelineCancelled)
+                ),
+                ordered_failures[0],
+            )
+            raise root
+        if len(results) != len(datasets):
+            raise DataPipelineCancelled("data pipeline cancellation requested")
+        return tuple(results[dataset] for dataset in datasets)
+
+    def _run_curate_dataset_worker(
+        self,
+        dataset: DatasetKind,
+        *,
+        window: tuple[date | None, date | None],
+        coordinator: _CurateProgressCoordinator,
+        publish_lock: threading.Lock,
+    ) -> tuple[DatasetCurateResult, ...]:
+        """在一个线程内运行单个数据集并维护活动线程证据。"""
+        observer = _CurateWorkerObserver(dataset, coordinator)
+        observer.worker_started()
+        try:
+            return self._curate_dataset(
+                (dataset,),
+                windows={dataset: window},
+                observer=observer,
+                publish_lock=publish_lock,
+            )
+        finally:
+            observer.worker_finished()
+
+    def _curate_dataset(
+        self,
+        datasets: Sequence[DatasetKind],
+        *,
+        windows: Mapping[DatasetKind, tuple[date | None, date | None]],
+        observer: PipelineObserver | None,
+        publish_lock: threading.Lock | None = None,
+    ) -> tuple[DatasetCurateResult, ...]:
+        """规划、构建并发布恰好一个 Canonical 数据集。"""
+        if len(datasets) != 1:
+            raise ValueError("CURATE dataset worker requires exactly one dataset")
+        publication_guard = publish_lock or threading.Lock()
         progress = observer or _NullPipelineObserver()
         run_id = uuid4().hex
         endpoint_records: dict[tuple[str, str], tuple[RawPartitionRecord, ...]] = {}
@@ -2615,9 +2867,10 @@ class DataPipeline:
                 )
                 results.append(result)
                 self._log_curate_completed(result, current, source, run_id)
-                self._repository.record_dataset_stage(
-                    dataset, "CURATE", completed_at=self._now()
-                )
+                with publication_guard:
+                    self._repository.record_dataset_stage(
+                        dataset, "CURATE", completed_at=self._now()
+                    )
                 self._notify_curate_result(
                     progress, result, len(results), len(datasets)
                 )
@@ -2707,19 +2960,23 @@ class DataPipeline:
                 raw_inputs_read=len(raw_inputs_read[dataset]),
                 input_rows=sum(item.frame.height for item in replacements),
             )
-            published_record = self._curated_store.publish_replacements(
-                dataset,
-                replacements,
-                removed_keys=tuple(sorted(removed_keys[dataset])),
-                previous=current,
-                run_id=run_id,
-                source=source,
-                start=resolved_start,
-                end=resolved_end,
-                repository=self._repository,
-                expected_raw_heads=snapshots[dataset],
-                logger=self._logger,
-            )
+            with publication_guard:
+                published_record = self._curated_store.publish_replacements(
+                    dataset,
+                    replacements,
+                    removed_keys=tuple(sorted(removed_keys[dataset])),
+                    previous=current,
+                    run_id=run_id,
+                    source=source,
+                    start=resolved_start,
+                    end=resolved_end,
+                    repository=self._repository,
+                    expected_raw_heads=snapshots[dataset],
+                    logger=self._logger,
+                )
+                self._repository.record_dataset_stage(
+                    dataset, "CURATE", completed_at=self._now()
+                )
             result = DatasetCurateResult(
                 dataset=dataset,
                 content_hash=published_record.content_hash,
@@ -2731,9 +2988,6 @@ class DataPipeline:
             )
             results.append(result)
             self._log_curate_completed(result, published_record, source, run_id)
-            self._repository.record_dataset_stage(
-                dataset, "CURATE", completed_at=self._now()
-            )
             self._notify_curate_result(progress, result, len(results), len(datasets))
         return tuple(results)
 

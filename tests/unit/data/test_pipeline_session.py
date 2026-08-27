@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+from collections import defaultdict
 from datetime import UTC, date, datetime
 from io import StringIO
 from pathlib import Path
@@ -21,6 +22,8 @@ from quant_research.data.contracts import (
 )
 from quant_research.data.pipeline.dataset import (
     DataPipeline,
+    DataPipelineCancelled,
+    DatasetCurateResult,
     DataUpdatePlan,
     DataUpdateWindow,
     DataUpdateWindowBasis,
@@ -242,6 +245,24 @@ class _CancelAfterFirstObserver(_Observer):
 
     def is_cancelled(self) -> bool:
         return self.cancelled
+
+
+class _RecordingCurateObserver(_Observer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completed: list[tuple[DatasetKind, int, int]] = []
+
+    def dataset_completed(
+        self,
+        stage: str,
+        dataset: DatasetKind,
+        completed: int,
+        total: int,
+        details: dict[str, object],
+    ) -> None:
+        assert stage == "CURATE"
+        assert details["max_concurrency"] in range(1, 9)
+        self.completed.append((dataset, completed, total))
 
 
 def _partial_plan() -> DataUpdatePlan:
@@ -598,6 +619,202 @@ def test_four_way_localize_concurrency_improves_network_throughput(
     concurrent = elapsed(4, "concurrent")
 
     assert concurrent < serial * 0.45
+
+
+def test_curate_runs_one_dataset_per_thread_with_bounded_serial_publication(
+    tmp_path: Path,
+) -> None:
+    datasets = tuple(sorted(TUSHARE_ROUTES, key=lambda item: item.value))[:10]
+    pipeline = DataPipeline(
+        source=_Source(),  # type: ignore[arg-type]
+        mapper=object(),  # type: ignore[arg-type]
+        calendar=_Calendar(),  # type: ignore[arg-type]
+        raw_store=SimpleNamespace(root=tmp_path / "raw"),  # type: ignore[arg-type]
+        curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+        repository=_Repository(),  # type: ignore[arg-type]
+        quality_runner=object(),  # type: ignore[arg-type]
+        routes=TUSHARE_ROUTES,
+        max_concurrent_curate_datasets=8,
+    )
+    observer = _RecordingCurateObserver()
+    guard = threading.Lock()
+    active = 0
+    maximum_active = 0
+    publishing = 0
+    maximum_publishing = 0
+    worker_threads: dict[DatasetKind, set[int]] = defaultdict(set)
+
+    def curated(
+        instance: DataPipeline,
+        selected: tuple[DatasetKind, ...],
+        *,
+        windows: dict[DatasetKind, tuple[date | None, date | None]],
+        observer: Any,
+        publish_lock: threading.Lock,
+    ) -> tuple[DatasetCurateResult, ...]:
+        del instance
+        nonlocal active, maximum_active, publishing, maximum_publishing
+        dataset = selected[0]
+        assert windows == {dataset: (None, None)}
+        with guard:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            worker_threads[dataset].add(threading.get_ident())
+        observer.boundary(
+            "CURATE",
+            dataset,
+            "raw_input",
+            {"status": "STARTED", "raw_index": 1, "raw_total": 1},
+        )
+        time.sleep(0.04)
+        observer.boundary(
+            "CURATE",
+            dataset,
+            "raw_input",
+            {"status": "COMPLETED", "raw_index": 1, "raw_total": 1},
+        )
+        with publish_lock:
+            with guard:
+                publishing += 1
+                maximum_publishing = max(maximum_publishing, publishing)
+            time.sleep(0.005)
+            with guard:
+                publishing -= 1
+        with guard:
+            active -= 1
+        return (
+            DatasetCurateResult(dataset, "a" * 64, 1, 1, 1, 0, 1),
+        )
+
+    with patch.object(
+        DataPipeline, "_curate_dataset", autospec=True, side_effect=curated
+    ):
+        results = pipeline._curate_datasets(
+            datasets,
+            windows={dataset: (None, None) for dataset in datasets},
+            observer=observer,
+        )
+
+    assert tuple(result.dataset for result in results) == datasets
+    assert maximum_active == 8
+    assert maximum_publishing == 1
+    assert all(len(threads) == 1 for threads in worker_threads.values())
+    assert [completed for _, completed, _ in observer.completed] == list(
+        range(1, len(datasets) + 1)
+    )
+    raw_completed = [
+        int(details["aggregate_completed"])
+        for _, _, kind, details in observer.boundaries
+        if kind == "raw_input" and details["status"] == "COMPLETED"
+    ]
+    assert raw_completed == sorted(raw_completed)
+    assert max(
+        int(details["active_concurrency"])
+        for _, _, _, details in observer.boundaries
+    ) <= 8
+
+
+def test_curate_preserves_root_failure_while_stopping_peer_datasets(
+    tmp_path: Path,
+) -> None:
+    datasets = tuple(sorted(TUSHARE_ROUTES, key=lambda item: item.value))[:4]
+    pipeline = _pipeline(_Source(), tmp_path)
+    started = threading.Barrier(len(datasets), timeout=2)
+
+    def curated(
+        instance: DataPipeline,
+        selected: tuple[DatasetKind, ...],
+        *,
+        windows: dict[DatasetKind, tuple[date | None, date | None]],
+        observer: Any,
+        publish_lock: threading.Lock,
+    ) -> tuple[DatasetCurateResult, ...]:
+        del instance, windows, publish_lock
+        dataset = selected[0]
+        started.wait()
+        if dataset is datasets[1]:
+            raise RuntimeError("planned CURATE failure")
+        deadline = time.monotonic() + 2
+        while not observer.is_cancelled() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        raise DataPipelineCancelled("peer CURATE stopped")
+
+    with (
+        patch.object(
+            DataPipeline, "_curate_dataset", autospec=True, side_effect=curated
+        ),
+        pytest.raises(RuntimeError, match="planned CURATE failure"),
+    ):
+        pipeline._curate_datasets(
+            datasets,
+            windows={dataset: (None, None) for dataset in datasets},
+            observer=_Observer(),
+        )
+
+
+@pytest.mark.performance
+def test_eight_way_curate_concurrency_improves_dataset_throughput(
+    tmp_path: Path,
+) -> None:
+    datasets = tuple(sorted(TUSHARE_ROUTES, key=lambda item: item.value))[:8]
+
+    def elapsed(concurrency: int, name: str) -> float:
+        pipeline = DataPipeline(
+            source=_Source(),  # type: ignore[arg-type]
+            mapper=object(),  # type: ignore[arg-type]
+            calendar=_Calendar(),  # type: ignore[arg-type]
+            raw_store=SimpleNamespace(root=tmp_path / name / "raw"),  # type: ignore[arg-type]
+            curated_store=SimpleNamespace(root=tmp_path / name / "canonical"),
+            repository=_Repository(),  # type: ignore[arg-type]
+            quality_runner=object(),  # type: ignore[arg-type]
+            routes=TUSHARE_ROUTES,
+            max_concurrent_curate_datasets=concurrency,
+        )
+
+        def curated(
+            instance: DataPipeline,
+            selected: tuple[DatasetKind, ...],
+            *,
+            windows: dict[DatasetKind, tuple[date | None, date | None]],
+            observer: Any,
+            publish_lock: threading.Lock,
+        ) -> tuple[DatasetCurateResult, ...]:
+            del instance, windows, publish_lock
+            dataset = selected[0]
+            time.sleep(0.04)
+            return (DatasetCurateResult(dataset, "a" * 64, 1, 1, 1, 0, 1),)
+
+        started_at = time.monotonic()
+        with patch.object(
+            DataPipeline, "_curate_dataset", autospec=True, side_effect=curated
+        ):
+            pipeline._curate_datasets(
+                datasets,
+                windows={dataset: (None, None) for dataset in datasets},
+                observer=_Observer(),
+            )
+        return time.monotonic() - started_at
+
+    assert elapsed(8, "concurrent") < elapsed(1, "serial") * 0.45
+
+
+@pytest.mark.parametrize("value", (0, 9, True))
+def test_curate_dataset_concurrency_requires_integer_from_one_through_eight(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="CURATE datasets"):
+        DataPipeline(
+            source=_Source(),  # type: ignore[arg-type]
+            mapper=object(),  # type: ignore[arg-type]
+            calendar=_Calendar(),  # type: ignore[arg-type]
+            raw_store=SimpleNamespace(root=tmp_path / "raw"),  # type: ignore[arg-type]
+            curated_store=SimpleNamespace(root=tmp_path / "canonical"),
+            repository=_Repository(),  # type: ignore[arg-type]
+            quality_runner=object(),  # type: ignore[arg-type]
+            routes=TUSHARE_ROUTES,
+            max_concurrent_curate_datasets=value,  # type: ignore[arg-type]
+        )
 
 
 def test_pipeline_stages_use_independent_business_log_contexts(

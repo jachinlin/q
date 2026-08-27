@@ -204,6 +204,34 @@ def test_pipeline_observer_reports_curate_partition_progress() -> None:
     assert current.message == "已构建 fund_daily_bar / year=2026"
 
 
+def test_pipeline_observer_uses_aggregate_curate_raw_progress() -> None:
+    progress = _Progress()
+    observer = _DataUpdateObserver(
+        cast(ProgressSink, progress), cast(CancellationToken, _Cancellation())
+    )
+    observer.stage_started("CURATE", 20)
+    observer.boundary(
+        "CURATE",
+        DatasetKind.STOCK_DAILY_BAR,
+        "raw_input",
+        {
+            "status": "COMPLETED",
+            "raw_index": 50,
+            "raw_total": 100,
+            "aggregate_completed": 250,
+            "aggregate_total": 1_000,
+            "active_concurrency": 8,
+            "max_concurrency": 8,
+        },
+    )
+
+    current = progress.values[-1]
+    assert (current.completed, current.total) == (250, 1_000)
+    assert current.message == (
+        "已清洗 stock_daily_bar Raw 50/100 · 全局 250/1000 · 并发 8/8"
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     ({}, {"years": 0}, {"years": True}, {"years": 5, "extra": "invalid"}),
