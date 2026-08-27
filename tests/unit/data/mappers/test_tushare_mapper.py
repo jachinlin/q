@@ -4,14 +4,19 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
-from quant_research.data.contracts import RawBatch
+from quant_research.data.contracts import CanonicalBatch, PublishedPartition, RawBatch
 from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.tushare.client import _FIELDS
 from quant_research.infrastructure.tushare.mapper import TushareMapper
+
+
+def _normalize_raw(raw: PublishedPartition) -> CanonicalBatch:
+    return TushareMapper().normalize(raw, pq.read_table(raw.data_path))[0]
 
 
 def test_trade_calendar_range_maps_to_all_partition(tmp_path: Path) -> None:
@@ -40,10 +45,12 @@ def test_trade_calendar_range_maps_to_all_partition(tmp_path: Path) -> None:
         )
     )
 
-    batch = TushareMapper().normalize(raw)[0]
+    batch = _normalize_raw(raw)
 
     assert batch.dataset is DatasetKind.TRADE_CALENDAR
-    assert TushareMapper().candidate_partition_keys(batch.dataset, raw) == ("all",)
+    assert TushareMapper().candidate_partition_keys_many(batch.dataset, (raw,)) == (
+        ("all",),
+    )
 
 
 def test_daily_maps_preclose_percent_and_units(tmp_path: Path) -> None:
@@ -81,7 +88,7 @@ def test_daily_maps_preclose_percent_and_units(tmp_path: Path) -> None:
             ),
         )
     )
-    batch = TushareMapper().normalize(raw)[0]
+    batch = _normalize_raw(raw)
     assert batch.dataset is DatasetKind.STOCK_DAILY_BAR
     row = batch.frame.row(0, named=True)
     assert row["instrument_id"] == "600000.SH"
@@ -133,7 +140,7 @@ def test_stock_basic_adds_bse_board(tmp_path: Path) -> None:
             ),
         )
     )
-    row = TushareMapper().normalize(raw)[0].frame.row(0, named=True)
+    row = _normalize_raw(raw).frame.row(0, named=True)
     assert row["instrument_id"] == "920001.BJ"
     assert row["board"] == "BSE"
 
@@ -180,7 +187,7 @@ def test_daily_basic_keeps_proxy_omitted_limit_status_nullable(
         )
     )
 
-    canonical = TushareMapper().normalize(raw)[0].frame.row(0, named=True)
+    canonical = _normalize_raw(raw).frame.row(0, named=True)
 
     assert canonical["instrument_id"] == "600000.SH"
     assert canonical["limit_status"] is None
@@ -228,7 +235,7 @@ def test_statement_maps_common_fields_and_actual_announcement_pit(
         )
     )
 
-    batch = TushareMapper().normalize(raw)[0]
+    batch = _normalize_raw(raw)
     canonical = batch.frame.row(0, named=True)
 
     assert batch.dataset is dataset
@@ -290,7 +297,7 @@ def test_statement_amount_names_containing_to_keep_supplier_units(
         )
     )
 
-    canonical = TushareMapper().normalize(raw)[0]
+    canonical = _normalize_raw(raw)
 
     assert canonical.dataset is dataset
     assert canonical.frame.get_column(amount_field).item() == pytest.approx(12345.67)
@@ -329,15 +336,15 @@ def test_stock_dividend_maps_units_and_implementation_availability(
         )
     )
 
-    batch = TushareMapper().normalize(raw)[0]
+    batch = _normalize_raw(raw)
     canonical = batch.frame.row(0, named=True)
 
     assert batch.dataset is DatasetKind.STOCK_DIVIDEND
     assert canonical["base_share_count"] == pytest.approx(1_235_000.0)
     assert canonical["cash_dividend_before_tax_per_share"] == pytest.approx(0.1)
     assert canonical["available_at"] == datetime(2026, 5, 5, 10, tzinfo=UTC)
-    assert TushareMapper().candidate_partition_keys(batch.dataset, raw) == (
-        "announcement_year=2026",
+    assert TushareMapper().candidate_partition_keys_many(batch.dataset, (raw,)) == (
+        ("announcement_year=2026",),
     )
 
 
@@ -376,7 +383,7 @@ def test_fund_dividend_filters_off_exchange_funds_and_converts_units(
         )
     )
 
-    batch = TushareMapper().normalize(raw)[0]
+    batch = _normalize_raw(raw)
 
     assert batch.dataset is DatasetKind.FUND_DIVIDEND
     assert batch.frame.height == 1

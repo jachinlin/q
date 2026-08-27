@@ -6,13 +6,13 @@ import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime, time
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import cast
-from zoneinfo import ZoneInfo
 
+import numpy as np
 import polars as pl
-import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import pyarrow as pa  # type: ignore[import-untyped]
 
 from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS, UTC_TIMESTAMP
 from quant_research.data.contracts import CanonicalBatch, JsonValue, PublishedPartition
@@ -20,7 +20,6 @@ from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.tushare.client import _FIELDS
 
-_SHANGHAI = ZoneInfo("Asia/Shanghai")
 _ENDPOINT_DATASET: Mapping[str, DatasetKind] = {
     "stock_basic": DatasetKind.STOCK_MASTER,
     "fund_basic": DatasetKind.FUND_MASTER,
@@ -229,36 +228,89 @@ class TushareMapper:
         )
 
     def normalize(
-        self, raw_partition: PublishedPartition
+        self,
+        raw_partition: PublishedPartition,
+        raw_table: pa.Table,
     ) -> tuple[CanonicalBatch, ...]:
-        """规范化分区。入参：Raw 分区。返回值：Canonical 批次。异常：端点或值非法时抛出。"""
+        """把一张已校验 Tushare Raw 表规范化为 Canonical 批次。
+
+        入参：
+            raw_partition：提供请求、采集时点和内容身份的不可变 Raw 分区。
+            raw_table：存储层完成内容、Schema 和行数校验后的 Arrow 表。
+        返回值：
+            返回与端点一一对应且符合 Canonical Schema 的单元素批次元组。
+        异常：
+            ValueError：端点、证券标识、日期或供应商字段值不符合契约时抛出。
+        """
         try:
             dataset = _ENDPOINT_DATASET[raw_partition.endpoint]
         except KeyError as error:
             raise ValueError(
                 f"unsupported Tushare endpoint: {raw_partition.endpoint}"
             ) from error
-        table = pq.read_table(raw_partition.data_path)
-        records = cast(list[dict[str, object]], table.to_pylist())
-        if dataset is DatasetKind.FUND_DIVIDEND:
-            records = [
-                row
-                for row in records
-                if str(row.get("ts_code") or "").endswith((".SH", ".SZ", ".BJ"))
-            ]
-        normalized = [
-            self._normalize_row(raw_partition, dataset, row) for row in records
-        ]
+        raw_frame = cast(pl.DataFrame, pl.from_arrow(raw_table, rechunk=False))
+        if dataset is DatasetKind.FUND_DIVIDEND and not raw_frame.is_empty():
+            raw_frame = raw_frame.filter(
+                pl.col("ts_code").str.contains(r"\.(?:SH|SZ|BJ)$")
+            )
+        frame = self._normalize_frame(raw_partition, dataset, raw_frame)
         if dataset in _REVISION_DATASETS:
-            normalized = self._deduplicate_and_assign(dataset, normalized)
-        schema = CANONICAL_SCHEMAS[dataset]
-        frame = pl.DataFrame(normalized, schema=schema.columns, strict=False)
+            invalid = frame.filter(
+                ~pl.col("instrument_id").str.contains(r"\.(?:SH|SZ|BJ)$")
+            )
+            if invalid.height:
+                raise ValueError(
+                    f"Tushare {raw_partition.endpoint} returned a non-tradable "
+                    "instrument_id"
+                )
+            normalized = self._deduplicate_and_assign(
+                dataset,
+                cast(list[dict[str, object | None]], frame.to_dicts()),
+            )
+            frame = pl.DataFrame(
+                normalized,
+                schema=CANONICAL_SCHEMAS[dataset].columns,
+                strict=False,
+            )
         return (CanonicalBatch(dataset, frame, (raw_partition.content_hash,)),)
 
-    def candidate_partition_keys(
-        self, dataset: DatasetKind, raw_partition: PublishedPartition
+    def candidate_partition_keys_many(
+        self,
+        dataset: DatasetKind,
+        raw_partitions: Sequence[PublishedPartition],
+    ) -> tuple[tuple[str, ...], ...]:
+        """批量推导每个 Tushare Raw 对应的候选 Canonical 分区键。
+
+        入参：
+            dataset：目标 Canonical 数据集。
+            raw_partitions：按稳定顺序排列的不可变 Raw 分区。
+        返回值：
+            返回与输入一一对应的候选分区键元组。
+        异常：
+            ValueError：请求日期或批量投影得到的公告年不符合分区契约时抛出。
+        """
+        if not raw_partitions:
+            return ()
+        dividend_years = (
+            self._dividend_partition_years(raw_partitions)
+            if dataset in _DIVIDEND_DATASETS
+            else {}
+        )
+        return tuple(
+            self._candidate_partition_keys(
+                dataset,
+                raw_partition,
+                dividend_years.get(str(raw_partition.data_path)),
+            )
+            for raw_partition in raw_partitions
+        )
+
+    def _candidate_partition_keys(
+        self,
+        dataset: DatasetKind,
+        raw_partition: PublishedPartition,
+        dividend_years: tuple[str, ...] | None,
     ) -> tuple[str, ...]:
-        """推导分区键。入参：数据集和 Raw 分区。返回值：分区键。异常：请求非法时抛出。"""
         if dataset is DatasetKind.TRADE_CALENDAR:
             return ("all",)
         schema = CANONICAL_SCHEMAS[dataset]
@@ -267,16 +319,10 @@ class TushareMapper:
             if value:
                 return (f"report_year={str(value)[:4]}",)
         if dataset in _DIVIDEND_DATASETS:
-            table = pq.read_table(raw_partition.data_path, columns=["ann_date"])
-            years = sorted(
-                {
-                    str(value)[:4]
-                    for value in table.column("ann_date").to_pylist()
-                    if value is not None and len(str(value)) >= 4
-                }
-            )
-            if years:
-                return tuple(f"announcement_year={year}" for year in years)
+            if dividend_years:
+                return tuple(
+                    f"announcement_year={year}" for year in dividend_years
+                )
             request_date = next(
                 (
                     str(raw_partition.request[field])
@@ -298,6 +344,31 @@ class TushareMapper:
                 f"year={year}" for year in range(int(start[:4]), int(end[:4]) + 1)
             )
         return ("all",)
+
+    @staticmethod
+    def _dividend_partition_years(
+        raw_partitions: Sequence[PublishedPartition],
+    ) -> dict[str, tuple[str, ...]]:
+        paths = [str(partition.data_path) for partition in raw_partitions]
+        years = (
+            pl.scan_parquet(
+                paths,
+                glob=False,
+                include_file_paths="__raw_path",
+            )
+            .select(
+                pl.col("__raw_path"),
+                pl.col("ann_date").str.slice(0, 4).alias("__year"),
+            )
+            .filter(pl.col("__year").str.contains(r"^\d{4}$"))
+            .group_by("__raw_path")
+            .agg(pl.col("__year").unique().sort())
+            .collect()
+        )
+        return {
+            str(row["__raw_path"]): tuple(cast(list[str], row["__year"]))
+            for row in years.iter_rows(named=True)
+        }
 
     def raw_head_is_usable(
         self,
@@ -336,139 +407,137 @@ class TushareMapper:
         schema = repr(CANONICAL_SCHEMAS[dataset]).encode("utf-8")
         return hashlib.sha256(source + b"\0" + schema).hexdigest()
 
-    def _normalize_row(
+    def _normalize_frame(
         self,
         partition: PublishedPartition,
         dataset: DatasetKind,
-        row: Mapping[str, object],
-    ) -> dict[str, object | None]:
-        endpoint = partition.endpoint
-        renamed = {
-            _RENAMES.get(endpoint, {}).get(key, key): value
-            for key, value in row.items()
-        }
-        result: dict[str, object | None] = {}
+        raw_frame: pl.DataFrame,
+    ) -> pl.DataFrame:
         schema = CANONICAL_SCHEMAS[dataset]
-        for field, dtype in schema.columns.items():
-            if field in {
-                "source",
-                "available_at",
-                "availability_source",
-                "pit_usable",
-                "ingested_at",
-            }:
-                continue
-            result[field] = self._convert(
-                dataset, field, dtype, renamed.get(field)
-            )
+        renames = {
+            source: target
+            for source, target in _RENAMES.get(partition.endpoint, {}).items()
+            if source in raw_frame.columns and source != target
+        }
+        renamed = raw_frame.rename(renames)
+        expressions = [
+            self._conversion_expression(
+                dataset,
+                field,
+                dtype,
+                pl.col(field)
+                if field in renamed.columns
+                else pl.lit(None, dtype=pl.String),
+            ).alias(field)
+            for field, dtype in schema.columns.items()
+            if field not in _AUDIT_FIELDS
+        ]
+        frame = renamed.select(expressions)
+        retrieved = partition.retrieved_at.astimezone(UTC)
+        retrieved_expression = pl.lit(retrieved, dtype=UTC_TIMESTAMP)
         if dataset is DatasetKind.STOCK_MASTER:
-            result["board"] = self._board(
-                str(result.get("market") or ""), str(result["instrument_id"])
+            frame = frame.with_columns(
+                pl.when(pl.col("instrument_id").str.ends_with(".BJ"))
+                .then(pl.lit("BSE"))
+                .when(pl.col("market") == "创业板")
+                .then(pl.lit("CHINEXT"))
+                .when(pl.col("market") == "科创板")
+                .then(pl.lit("STAR"))
+                .otherwise(pl.lit("MAIN"))
+                .alias("board")
             )
         if dataset is DatasetKind.INDUSTRY_MEMBERSHIP:
-            out_date = cast(date | None, result["out_date"])
-            retrieved = partition.retrieved_at.astimezone(UTC)
-            result["in_available_at"] = retrieved
-            result["out_available_at"] = retrieved if out_date else None
-        if dataset in _REVISION_DATASETS:
-            instrument_id = str(result.get("instrument_id") or "")
-            if not instrument_id.endswith((".SH", ".SZ", ".BJ")):
-                raise ValueError(
-                    f"Tushare {endpoint} returned a non-tradable instrument_id"
-                )
-        available_at, availability_source = self._availability(
-            partition, dataset, result
+            frame = frame.with_columns(
+                retrieved_expression.alias("in_available_at"),
+                pl.when(pl.col("out_date").is_not_null())
+                .then(retrieved_expression)
+                .otherwise(pl.lit(None, dtype=UTC_TIMESTAMP))
+                .alias("out_available_at"),
+            )
+        available_at, availability_source = self._availability_expressions(
+            dataset,
+            retrieved_expression,
         )
-        result.update(
-            source="tushare",
-            available_at=available_at,
-            availability_source=availability_source,
-            pit_usable=available_at is not None,
-            ingested_at=partition.retrieved_at.astimezone(UTC),
+        frame = frame.with_columns(
+            pl.lit("tushare").alias("source"),
+            available_at.alias("available_at"),
+            availability_source.alias("availability_source"),
+            available_at.is_not_null().alias("pit_usable"),
+            retrieved_expression.alias("ingested_at"),
         )
-        return result
+        return frame.select(
+            pl.col(field).cast(dtype, strict=True).alias(field)
+            for field, dtype in schema.columns.items()
+        )
 
-    def _convert(
+    def _conversion_expression(
         self,
         dataset: DatasetKind,
         field: str,
         dtype: pl.DataType,
-        value: object,
-    ) -> object | None:
-        if value is None or str(value).strip() in {"", "None", "nan", "NaN"}:
-            return None
-        text = str(value).strip()
+        value: pl.Expr,
+    ) -> pl.Expr:
+        text = value.cast(pl.String).str.strip_chars()
+        cleaned = pl.when(
+            text.is_null() | text.is_in(["", "None", "nan", "NaN"])
+        ).then(pl.lit(None, dtype=pl.String)).otherwise(text)
         if field in _DATE_FIELDS:
-            return self._date(text)
+            return cleaned.str.replace_all("-", "").str.strptime(
+                pl.Date,
+                format="%Y%m%d",
+                strict=True,
+            )
         if dtype == pl.String:
-            return text
+            return cleaned
         if dtype == pl.Boolean:
-            return text in {"1", "Y", "true", "True"}
+            return cleaned.is_in(["1", "Y", "true", "True"])
         if dtype == pl.Int64:
-            number = float(text)
+            number = cleaned.cast(pl.Float64, strict=True)
             if field in {"volume", "after_hours_volume"}:
                 number *= 100.0
-            return round(number)
+            return number.round(0).cast(pl.Int64, strict=True)
         if dtype == pl.Float64:
-            number = float(text)
+            number = cleaned.cast(pl.Float64, strict=True)
             if field in _PERCENT_FIELDS or (
                 dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR
                 and self._financial_percent_field(field)
             ):
-                number /= 100.0
+                number = number.map_batches(
+                    self._divide_percent_batch,
+                    return_dtype=pl.Float64,
+                )
             if field in {"amount", "after_hours_amount"}:
                 number *= 1000.0
-            if field in {"total_share", "float_share", "free_share"}:
-                number *= 10_000.0
-            if field in {"total_market_value", "circulating_market_value"}:
-                number *= 10_000.0
-            if field in {"base_share_count", "base_unit_count"}:
+            if field in {
+                "total_share",
+                "float_share",
+                "free_share",
+                "total_market_value",
+                "circulating_market_value",
+                "base_share_count",
+                "base_unit_count",
+            }:
                 number *= 10_000.0
             return number
         if dtype == UTC_TIMESTAMP:
-            return value
+            return pl.lit(None, dtype=UTC_TIMESTAMP)
         raise TypeError(f"unsupported Canonical type for {field}: {dtype}")
 
     @staticmethod
-    def _financial_percent_field(field: str) -> bool:
-        return (
-            field.startswith(("roe", "roa", "q_roe", "q_dt_roe", "q_npta"))
-            or field.endswith(("_yoy", "_qoq", "_margin"))
-            or "_to_" in field
-            or field
-            in {"npta", "roic", "gross_margin", "cogs_of_sales", "expense_of_sales"}
-        )
+    def _divide_percent_batch(series: pl.Series) -> pl.Series:
+        missing = series.is_null()
+        values = np.divide(series.fill_null(0.0).to_numpy(), 100.0)
+        return pl.Series(values).set(missing, None)
 
     @staticmethod
-    def _date(value: str) -> date:
-        digits = value.replace("-", "")
-        if len(digits) != 8 or not digits.isdecimal():
-            raise ValueError(f"invalid Tushare date: {value}")
-        return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
-
-    @staticmethod
-    def _board(market: str, instrument_id: str) -> str:
-        if instrument_id.endswith(".BJ"):
-            return "BSE"
-        return {"创业板": "CHINEXT", "科创板": "STAR"}.get(market, "MAIN")
-
-    @staticmethod
-    def _end_of_day(value: date) -> datetime:
-        return datetime.combine(value, time(18, 0), _SHANGHAI).astimezone(UTC)
-
-    def _availability(
-        self,
-        partition: PublishedPartition,
+    def _availability_expressions(
         dataset: DatasetKind,
-        row: Mapping[str, object | None],
-    ) -> tuple[datetime | None, str]:
+        retrieved: pl.Expr,
+    ) -> tuple[pl.Expr, pl.Expr]:
         if dataset is DatasetKind.STOCK_RISK_WARNING:
-            day = cast(date | None, row.get("trade_date"))
             return (
-                datetime.combine(day, time(9, 20), _SHANGHAI).astimezone(UTC)
-                if day
-                else None,
-                "tushare_documented_0920",
+                TushareMapper._market_time_expression("trade_date", time(9, 20)),
+                pl.lit("tushare_documented_0920"),
             )
         if dataset in {
             DatasetKind.STOCK_DAILY_BAR,
@@ -479,35 +548,65 @@ class TushareMapper:
             DatasetKind.STOCK_DAILY_BASIC,
             DatasetKind.STOCK_SUSPENSION,
         }:
-            day = cast(date | None, row.get("trade_date"))
-            return (self._end_of_day(day) if day else None, "reconstructed_market_eod")
-        if dataset in _STATEMENT_DATASETS:
-            actual = cast(date | None, row.get("actual_announcement_date"))
-            announced = cast(date | None, row.get("announcement_date"))
-            day = actual or announced
             return (
-                self._end_of_day(day) if day else None,
-                "actual_announcement_date_eod" if actual else "announcement_date_eod",
+                TushareMapper._market_time_expression("trade_date", time(18, 0)),
+                pl.lit("reconstructed_market_eod"),
+            )
+        if dataset in _STATEMENT_DATASETS:
+            actual = pl.col("actual_announcement_date")
+            announced = pl.col("announcement_date")
+            return (
+                actual.fill_null(announced)
+                .dt.combine(time(18, 0))
+                .dt.replace_time_zone("Asia/Shanghai")
+                .dt.convert_time_zone("UTC"),
+                pl.when(actual.is_not_null())
+                .then(pl.lit("actual_announcement_date_eod"))
+                .otherwise(pl.lit("announcement_date_eod")),
             )
         if dataset is DatasetKind.STOCK_FINANCIAL_INDICATOR:
-            day = cast(date | None, row.get("announcement_date"))
-            return (self._end_of_day(day) if day else None, "announcement_date_eod")
-        if dataset in _DIVIDEND_DATASETS:
-            implemented = cast(date | None, row.get("implementation_announcement_date"))
-            announced = cast(date | None, row.get("announcement_date"))
-            day = implemented or announced
             return (
-                self._end_of_day(day) if day else None,
-                "implementation_announcement_date_eod"
-                if implemented
-                else "announcement_date_eod",
+                TushareMapper._market_time_expression(
+                    "announcement_date", time(18, 0)
+                ),
+                pl.lit("announcement_date_eod"),
+            )
+        if dataset in _DIVIDEND_DATASETS:
+            implemented = pl.col("implementation_announcement_date")
+            announced = pl.col("announcement_date")
+            return (
+                implemented.fill_null(announced)
+                .dt.combine(time(18, 0))
+                .dt.replace_time_zone("Asia/Shanghai")
+                .dt.convert_time_zone("UTC"),
+                pl.when(implemented.is_not_null())
+                .then(pl.lit("implementation_announcement_date_eod"))
+                .otherwise(pl.lit("announcement_date_eod")),
             )
         if dataset is DatasetKind.INDUSTRY_MEMBERSHIP:
-            return (
-                cast(datetime | None, row.get("in_available_at")),
-                "retrieved_at_no_supplier_announcement",
+            return pl.col("in_available_at"), pl.lit(
+                "retrieved_at_no_supplier_announcement"
             )
-        return partition.retrieved_at.astimezone(UTC), "retrieved_at"
+        return retrieved, pl.lit("retrieved_at")
+
+    @staticmethod
+    def _market_time_expression(field: str, value: time) -> pl.Expr:
+        return (
+            pl.col(field)
+            .dt.combine(value)
+            .dt.replace_time_zone("Asia/Shanghai")
+            .dt.convert_time_zone("UTC")
+        )
+
+    @staticmethod
+    def _financial_percent_field(field: str) -> bool:
+        return (
+            field.startswith(("roe", "roa", "q_roe", "q_dt_roe", "q_npta"))
+            or field.endswith(("_yoy", "_qoq", "_margin"))
+            or "_to_" in field
+            or field
+            in {"npta", "roic", "gross_margin", "cogs_of_sales", "expense_of_sales"}
+        )
 
     @classmethod
     def _deduplicate_and_assign(

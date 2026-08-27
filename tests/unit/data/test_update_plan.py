@@ -310,7 +310,7 @@ def test_instrument_canonical_window_uses_snapshot_time_not_listing_lifecycle() 
         ("a" * 64,),
     )
 
-    assert DataPipeline._batch_window((batch,), None, None) == (
+    assert DataPipeline._batch_window(batch.dataset, (batch.frame,), None, None) == (
         date(2026, 8, 20),
         date(2026, 8, 20),
     )

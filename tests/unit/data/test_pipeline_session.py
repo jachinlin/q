@@ -634,7 +634,6 @@ def test_curate_runs_one_dataset_per_thread_with_bounded_serial_publication(
         repository=_Repository(),  # type: ignore[arg-type]
         quality_runner=object(),  # type: ignore[arg-type]
         routes=TUSHARE_ROUTES,
-        max_concurrent_curate_datasets=8,
     )
     observer = _RecordingCurateObserver()
     guard = threading.Lock()
@@ -696,7 +695,7 @@ def test_curate_runs_one_dataset_per_thread_with_bounded_serial_publication(
         )
 
     assert tuple(result.dataset for result in results) == datasets
-    assert maximum_active == 8
+    assert maximum_active == 4
     assert maximum_publishing == 1
     assert all(len(threads) == 1 for threads in worker_threads.values())
     assert [completed for _, completed, _ in observer.completed] == list(
@@ -711,7 +710,7 @@ def test_curate_runs_one_dataset_per_thread_with_bounded_serial_publication(
     assert max(
         int(details["active_concurrency"])
         for _, _, _, details in observer.boundaries
-    ) <= 8
+    ) <= 4
 
 
 def test_curate_preserves_root_failure_while_stopping_peer_datasets(
@@ -753,7 +752,7 @@ def test_curate_preserves_root_failure_while_stopping_peer_datasets(
 
 
 @pytest.mark.performance
-def test_eight_way_curate_concurrency_improves_dataset_throughput(
+def test_four_way_curate_concurrency_improves_dataset_throughput(
     tmp_path: Path,
 ) -> None:
     datasets = tuple(sorted(TUSHARE_ROUTES, key=lambda item: item.value))[:8]
@@ -795,7 +794,7 @@ def test_eight_way_curate_concurrency_improves_dataset_throughput(
             )
         return time.monotonic() - started_at
 
-    assert elapsed(8, "concurrent") < elapsed(1, "serial") * 0.45
+    assert elapsed(4, "concurrent") < elapsed(1, "serial") * 0.6
 
 
 @pytest.mark.parametrize("value", (0, 9, True))

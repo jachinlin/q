@@ -270,10 +270,15 @@ CURATE 从 Raw 读取数据，并执行以下步骤：
 
 ### 6.1 数据集级并发
 
-`curate-all` 把每个数据集作为独立工作单元，最多同时运行 8 个数据集。一个运行中的
-数据集由同一个 Python 工作线程完成 Raw 读取、字段规范化和分区合并；结果仍按数据
-目录顺序返回，不能依赖线程完成顺序。任务进度同时记录当前数据集明细、全局 Raw
-完成数和活动数据集集合。
+`curate-all` 把每个数据集作为独立工作单元，默认同时运行 4 个数据集，并允许测试或
+组合根在 `1..8` 范围内显式注入。一个运行中的数据集由同一个 Python 工作线程完成
+Raw 读取、字段规范化和分区合并；结果仍按数据目录顺序返回，不能依赖线程完成顺序。
+任务进度同时记录当前数据集明细、全局 Raw 完成数和活动数据集集合。
+
+每个 Raw Parquet 由存储层完整读取并校验一次，同一张已校验 Arrow 表直接交给 Mapper；
+Mapper 使用 Polars 列表达式完成非修订型数据集的字段转换，避免重新读取文件和逐行
+构造 Python 字典。分红数据集的公告年通过批量投影扫描规划，分区内的小 Frame 分层
+合并，以限制对象数量和最终合并峰值。
 
 Canonical 发布不参与并行：文件写入与校验、SQLite 当前指针切换、目录身份更新、阶段
 状态登记和孤儿文件清理共用一把发布锁。这样既让耗时的 Parquet/Polars 计算并行，又
@@ -693,11 +698,14 @@ CLI 和独立流水线日志写入 `$QUANT_DATA_ROOT/logs/data_pipeline.log`。
 - 内部活动：LOCALIZE 的端点、请求序号和 `trade_date`/市场/行业等请求切片，CURATE
   的 Raw 输入和 Canonical 分区，VALIDATE 的 Canonical 数据集载入与质量运行结果。
 
-关键事件成对记录 `STARTED` 和 `COMPLETED`。例如 `localize.raw_started` 会在访问供应商
-前记录端点、完整受控请求、请求序号和总数，`localize.raw_completed` 再记录行数、
+LOCALIZE 的外部请求事件成对记录 `STARTED` 和 `COMPLETED`。例如
+`localize.raw_started` 会在访问供应商前记录端点、完整受控请求、请求序号和总数，
+`localize.raw_completed` 再记录行数、
 request/content hash 与抓取或复用方式；失败时最后一个 `STARTED` 事件就是精确故障位置。
 请求规划和已存在的 Raw checkpoint 会单独汇总，因此断点续跑时也能区分“已经完成”与
-“仍待下载”。Token、代理凭据和其他敏感环境配置不得进入任务进度或日志。
+“仍待下载”。CURATE 的本地 Raw 进度最多每秒汇总一次，数据集完成时强制发送最终计数；
+失败事件始终包含出错 Raw 的受控身份。Token、代理凭据和其他敏感环境配置不得进入任务
+进度或日志。
 
 生产假设是 Tushare 账户具有所需积分、VIP 和基金复权权限。Token 不得写入代码、配置文件、日志或测试数据。
 

@@ -8,6 +8,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
+
+import pyarrow as pa  # type: ignore[import-untyped]
 
 from quant_research.data.contracts import PublishedPartition, RawBatch
 from quant_research.data.pipeline.curate import CuratedPartitionStore
@@ -35,10 +38,12 @@ class _ConcurrentMapper(TushareMapper):
         self._barrier = threading.Barrier(2, timeout=5)
 
     def normalize(
-        self, raw_partition: PublishedPartition
+        self,
+        raw_partition: PublishedPartition,
+        raw_table: pa.Table,
     ) -> tuple[Any, ...]:
         self._barrier.wait()
-        return super().normalize(raw_partition)
+        return super().normalize(raw_partition, raw_table)
 
 
 class _RecordingCuratedStore(CuratedPartitionStore):
@@ -62,19 +67,40 @@ class _RecordingCuratedStore(CuratedPartitionStore):
                 self._active -= 1
 
 
+class _RecordingRawStore(RawPartitionStore):
+    """记录 CURATE 对完整 Raw 内容的读取次数。"""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.read_calls = 0
+
+    def read(
+        self,
+        partition: PublishedPartition,
+        *,
+        verify: bool = True,
+    ) -> pa.Table:
+        self.read_calls += 1
+        return super().read(partition, verify=verify)
+
+
 def _register_raw(
     raw_store: RawPartitionStore,
     repository: MetadataRepository,
     *,
     endpoint: str,
     row: dict[str, object],
+    request_discriminator: str | None = None,
 ) -> None:
     fields = _FIELDS[endpoint]
+    request = {"endpoint": endpoint, "fields": ",".join(fields)}
+    if request_discriminator is not None:
+        request["scope"] = request_discriminator
     published = raw_store.publish(
         RawBatch(
             source="tushare",
             endpoint=endpoint,
-            request={"endpoint": endpoint, "fields": ",".join(fields)},
+            request=request,
             retrieved_at=datetime(2026, 8, 27, tzinfo=UTC),
             schema=fields,
             rows=(dict.fromkeys(fields) | row,),
@@ -103,7 +129,7 @@ def test_curate_builds_datasets_concurrently_and_publishes_serially(
     upgrade_database(database)
     engine = create_sqlite_engine(database)
     repository = MetadataRepository(engine)
-    raw_store = RawPartitionStore(tmp_path / "raw")
+    raw_store = _RecordingRawStore(tmp_path / "raw")
     curated_store = _RecordingCuratedStore(tmp_path / "canonical")
     _register_raw(
         raw_store,
@@ -160,6 +186,7 @@ def test_curate_builds_datasets_concurrently_and_publishes_serially(
     )
     assert all(partition.path.is_file() for record in records for partition in record.partitions)
     assert len(repository.catalog_state().catalog_hash) == 64
+    assert raw_store.read_calls == 2
 
     retry = DataPipeline(
         source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
@@ -182,4 +209,151 @@ def test_curate_builds_datasets_concurrently_and_publishes_serially(
     )
     assert all(result.rebuilt_partitions == 0 for result in retry)
     assert all(result.raw_inputs_read == 0 for result in retry)
+    assert raw_store.read_calls == 2
+    engine.dispose()
+
+
+def test_curate_content_is_identical_at_one_four_and_eight_workers(
+    tmp_path: Path,
+) -> None:
+    def build(concurrency: int) -> tuple[str, ...]:
+        root = tmp_path / str(concurrency)
+        database = root / "state" / "quant.db"
+        upgrade_database(database)
+        engine = create_sqlite_engine(database)
+        repository = MetadataRepository(engine)
+        raw_store = RawPartitionStore(root / "raw")
+        _register_raw(
+            raw_store,
+            repository,
+            endpoint="stock_basic",
+            row={
+                "ts_code": "600000.SH",
+                "symbol": "600000",
+                "name": "浦发银行",
+                "market": "主板",
+                "exchange": "SSE",
+                "list_status": "L",
+                "list_date": "19991110",
+            },
+        )
+        _register_raw(
+            raw_store,
+            repository,
+            endpoint="fund_basic",
+            row={
+                "ts_code": "510300.SH",
+                "name": "沪深300ETF",
+                "fund_type": "股票型",
+                "list_date": "20120528",
+                "market": "E",
+                "status": "L",
+            },
+        )
+        datasets = (DatasetKind.STOCK_MASTER, DatasetKind.FUND_MASTER)
+        results = DataPipeline(
+            source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+            mapper=TushareMapper(),
+            calendar=object(),  # type: ignore[arg-type]
+            raw_store=raw_store,
+            curated_store=CuratedPartitionStore(root / "canonical"),
+            repository=repository,
+            quality_runner=QualityRunner(),
+            routes=TUSHARE_ROUTES,
+            max_concurrent_curate_datasets=concurrency,
+        )._curate_datasets(
+            datasets,
+            windows={dataset: (None, None) for dataset in datasets},
+            observer=None,
+        )
+        hashes = tuple(result.content_hash for result in results)
+        engine.dispose()
+        return hashes
+
+    assert build(1) == build(4) == build(8)
+
+
+def test_curate_raw_progress_is_throttled_and_finishes_with_exact_count(
+    tmp_path: Path,
+) -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.boundaries: list[tuple[str, dict[str, Any]]] = []
+
+        def stage_started(self, stage: str, total: int) -> None:
+            del stage, total
+
+        def dataset_completed(
+            self,
+            stage: str,
+            dataset: DatasetKind,
+            completed: int,
+            total: int,
+            details: Any,
+        ) -> None:
+            del stage, dataset, completed, total, details
+
+        def boundary(
+            self,
+            stage: str,
+            dataset: DatasetKind,
+            kind: str,
+            details: Any,
+        ) -> None:
+            del stage, dataset
+            self.boundaries.append((kind, dict(details)))
+
+        def is_cancelled(self) -> bool:
+            return False
+
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    repository = MetadataRepository(engine)
+    raw_store = RawPartitionStore(tmp_path / "raw")
+    for index in range(3):
+        _register_raw(
+            raw_store,
+            repository,
+            endpoint="stock_basic",
+            request_discriminator=str(index),
+            row={
+                "ts_code": f"60000{index}.SH",
+                "symbol": f"60000{index}",
+                "name": f"测试{index}",
+                "market": "主板",
+                "exchange": "SSE",
+                "list_status": "L",
+                "list_date": "19991110",
+            },
+        )
+    observer = Observer()
+    pipeline = DataPipeline(
+        source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+        mapper=TushareMapper(),
+        calendar=object(),  # type: ignore[arg-type]
+        raw_store=raw_store,
+        curated_store=CuratedPartitionStore(tmp_path / "canonical"),
+        repository=repository,
+        quality_runner=QualityRunner(),
+        routes=TUSHARE_ROUTES,
+        max_concurrent_curate_datasets=1,
+    )
+
+    with patch(
+        "quant_research.data.pipeline.dataset.time.monotonic",
+        return_value=0.0,
+    ):
+        pipeline._curate_datasets(
+            (DatasetKind.STOCK_MASTER,),
+            windows={DatasetKind.STOCK_MASTER: (None, None)},
+            observer=observer,
+        )
+
+    raw_events = [
+        details for kind, details in observer.boundaries if kind == "raw_input"
+    ]
+    assert [event["raw_index"] for event in raw_events] == [1, 3]
+    assert raw_events[-1]["aggregate_completed"] == 3
+    assert raw_events[-1]["aggregate_total"] == 3
     engine.dispose()

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Protocol
 
 import polars as pl
+import pyarrow as pa  # type: ignore[import-untyped]
 
 from quant_research.data.contracts import CanonicalBatch, JsonValue, PublishedPartition
 from quant_research.domain.enums import DatasetKind
@@ -33,27 +34,34 @@ class CanonicalMapper(Protocol):
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
 
-    def normalize(self, raw_partition: PublishedPartition) -> Iterable[CanonicalBatch]:
-        """读取并校验已发布 Raw 分区，再生成 Canonical 批次。
+    def normalize(
+        self,
+        raw_partition: PublishedPartition,
+        raw_table: pa.Table,
+    ) -> Iterable[CanonicalBatch]:
+        """把已校验 Raw 表规范化为 Canonical 批次。
 
         入参：
             raw_partition：已发布且不可变的 Raw 分区。
+            raw_table：由 Raw 存储完成内容校验后返回的 Arrow 表。
         返回值：
             返回规范化Canonical 数据后的``normalize``（``Iterable[CanonicalBatch]``）。
         异常：
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
 
-    def candidate_partition_keys(
-        self, dataset: DatasetKind, raw_partition: PublishedPartition
-    ) -> tuple[str, ...]:
-        """根据 Raw 发布信息推导候选 Canonical 分区键。
+    def candidate_partition_keys_many(
+        self,
+        dataset: DatasetKind,
+        raw_partitions: Sequence[PublishedPartition],
+    ) -> tuple[tuple[str, ...], ...]:
+        """批量推导 Raw 对应的候选 Canonical 分区键。
 
         入参：
             dataset：目标 Canonical 数据集标识。
-            raw_partition：已发布且不可变的 Raw 分区。
+            raw_partitions：按稳定顺序排列的已发布不可变 Raw 分区。
         返回值：
-            返回分区``keys``（``tuple[str, ...]``）。
+            返回与输入一一对应的候选分区键元组。
         异常：
             实现可读取形成分区键所需的最小 Raw 字段，并传播参数校验、目录状态或
             文件完整性异常。

@@ -26,7 +26,6 @@ from quant_research.data.catalog import (
     ReuseSemantics,
 )
 from quant_research.data.contracts import (
-    CanonicalBatch,
     JsonValue,
     PublishedPartition,
     RawBatch,
@@ -1380,7 +1379,7 @@ class DataPipeline:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         logger: StructuredLogger | None = None,
         max_concurrent_requests: Callable[[], int] = lambda: 4,
-        max_concurrent_curate_datasets: int = 8,
+        max_concurrent_curate_datasets: int = 4,
     ) -> None:
         if (
             type(max_concurrent_curate_datasets) is not int
@@ -2597,10 +2596,25 @@ class DataPipeline:
             )
             records_by_dataset[dataset] = ordered_records
             accepts_raw_schema = getattr(self._mapper, "accepts_raw_schema", None)
-            for record in ordered_records:
-                partition = self._published_partition(record)
+            published_partitions = tuple(
+                self._published_partition(record) for record in ordered_records
+            )
+            candidate_keys = self._mapper.candidate_partition_keys_many(
+                dataset,
+                published_partitions,
+            )
+            if len(candidate_keys) != len(ordered_records):
+                raise ValueError(
+                    "mapper candidate partition result must match Raw input count"
+                )
+            for record, partition, keys in zip(
+                ordered_records,
+                published_partitions,
+                candidate_keys,
+                strict=True,
+            ):
                 try:
-                    keys = self._mapper.candidate_partition_keys(dataset, partition)
+                    keys = tuple(keys)
                 except (KeyError, TypeError, ValueError) as error:
                     raise QuantError(
                         ErrorDetail(
@@ -2721,7 +2735,6 @@ class DataPipeline:
         frames: dict[DatasetKind, dict[str, list[pl.DataFrame]]] = defaultdict(
             lambda: defaultdict(list)
         )
-        normalized_batches: dict[DatasetKind, list[CanonicalBatch]] = defaultdict(list)
         raw_inputs_read: dict[DatasetKind, set[tuple[str, str, str, str]]] = (
             defaultdict(set)
         )
@@ -2733,6 +2746,8 @@ class DataPipeline:
                 item.request_hash,
             ),
         )
+        last_raw_progress_at = float("-inf")
+        last_reported_raw_index = 0
         for raw_index, record in enumerate(ordered_to_read, start=1):
             if progress.is_cancelled():
                 raise DataPipelineCancelled("data pipeline cancellation requested")
@@ -2742,7 +2757,6 @@ class DataPipeline:
             )
             progress_dataset = affected_datasets[0]
             raw_context: dict[str, JsonValue] = {
-                "status": "STARTED",
                 "raw_index": raw_index,
                 "raw_total": len(ordered_to_read),
                 "endpoint": record.endpoint,
@@ -2750,17 +2764,19 @@ class DataPipeline:
                 "request_hash": record.request_hash,
                 "affected_datasets": [item.value for item in affected_datasets],
             }
-            progress.boundary(
-                "CURATE", progress_dataset, "raw_input", raw_context
-            )
-            self._curate_log(
-                "curate.raw_input_started",
-                source=record.source,
-                activity=raw_context,
-            )
             partition = self._published_partition(record)
-            self._raw_store.verify_managed_partition(partition)
-            outputs = tuple(self._mapper.normalize(partition))
+            try:
+                raw_table = self._raw_store.read(partition, verify=True)
+                outputs = tuple(self._mapper.normalize(partition, raw_table))
+            except Exception as error:
+                self._curate_log(
+                    "curate.raw_input_failed",
+                    level="ERROR",
+                    source=record.source,
+                    error_type=type(error).__name__,
+                    activity=raw_context,
+                )
+                raise
             for dataset in raw_targets[raw_identity]:
                 raw_inputs_read[dataset].add(raw_identity)
             for batch in outputs:
@@ -2796,23 +2812,39 @@ class DataPipeline:
                             retryable=False,
                         )
                     )
-                normalized_batches[batch.dataset].append(batch)
                 for partition_key, frame in actual:
                     if partition_key in wanted:
-                        frames[batch.dataset][partition_key].append(frame)
-            completed_raw_context = {
-                **raw_context,
-                "status": "COMPLETED",
-                "output_batches": len(outputs),
-            }
-            progress.boundary(
-                "CURATE", progress_dataset, "raw_input", completed_raw_context
-            )
-            self._curate_log(
-                "curate.raw_input_completed",
-                source=record.source,
-                activity=completed_raw_context,
-            )
+                        pieces = frames[batch.dataset][partition_key]
+                        pieces.append(frame)
+                        if len(pieces) >= 64:
+                            compacted = pl.concat(pieces, how="vertical_relaxed")
+                            pieces.clear()
+                            pieces.append(compacted)
+            progress_now = time.monotonic()
+            if (
+                raw_index == 1
+                or raw_index == len(ordered_to_read)
+                or progress_now - last_raw_progress_at >= 1.0
+            ):
+                completed_raw_context = {
+                    **raw_context,
+                    "status": "COMPLETED",
+                    "output_batches": len(outputs),
+                    "batch_completed": raw_index - last_reported_raw_index,
+                }
+                progress.boundary(
+                    "CURATE",
+                    progress_dataset,
+                    "raw_input",
+                    completed_raw_context,
+                )
+                self._curate_log(
+                    "curate.raw_batch_completed",
+                    source=record.source,
+                    activity=completed_raw_context,
+                )
+                last_raw_progress_at = progress_now
+                last_reported_raw_index = raw_index
 
         results: list[DatasetCurateResult] = []
         for dataset_index, dataset in enumerate(datasets, start=1):
@@ -2927,9 +2959,13 @@ class DataPipeline:
                     },
                 )
             start, end = windows[dataset]
-            if normalized_batches[dataset]:
+            replacement_frames = tuple(item.frame for item in replacements)
+            if replacement_frames:
                 resolved_start, resolved_end = self._batch_window(
-                    normalized_batches[dataset], start, end
+                    dataset,
+                    replacement_frames,
+                    start,
+                    end,
                 )
             elif current is not None and current.start_date and current.end_date:
                 resolved_start, resolved_end = current.start_date, current.end_date
@@ -3485,15 +3521,16 @@ class DataPipeline:
 
     @staticmethod
     def _batch_window(
-        batches: Sequence[CanonicalBatch], start: date | None, end: date | None
+        dataset: DatasetKind,
+        frames: Sequence[pl.DataFrame],
+        start: date | None,
+        end: date | None,
     ) -> tuple[date, date]:
-        if batches and all(
-            batch.dataset in _SNAPSHOT_DATASETS for batch in batches
-        ):
+        if frames and dataset in _SNAPSHOT_DATASETS:
             snapshot_dates = [
                 value.astimezone(ZoneInfo("Asia/Shanghai")).date()
-                for batch in batches
-                for value in batch.frame["ingested_at"].to_list()
+                for frame in frames
+                for value in frame["ingested_at"].to_list()
                 if isinstance(value, datetime)
             ]
             if snapshot_dates:
@@ -3501,8 +3538,7 @@ class DataPipeline:
         if start is not None and end is not None:
             return start, end
         dates: list[date] = []
-        for batch in batches:
-            frame = batch.frame
+        for frame in frames:
             for column in (
                 "trade_date",
                 "report_period",
