@@ -22,6 +22,13 @@ const client = useQueryClient()
 const route = useRoute()
 const page = ref(1)
 const taskStatuses = ['QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCEL_REQUESTED', 'CANCELLED', 'ORPHANED'] as const
+const taskTypeLabels: Record<string, string> = {
+  DATA_BOOTSTRAP: '数据初始化',
+  DATA_UPDATE: '数据更新',
+  DATA_VALIDATION: '数据校验',
+  EXPERIMENT_RUN: '实验运行',
+  FACTOR_STUDY: '因子研究',
+}
 const requestedStatus = typeof route.query.status === 'string' && taskStatuses.some((item) => item === route.query.status)
   ? route.query.status
   : ''
@@ -219,6 +226,16 @@ function progress(task: Task) {
   return total > 0 ? Math.round(completed / total * 100) : 0
 }
 
+function taskTypeLabel(taskType: string) {
+  return taskTypeLabels[taskType] ?? taskType
+}
+
+function factorStudyPath(task: Task) {
+  return task.subject_kind === 'FACTOR_STUDY' && task.subject_id
+    ? `/factor-studies/${task.subject_id}`
+    : null
+}
+
 function duration(startedAt: string | null, completedAt: string | null) {
   return formatDuration(startedAt, completedAt, now.value)
 }
@@ -399,7 +416,7 @@ onUnmounted(() => {
           <el-table-column label="任务" width="170">
             <template #default="scope">
               <button class="task-link" type="button" @click="openDetail(scope.row)">
-                <strong>{{ scope.row.task_type }}</strong>
+                <strong>{{ taskTypeLabel(scope.row.task_type) }}</strong>
                 <span>{{ scope.row.id.slice(0, 8) }}</span>
               </button>
             </template>
@@ -407,10 +424,16 @@ onUnmounted(() => {
           <el-table-column label="关联" width="135">
             <template #default="scope">
               <div class="association-cell">
-                <span v-if="scope.row.subject_kind" class="experiment-link">
+                <RouterLink
+                  v-if="factorStudyPath(scope.row)"
+                  class="association-link"
+                  :to="factorStudyPath(scope.row) ?? '/factor-studies'"
+                >
+                  因子研究 · {{ scope.row.subject_id?.slice(0, 8) }}
+                </RouterLink>
+                <span v-else-if="scope.row.subject_kind" class="association-value">
                   {{ scope.row.subject_kind }} · {{ scope.row.subject_id?.slice(0, 8) }}
                 </span>
-                <span v-else class="muted-value">数据/系统任务</span>
               </div>
             </template>
           </el-table-column>
@@ -450,9 +473,16 @@ onUnmounted(() => {
       <template v-else-if="detail.data.value">
         <div class="drawer-task">
           <div>
-            <span class="eyebrow">{{ detail.data.value.task_type }}</span>
+            <span class="eyebrow">{{ taskTypeLabel(detail.data.value.task_type) }}</span>
             <h2>{{ detail.data.value.id }}</h2>
-            <p>{{ detail.data.value.subject_kind ? `${detail.data.value.subject_kind} · ${detail.data.value.subject_id}` : '数据或系统后台任务' }}</p>
+            <p v-if="factorStudyPath(detail.data.value)">
+              <RouterLink class="association-link" :to="factorStudyPath(detail.data.value) ?? '/factor-studies'">
+                因子研究 · {{ detail.data.value.subject_id }}
+              </RouterLink>
+            </p>
+            <p v-else-if="detail.data.value.subject_kind">
+              {{ detail.data.value.subject_kind }} · {{ detail.data.value.subject_id }}
+            </p>
           </div>
           <div class="drawer-task-actions">
             <StatusBadge :status="detail.data.value.status" />
@@ -493,7 +523,16 @@ onUnmounted(() => {
               <el-descriptions-item label="运行时长">{{ duration(detail.data.value.started_at, detail.data.value.completed_at) }}</el-descriptions-item>
               <el-descriptions-item label="最近心跳">{{ formatTime(detail.data.value.heartbeat_at) }}</el-descriptions-item>
               <el-descriptions-item label="完成时间">{{ formatTime(detail.data.value.completed_at) }}</el-descriptions-item>
-              <el-descriptions-item label="关联对象" :span="2"><span class="hash">{{ detail.data.value.subject_kind ? `${detail.data.value.subject_kind}/${detail.data.value.subject_id}` : '—' }}</span></el-descriptions-item>
+              <el-descriptions-item label="关联对象" :span="2">
+                <RouterLink
+                  v-if="factorStudyPath(detail.data.value)"
+                  class="association-link hash"
+                  :to="factorStudyPath(detail.data.value) ?? '/factor-studies'"
+                >
+                  因子研究/{{ detail.data.value.subject_id }}
+                </RouterLink>
+                <span v-else class="hash">{{ detail.data.value.subject_kind ? `${detail.data.value.subject_kind}/${detail.data.value.subject_id}` : '—' }}</span>
+              </el-descriptions-item>
             </el-descriptions>
             <section class="parameter-panel">
               <header>
@@ -602,7 +641,7 @@ onUnmounted(() => {
 
 <style scoped>
 .runtime-overview{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}.runtime-stat{position:relative;min-height:92px;padding:16px 18px;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--muted);text-align:left;cursor:pointer;overflow:hidden}.runtime-stat::after{content:"";position:absolute;width:62px;height:62px;right:-18px;bottom:-24px;border-radius:50%;background:var(--accent,var(--dim));opacity:.11}.runtime-stat span{display:block;font-size:11px}.runtime-stat strong{display:block;margin-top:10px;color:var(--text);font-size:26px}.runtime-stat.active{border-color:var(--accent,var(--blue));box-shadow:0 0 0 2px color-mix(in srgb,var(--accent,var(--blue)) 12%,transparent)}.tone-blue{--accent:var(--blue)}.tone-cyan{--accent:var(--cyan)}.tone-danger{--accent:var(--danger)}.tone-warning{--accent:var(--warning)}
-.task-link{display:flex;flex-direction:column;gap:4px;padding:0;border:0;background:none;color:var(--text);text-align:left;cursor:pointer}.task-link span{color:var(--dim);font:10px ui-monospace,Consolas,monospace}.task-link:hover strong{color:var(--cyan)}.association-cell{display:flex;flex-direction:column;align-items:flex-start;gap:4px}.experiment-link{display:inline-block;color:var(--blue);font-size:10px;text-decoration:none}.progress-cell span{width:76px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);font-size:10px}.muted-value{color:var(--dim)}.pagination-row{display:flex;justify-content:flex-end;padding:14px 0}.runtime-table :deep(.el-table__cell){padding-top:13px;padding-bottom:13px}.runtime-table :deep(.el-table__header .el-table__cell){padding-top:11px;padding-bottom:11px}.runtime-center :deep(.runtime-row-failed td.el-table__cell){background:rgba(214,59,86,.045)}.runtime-center :deep(.runtime-row-orphaned td.el-table__cell){background:rgba(169,109,10,.06)}.runtime-center :deep(.runtime-row-running td.el-table__cell:first-child){box-shadow:inset 3px 0 var(--blue)}
+.task-link{display:flex;min-height:38px;flex-direction:column;justify-content:center;gap:4px;padding:0;border:0;background:none;color:var(--text);text-align:left;cursor:pointer}.task-link span{color:var(--dim);font:10px ui-monospace,Consolas,monospace}.task-link:hover strong{color:var(--cyan)}.association-cell{display:flex;min-height:38px;flex-direction:column;align-items:flex-start;justify-content:center;gap:4px}.association-link,.association-value{display:inline-block;color:var(--blue);font-size:10px;text-decoration:none}.association-link:hover{text-decoration:underline}.progress-cell{display:grid;min-height:38px;grid-template-columns:minmax(110px,160px) minmax(120px,1fr);align-items:center;column-gap:12px;max-width:900px}.progress-cell span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim);font-size:10px}.pagination-row{display:flex;justify-content:flex-end;padding:14px 0}.runtime-table :deep(.el-table__cell){padding-top:13px;padding-bottom:13px;vertical-align:middle}.runtime-table :deep(.el-table__header .el-table__cell){padding-top:11px;padding-bottom:11px}.runtime-center :deep(.runtime-row-failed td.el-table__cell){background:rgba(214,59,86,.045)}.runtime-center :deep(.runtime-row-orphaned td.el-table__cell){background:rgba(169,109,10,.06)}.runtime-center :deep(.runtime-row-running td.el-table__cell:first-child){box-shadow:inset 3px 0 var(--blue)}
 .drawer-task{display:flex;justify-content:space-between;gap:18px;padding:18px;border:1px solid var(--border);border-radius:12px;background:var(--surface-raised)}.drawer-task h2{margin:6px 0 0;font:16px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.drawer-task p{margin:8px 0 0;color:var(--dim);font-size:11px}.drawer-task-actions{display:flex;flex-direction:column;align-items:flex-end;gap:12px}.drawer-task-actions a{text-decoration:none}.diagnostic-card{margin-top:14px;padding:18px;border:1px solid rgba(214,59,86,.28);border-radius:12px;background:rgba(214,59,86,.045)}.diagnostic-heading{display:flex;justify-content:space-between;gap:16px}.diagnostic-heading h3{margin:7px 0 0;font-size:15px;line-height:1.5}.diagnostic-grid{display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:12px;margin:16px 0 0}.diagnostic-grid div{min-width:0}.diagnostic-grid .wide{grid-column:1/-1}.diagnostic-grid dt{color:var(--dim);font-size:10px}.diagnostic-grid dd{margin:5px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.diagnostic-grid code{color:var(--danger)}.traceback-details{margin-top:14px;border-top:1px solid rgba(214,59,86,.18);padding-top:12px}.traceback-details summary{color:var(--blue);font-size:11px;cursor:pointer}.traceback-details pre{max-height:320px;overflow:auto;margin:12px 0 0;padding:12px;border-radius:8px;background:#fff;color:#3c4858;font:11px/1.65 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.runtime-tabs{margin-top:18px}.attempt-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:14px}.attempt-card{display:flex;flex-direction:column;align-items:stretch;gap:8px;padding:12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--muted);text-align:left;cursor:pointer}.attempt-card.selected{border-color:var(--blue);background:rgba(37,99,235,.045)}.attempt-card>span{display:flex;align-items:center;justify-content:space-between}.attempt-card small,.attempt-card em{color:var(--dim);font-size:10px;font-style:normal}.attempt-card code{color:var(--danger);font-size:10px}.log-section{display:flex;flex-direction:column;gap:10px}.log-toolbar{display:flex;align-items:center;justify-content:space-between}.log-toolbar>div{display:flex;flex-direction:column;gap:4px}.log-toolbar strong{font-size:12px}.log-toolbar span{color:var(--dim);font-size:10px}.log-empty{display:grid;min-height:120px;place-items:center;border:1px dashed var(--border);border-radius:9px;color:var(--dim);font-size:12px;background:var(--surface-raised)}
 .parameter-panel{margin-top:14px;padding:16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-raised)}.parameter-panel>header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.parameter-panel h3{margin:5px 0 0;font-size:14px}.readonly-pill{padding:5px 7px;border-radius:5px;color:#708198;background:#edf1f6;font-size:8px;letter-spacing:.1em}.parameter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:14px 0 0}.parameter-item{min-width:0;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.parameter-item dt{color:var(--dim);font-size:10px}.parameter-item dd{margin:6px 0 0;overflow:hidden;color:var(--muted);font-size:11px;overflow-wrap:anywhere}.parameter-item code{white-space:pre-wrap}.parameter-json{margin-top:12px;border-top:1px solid var(--border);padding-top:11px}.parameter-json summary{color:var(--blue);font-size:11px;cursor:pointer}.parameter-json pre{max-height:320px;overflow:auto;margin:10px 0 0;padding:12px;border-radius:8px;background:#fff;color:#3c4858;font:11px/1.65 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.parameter-empty{display:grid;min-height:92px;place-items:center;margin-top:12px;border:1px dashed var(--border);border-radius:8px;color:var(--dim);font-size:11px;background:var(--surface)}
 .update-parameter-summary{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.update-parameter-summary>div{padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}.update-parameter-summary .wide{grid-column:1/-1}.update-parameter-summary dt{color:var(--dim);font-size:10px}.update-parameter-summary dd{margin:6px 0 0;color:var(--muted);font-size:11px}.update-window-table{margin-top:12px}

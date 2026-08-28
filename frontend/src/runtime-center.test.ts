@@ -114,6 +114,7 @@ async function mountRuntimeCenter(
     routes: [
       { path: '/tasks', component: TasksView },
       { path: '/experiments/:experimentId', name: 'experiment-detail', component: { template: '<div />' } },
+      { path: '/factor-studies/:factorStudyId', name: 'factor-study-detail', component: { template: '<div class="factor-study-detail-target" />' } },
     ],
   })
   await router.push(initialPath)
@@ -150,6 +151,41 @@ describe('runtime center', () => {
     expect(wrapper.find('.task-link').element.closest('td'))
       .not.toBe(wrapper.find('.association-cell').element.closest('td'))
     expect(wrapper.find('.association-cell').text()).toContain('EXPERIMENT_RUN · research')
+    expect(wrapper.find('.task-link strong').text()).toBe('实验运行')
+    wrapper.unmount()
+  })
+
+  it('uses Chinese task labels and leaves data-task associations empty', async () => {
+    const wrapper = await mountRuntimeCenter(
+      true,
+      { years: 5 },
+      'DATA_BOOTSTRAP',
+      '/tasks',
+      { subject_kind: null, subject_id: null },
+    )
+
+    expect(wrapper.find('.task-link strong').text()).toBe('数据初始化')
+    expect(wrapper.find('.association-cell').text()).toBe('')
+    expect(wrapper.text()).not.toContain('数据/系统任务')
+    wrapper.unmount()
+  })
+
+  it('links a factor-study task to its factor-study detail', async () => {
+    const wrapper = await mountRuntimeCenter(
+      true,
+      { factor_study_id: 'study-0001' },
+      'FACTOR_STUDY',
+      '/tasks',
+      { subject_kind: 'FACTOR_STUDY', subject_id: 'study-0001' },
+    )
+
+    expect(wrapper.find('.task-link strong').text()).toBe('因子研究')
+    const link = wrapper.find('.association-link')
+    expect(link.text()).toBe('因子研究 · study-00')
+    expect(link.attributes('href')).toBe('/factor-studies/study-0001')
+    await link.trigger('click')
+    await flushPromises()
+    expect(wrapper.vm.$router.currentRoute.value.fullPath).toBe('/factor-studies/study-0001')
     wrapper.unmount()
   })
 
