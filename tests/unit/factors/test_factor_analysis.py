@@ -425,6 +425,170 @@ def test_quantile_and_long_short_returns_align_exact_signal_keys() -> None:
     assert long_short_returns(groups)["long_short_return"].item() == pytest.approx(0.02)
 
 
+def test_vectorized_daily_ic_and_quantiles_match_naive_reference() -> None:
+    """批量分区实现与逐日逐分位参考算法保持相同统计语义。"""
+    days = [_day(offset) for offset in range(3)]
+    instruments = tuple("ABCDEFGH")
+    factor_rows: list[dict[str, object]] = []
+    return_rows: list[dict[str, object]] = []
+    for day_index, signal_date in enumerate(days):
+        for instrument_index, instrument_id in enumerate(instruments):
+            value: float | None = float((instrument_index + day_index) // 2)
+            is_valid = True
+            if instrument_id == "G":
+                value = float("inf")
+            elif instrument_id == "H":
+                value = None
+                is_valid = False
+            factor_rows.append(
+                {
+                    "signal_date": signal_date,
+                    "instrument_id": instrument_id,
+                    "value": value,
+                    "is_valid": is_valid,
+                }
+            )
+            future_return: float | None = (
+                float(instrument_index - day_index) / 100.0
+            )
+            return_start = signal_date + timedelta(days=1)
+            if day_index == 1 and instrument_id == "F":
+                future_return = None
+            elif instrument_id == "G":
+                future_return = float("inf")
+            elif instrument_id == "H":
+                return_start = None
+            return_rows.append(
+                {
+                    "signal_date": signal_date,
+                    "instrument_id": instrument_id,
+                    "return_start": return_start,
+                    "return_end": signal_date + timedelta(days=2),
+                    "future_return": future_return,
+                }
+            )
+    factors = pl.DataFrame(factor_rows)
+    future = pl.DataFrame(
+        return_rows,
+        schema={
+            "signal_date": pl.Date,
+            "instrument_id": pl.String,
+            "return_start": pl.Date,
+            "return_end": pl.Date,
+            "future_return": pl.Float64,
+        },
+    )
+
+    daily = InformationCoefficientAnalyzer(
+        rolling_window=2, rolling_min_valid=2
+    ).daily(factors, future, minimum_cross_section=4)
+    valid_factors = factors.filter(
+        pl.col("is_valid")
+        & pl.col("value").is_not_null()
+        & pl.col("value").is_finite()
+    )
+    valid_returns = future.filter(
+        pl.col("return_start").is_not_null()
+        & pl.col("return_end").is_not_null()
+        & pl.col("future_return").is_not_null()
+        & pl.col("future_return").is_finite()
+    )
+    expected_ic: list[tuple[int, int, float, float]] = []
+    for signal_date in days:
+        factor_group = valid_factors.filter(
+            pl.col("signal_date") == signal_date
+        )
+        paired = factor_group.join(
+            valid_returns.filter(pl.col("signal_date") == signal_date),
+            on=["signal_date", "instrument_id"],
+            how="inner",
+        )
+        left = paired["value"].to_numpy()
+        right = paired["future_return"].to_numpy()
+
+        def average_ranks(values: np.ndarray) -> np.ndarray:
+            order = np.argsort(values, kind="stable")
+            ranks = np.empty(len(values), dtype=float)
+            index = 0
+            while index < len(values):
+                stop = index + 1
+                while (
+                    stop < len(values)
+                    and values[order[stop]] == values[order[index]]
+                ):
+                    stop += 1
+                ranks[order[index:stop]] = (index + stop - 1) / 2.0
+                index = stop
+            return ranks
+
+        expected_ic.append(
+            (
+                factor_group.height,
+                paired.height,
+                float(np.corrcoef(left, right)[0, 1]),
+                float(
+                    np.corrcoef(
+                        average_ranks(left), average_ranks(right)
+                    )[0, 1]
+                ),
+            )
+        )
+    assert daily.select("factor_valid_count", "sample_count").rows() == [
+        row[:2] for row in expected_ic
+    ]
+    assert daily["pearson_ic"].to_list() == pytest.approx(
+        [row[2] for row in expected_ic], rel=1e-12, abs=1e-12
+    )
+    assert daily["rank_ic"].to_list() == pytest.approx(
+        [row[3] for row in expected_ic], rel=1e-12, abs=1e-12
+    )
+
+    assigned = assign_quantiles(factors, 5)
+    quantiles = quantile_future_returns(factors, future, 5)
+    joined = assigned.join(
+        valid_returns.select(
+            "signal_date", "instrument_id", "future_return"
+        ),
+        on=["signal_date", "instrument_id"],
+        how="left",
+    )
+    expected_quantiles: list[tuple[object, ...]] = []
+    for signal_date in days:
+        day_rows = joined.filter(pl.col("signal_date") == signal_date)
+        for quantile in range(1, 6):
+            bucket = day_rows.filter(pl.col("quantile") == quantile)
+            values = bucket["future_return"].drop_nulls().to_list()
+            factor_values = bucket["value"].drop_nulls().to_list()
+            expected_quantiles.append(
+                (
+                    signal_date,
+                    quantile,
+                    len(values),
+                    sum(values) / len(values) if values else None,
+                    min(factor_values) if factor_values else None,
+                    max(factor_values) if factor_values else None,
+                    not values,
+                )
+            )
+    actual_quantiles = quantiles.select(
+        "signal_date",
+        "quantile",
+        "count",
+        "mean_return",
+        "factor_lower_bound",
+        "factor_upper_bound",
+        "is_empty",
+    ).rows()
+    for actual, expected in zip(
+        actual_quantiles, expected_quantiles, strict=True
+    ):
+        assert actual[:3] == expected[:3]
+        assert actual[3:6] == pytest.approx(
+            expected[3:6], rel=1e-12, abs=1e-12
+        )
+        assert actual[6] is expected[6]
+
+
 def test_factor_correlations_pair_same_security_within_each_date() -> None:
     first = _factors(
         [

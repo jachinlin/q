@@ -151,28 +151,85 @@ class InformationCoefficientAnalyzer:
         _AnalysisSupport._unique(factors, "factors")
         _AnalysisSupport._validate_future(future_returns)
         valid_factors = _AnalysisSupport._valid_factors(factors)
-        pairs = valid_factors.join(
+        return self._daily_from_valid_inputs(
+            factors,
+            valid_factors,
             _AnalysisSupport._valid_returns(future_returns),
+            minimum_cross_section=minimum_cross_section,
+        )
+
+    def _daily_from_valid_inputs(
+        self,
+        factors: pl.DataFrame,
+        valid_factors: pl.DataFrame,
+        valid_returns: pl.DataFrame,
+        *,
+        minimum_cross_section: int,
+        factor_counts_override: dict[date, int] | None = None,
+        additional_valid_factors: pl.DataFrame | None = None,
+        valid_factors_sorted: bool = False,
+    ) -> pl.DataFrame:
+        """从已校验且已过滤的输入按连续日期分区计算 IC。"""
+        prepared_factors = valid_factors.filter(
+            pl.col("instrument_id").is_not_null()
+        ).select("signal_date", "instrument_id", "value")
+        if not valid_factors_sorted:
+            prepared_factors = prepared_factors.sort(
+                "signal_date", "instrument_id"
+            )
+        pairs = prepared_factors.join(
+            valid_returns,
             on=["signal_date", "instrument_id"],
             how="inner",
+            maintain_order="left",
         )
-        rows: list[
-            tuple[date, int, int, float | None, float | None, bool, str | None]
-        ] = []
-        dates = sorted(set(factors["signal_date"].to_list()))
-        for day in dates:
-            factor_group = valid_factors.filter(pl.col("signal_date") == day)
-            group = pairs.filter(pl.col("signal_date") == day)
-            factor_count = factor_group.height
-            sample_count = group.height
+        if (
+            additional_valid_factors is not None
+            and not additional_valid_factors.is_empty()
+        ):
+            pairs = pl.concat(
+                [
+                    pairs,
+                    additional_valid_factors.select(
+                    "signal_date", "instrument_id", "value"
+                    ).join(
+                        valid_returns,
+                        on=["signal_date", "instrument_id"],
+                        how="inner",
+                        maintain_order="left",
+                    ),
+                ]
+            ).sort("signal_date", "instrument_id")
+        factor_counts = factor_counts_override or {
+            cast(date, signal_date): int(count)
+            for signal_date, count in valid_factors.filter(
+                pl.col("instrument_id").is_not_null()
+            )
+            .group_by("signal_date")
+            .len()
+            .iter_rows()
+        }
+        pair_statistics: dict[
+            date, tuple[int, float | None, float | None, str | None]
+        ] = {}
+        offset = 0
+        for signal_date, count in (
+            pairs.group_by("signal_date", maintain_order=True)
+            .len()
+            .iter_rows()
+        ):
+            day = cast(date, signal_date)
+            size = int(count)
+            factor_count = factor_counts.get(day, 0)
             pearson_ic: float | None = None
             rank_ic: float | None = None
             invalid_reason: str | None = None
             if factor_count < minimum_cross_section:
                 invalid_reason = "INSUFFICIENT_CROSS_SECTION"
-            elif sample_count < minimum_cross_section:
+            elif size < minimum_cross_section:
                 invalid_reason = "INSUFFICIENT_FORWARD_PAIRS"
             else:
+                group = pairs.slice(offset, size)
                 factor_values = group["value"].to_numpy()
                 return_values = group["future_return"].to_numpy()
                 if np.ptp(factor_values) == 0:
@@ -191,6 +248,31 @@ class InformationCoefficientAnalyzer:
                         pearson_ic = None
                         rank_ic = None
                         invalid_reason = "NONFINITE_IC"
+            pair_statistics[day] = (
+                size,
+                pearson_ic,
+                rank_ic,
+                invalid_reason,
+            )
+            offset += size
+        rows: list[
+            tuple[date, int, int, float | None, float | None, bool, str | None]
+        ] = []
+        dates = sorted(set(cast(list[date], factors["signal_date"].to_list())))
+        for day in dates:
+            factor_count = factor_counts.get(day, 0)
+            statistics = pair_statistics.get(day)
+            if statistics is None:
+                sample_count = 0
+                pearson_ic = None
+                rank_ic = None
+                invalid_reason = (
+                    "INSUFFICIENT_CROSS_SECTION"
+                    if factor_count < minimum_cross_section
+                    else "INSUFFICIENT_FORWARD_PAIRS"
+                )
+            else:
+                sample_count, pearson_ic, rank_ic, invalid_reason = statistics
             rows.append(
                 (
                     day,
@@ -503,49 +585,11 @@ def quantile_future_returns(
     """
     assigned = assign_quantiles(factors, quantiles)
     _AnalysisSupport._validate_future(future_returns)
-    joined = assigned.join(
+    return _AnalysisSupport._quantile_returns_from_assigned(
+        assigned,
         _AnalysisSupport._valid_returns(future_returns),
-        on=["signal_date", "instrument_id"],
-        how="left",
+        quantiles,
     )
-    rows = []
-    for day in sorted(set(factors["signal_date"].to_list())):
-        day_rows = joined.filter(pl.col("signal_date") == day)
-        for quantile in range(1, quantiles + 1):
-            bucket = day_rows.filter(pl.col("quantile") == quantile)
-            values = bucket["future_return"].drop_nulls().to_list()
-            factor_values = bucket.filter(pl.col("instrument_id").is_not_null())[
-                "value"
-            ]
-            numeric_values = cast(list[float], factor_values.to_list())
-            lower_bound = None if not numeric_values else min(numeric_values)
-            upper_bound = None if not numeric_values else max(numeric_values)
-            rows.append(
-                (
-                    day,
-                    quantile,
-                    len(values),
-                    sum(values) / len(values) if values else None,
-                    lower_bound,
-                    upper_bound,
-                    quantiles,
-                    not values,
-                )
-            )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "signal_date": pl.Date,
-            "quantile": pl.Int64,
-            "count": pl.Int64,
-            "mean_return": pl.Float64,
-            "factor_lower_bound": pl.Float64,
-            "factor_upper_bound": pl.Float64,
-            "quantiles": pl.Int64,
-            "is_empty": pl.Boolean,
-        },
-        orient="row",
-    ).sort("signal_date", "quantile")
 
 
 def long_short_returns(quantile_returns: pl.DataFrame) -> pl.DataFrame:
@@ -778,6 +822,45 @@ class _AnalysisSupport:
         )
 
     @staticmethod
+    def _quantile_returns_from_assigned(
+        assigned: pl.DataFrame,
+        valid_returns: pl.DataFrame,
+        quantiles: int,
+    ) -> pl.DataFrame:
+        """从已分配分位和已过滤收益批量聚合分层收益。"""
+        joined = assigned.join(
+            valid_returns.select(
+                "signal_date", "instrument_id", "future_return"
+            ),
+            on=["signal_date", "instrument_id"],
+            how="left",
+        )
+        return (
+            joined.group_by("signal_date", "quantile")
+            .agg(
+                pl.col("future_return").count().cast(pl.Int64).alias("count"),
+                pl.col("future_return").mean().alias("mean_return"),
+                pl.col("value").min().alias("factor_lower_bound"),
+                pl.col("value").max().alias("factor_upper_bound"),
+            )
+            .with_columns(
+                pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
+                (pl.col("count") == 0).alias("is_empty"),
+            )
+            .select(
+                "signal_date",
+                "quantile",
+                "count",
+                "mean_return",
+                "factor_lower_bound",
+                "factor_upper_bound",
+                "quantiles",
+                "is_empty",
+            )
+            .sort("signal_date", "quantile")
+        )
+
+    @staticmethod
     def _validate_future(frame: pl.DataFrame) -> None:
         _AnalysisSupport._require(
             frame,
@@ -824,13 +907,22 @@ class _AnalysisSupport:
     def _ranks(values: np.ndarray) -> np.ndarray:
         order = np.argsort(values, kind="stable")
         ranks = np.empty(len(values), dtype=np.float64)
-        index = 0
-        while index < len(values):
-            stop = index + 1
-            while stop < len(values) and values[order[stop]] == values[order[index]]:
-                stop += 1
-            ranks[order[index:stop]] = (index + stop - 1) / 2.0
-            index = stop
+        if len(values) == 0:
+            return ranks
+        ordered = values[order]
+        starts = np.concatenate(
+            (
+                np.asarray([0], dtype=np.int64),
+                np.flatnonzero(ordered[1:] != ordered[:-1]) + 1,
+            )
+        )
+        stops = np.concatenate(
+            (starts[1:], np.asarray([len(values)], dtype=np.int64))
+        )
+        ranks[order] = np.repeat(
+            (starts + stops - 1).astype(np.float64) / 2.0,
+            stops - starts,
+        )
         return ranks
 
     @staticmethod

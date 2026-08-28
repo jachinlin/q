@@ -13,10 +13,10 @@ import polars as pl
 
 from quant_research.factors.analysis import (
     InformationCoefficientAnalyzer,
+    _AnalysisSupport,
     assign_quantiles,
     factor_rank_correlation_matrix,
     long_short_returns,
-    quantile_future_returns,
 )
 
 DIRECTION_ADJUSTED = "DIRECTION_ADJUSTED"
@@ -433,6 +433,9 @@ class _StudyAnalyzer:
         variants = sorted(
             set(cast(list[str], factors["signal_variant"].to_list()))
         )
+        ordered_returns = tuple(sorted(future_returns.items()))
+        for _, returns in ordered_returns:
+            _AnalysisSupport._validate_future(returns)
         for variant in variants:
             variant_factors = factors.filter(
                 pl.col("signal_variant") == variant
@@ -442,6 +445,16 @@ class _StudyAnalyzer:
                     variant_factors, minimum_pairs=self._minimum
                 ).with_columns(pl.lit(variant).alias("signal_variant"))
             )
+            prepared: list[
+                tuple[
+                    str,
+                    pl.DataFrame,
+                    dict[date, int],
+                    pl.DataFrame,
+                    pl.DataFrame,
+                    pl.DataFrame,
+                ]
+            ] = []
             for factor_ref in refs:
                 frame = variant_factors.filter(
                     pl.col("factor_id") == factor_ref
@@ -476,23 +489,76 @@ class _StudyAnalyzer:
                             ),
                         }
                     )
+                valid_factors = _AnalysisSupport._valid_factors(frame)
+                factor_counts = {
+                    cast(date, signal_date): int(count)
+                    for signal_date, count in valid_factors.group_by(
+                        "signal_date"
+                    )
+                    .len()
+                    .iter_rows()
+                }
+                removed_dates = counts.filter(
+                    pl.col("valid_count") < self._minimum
+                ).select("signal_date")
+                additional_valid_factors = valid_factors.join(
+                    removed_dates,
+                    on="signal_date",
+                    how="inner",
+                ).select("signal_date", "instrument_id", "value")
+                del valid_factors
                 masked = self._minimum_mask(frame)
-                turnover = self._turnover(masked).with_columns(
+                assigned = assign_quantiles(masked, self._quantiles)
+                del masked
+                turnover = self._turnover(assigned).with_columns(
                     pl.lit(variant).alias("signal_variant"),
                     pl.lit(factor_ref).alias("factor_ref"),
                 )
                 turnover_frames.append(turnover)
-                for (horizon, label_kind), returns in sorted(
-                    future_returns.items()
-                ):
-                    ic = self._ic(frame, returns, denominator).with_columns(
+                prepared.append(
+                    (
+                        factor_ref,
+                        frame.select("signal_date").unique(),
+                        factor_counts,
+                        additional_valid_factors,
+                        assigned,
+                        turnover,
+                    )
+                )
+            for (horizon, label_kind), returns in ordered_returns:
+                valid_returns = _AnalysisSupport._valid_returns(returns)
+                label_counts = (
+                    returns.filter(pl.col("is_valid"))
+                    .group_by("signal_date")
+                    .len()
+                    .rename({"len": "label_valid_count"})
+                )
+                for (
+                    factor_ref,
+                    factor_dates,
+                    factor_counts,
+                    additional_valid_factors,
+                    assigned,
+                    turnover,
+                ) in prepared:
+                    ic = self._ic(
+                        factor_dates,
+                        factor_counts,
+                        additional_valid_factors,
+                        assigned,
+                        valid_returns,
+                        label_counts,
+                        denominator,
+                    ).with_columns(
                         pl.lit(variant).alias("signal_variant"),
                         pl.lit(factor_ref).alias("factor_ref"),
                         pl.lit(horizon).alias("horizon"),
                         pl.lit(label_kind).alias("label_kind"),
                     )
-                    quantile = quantile_future_returns(
-                        masked, returns, self._quantiles
+                    quantile = _AnalysisSupport._quantile_returns_from_assigned(
+                        assigned,
+                        valid_returns,
+                        self._quantiles,
                     )
                     paired = quantile.group_by("signal_date").agg(
                         pl.col("count").sum().alias("paired_count")
@@ -630,18 +696,22 @@ class _StudyAnalyzer:
 
     def _ic(
         self,
-        frame: pl.DataFrame,
-        returns: pl.DataFrame,
+        factor_dates: pl.DataFrame,
+        factor_counts: dict[date, int],
+        additional_valid_factors: pl.DataFrame,
+        assigned: pl.DataFrame,
+        valid_returns: pl.DataFrame,
+        label_counts: pl.DataFrame,
         denominator: pl.DataFrame,
     ) -> pl.DataFrame:
-        daily = self._ic_analyzer.daily(
-            frame, returns, minimum_cross_section=self._minimum
-        )
-        label_counts = (
-            returns.filter(pl.col("is_valid"))
-            .group_by("signal_date")
-            .len()
-            .rename({"len": "label_valid_count"})
+        daily = self._ic_analyzer._daily_from_valid_inputs(
+            factor_dates,
+            assigned,
+            valid_returns,
+            minimum_cross_section=self._minimum,
+            factor_counts_override=factor_counts,
+            additional_valid_factors=additional_valid_factors,
+            valid_factors_sorted=True,
         )
         return (
             daily.join(denominator, on="signal_date", how="left")
@@ -797,15 +867,17 @@ class _StudyAnalyzer:
             orient="row",
         ).sort("signal_date")
 
-    def _turnover(self, frame: pl.DataFrame) -> pl.DataFrame:
-        assigned = assign_quantiles(frame, self._quantiles).filter(
-            pl.col("instrument_id").is_not_null()
-        )
-        dates = sorted(set(cast(list[date], frame["signal_date"].to_list())))
+    def _turnover(self, assigned: pl.DataFrame) -> pl.DataFrame:
+        grouped = assigned.group_by("signal_date", maintain_order=True).len()
         rows: list[tuple[object, ...]] = []
         previous: pl.DataFrame | None = None
-        for day in dates:
-            current = assigned.filter(pl.col("signal_date") == day)
+        offset = 0
+        for signal_date, count in grouped.iter_rows():
+            day = cast(date, signal_date)
+            size = int(count)
+            current = assigned.slice(offset, size).filter(
+                pl.col("instrument_id").is_not_null()
+            )
             if previous is None:
                 rows.append(
                     (
@@ -820,6 +892,7 @@ class _StudyAnalyzer:
                     )
                 )
                 previous = current
+                offset += size
                 continue
             rank = self._rank_autocorrelation(previous, current)
             low = self._leg_turnover(previous, current, 1)
@@ -845,6 +918,7 @@ class _StudyAnalyzer:
                 )
             )
             previous = current
+            offset += size
         return pl.DataFrame(
             rows,
             schema={
@@ -931,36 +1005,38 @@ class _StudyAnalyzer:
         self,
         future_returns: Mapping[tuple[int, str], pl.DataFrame],
     ) -> pl.DataFrame:
-        rows: list[dict[str, object]] = []
+        frames: list[pl.DataFrame] = []
         for (horizon, label_kind), frame in sorted(future_returns.items()):
-            for group in frame.partition_by(
-                "signal_date", maintain_order=False
-            ):
-                day = group["signal_date"].item(0)
-                total = group.height
-                reasons = (
-                    group.with_columns(
-                        pl.col("invalid_reason")
-                        .fill_null("VALID")
-                        .alias("reason")
-                    )
-                    .group_by("reason")
-                    .len()
-                    .sort("reason")
+            prepared = frame.select(
+                "signal_date",
+                pl.col("invalid_reason").fill_null("VALID").alias("reason"),
+            )
+            totals = prepared.group_by("signal_date").len().rename(
+                {"len": "eligible_count"}
+            )
+            frames.append(
+                prepared.group_by("signal_date", "reason")
+                .len()
+                .rename({"len": "count"})
+                .join(totals, on="signal_date", how="left")
+                .with_columns(
+                    pl.lit(label_kind).alias("label_kind"),
+                    pl.lit(horizon, dtype=pl.Int64).alias("horizon"),
+                    (pl.col("count") / pl.col("eligible_count")).alias(
+                        "rate"
+                    ),
                 )
-                for reason, count in reasons.iter_rows():
-                    rows.append(
-                        {
-                            "label_kind": label_kind,
-                            "horizon": horizon,
-                            "signal_date": day,
-                            "reason": reason,
-                            "count": count,
-                            "eligible_count": total,
-                            "rate": count / total if total else None,
-                        }
-                    )
-        return pl.DataFrame(rows).sort(
+                .select(
+                    "label_kind",
+                    "horizon",
+                    "signal_date",
+                    "reason",
+                    "count",
+                    "eligible_count",
+                    "rate",
+                )
+            )
+        return pl.concat(frames).sort(
             "label_kind", "horizon", "signal_date", "reason"
         )
 
@@ -1023,19 +1099,7 @@ class _StudyAnalyzer:
 
     @staticmethod
     def _average_ranks(values: np.ndarray) -> np.ndarray:
-        order = np.argsort(values, kind="stable")
-        ranks = np.empty(len(values), dtype=float)
-        index = 0
-        while index < len(values):
-            stop = index + 1
-            while (
-                stop < len(values)
-                and values[order[stop]] == values[order[index]]
-            ):
-                stop += 1
-            ranks[order[index:stop]] = (index + stop - 1) / 2.0
-            index = stop
-        return ranks
+        return _AnalysisSupport._ranks(values)
 
     @staticmethod
     def _mean(values: list[float]) -> float | None:

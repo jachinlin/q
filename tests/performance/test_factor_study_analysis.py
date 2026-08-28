@@ -9,13 +9,26 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from quant_research.factor_studies.analysis import build_future_returns
+from quant_research.factor_studies.analysis import (
+    DIRECTION_ADJUSTED,
+    EXECUTABLE_FORWARD_RETURN,
+    INDUSTRY_NEUTRALIZED,
+    THEORETICAL_FORWARD_RETURN,
+    analyze,
+    build_future_returns,
+)
 from quant_research.factors.analysis import assign_quantiles
 from tests.performance._process_memory import process_peak_rss_bytes
 
 pytestmark = pytest.mark.performance
 
 _PARTITION_SIZE = 100
+_FULL_SESSION_COUNT = 1_215
+_FULL_INSTRUMENT_COUNT = 5_891
+_FULL_FACTOR_INSTRUMENT_COUNT = 3_878
+_BASELINE_ANALYSIS_SECONDS = 351.15476090001175
+_MAX_ANALYSIS_SECONDS = 120.0
+_BASELINE_ANALYSIS_PEAK_RSS_BYTES = 3_125_710_848
 
 
 def test_twenty_year_partition_labels_and_quantiles_record_evidence() -> None:
@@ -101,3 +114,110 @@ def test_twenty_year_partition_labels_and_quantiles_record_evidence() -> None:
         },
     }
     print(f"factor_study_performance={json.dumps(evidence, sort_keys=True)}")
+
+
+def test_full_scale_factor_study_statistics_record_evidence() -> None:
+    """五年全市场统计负载保持在约定耗时和内存上限内。"""
+    sessions: list[date] = []
+    current = date(2018, 1, 2)
+    while len(sessions) < _FULL_SESSION_COUNT:
+        if current.weekday() < 5:
+            sessions.append(current)
+        current += timedelta(days=1)
+    session_frame = pl.DataFrame(
+        {
+            "signal_date": sessions,
+            "_session_rank": range(_FULL_SESSION_COUNT),
+        },
+        schema={"signal_date": pl.Date, "_session_rank": pl.Int32},
+    )
+    instruments = pl.DataFrame(
+        {
+            "instrument_id": [
+                f"{index:06d}.SZ" for index in range(_FULL_INSTRUMENT_COUNT)
+            ],
+            "_instrument_rank": range(_FULL_INSTRUMENT_COUNT),
+        },
+        schema={"instrument_id": pl.String, "_instrument_rank": pl.Int32},
+    )
+    scope = session_frame.join(instruments, how="cross")
+    eligible = scope.select(
+        "signal_date", "instrument_id", pl.lit(True).alias("eligible")
+    )
+    factor_base = scope.filter(
+        pl.col("_instrument_rank") < _FULL_FACTOR_INSTRUMENT_COUNT
+    ).select(
+        "signal_date",
+        "instrument_id",
+        pl.lit("log_total_market_cap").alias("factor_id"),
+        (
+            pl.col("_instrument_rank").cast(pl.Float64)
+            + pl.col("_session_rank").cast(pl.Float64) / 1_000_000.0
+        ).alias("value"),
+        pl.lit(True).alias("is_valid"),
+    )
+    factors = pl.concat(
+        [
+            factor_base.with_columns(
+                pl.lit(variant).alias("signal_variant")
+            )
+            for variant in (DIRECTION_ADJUSTED, INDUSTRY_NEUTRALIZED)
+        ]
+    )
+    return_base = scope.select(
+        "signal_date",
+        "instrument_id",
+        (pl.col("signal_date") + pl.duration(days=1)).alias("return_start"),
+        (pl.col("signal_date") + pl.duration(days=20)).alias("return_end"),
+        (
+            pl.col("_instrument_rank").cast(pl.Float64) / 100_000.0
+            + pl.col("_session_rank").cast(pl.Float64) / 10_000_000.0
+        ).alias("future_return"),
+        pl.lit(True).alias("is_valid"),
+        pl.lit(None, dtype=pl.String).alias("invalid_reason"),
+    )
+    future = {
+        (horizon, label_kind): return_base.with_columns(
+            pl.lit(horizon, dtype=pl.Int64).alias("horizon"),
+            pl.lit(label_kind).alias("label_kind"),
+        )
+        for horizon in (1, 5, 20)
+        for label_kind in (
+            THEORETICAL_FORWARD_RETURN,
+            EXECUTABLE_FORWARD_RETURN,
+        )
+    }
+
+    started = time.perf_counter()
+    outputs = analyze(
+        factors,
+        eligible,
+        future,
+        quantiles=5,
+        cost_bps_scenarios=(5, 10, 20),
+    )
+    analysis_seconds = time.perf_counter() - started
+    peak_rss_bytes = process_peak_rss_bytes()
+    evidence = {
+        "workload": "SYNTHETIC_FULL_FACTOR_STUDY_STATISTICS",
+        "sessions": _FULL_SESSION_COUNT,
+        "instruments": _FULL_INSTRUMENT_COUNT,
+        "factor_rows": factors.height,
+        "label_rows": sum(frame.height for frame in future.values()),
+        "analysis_seconds": analysis_seconds,
+        "peak_rss_bytes": peak_rss_bytes,
+        "output_row_counts": {
+            name: frame.height for name, frame in sorted(outputs.items())
+        },
+    }
+    print(
+        "factor_study_statistics_performance="
+        f"{json.dumps(evidence, sort_keys=True)}"
+    )
+
+    assert outputs["summary"].height == 12
+    assert outputs["ic"].height == 14_580
+    assert outputs["quantile_returns"].height == 72_900
+    assert analysis_seconds <= _MAX_ANALYSIS_SECONDS
+    assert analysis_seconds <= _BASELINE_ANALYSIS_SECONDS * 0.4
+    assert peak_rss_bytes <= _BASELINE_ANALYSIS_PEAK_RSS_BYTES
