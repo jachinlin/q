@@ -188,7 +188,7 @@ def required_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
 
 
 def instrument_identifier_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
-    """检查场内证券代码；该函数作为质量规则框架入口保留在模块级。
+    """检查场内证券代码；该函数作为稳定公开 API 保留在模块级。
 
     入参：Canonical 分区。返回值：代码不满足六位数字加交易所后缀时的质量问题。
     异常：帧错误按原类型传播。

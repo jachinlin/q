@@ -80,6 +80,7 @@ _MODULE_FUNCTION_ALLOWLIST: Mapping[str, str] = {
     "quant_research.data.quality.rules.canonical_conforming_partitions": "stable_public_api",
     "quant_research.data.quality.rules.primary_key_issues": "stable_public_api",
     "quant_research.data.quality.rules.required_value_issues": "stable_public_api",
+    "quant_research.data.quality.rules.instrument_identifier_issues": "stable_public_api",
     "quant_research.data.quality.rules.daily_bar_value_issues": "stable_public_api",
     "quant_research.data.quality.rules.coverage_issues": "stable_public_api",
     "quant_research.data.quality.rules.financial_availability_issues": "stable_public_api",
