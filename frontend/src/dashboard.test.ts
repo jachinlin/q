@@ -66,6 +66,13 @@ describe('dashboard shell contract', () => {
     expect(formatDuration('2026-08-15T00:00:00Z', null, Date.parse('2026-08-15T01:02:03Z'))).toBe('1小时 2分')
   })
 
+  it('uses distinct semantic colors for dataset freshness', () => {
+    expect(statusType('CURRENT')).toBe('success')
+    expect(statusType('STALE')).toBe('warning')
+    expect(statusType('MISSING')).toBe('danger')
+    expect(statusType('UNKNOWN')).toBe('info')
+  })
+
   it('shows the structured API reason instead of a generic unavailable state', () => {
     const error = new DashboardApiError({
       code: 'DASHBOARD_INPUT_INVALID',

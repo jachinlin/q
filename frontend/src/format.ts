@@ -37,9 +37,9 @@ export const formatPercent = (value?: number | null) =>
 export const shortHash = (value?: string | null) => (value ? `${value.slice(0, 8)}…` : '—')
 
 export const statusType = (status: string) => {
-  if (['SUCCEEDED', 'PASSED', 'READY'].includes(status)) return 'success'
-  if (['FAILED', 'FATAL', 'SEVERE', 'BLOCKED', 'ORPHANED'].includes(status)) return 'danger'
+  if (['SUCCEEDED', 'PASSED', 'READY', 'CURRENT'].includes(status)) return 'success'
+  if (['FAILED', 'FATAL', 'SEVERE', 'BLOCKED', 'ORPHANED', 'MISSING'].includes(status)) return 'danger'
   if (['RUNNING', 'QUEUED', 'CANCEL_REQUESTED'].includes(status)) return 'primary'
-  if (['WARNING', 'CANCELLED'].includes(status)) return 'warning'
+  if (['WARNING', 'CANCELLED', 'STALE'].includes(status)) return 'warning'
   return 'info'
 }
