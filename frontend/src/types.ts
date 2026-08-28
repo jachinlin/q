@@ -290,6 +290,7 @@ export type FactorStudyDefinition = {
   horizons: number[]
   quantiles: number
   industry: { taxonomy: 'SW2021'; unclassified_policy: 'EXCLUDE' | 'UNCLASSIFIED' } | null
+  market_cap: { exposure: 'LOG_TOTAL_MARKET_VALUE' } | null
   cost_bps_scenarios: number[]
 }
 

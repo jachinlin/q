@@ -9,6 +9,8 @@ import pytest
 from quant_research.factors.transforms import (
     MIN_CROSS_SECTION_SIZE,
     neutralize_industry,
+    neutralize_industry_market_cap,
+    neutralize_market_cap,
     winsorize_mad,
     zscore,
 )
@@ -211,6 +213,107 @@ def test_industry_neutralization_preserves_upstream_invalidity_and_rejects_singl
         "MISSING_INDUSTRY",
         "UPSTREAM_REJECTED",
     ]
+
+
+def test_market_cap_neutralization_matches_literal_ols_residuals() -> None:
+    source = _frame(
+        day=[1] * 4,
+        value=[1.0, 4.0, 2.0, 8.0],
+        total_market_value=[1.0, np.e, np.e**2, np.e**3],
+        marker=list("ABCD"),
+    )
+
+    result = neutralize_market_cap(
+        source, "value", "total_market_value", ("day",)
+    )
+
+    x = np.arange(4, dtype=np.float64)
+    y = np.array([1.0, 4.0, 2.0, 8.0])
+    slope = np.sum((x - x.mean()) * (y - y.mean())) / np.sum(
+        (x - x.mean()) ** 2
+    )
+    expected = y - y.mean() - slope * (x - x.mean())
+    np.testing.assert_allclose(result["value"].to_numpy(), expected, atol=1e-12)
+    assert result["marker"].to_list() == list("ABCD")
+    assert result["is_valid"].to_list() == [True] * 4
+
+
+def test_joint_neutralization_matches_industry_fixed_effect_reference() -> None:
+    source = _frame(
+        day=[1] * 6,
+        industry=["A", "A", "A", "B", "B", "B"],
+        value=[1.0, 5.0, 4.0, 10.0, 8.0, 15.0],
+        total_market_value=[1.0, np.e, np.e**2, np.e, np.e**2, np.e**3],
+    )
+
+    result = neutralize_industry_market_cap(
+        source,
+        "value",
+        "total_market_value",
+        "industry",
+        ("day",),
+    )
+
+    x = np.log(np.asarray(source["total_market_value"].to_list()))
+    y = np.asarray(source["value"].to_list())
+    industries = source["industry"].to_list()
+    x_centered = np.empty(6)
+    y_centered = np.empty(6)
+    for industry in ("A", "B"):
+        mask = np.asarray([item == industry for item in industries])
+        x_centered[mask] = x[mask] - x[mask].mean()
+        y_centered[mask] = y[mask] - y[mask].mean()
+    slope = np.sum(x_centered * y_centered) / np.sum(x_centered**2)
+    expected = y_centered - slope * x_centered
+    np.testing.assert_allclose(result["value"].to_numpy(), expected, atol=1e-12)
+
+
+def test_market_cap_neutralization_has_stable_invalid_reasons() -> None:
+    source = _frame(
+        day=[1] * 8,
+        value=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, float("inf"), 8.0],
+        total_market_value=[1.0, np.e, np.e**2, None, float("inf"), 0.0, 9.0, -1.0],
+        is_valid=[True, True, True, True, True, True, True, False],
+        invalid_reason=[None, None, None, None, None, None, None, "UPSTREAM"],
+    )
+
+    result = neutralize_market_cap(
+        source, "value", "total_market_value", ("day",)
+    )
+
+    assert result["invalid_reason"].to_list()[3:] == [
+        "MISSING_MARKET_CAP",
+        "NONFINITE_MARKET_CAP",
+        "NONPOSITIVE_MARKET_CAP",
+        "NONFINITE_VALUE",
+        "UPSTREAM",
+    ]
+
+
+def test_joint_neutralization_rejects_singletons_and_zero_exposure_variance() -> None:
+    singleton = _frame(
+        day=[1] * 4,
+        industry=["A", "A", "A", "B"],
+        value=[1.0, 2.0, 3.0, 4.0],
+        total_market_value=[1.0, np.e, np.e**2, np.e**3],
+    )
+    constant = _frame(
+        day=[1] * 4,
+        value=[1.0, 2.0, 3.0, 4.0],
+        total_market_value=[10.0] * 4,
+    )
+
+    singleton_result = neutralize_industry_market_cap(
+        singleton, "value", "total_market_value", "industry", ("day",)
+    )
+    constant_result = neutralize_market_cap(
+        constant, "value", "total_market_value", ("day",)
+    )
+
+    assert singleton_result["invalid_reason"].to_list()[-1] == "SINGLE_MEMBER_INDUSTRY"
+    assert constant_result["invalid_reason"].to_list() == [
+        "ZERO_MARKET_CAP_VARIANCE"
+    ] * 4
 
 
 @pytest.mark.parametrize(

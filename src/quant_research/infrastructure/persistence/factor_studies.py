@@ -13,7 +13,12 @@ from sqlalchemy import Engine, delete, select, update
 from sqlalchemy.orm import Session
 
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
-from quant_research.factor_studies.analysis import LABEL_KINDS
+from quant_research.factor_studies.analysis import (
+    INDUSTRY_MARKET_CAP_NEUTRALIZED,
+    INDUSTRY_NEUTRALIZED,
+    LABEL_KINDS,
+    MARKET_CAP_NEUTRALIZED,
+)
 from quant_research.factor_studies.models import (
     FactorDecisionMark,
     FactorStudyArtifactRecord,
@@ -441,8 +446,12 @@ class FactorStudyRegistry:
         definition: FactorStudyDefinition, key: FactorStudyDecisionKey
     ) -> None:
         variants = {"DIRECTION_ADJUSTED"}
-        if definition.industry is not None:
-            variants.add("INDUSTRY_NEUTRALIZED")
+        if definition.industry is not None and definition.market_cap is not None:
+            variants.add(INDUSTRY_MARKET_CAP_NEUTRALIZED)
+        elif definition.industry is not None:
+            variants.add(INDUSTRY_NEUTRALIZED)
+        elif definition.market_cap is not None:
+            variants.add(MARKET_CAP_NEUTRALIZED)
         if key.signal_variant not in variants:
             raise ValueError("decision signal_variant is not part of the study")
         if key.label_kind not in LABEL_KINDS:
@@ -454,7 +463,9 @@ class FactorStudyRegistry:
 
     @staticmethod
     def _decision_unit_count(definition: FactorStudyDefinition) -> int:
-        variants = 2 if definition.industry is not None else 1
+        variants = 2 if (
+            definition.industry is not None or definition.market_cap is not None
+        ) else 1
         return variants * len(LABEL_KINDS) * len(definition.factor_ids) * len(
             definition.horizons
         )

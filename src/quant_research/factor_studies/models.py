@@ -76,6 +76,12 @@ class FactorIndustrySettings(_FrozenModel):
     unclassified_policy: IndustryUnclassifiedPolicy
 
 
+class FactorMarketCapSettings(_FrozenModel):
+    """定义市值中性化暴露。入参：固定对数总市值口径。返回值：冻结设置。异常：口径非法时校验失败。"""
+
+    exposure: Literal["LOG_TOTAL_MARKET_VALUE"]
+
+
 class FactorStudyDefinition(_FrozenModel):
     """定义一次不可变、提交后仅执行一次的因子研究。
 
@@ -94,6 +100,7 @@ class FactorStudyDefinition(_FrozenModel):
     horizons: tuple[int, ...] = Field(min_length=1)
     quantiles: int = Field(default=5, ge=2)
     industry: FactorIndustrySettings | None = None
+    market_cap: FactorMarketCapSettings | None = None
     cost_bps_scenarios: tuple[int, ...] = (5, 10, 20)
 
     @field_validator("start_date", "end_date", mode="before")
@@ -204,6 +211,7 @@ __all__ = [
     "FACTOR_STUDY_STAGES",
     "FactorDecisionMark",
     "FactorIndustrySettings",
+    "FactorMarketCapSettings",
     "FactorStudyArtifactRecord",
     "FactorStudyDecisionKey",
     "FactorStudyDecisionRecord",

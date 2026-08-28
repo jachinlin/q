@@ -180,7 +180,11 @@ function signalVariantLabel(value: string) {
     ? '方向统一'
     : value === 'INDUSTRY_NEUTRALIZED'
       ? '行业中性'
-      : value
+      : value === 'MARKET_CAP_NEUTRALIZED'
+        ? '市值中性'
+        : value === 'INDUSTRY_MARKET_CAP_NEUTRALIZED'
+          ? '行业与市值联合中性'
+          : value
 }
 function returnLabel(value: string) {
   return value === 'THEORETICAL_FORWARD_RETURN'

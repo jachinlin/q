@@ -8,12 +8,13 @@ import { parse, stringify } from 'yaml'
 
 import { api, DashboardApiError } from '../api'
 import ErrorState from '../components/ErrorState.vue'
-import type { FactorStudy, FactorStudyCatalog, FactorStudyDefinition, FactorStudyValidation } from '../types'
+import type { FactorStudy, FactorStudyCatalog, FactorStudyDefinition, FactorStudyValidation, MarketReviewDates } from '../types'
 
-type FormState = Omit<FactorStudyDefinition, 'tags' | 'industry'> & {
+type FormState = Omit<FactorStudyDefinition, 'tags' | 'industry' | 'market_cap'> & {
   tags: string
   industry_enabled: boolean
   industry_policy: 'EXCLUDE' | 'UNCLASSIFIED'
+  market_cap_enabled: boolean
 }
 
 const router = useRouter()
@@ -25,6 +26,7 @@ const form = reactive<FormState>({
   start_date: '2018-01-01', end_date: '2022-12-31', correction: 'BH_FDR',
   factor_ids: ['book_to_price_mrq', 'momentum_120_20'], universe: { name: 'CN_STOCK_STANDARD' },
   horizons: [1, 5, 20], quantiles: 5, industry_enabled: true, industry_policy: 'EXCLUDE',
+  market_cap_enabled: false,
   cost_bps_scenarios: [5, 10, 20],
 })
 
@@ -36,6 +38,7 @@ function definitionFromForm(): FactorStudyDefinition {
     factor_ids: [...form.factor_ids], universe: { name: 'CN_STOCK_STANDARD' },
     horizons: [...form.horizons].sort((a, b) => a - b), quantiles: form.quantiles,
     industry: form.industry_enabled ? { taxonomy: 'SW2021', unclassified_policy: form.industry_policy } : null,
+    market_cap: form.market_cap_enabled ? { exposure: 'LOG_TOTAL_MARKET_VALUE' } : null,
     cost_bps_scenarios: [...form.cost_bps_scenarios].sort((a, b) => a - b),
   }
 }
@@ -65,6 +68,7 @@ function syncFormFromYaml() {
     if (typeof value.quantiles === 'number') form.quantiles = value.quantiles
     form.industry_enabled = value.industry != null
     if (value.industry?.unclassified_policy) form.industry_policy = value.industry.unclassified_policy
+    form.market_cap_enabled = value.market_cap != null
     if (Array.isArray(value.cost_bps_scenarios)) form.cost_bps_scenarios = value.cost_bps_scenarios.map(Number)
   } catch {
     // 编辑中的不完整 YAML 仍保留原文，错误由后端校验统一报告。
@@ -74,6 +78,32 @@ function syncFormFromYaml() {
 }
 
 const catalog = useQuery({ queryKey: ['factor-study-catalog'], queryFn: () => api.get<FactorStudyCatalog>('/api/v1/factor-studies/catalog') })
+const marketDates = useQuery({ queryKey: ['market-review-dates'], queryFn: () => api.get<MarketReviewDates>('/api/v1/market-review/dates') })
+const dateShortcuts = [
+  { label: '近3月', months: 3 },
+  { label: '近1年', months: 12 },
+  { label: '近3年', months: 36 },
+  { label: '近10年', months: 120 },
+]
+const shortcutDisabled = computed(() => !marketDates.data.value?.latest_trade_date)
+const shortcutTitle = computed(() => marketDates.error.value ? '最新数据日不可用，请手工输入日期' : '')
+
+function subtractCalendarMonths(value: string, months: number) {
+  const [year, month, day] = value.split('-').map(Number)
+  if (!year || !month || !day) return value
+  const monthIndex = year * 12 + month - 1 - months
+  const targetYear = Math.floor(monthIndex / 12)
+  const targetMonth = monthIndex - targetYear * 12 + 1
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate()
+  return `${String(targetYear).padStart(4, '0')}-${String(targetMonth).padStart(2, '0')}-${String(Math.min(day, lastDay)).padStart(2, '0')}`
+}
+
+function applyDateShortcut(months: number) {
+  const latest = marketDates.data.value?.latest_trade_date
+  if (!latest) return
+  form.end_date = latest
+  form.start_date = subtractCalendarMonths(latest, months)
+}
 const validate = useMutation({
   mutationFn: (candidate: string) => api.post<FactorStudyValidation>('/api/v1/factor-studies/validate', { yaml: candidate }),
   onSuccess: (_, candidate) => { validatedYaml.value = candidate; ElMessage.success('因子研究配置有效') },
@@ -98,8 +128,20 @@ const error = computed(() => validate.error.value ?? submit.error.value ?? catal
       <div v-if="mode === 'form'" class="factor-form">
         <label class="wide"><span>研究名称</span><el-input v-model="form.name" /></label>
         <label class="wide"><span>描述</span><el-input v-model="form.description" /></label>
-        <label><span>开始日期</span><el-input v-model="form.start_date" placeholder="YYYY-MM-DD" /></label>
-        <label><span>结束日期</span><el-input v-model="form.end_date" placeholder="YYYY-MM-DD" /></label>
+        <label><span>开始日期</span><el-input v-model="form.start_date" aria-label="开始日期" placeholder="YYYY-MM-DD" /></label>
+        <label><span>结束日期</span><el-input v-model="form.end_date" aria-label="结束日期" placeholder="YYYY-MM-DD" /></label>
+        <div class="date-shortcuts wide" :title="shortcutTitle">
+          <span>快捷区间</span>
+          <el-button
+            v-for="item in dateShortcuts"
+            :key="item.months"
+            size="small"
+            :disabled="shortcutDisabled"
+            :data-date-shortcut="item.months"
+            @click="applyDateShortcut(item.months)"
+          >{{ item.label }}</el-button>
+          <small v-if="marketDates.error.value">最新数据日不可用，请手工输入日期</small>
+        </div>
         <label><span>多重检验</span><el-select v-model="form.correction"><el-option v-for="item in catalog.data.value?.corrections ?? []" :key="item" :label="item" :value="item" /></el-select></label>
         <label><span>分位数</span><el-input-number v-model="form.quantiles" :min="2" :max="20" /></label>
         <label class="wide"><span>因子</span><el-select v-model="form.factor_ids" multiple filterable aria-label="因子选择"><el-option v-for="item in catalog.data.value?.factors ?? []" :key="item.factor_id" :label="item.factor_id" :value="item.factor_id" /></el-select></label>
@@ -107,7 +149,8 @@ const error = computed(() => validate.error.value ?? submit.error.value ?? catal
         <label><span>成本情景（bps）</span><el-select v-model="form.cost_bps_scenarios" multiple allow-create filterable><el-option v-for="item in [0,5,10,20,30]" :key="item" :label="item" :value="item" /></el-select></label>
         <label><span>标签（逗号分隔）</span><el-input v-model="form.tags" /></label>
         <label><span>股票池</span><el-input model-value="CN_STOCK_STANDARD" disabled /></label>
-        <label class="industry"><span>行业处理</span><el-switch v-model="form.industry_enabled" active-text="启用" /><el-select v-if="form.industry_enabled" v-model="form.industry_policy"><el-option v-for="item in catalog.data.value?.industry_policies ?? []" :key="item" :label="item" :value="item" /></el-select></label>
+        <label class="industry"><span>行业处理</span><el-switch v-model="form.industry_enabled" aria-label="行业中性化" active-text="启用" /><el-select v-if="form.industry_enabled" v-model="form.industry_policy"><el-option v-for="item in catalog.data.value?.industry_policies ?? []" :key="item" :label="item" :value="item" /></el-select></label>
+        <label class="neutralization"><span>市值中性化</span><el-switch v-model="form.market_cap_enabled" aria-label="市值中性化" active-text="启用" /></label>
       </div>
       <el-input v-else v-model="yaml" type="textarea" :rows="32" class="yaml-editor" aria-label="因子研究 YAML" @input="syncFormFromYaml" />
     </section>
@@ -115,5 +158,5 @@ const error = computed(() => validate.error.value ?? submit.error.value ?? catal
 </template>
 
 <style scoped>
-.composer-header{display:flex;align-items:center;justify-content:space-between;gap:24px}.composer-header h2{margin:8px 0}.composer-header p{margin:0;color:var(--muted)}.mode-panel{padding:22px}.mode-switch{display:flex;align-items:center;gap:14px}.factor-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:17px 20px;max-width:1040px}.factor-form label{display:grid;gap:7px;color:var(--muted);font-size:11px}.factor-form .wide{grid-column:1/-1}.factor-form :deep(.el-select),.factor-form :deep(.el-input-number){width:100%}.industry{grid-template-columns:auto auto 1fr;align-items:center}.yaml-editor :deep(textarea){font:12px/1.65 ui-monospace,Consolas,monospace}@media(max-width:1200px){.factor-form{grid-template-columns:1fr}.factor-form .wide{grid-column:auto}}
+.composer-header{display:flex;align-items:center;justify-content:space-between;gap:24px}.composer-header h2{margin:8px 0}.composer-header p{margin:0;color:var(--muted)}.mode-panel{padding:22px}.mode-switch{display:flex;align-items:center;gap:14px}.factor-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:17px 20px;max-width:1040px}.factor-form label{display:grid;gap:7px;color:var(--muted);font-size:11px}.factor-form .wide{grid-column:1/-1}.factor-form :deep(.el-select),.factor-form :deep(.el-input-number){width:100%}.industry{grid-template-columns:auto auto 1fr;align-items:center}.neutralization{grid-template-columns:auto auto;align-items:center;justify-content:start}.date-shortcuts{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px}.date-shortcuts small{color:var(--danger)}.yaml-editor :deep(textarea){font:12px/1.65 ui-monospace,Consolas,monospace}@media(max-width:1200px){.factor-form{grid-template-columns:1fr}.factor-form .wide{grid-column:auto}}
 </style>

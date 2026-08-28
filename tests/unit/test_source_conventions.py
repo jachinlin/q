@@ -120,6 +120,8 @@ _MODULE_FUNCTION_ALLOWLIST: Mapping[str, str] = {
     "quant_research.factors.builtin.code_hash.builtin_source_hash": "stable_public_api",
     "quant_research.factors.transforms.winsorize_mad": "stable_public_api",
     "quant_research.factors.transforms.neutralize_industry": "stable_public_api",
+    "quant_research.factors.transforms.neutralize_market_cap": "stable_public_api",
+    "quant_research.factors.transforms.neutralize_industry_market_cap": "stable_public_api",
     "quant_research.factors.transforms.zscore": "stable_public_api",
     "quant_research.logging.redact_context": "stable_public_api",
     "quant_research.logging.sensitive_environment_values": "stable_public_api",

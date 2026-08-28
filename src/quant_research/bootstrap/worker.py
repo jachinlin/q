@@ -55,8 +55,10 @@ from quant_research.experiments.statistics import MultipleTestingCorrector
 from quant_research.factor_studies.analysis import (
     DIRECTION_ADJUSTED,
     EXECUTABLE_FORWARD_RETURN,
+    INDUSTRY_MARKET_CAP_NEUTRALIZED,
     INDUSTRY_NEUTRALIZED,
     LABEL_KINDS,
+    MARKET_CAP_NEUTRALIZED,
     THEORETICAL_FORWARD_RETURN,
     analyze,
     build_future_returns,
@@ -77,7 +79,11 @@ from quant_research.factors import (
     FactorRegistry,
 )
 from quant_research.factors.builtin import register_stock_factors
-from quant_research.factors.transforms import neutralize_industry
+from quant_research.factors.transforms import (
+    neutralize_industry,
+    neutralize_industry_market_cap,
+    neutralize_market_cap,
+)
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -1112,7 +1118,7 @@ class _FactorStudySession:
             .sort("signal_date", "instrument_id", "factor_id")
         )
 
-    def _industry_variants(
+    def _signal_variants(
         self,
         factor_frame: pl.DataFrame,
         eligible: pl.DataFrame,
@@ -1120,124 +1126,161 @@ class _FactorStudySession:
         sessions: tuple[date, ...],
         config: FactorStudyDefinition,
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """按显式 PIT 行业配置生成中性版本和逐日覆盖证据。"""
+        """按显式 PIT 行业和市值配置生成唯一中性版本及行业覆盖证据。"""
         industry = config.industry
-        if industry is None:
-            return factor_frame, pl.DataFrame(
-                schema={
-                    "signal_date": pl.Date,
-                    "taxonomy": pl.String,
-                    "unclassified_policy": pl.String,
-                    "eligible_count": pl.Int64,
-                    "classified_count": pl.Int64,
-                    "tombstone_count": pl.Int64,
-                    "missing_state_count": pl.Int64,
-                    "usable_count": pl.Int64,
-                    "classified_coverage": pl.Float64,
-                    "usable_coverage": pl.Float64,
-                }
-            )
-        state = (
-            self._repository.industry_memberships_on_dates(
-                universe_ids, sessions
-            )
-            .collect()
-            .select(
-                pl.col("query_date").alias("signal_date"),
-                "instrument_id",
-                pl.col("level1_code").alias("industry_code"),
-                pl.lit(True).alias("is_classified"),
-            )
-            .with_columns(pl.lit(True).alias("_state_present"))
+        market_cap = config.market_cap
+        coverage = pl.DataFrame(
+            schema={
+                "signal_date": pl.Date,
+                "taxonomy": pl.String,
+                "unclassified_policy": pl.String,
+                "eligible_count": pl.Int64,
+                "classified_count": pl.Int64,
+                "tombstone_count": pl.Int64,
+                "missing_state_count": pl.Int64,
+                "usable_count": pl.Int64,
+                "classified_coverage": pl.Float64,
+                "usable_coverage": pl.Float64,
+            }
         )
-        aligned = (
-            eligible.filter(pl.col("eligible"))
-            .select("signal_date", "instrument_id")
-            .join(state, on=["signal_date", "instrument_id"], how="left")
-            .with_columns(
-                pl.col("_state_present").fill_null(False),
-                (
-                    pl.col("is_classified").fill_null(False)
-                    & pl.col("industry_code").is_not_null()
-                    & (pl.col("industry_code").str.len_chars() > 0)
-                ).alias("_classified"),
+        if industry is None and market_cap is None:
+            return factor_frame, coverage
+
+        joined = factor_frame
+        helper_columns: list[str] = []
+        if industry is not None:
+            state = (
+                self._repository.industry_memberships_on_dates(
+                    universe_ids, sessions
+                )
+                .collect()
+                .select(
+                    pl.col("query_date").alias("signal_date"),
+                    "instrument_id",
+                    pl.col("level1_code").alias("industry_code"),
+                    pl.lit(True).alias("is_classified"),
+                )
+                .with_columns(pl.lit(True).alias("_state_present"))
             )
-        )
-        if (
-            industry.unclassified_policy
-            is IndustryUnclassifiedPolicy.UNCLASSIFIED
-        ):
-            aligned = aligned.with_columns(
-                pl.when(pl.col("_classified"))
-                .then(pl.col("industry_code"))
-                .otherwise(pl.lit("__UNCLASSIFIED__"))
-                .alias("_neutralization_industry")
+            aligned = (
+                eligible.filter(pl.col("eligible"))
+                .select("signal_date", "instrument_id")
+                .join(state, on=["signal_date", "instrument_id"], how="left")
+                .with_columns(
+                    pl.col("_state_present").fill_null(False),
+                    (
+                        pl.col("is_classified").fill_null(False)
+                        & pl.col("industry_code").is_not_null()
+                        & (pl.col("industry_code").str.len_chars() > 0)
+                    ).alias("_classified"),
+                )
             )
-        else:
-            aligned = aligned.with_columns(
-                pl.when(pl.col("_classified"))
-                .then(pl.col("industry_code"))
-                .otherwise(pl.lit(None, dtype=pl.String))
-                .alias("_neutralization_industry")
+            if industry.unclassified_policy is IndustryUnclassifiedPolicy.UNCLASSIFIED:
+                aligned = aligned.with_columns(
+                    pl.when(pl.col("_classified"))
+                    .then(pl.col("industry_code"))
+                    .otherwise(pl.lit("__UNCLASSIFIED__"))
+                    .alias("_neutralization_industry")
+                )
+            else:
+                aligned = aligned.with_columns(
+                    pl.when(pl.col("_classified"))
+                    .then(pl.col("industry_code"))
+                    .otherwise(pl.lit(None, dtype=pl.String))
+                    .alias("_neutralization_industry")
+                )
+            coverage = (
+                aligned.group_by("signal_date")
+                .agg(
+                    pl.len().alias("eligible_count"),
+                    pl.col("_classified").sum().cast(pl.Int64).alias("classified_count"),
+                    (pl.col("_state_present") & ~pl.col("_classified"))
+                    .sum().cast(pl.Int64).alias("tombstone_count"),
+                    (~pl.col("_state_present")).sum().cast(pl.Int64).alias("missing_state_count"),
+                    pl.col("_neutralization_industry").is_not_null().sum().cast(pl.Int64).alias("usable_count"),
+                )
+                .with_columns(
+                    pl.lit(industry.taxonomy).alias("taxonomy"),
+                    pl.lit(industry.unclassified_policy.value).alias("unclassified_policy"),
+                    (pl.col("classified_count") / pl.col("eligible_count")).alias("classified_coverage"),
+                    (pl.col("usable_count") / pl.col("eligible_count")).alias("usable_coverage"),
+                )
+                .select(*coverage.columns)
+                .sort("signal_date")
             )
-        coverage = (
-            aligned.group_by("signal_date")
-            .agg(
-                pl.len().alias("eligible_count"),
-                pl.col("_classified").sum().cast(pl.Int64).alias("classified_count"),
-                (
-                    pl.col("_state_present") & ~pl.col("_classified")
-                ).sum().cast(pl.Int64).alias("tombstone_count"),
-                (~pl.col("_state_present"))
-                .sum()
-                .cast(pl.Int64)
-                .alias("missing_state_count"),
-                pl.col("_neutralization_industry")
-                .is_not_null()
-                .sum()
-                .cast(pl.Int64)
-                .alias("usable_count"),
-            )
-            .with_columns(
-                pl.lit(industry.taxonomy).alias("taxonomy"),
-                pl.lit(industry.unclassified_policy.value).alias(
-                    "unclassified_policy"
-                ),
-                (pl.col("classified_count") / pl.col("eligible_count")).alias(
-                    "classified_coverage"
-                ),
-                (pl.col("usable_count") / pl.col("eligible_count")).alias(
-                    "usable_coverage"
-                ),
-            )
-            .select(
-                "signal_date",
-                "taxonomy",
-                "unclassified_policy",
-                "eligible_count",
-                "classified_count",
-                "tombstone_count",
-                "missing_state_count",
-                "usable_count",
-                "classified_coverage",
-                "usable_coverage",
-            )
-            .sort("signal_date")
-        )
-        neutralized = neutralize_industry(
-            factor_frame.join(
-                aligned.select(
-                    "signal_date", "instrument_id", "_neutralization_industry"
-                ),
+            joined = joined.join(
+                aligned.select("signal_date", "instrument_id", "_neutralization_industry"),
                 on=["signal_date", "instrument_id"],
                 how="left",
-            ),
-            "value",
-            "_neutralization_industry",
-            ("signal_date", "factor_id"),
-        ).with_columns(
-            pl.lit(INDUSTRY_NEUTRALIZED).alias("signal_variant")
-        ).drop("_neutralization_industry")
+            )
+            helper_columns.append("_neutralization_industry")
+
+        if market_cap is not None:
+            cutoffs = pl.DataFrame(
+                {
+                    "signal_date": sessions,
+                    "_pit_cutoff": [
+                        datetime.combine(value, time.max, tzinfo=_SHANGHAI).astimezone(UTC)
+                        for value in sessions
+                    ],
+                },
+                schema={
+                    "signal_date": pl.Date,
+                    "_pit_cutoff": pl.Datetime("us", "UTC"),
+                },
+            )
+            basics = self._repository.stock_daily_basics(
+                universe_ids, sessions[0], sessions[-1]
+            ).collect()
+            visible = (
+                basics.rename({"trade_date": "signal_date"})
+                .join(cutoffs, on="signal_date", how="inner")
+                .filter(
+                    pl.col("pit_usable")
+                    & pl.col("available_at").is_not_null()
+                    & (pl.col("available_at") <= pl.col("_pit_cutoff"))
+                )
+                .select(
+                    "signal_date",
+                    "instrument_id",
+                    pl.col("total_market_value").alias("_neutralization_market_cap"),
+                )
+                .sort("signal_date", "instrument_id")
+            )
+            if visible.select("signal_date", "instrument_id").is_duplicated().any():
+                raise ValueError("factor study market-cap input has duplicate keys")
+            joined = joined.join(
+                visible,
+                on=["signal_date", "instrument_id"],
+                how="left",
+            )
+            helper_columns.append("_neutralization_market_cap")
+
+        if industry is not None and market_cap is not None:
+            neutralized = neutralize_industry_market_cap(
+                joined,
+                "value",
+                "_neutralization_market_cap",
+                "_neutralization_industry",
+                ("signal_date", "factor_id"),
+            ).with_columns(
+                pl.lit(INDUSTRY_MARKET_CAP_NEUTRALIZED).alias("signal_variant")
+            )
+        elif industry is not None:
+            neutralized = neutralize_industry(
+                joined,
+                "value",
+                "_neutralization_industry",
+                ("signal_date", "factor_id"),
+            ).with_columns(pl.lit(INDUSTRY_NEUTRALIZED).alias("signal_variant"))
+        else:
+            neutralized = neutralize_market_cap(
+                joined,
+                "value",
+                "_neutralization_market_cap",
+                ("signal_date", "factor_id"),
+            ).with_columns(pl.lit(MARKET_CAP_NEUTRALIZED).alias("signal_variant"))
+        neutralized = neutralized.drop(helper_columns)
         return (
             pl.concat([factor_frame, neutralized], how="diagonal_relaxed").sort(
                 "signal_variant", "signal_date", "instrument_id", "factor_id"
@@ -1617,10 +1660,13 @@ class _FactorStudySession:
         )
         progress.substage_started(
             "BUILD_SIGNALS",
-            "正在构建方向统一与行业处理信号",
-            {"industry_enabled": config.industry is not None},
+            "正在构建方向统一与中性化信号",
+            {
+                "industry_enabled": config.industry is not None,
+                "market_cap_enabled": config.market_cap is not None,
+            },
         )
-        factor_frame, industry_coverage = self._industry_variants(
+        factor_frame, industry_coverage = self._signal_variants(
             factor_frame, eligible, universe_ids, sessions, config
         )
         progress.substage_completed(
@@ -1629,6 +1675,17 @@ class _FactorStudySession:
             {
                 "signal_row_count": len(factor_frame),
                 "signal_variant_count": factor_frame["signal_variant"].n_unique(),
+                "signal_variants": cast(
+                    list[JsonValue],
+                    sorted(
+                        cast(
+                            list[str],
+                            factor_frame["signal_variant"].unique().to_list(),
+                        )
+                    ),
+                ),
+                "industry_enabled": config.industry is not None,
+                "market_cap_enabled": config.market_cap is not None,
                 "industry_coverage_row_count": len(industry_coverage),
             },
         )

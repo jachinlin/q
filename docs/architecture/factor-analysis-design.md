@@ -24,6 +24,8 @@ quantiles: 5
 industry:
   taxonomy: SW2021
   unclassified_policy: EXCLUDE
+market_cap:
+  exposure: LOG_TOTAL_MARKET_VALUE
 cost_bps_scenarios: [5, 10, 20]
 ```
 
@@ -70,8 +72,15 @@ VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PUBLISH
 
 - `THEORETICAL_FORWARD_RETURN`：T+1 开盘到 T+h 收盘，两个端点价格有效即可。
 - `EXECUTABLE_FORWARD_RETURN`：在理论口径上，T+1 入场还必须已上市、未停牌且不是一字涨停。
-- 配置行业块时同时发布方向调整和行业中性化信号；`EXCLUDE` 排除无法分类样本，
-  `UNCLASSIFIED` 将其放入固定未分类组。
+- 始终发布 `DIRECTION_ADJUSTED`。只配置行业时增加 `INDUSTRY_NEUTRALIZED`；只配置
+  `market_cap` 时增加 `MARKET_CAP_NEUTRALIZED`；两者都配置时只增加
+  `INDUSTRY_MARKET_CAP_NEUTRALIZED`，不同时发布两个单项版本。
+- 行业中性化保持等权组内去均值；`EXCLUDE` 排除无法分类样本，`UNCLASSIFIED` 将其放入
+  固定未分类组。市值中性化以当日 PIT 可见的正数 `total_market_value` 的自然对数为暴露，
+  计算带截距的一元等权截面回归残差。联合版本先将因子和对数市值行业内中心化，再回归
+  市值暴露，等价于行业固定效应加市值暴露。
+- 缺失、非有限或非正市值、行业缺失、单成员行业、截面不足和市值暴露零方差都生成稳定
+  无效原因；不得用原因子值回填。计算按证券稳定排序并使用确定性求和。
 
 Pearson IC、Rank IC、毛多空 spread 和成本情景净 spread 使用 Bartlett kernel 的
 Newey–West/HAC 推断。多重检验按 Rank IC 与毛多空 spread 两个 family 分别应用
@@ -112,3 +121,7 @@ CLI 使用 `quant factor-studies validate|submit|show|list`。Dashboard API 位�
 非主键字段，未知新增字段也不得静默隐藏，并同时展开 IC、分层、多空、单调性、换手、成本、
 覆盖率、标签质量、行业覆盖和相关性曲线。全局选择器同步 URL query。
 工作台只汇总研究数量和人工评审进度，不生成跨研究排行榜。
+
+创建页的“近 3 月、近 1 年、近 3 年、近 10 年”快捷项使用当前已验证数据目录的最新交易日
+作为结束日期，并按自然月或自然年回推开始日期；月末或闰日取目标月最后一天，不自动改写为
+交易日。日期服务不可用时只禁用快捷项，手工输入和 YAML 编辑仍可使用。

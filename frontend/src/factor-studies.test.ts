@@ -20,7 +20,7 @@ vi.mock('vue-echarts', () => ({ default: { name: 'VChart', props: ['option'], te
 const definition = {
   name: '价值动量研究', description: '候选诊断', tags: ['factor'], start_date: '2018-01-01', end_date: '2022-12-31',
   correction: 'BH_FDR', factor_ids: ['book_to_price_mrq'], universe: { name: 'CN_STOCK_STANDARD' }, horizons: [5], quantiles: 5,
-  industry: { taxonomy: 'SW2021', unclassified_policy: 'EXCLUDE' }, cost_bps_scenarios: [5, 10, 20],
+  industry: { taxonomy: 'SW2021', unclassified_policy: 'EXCLUDE' }, market_cap: null, cost_bps_scenarios: [5, 10, 20],
 }
 const study = {
   id: 'study-1', definition, config_hash: 'a'.repeat(64), catalog_hash: 'b'.repeat(64), status: 'SUCCEEDED', stage: 'PUBLISH', task_id: 'task-1',
@@ -67,7 +67,9 @@ describe('independent factor study dashboard', () => {
   })
 
   it('synchronizes form and YAML and invalidates the last backend validation', async () => {
-    apiGet.mockResolvedValue(catalog)
+    apiGet.mockImplementation((path: string) => path === '/api/v1/factor-studies/catalog'
+      ? Promise.resolve(catalog)
+      : Promise.resolve({ catalog_hash: 'a'.repeat(64), validated_at: '2024-02-29T00:00:00Z', latest_trade_date: '2024-02-29', dates: [] }))
     apiPost.mockImplementation((path: string) => path.endsWith('/validate') ? Promise.resolve({ config_hash: 'd'.repeat(64), normalized: definition }) : Promise.resolve(study))
     const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/factor-studies/new', component: FactorStudyComposerView }, { path: '/factor-studies/:factorStudyId', component: { template: '<div />' } }, { path: '/factor-studies', component: { template: '<div />' } }] })
     await router.push('/factor-studies/new'); await router.isReady()
@@ -83,6 +85,41 @@ describe('independent factor study dashboard', () => {
     expect((editor.element as HTMLTextAreaElement).value).toContain('factor_ids:')
     await editor.setValue(`${(editor.element as HTMLTextAreaElement).value}\n`)
     expect(submitButton.attributes('disabled')).toBeDefined()
+  })
+
+  it('applies latest-data calendar shortcuts and synchronizes neutralization YAML', async () => {
+    apiGet.mockImplementation((path: string) => path === '/api/v1/factor-studies/catalog'
+      ? Promise.resolve(catalog)
+      : Promise.resolve({ catalog_hash: 'a'.repeat(64), validated_at: '2024-02-29T00:00:00Z', latest_trade_date: '2024-02-29', dates: [] }))
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/factor-studies/new', component: FactorStudyComposerView }, { path: '/factor-studies', component: { template: '<div />' } }] })
+    await router.push('/factor-studies/new'); await router.isReady()
+    const wrapper = mount(FactorStudyComposerView, { global: { plugins: [[VueQueryPlugin, { queryClient: client() }], router] } })
+    await vi.waitFor(() => expect(wrapper.get('[data-date-shortcut="12"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-date-shortcut="12"]').trigger('click')
+    expect((wrapper.get('input[aria-label="开始日期"]').element as HTMLInputElement).value).toBe('2023-02-28')
+    expect((wrapper.get('input[aria-label="结束日期"]').element as HTMLInputElement).value).toBe('2024-02-29')
+    await wrapper.get('input[aria-label="行业中性化"]').setValue(false)
+    await wrapper.get('input[aria-label="市值中性化"]').setValue(true)
+    await wrapper.get('input[value="yaml"]').setValue(true)
+    await flushPromises()
+    const yamlValue = (wrapper.get('textarea[aria-label="因子研究 YAML"]').element as HTMLTextAreaElement).value
+    expect(yamlValue).toContain('industry: null')
+    expect(yamlValue).toContain('market_cap:')
+    expect(yamlValue).toContain('exposure: LOG_TOTAL_MARKET_VALUE')
+  })
+
+  it('keeps manual dates available when latest-data lookup fails', async () => {
+    apiGet.mockImplementation((path: string) => path === '/api/v1/factor-studies/catalog'
+      ? Promise.resolve(catalog)
+      : Promise.reject(new Error('dates unavailable')))
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/factor-studies/new', component: FactorStudyComposerView }, { path: '/factor-studies', component: { template: '<div />' } }] })
+    await router.push('/factor-studies/new'); await router.isReady()
+    const wrapper = mount(FactorStudyComposerView, { global: { plugins: [[VueQueryPlugin, { queryClient: client() }], router] } })
+    await vi.waitFor(() => expect(wrapper.text()).toContain('最新数据日不可用'))
+    expect(wrapper.get('[data-date-shortcut="3"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('input[aria-label="开始日期"]').setValue('2020-01-01')
+    expect((wrapper.get('input[aria-label="开始日期"]').element as HTMLInputElement).value).toBe('2020-01-01')
   })
 
   it('deep-links global selectors, saves matrix decisions and maps IC chart data', async () => {

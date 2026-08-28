@@ -173,3 +173,40 @@ def test_decisions_are_idempotent_and_validate_dimensions(tmp_path: Path) -> Non
             actor="b",
         )
     engine.dispose()
+
+
+def test_decision_dimensions_follow_the_single_configured_neutralization_variant() -> None:
+    """任意中性化组合只能增加一个与配置一致的决策版本。"""
+    joint = _definition()
+    industry = joint.model_copy(update={"market_cap": None})
+    market_cap = joint.model_copy(update={"industry": None})
+    base = joint.model_copy(update={"industry": None, "market_cap": None})
+
+    for definition, variant in (
+        (industry, "INDUSTRY_NEUTRALIZED"),
+        (market_cap, "MARKET_CAP_NEUTRALIZED"),
+        (joint, "INDUSTRY_MARKET_CAP_NEUTRALIZED"),
+    ):
+        FactorStudyRegistry._validate_decision_key(
+            definition,
+            FactorStudyDecisionKey(
+                signal_variant=variant,
+                label_kind="THEORETICAL_FORWARD_RETURN",
+                factor_ref=definition.factor_ids[0],
+                horizon=definition.horizons[0],
+            ),
+        )
+        assert FactorStudyRegistry._decision_unit_count(definition) == (
+            2 * FactorStudyRegistry._decision_unit_count(base)
+        )
+
+    with pytest.raises(ValueError, match="signal_variant"):
+        FactorStudyRegistry._validate_decision_key(
+            joint,
+            FactorStudyDecisionKey(
+                signal_variant="INDUSTRY_NEUTRALIZED",
+                label_kind="THEORETICAL_FORWARD_RETURN",
+                factor_ref=joint.factor_ids[0],
+                horizon=joint.horizons[0],
+            ),
+        )

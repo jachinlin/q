@@ -18,6 +18,10 @@ _INSUFFICIENT_CROSS_SECTION = "INSUFFICIENT_CROSS_SECTION"
 _ZERO_VARIANCE = "ZERO_VARIANCE"
 _MISSING_INDUSTRY = "MISSING_INDUSTRY"
 _SINGLE_MEMBER_INDUSTRY = "SINGLE_MEMBER_INDUSTRY"
+_MISSING_MARKET_CAP = "MISSING_MARKET_CAP"
+_NONFINITE_MARKET_CAP = "NONFINITE_MARKET_CAP"
+_NONPOSITIVE_MARKET_CAP = "NONPOSITIVE_MARKET_CAP"
+_ZERO_MARKET_CAP_VARIANCE = "ZERO_MARKET_CAP_VARIANCE"
 _AUDIT_COLUMNS = frozenset({"is_valid", "invalid_reason"})
 
 type _GroupKey = tuple[object, ...]
@@ -151,6 +155,49 @@ def neutralize_industry(
     )
 
 
+def neutralize_market_cap(
+    frame: pl.DataFrame,
+    value_col: str,
+    market_cap_col: str,
+    group_cols: Sequence[str] = (),
+) -> pl.DataFrame:
+    """按对数总市值执行等权截面回归中性化；该函数作为稳定公开 API 保留在模块级。
+
+    入参：数据帧、因子值列、原始总市值列和截面分组列。
+    返回值：保留原顺序并以回归残差替换因子值的审计数据帧。
+    异常：列、类型或分组非法时抛出 ``TypeError`` 或 ``ValueError``。
+    """
+    return _TransformsSupport.neutralize_market_cap(
+        frame,
+        value_col,
+        market_cap_col,
+        group_cols,
+        industry_col=None,
+    )
+
+
+def neutralize_industry_market_cap(
+    frame: pl.DataFrame,
+    value_col: str,
+    market_cap_col: str,
+    industry_col: str,
+    group_cols: Sequence[str] = (),
+) -> pl.DataFrame:
+    """执行行业固定效应与对数总市值联合中性化；该函数作为稳定公开 API 保留在模块级。
+
+    入参：数据帧、因子值列、原始总市值列、PIT 行业列和截面分组列。
+    返回值：先行业内中心化，再回归市值暴露并返回确定性残差帧。
+    异常：列、类型或分组非法时抛出 ``TypeError`` 或 ``ValueError``。
+    """
+    return _TransformsSupport.neutralize_market_cap(
+        frame,
+        value_col,
+        market_cap_col,
+        group_cols,
+        industry_col=industry_col,
+    )
+
+
 class _TransformsSupport:
     """集中承载本模块的私有实现逻辑。"""
 
@@ -207,6 +254,156 @@ class _TransformsSupport:
         if not math.isfinite(multiplier) or multiplier <= 0.0:
             raise ValueError("n_mad must be a positive finite number")
         return multiplier
+
+    @staticmethod
+    def neutralize_market_cap(
+        frame: pl.DataFrame,
+        value_col: str,
+        market_cap_col: str,
+        group_cols: Sequence[str],
+        *,
+        industry_col: str | None,
+    ) -> pl.DataFrame:
+        """校验输入并按稳定分组计算市值回归残差。"""
+        _TransformsSupport._validate_frame(frame)
+        if isinstance(group_cols, str) or not isinstance(group_cols, Sequence):
+            raise TypeError("group columns must be a sequence")
+        other = (*group_cols, market_cap_col)
+        if industry_col is not None:
+            other = (*other, industry_col)
+        groups = _TransformsSupport._validate_columns(frame, value_col, other)
+        grouping = tuple(groups[: len(group_cols)])
+        _TransformsSupport._validate_group_dtypes(frame, grouping)
+        _TransformsSupport._require_numeric_column(frame, market_cap_col)
+        if industry_col is not None and frame.schema[industry_col] != pl.String:
+            raise ValueError("industry column must have String dtype")
+
+        state = _TransformsSupport._initial_state(frame, value_col)
+        market_caps = frame[market_cap_col].to_list()
+        industries = (
+            frame[industry_col].to_list() if industry_col is not None else None
+        )
+        exposures = [0.0] * frame.height
+        for index, source in enumerate(market_caps):
+            if not state.valid[index]:
+                continue
+            if source is None:
+                _TransformsSupport._invalidate(state, (index,), _MISSING_MARKET_CAP)
+                continue
+            numeric = float(cast(int | float, source))
+            if not math.isfinite(numeric):
+                _TransformsSupport._invalidate(
+                    state, (index,), _NONFINITE_MARKET_CAP
+                )
+                continue
+            if numeric <= 0.0:
+                _TransformsSupport._invalidate(
+                    state, (index,), _NONPOSITIVE_MARKET_CAP
+                )
+                continue
+            if industries is not None:
+                industry = industries[index]
+                if not isinstance(industry, str) or not industry:
+                    _TransformsSupport._invalidate(
+                        state, (index,), _MISSING_INDUSTRY
+                    )
+                    continue
+            exposures[index] = math.log(numeric)
+
+        if industries is not None:
+            industry_groups = _TransformsSupport._candidate_groups(
+                frame, (*grouping, cast(str, industry_col)), state.valid
+            )
+            for indices in industry_groups.values():
+                if len(indices) < 2:
+                    _TransformsSupport._invalidate(
+                        state, indices, _SINGLE_MEMBER_INDUSTRY
+                    )
+
+        cross_sections = _TransformsSupport._candidate_groups(
+            frame, grouping, state.valid
+        )
+        for indices in cross_sections.values():
+            if len(indices) < MIN_CROSS_SECTION_SIZE:
+                _TransformsSupport._invalidate(
+                    state, indices, _INSUFFICIENT_CROSS_SECTION
+                )
+                continue
+            values = [state.values[index] for index in indices]
+            exposure_values = [exposures[index] for index in indices]
+            if industries is None:
+                residuals = _TransformsSupport._linear_residuals(
+                    values, exposure_values
+                )
+            else:
+                centered_values = [0.0] * len(indices)
+                centered_exposures = [0.0] * len(indices)
+                positions: dict[str, list[int]] = defaultdict(list)
+                for position, index in enumerate(indices):
+                    positions[cast(str, industries[index])].append(position)
+                for group_positions in positions.values():
+                    value_mean = math.fsum(
+                        values[position] for position in group_positions
+                    ) / len(group_positions)
+                    exposure_mean = math.fsum(
+                        exposure_values[position] for position in group_positions
+                    ) / len(group_positions)
+                    for position in group_positions:
+                        centered_values[position] = values[position] - value_mean
+                        centered_exposures[position] = (
+                            exposure_values[position] - exposure_mean
+                        )
+                residuals = _TransformsSupport._linear_residuals(
+                    centered_values,
+                    centered_exposures,
+                    centered=True,
+                )
+            if residuals is None:
+                _TransformsSupport._invalidate(
+                    state, indices, _ZERO_MARKET_CAP_VARIANCE
+                )
+                continue
+            for index, residual in zip(indices, residuals, strict=True):
+                state.values[index] = residual
+        return _TransformsSupport._result(frame, value_col, state)
+
+    @staticmethod
+    def _linear_residuals(
+        values: Sequence[float],
+        exposures: Sequence[float],
+        *,
+        centered: bool = False,
+    ) -> list[float] | None:
+        """使用缩放和 ``fsum`` 计算确定性一元回归残差。"""
+        value_scale = max(abs(value) for value in values)
+        exposure_scale = max(abs(value) for value in exposures)
+        if exposure_scale == 0.0:
+            return None
+        scaled_values = [
+            value / value_scale if value_scale else 0.0 for value in values
+        ]
+        scaled_exposures = [value / exposure_scale for value in exposures]
+        value_mean = 0.0 if centered else math.fsum(scaled_values) / len(values)
+        exposure_mean = (
+            0.0 if centered else math.fsum(scaled_exposures) / len(exposures)
+        )
+        deviations = [value - exposure_mean for value in scaled_exposures]
+        denominator = math.fsum(value * value for value in deviations)
+        if not math.isfinite(denominator) or denominator <= 0.0:
+            return None
+        numerator = math.fsum(
+            exposure * (value - value_mean)
+            for exposure, value in zip(
+                deviations, scaled_values, strict=True
+            )
+        )
+        slope = numerator / denominator
+        return [
+            ((value - value_mean) - slope * exposure) * value_scale
+            for value, exposure in zip(
+                scaled_values, deviations, strict=True
+            )
+        ]
 
     @staticmethod
     def _initial_state(frame: pl.DataFrame, value_col: str) -> _TransformState:

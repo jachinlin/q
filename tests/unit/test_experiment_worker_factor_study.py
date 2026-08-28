@@ -10,8 +10,10 @@ import polars as pl
 
 from quant_research.bootstrap.worker import _FactorPublisher, _FactorStudySession
 from quant_research.domain.enums import MultipleTestingMethod
+from quant_research.domain.identifiers import InstrumentId
 from quant_research.factor_studies.models import (
     FactorIndustrySettings,
+    FactorMarketCapSettings,
     FactorStudyDefinition,
     FactorStudyUniverse,
     IndustryUnclassifiedPolicy,
@@ -47,6 +49,20 @@ class _IndustryRepository:
             无。
         """
         return self._frame.lazy()
+
+
+class _SignalRepository(_IndustryRepository):
+    """同时返回固定行业和 PIT 市值输入。"""
+
+    def __init__(self, industry: pl.DataFrame, basics: pl.DataFrame) -> None:
+        super().__init__(industry)
+        self._basics = basics
+
+    def stock_daily_basics(
+        self, _: object, __: date, ___: date
+    ) -> pl.LazyFrame:
+        """返回固定日频市值输入。"""
+        return self._basics.lazy()
 
 
 class _EmptyExecutableRepository:
@@ -200,14 +216,14 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
             cost_bps_scenarios=(5, 10, 20),
         )
 
-    excluded, exclude_coverage = session._industry_variants(
+    excluded, exclude_coverage = session._signal_variants(
         factor_frame,
         eligible,
         (),
         (day,),
         config(IndustryUnclassifiedPolicy.EXCLUDE),
     )
-    unclassified, unclassified_coverage = session._industry_variants(
+    unclassified, unclassified_coverage = session._signal_variants(
         factor_frame,
         eligible,
         (),
@@ -233,6 +249,95 @@ def test_industry_policies_publish_coverage_and_distinct_unclassified_scope() ->
     )
     assert exclude_neutral["is_valid"].to_list() == [True, True, False, False, False]
     assert unclassified_neutral["is_valid"].to_list() == [True, True, False, True, True]
+
+
+def test_market_cap_and_joint_variants_use_daily_pit_inputs() -> None:
+    day = date(2026, 1, 5)
+    instruments = [f"00000{index}.SZ" for index in range(1, 7)]
+    factor_frame = pl.DataFrame(
+        {
+            "signal_date": [day] * 6,
+            "instrument_id": instruments,
+            "factor_id": ["value"] * 6,
+            "value": [1.0, 4.0, 2.0, 8.0, 3.0, 9.0],
+            "is_valid": [True] * 6,
+            "invalid_reason": pl.Series([None] * 6, dtype=pl.String),
+            "signal_variant": ["DIRECTION_ADJUSTED"] * 6,
+        }
+    )
+    eligible = factor_frame.select("signal_date", "instrument_id").with_columns(
+        pl.lit(True).alias("eligible")
+    )
+    basics = pl.DataFrame(
+        {
+            "trade_date": [day] * 6,
+            "instrument_id": instruments,
+            "total_market_value": [1.0, 2.0, 4.0, 2.0, 4.0, 8.0],
+            "available_at": [
+                datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+                datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+                datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+                datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+                datetime(2026, 1, 5, 10, 0, tzinfo=UTC),
+                datetime(2026, 1, 6, 10, 0, tzinfo=UTC),
+            ],
+            "pit_usable": [True] * 6,
+        }
+    )
+    industry = pl.DataFrame(
+        {
+            "query_date": [day] * 6,
+            "instrument_id": instruments,
+            "level1_code": ["A", "A", "A", "B", "B", "B"],
+        }
+    )
+    session = _FactorStudySession(
+        cast(Any, object()),
+        cast(Any, _SignalRepository(industry, basics)),
+        cast(Any, object()),
+        cast(Any, object()),
+        Path("."),
+    )
+
+    def config(*, with_industry: bool) -> FactorStudyDefinition:
+        return FactorStudyDefinition(
+            name="market cap",
+            start_date=day,
+            end_date=day,
+            correction=MultipleTestingMethod.BH_FDR,
+            factor_ids=("value",),
+            universe=FactorStudyUniverse(name="CN_STOCK_STANDARD"),
+            horizons=(1,),
+            industry=(
+                FactorIndustrySettings(
+                    taxonomy="SW2021",
+                    unclassified_policy=IndustryUnclassifiedPolicy.EXCLUDE,
+                )
+                if with_industry
+                else None
+            ),
+            market_cap=FactorMarketCapSettings(
+                exposure="LOG_TOTAL_MARKET_VALUE"
+            ),
+        )
+
+    universe = tuple(InstrumentId.parse(item) for item in instruments)
+    market, _ = session._signal_variants(
+        factor_frame, eligible, universe, (day,), config(with_industry=False)
+    )
+    joint, coverage = session._signal_variants(
+        factor_frame, eligible, universe, (day,), config(with_industry=True)
+    )
+
+    market_variant = market.filter(
+        pl.col("signal_variant") == "MARKET_CAP_NEUTRALIZED"
+    )
+    assert market_variant["invalid_reason"].to_list()[-1] == "MISSING_MARKET_CAP"
+    assert set(joint["signal_variant"].to_list()) == {
+        "DIRECTION_ADJUSTED",
+        "INDUSTRY_MARKET_CAP_NEUTRALIZED",
+    }
+    assert coverage["usable_count"].item() == 6
 
 
 def test_factor_metrics_keep_rank_and_spread_corrections_in_separate_families() -> None:

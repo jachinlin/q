@@ -11,4 +11,6 @@ quantiles: 5
 industry:
   taxonomy: SW2021
   unclassified_policy: EXCLUDE
+market_cap:
+  exposure: LOG_TOTAL_MARKET_VALUE
 cost_bps_scenarios: [5, 10, 20]

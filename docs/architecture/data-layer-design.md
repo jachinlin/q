@@ -593,6 +593,11 @@ trade_calendar(...)
 
 接口返回 Polars `LazyFrame`。可以把它理解为“尚未执行的查询计划”：Repository 先描述需要哪些列、日期和证券，调用 `.collect()` 时才真正读取 Parquet。这有助于减少不必要的磁盘扫描。
 
+因子研究的市值中性化通过 `stock_daily_basics(...)` 读取已有
+`stock_daily_basic.total_market_value`，不新增派生 Canonical 数据集。Worker 在整段读取后仍须
+按每个信号日的上海日终重新应用 `pit_usable` 和 `available_at` 截止，仅对有限正市值取自然
+对数；禁止用区间末日才可见的行回填历史截面，也禁止绕过全局研究读取门禁直接扫描 Parquet。
+
 不存在通用 `instruments()`、`bars()`、`adjusted_bars()` 或 `security_status()`。拆分接口让调用者明确自己处理的是股票、基金还是指数，也避免把停牌和 ST 两种不同事件混成一个来源不清的状态表。
 
 ## 13. 各类消费者怎样组合数据

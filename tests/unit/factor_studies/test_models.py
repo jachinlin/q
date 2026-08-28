@@ -26,6 +26,8 @@ def test_checked_in_factor_study_uses_flat_final_contract() -> None:
     assert first.definition.horizons == (1, 5, 20)
     assert first.definition.cost_bps_scenarios == (5, 10, 20)
     assert first.definition.industry is not None
+    assert first.definition.market_cap is not None
+    assert first.definition.market_cap.exposure == "LOG_TOTAL_MARKET_VALUE"
     with pytest.raises(ValidationError):
         first.definition.name = "mutated"  # type: ignore[misc]
 
@@ -61,3 +63,21 @@ initial_run: {kind: FACTOR_STUDY}
 """
     with pytest.raises(ValueError, match="kind|start_date"):
         FactorStudyConfigParser().parse(legacy)
+
+
+def test_market_cap_defaults_to_none_and_rejects_unknown_exposure() -> None:
+    """旧研究缺少可选块时可读取，未知市值口径必须失败关闭。"""
+    text = Path("configs/factor_studies/examples/factor_study.yaml").read_text(
+        encoding="utf-8"
+    )
+    without_market_cap = text.replace(
+        "market_cap:\n  exposure: LOG_TOTAL_MARKET_VALUE\n", ""
+    )
+
+    assert FactorStudyConfigParser().parse(
+        without_market_cap
+    ).definition.market_cap is None
+    with pytest.raises(ValueError, match="market_cap.exposure"):
+        FactorStudyConfigParser().parse(
+            text.replace("LOG_TOTAL_MARKET_VALUE", "FLOAT_MARKET_VALUE")
+        )
