@@ -151,6 +151,43 @@ def test_quality_runner_records_pct_change_cross_check_failure() -> None:
     assert result.threshold == 0
 
 
+def test_quality_runner_rejects_non_canonical_instrument_identifier() -> None:
+    dataset = DatasetKind.STOCK_MASTER
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    frame = pl.DataFrame(
+        [
+            dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names())
+            | {
+                "instrument_id": "T00018.SH",
+                "symbol": "T00018",
+                "exchange": "SSE",
+                "board": "MAIN",
+                "name": "供应商测试证券",
+                "list_status": "L",
+                "source": "tushare",
+                "available_at": now,
+                "availability_source": "retrieved_at",
+                "pit_usable": True,
+                "ingested_at": now,
+            }
+        ],
+        schema=CANONICAL_SCHEMAS[dataset].columns,
+        strict=False,
+    )
+
+    evaluation = QualityRunner().evaluate({dataset: (frame,)})
+    result = next(
+        item
+        for item in evaluation.rule_results
+        if item.rule_id == "instrument_identifier"
+    )
+
+    assert result.status is QualityRuleStatus.FAIL
+    assert result.severity is Severity.FATAL
+    assert result.actual == 1
+    assert result.threshold == 0
+
+
 def test_daily_bar_pct_change_allows_supplier_rounding() -> None:
     frame = _daily_bar().with_columns(pl.lit(0.0509).alias("pct_change"))
 

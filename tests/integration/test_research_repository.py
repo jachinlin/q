@@ -17,6 +17,7 @@ from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.quality.models import QualityRunSpec
 from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.domain.enums import DatasetKind
+from quant_research.domain.errors import QuantError
 from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
@@ -30,6 +31,67 @@ from quant_research.infrastructure.persistence.repositories import (
 )
 
 _NOW = datetime(2026, 8, 11, tzinfo=UTC)
+
+
+def _partition_record(
+    path: Path, partition_key: str, *, content_hash: str = "a" * 64
+) -> CanonicalPartitionRecord:
+    """构造目录分区记录以验证研究仓库的分区身份边界。"""
+    return CanonicalPartitionRecord(
+        partition_key=partition_key,
+        content_hash=content_hash,
+        path=path,
+        schema_fingerprint="b" * 64,
+        input_hash="c" * 64,
+        row_count=0,
+    )
+
+
+def _dataset_record(
+    partitions: tuple[CanonicalPartitionRecord, ...],
+) -> CanonicalDatasetRecord:
+    """构造只用于目录身份校验的 Canonical 数据集记录。"""
+    return CanonicalDatasetRecord(
+        dataset=DatasetKind.STOCK_RISK_WARNING,
+        content_hash="d" * 64,
+        source="tushare",
+        partitions=partitions,
+        start_date=date(2006, 1, 1),
+        end_date=date(2007, 12, 31),
+        updated_at=_NOW,
+    )
+
+
+def test_repository_allows_identical_empty_content_across_partition_keys(
+    tmp_path: Path,
+) -> None:
+    """不同年份的空分区可以具有相同内容哈希，但必须保留不同路径。"""
+    record = _dataset_record(
+        (
+            _partition_record(tmp_path / "year=2006" / "empty.parquet", "year=2006"),
+            _partition_record(tmp_path / "year=2007" / "empty.parquet", "year=2007"),
+        )
+    )
+
+    CanonicalResearchRepository._validate_catalog_partition_identities(
+        DatasetKind.STOCK_RISK_WARNING, record
+    )
+
+
+def test_repository_rejects_duplicate_partition_paths(tmp_path: Path) -> None:
+    """两个目录分区不得指向同一个物理文件。"""
+    path = tmp_path / "shared.parquet"
+    record = _dataset_record(
+        (
+            _partition_record(path, "year=2006"),
+            _partition_record(path, "year=2007", content_hash="e" * 64),
+        )
+    )
+
+    with pytest.raises(QuantError, match="duplicate partition path"):
+        CanonicalResearchRepository._validate_catalog_partition_identities(
+            DatasetKind.STOCK_RISK_WARNING, record
+        )
 
 
 def _canonical_frame(

@@ -27,6 +27,7 @@ from quant_research.data.quality.rules import (
     dividend_event_issues,
     financial_availability_issues,
     industry_state_issues,
+    instrument_identifier_issues,
     primary_key_issues,
     required_dataset_issues,
     required_value_issues,
@@ -67,6 +68,7 @@ class QualityRunner:
         for rule in (
             primary_key_issues,
             required_value_issues,
+            instrument_identifier_issues,
             daily_bar_value_issues,
             dividend_event_issues,
             coverage_issues,

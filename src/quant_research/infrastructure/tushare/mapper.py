@@ -199,6 +199,8 @@ _STATEMENT_DATASETS = frozenset(
 _DIVIDEND_DATASETS = frozenset({DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND})
 _EXCHANGE_INSTRUMENT_DATASETS = frozenset(
     {
+        DatasetKind.STOCK_MASTER,
+        DatasetKind.FUND_MASTER,
         DatasetKind.STOCK_DAILY_BAR,
         DatasetKind.STOCK_ADJUSTMENT_FACTOR,
         DatasetKind.FUND_DAILY_BAR,
@@ -207,6 +209,7 @@ _EXCHANGE_INSTRUMENT_DATASETS = frozenset(
         DatasetKind.STOCK_SUSPENSION,
         DatasetKind.STOCK_RISK_WARNING,
         DatasetKind.STOCK_FINANCIAL_INDICATOR,
+        DatasetKind.INDUSTRY_MEMBERSHIP,
         *_STATEMENT_DATASETS,
         *_DIVIDEND_DATASETS,
     }

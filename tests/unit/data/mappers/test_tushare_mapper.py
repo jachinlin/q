@@ -134,7 +134,7 @@ def test_fund_daily_filters_non_canonical_exchange_code(tmp_path: Path) -> None:
     assert canonical.get_column("instrument_id").to_list() == ["510300.SH"]
 
 
-def test_stock_basic_adds_bse_board(tmp_path: Path) -> None:
+def test_stock_basic_filters_test_codes_and_adds_bse_board(tmp_path: Path) -> None:
     fields = (
         "ts_code",
         "symbol",
@@ -172,10 +172,22 @@ def test_stock_basic_adds_bse_board(tmp_path: Path) -> None:
                     "list_status": "L",
                     "list_date": "20260801",
                 },
+                dict.fromkeys(fields, None)
+                | {
+                    "ts_code": "T00018.SH",
+                    "symbol": "T00018",
+                    "name": "供应商测试证券",
+                    "market": "主板",
+                    "exchange": "SSE",
+                    "list_status": "L",
+                    "list_date": "20260801",
+                },
             ),
         )
     )
-    row = _normalize_raw(raw).frame.row(0, named=True)
+    frame = _normalize_raw(raw).frame
+    assert frame.height == 1
+    row = frame.row(0, named=True)
     assert row["instrument_id"] == "920001.BJ"
     assert row["board"] == "BSE"
 

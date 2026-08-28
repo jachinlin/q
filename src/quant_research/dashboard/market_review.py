@@ -207,10 +207,19 @@ class MarketReviewService:
             raise ValueError("market review history is empty")
         history_start = sessions[0]
 
-        stock_rows = self._repository.stocks().collect().rows(named=True)
-        stock_ids = tuple(
-            InstrumentId.parse(cast(str, row["instrument_id"])) for row in stock_rows
-        )
+        raw_stock_rows = self._repository.stocks().collect().rows(named=True)
+        stock_rows: list[dict[str, object]] = []
+        parsed_stock_ids: list[InstrumentId] = []
+        for row in raw_stock_rows:
+            try:
+                parsed_identifier = InstrumentId.parse(
+                    cast(str, row["instrument_id"])
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            stock_rows.append(row)
+            parsed_stock_ids.append(parsed_identifier)
+        stock_ids = tuple(parsed_stock_ids)
         if not stock_ids:
             raise ValueError("market review stock universe is empty")
         metadata = {cast(str, row["instrument_id"]): row for row in stock_rows}

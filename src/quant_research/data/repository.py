@@ -1014,16 +1014,14 @@ class CanonicalResearchRepository:
         record: CanonicalDatasetRecord,
     ) -> None:
         paths: set[Path] = set()
-        content_hashes: set[str] = set()
         for partition in record.partitions:
             path = partition.path.resolve()
-            if path in paths or partition.content_hash in content_hashes:
+            if path in paths:
                 cls._raise_catalog_error(
                     dataset,
-                    "canonical dataset contains duplicate partition identity",
+                    "canonical dataset contains duplicate partition path",
                 )
             paths.add(path)
-            content_hashes.add(partition.content_hash)
 
     @staticmethod
     def _raise_catalog_error(dataset: DatasetKind, message: str) -> Never:

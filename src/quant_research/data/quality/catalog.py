@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.quality.rules import FOUNDATION_REQUIRED_DATASETS
 from quant_research.domain.enums import DatasetKind, Severity
 
@@ -20,6 +21,11 @@ _FINANCIAL_DATASETS = (
     DatasetKind.STOCK_CASH_FLOW_STATEMENT,
 )
 _DIVIDEND_DATASETS = (DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND)
+_INSTRUMENT_DATASETS = tuple(
+    dataset
+    for dataset in _ALL_DATASETS
+    if "instrument_id" in CANONICAL_SCHEMAS[dataset].columns
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +112,15 @@ QUALITY_RULE_CATALOG: tuple[QualityRuleDefinition, ...] = (
         "关键字段空值数为 0。",
         Severity.SEVERE,
         _ALL_DATASETS,
+        prerequisite_rules=("canonical_schema", "required_dataset_empty"),
+    ),
+    QualityRuleDefinition(
+        "instrument_identifier",
+        "场内证券代码规范",
+        "检查证券代码是否为六位 ASCII 数字并使用 SH、SZ 或 BJ 后缀。",
+        "非法证券代码记录数为 0。",
+        Severity.FATAL,
+        _INSTRUMENT_DATASETS,
         prerequisite_rules=("canonical_schema", "required_dataset_empty"),
     ),
     QualityRuleDefinition(

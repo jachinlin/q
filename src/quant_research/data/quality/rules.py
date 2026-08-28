@@ -33,6 +33,11 @@ _STATEMENT_DATASETS = (
     DatasetKind.STOCK_CASH_FLOW_STATEMENT,
 )
 _DIVIDEND_DATASETS = (DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND)
+_INSTRUMENT_DATASETS = tuple(
+    dataset
+    for dataset, schema in CANONICAL_SCHEMAS.items()
+    if "instrument_id" in schema.columns
+)
 
 
 def required_dataset_issues(
@@ -177,6 +182,41 @@ def required_value_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
             issues.append(
                 _Support.issue(
                     "required_value_null", Severity.SEVERE, dataset, invalid, 0
+                )
+            )
+    return issues
+
+
+def instrument_identifier_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
+    """检查场内证券代码；该函数作为质量规则框架入口保留在模块级。
+
+    入参：Canonical 分区。返回值：代码不满足六位数字加交易所后缀时的质量问题。
+    异常：帧错误按原类型传播。
+    """
+    issues: list[QualityIssue] = []
+    for dataset in _INSTRUMENT_DATASETS:
+        frame = _Support.compatible(inputs.get(dataset, ()))
+        if frame is None:
+            continue
+        invalid = int(
+            frame.filter(
+                pl.col("instrument_id").is_not_null()
+                & ~pl.col("instrument_id").str.contains(
+                    r"^[0-9]{6}\.(?:SH|SZ|BJ)$"
+                )
+            )
+            .select(pl.len())
+            .collect()
+            .item()
+        )
+        if invalid:
+            issues.append(
+                _Support.issue(
+                    "instrument_identifier",
+                    Severity.FATAL,
+                    dataset,
+                    invalid,
+                    0,
                 )
             )
     return issues

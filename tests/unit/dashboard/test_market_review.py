@@ -355,6 +355,31 @@ def test_market_review_excludes_st_consistently_and_caches_by_scope() -> None:
     assert excluded.valuation.turnover_valid_count == 4
 
 
+def test_market_review_ignores_non_tradable_supplier_test_codes() -> None:
+    service, repository = _service()
+    repository.instrument_frame = pl.concat(
+        (
+            repository.instrument_frame,
+            pl.DataFrame(
+                {
+                    "instrument_id": ["T00018.SH"],
+                    "instrument_type": ["STOCK"],
+                    "name": ["供应商测试证券"],
+                    "board": ["MAIN"],
+                    "list_date": [date(2020, 1, 2)],
+                }
+            ),
+        )
+    )
+
+    result = service.review(_sessions()[-1], exclude_st=False)
+
+    assert result.data_quality.expected_count == 7
+    assert all(
+        item.instrument_id != "T00018.SH" for item in result.sentiment.events
+    )
+
+
 def test_market_review_rejects_non_session_and_never_falls_back_industry() -> None:
     service, repository = _service()
     repository.industry_frame = pl.DataFrame(
