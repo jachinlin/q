@@ -2966,6 +2966,7 @@ class DataPipeline:
                     replacement_frames,
                     start,
                     end,
+                    watermark_field=self._catalog[dataset].freshness.watermark_field,
                 )
             elif current is not None and current.start_date and current.end_date:
                 resolved_start, resolved_end = current.start_date, current.end_date
@@ -3525,6 +3526,8 @@ class DataPipeline:
         frames: Sequence[pl.DataFrame],
         start: date | None,
         end: date | None,
+        *,
+        watermark_field: str | None = None,
     ) -> tuple[date, date]:
         if frames and dataset in _SNAPSHOT_DATASETS:
             snapshot_dates = [
@@ -3538,6 +3541,16 @@ class DataPipeline:
         if start is not None and end is not None:
             return start, end
         dates: list[date] = []
+        if watermark_field is not None:
+            for frame in frames:
+                if watermark_field in frame.columns:
+                    dates.extend(
+                        value
+                        for value in frame[watermark_field].to_list()
+                        if value is not None
+                    )
+            if dates:
+                return min(dates), max(dates)
         for frame in frames:
             for column in (
                 "trade_date",

@@ -314,3 +314,22 @@ def test_instrument_canonical_window_uses_snapshot_time_not_listing_lifecycle() 
         date(2026, 8, 20),
         date(2026, 8, 20),
     )
+
+
+def test_dividend_canonical_window_uses_declared_freshness_watermark() -> None:
+    frame = pl.DataFrame(
+        {
+            "report_period": [date(2026, 6, 30), date(2026, 8, 26)],
+            "announcement_date": [date(2026, 8, 26), date(2026, 8, 27)],
+        }
+    )
+
+    assert DataPipeline._batch_window(
+        DatasetKind.STOCK_DIVIDEND,
+        (frame,),
+        None,
+        None,
+        watermark_field=DATASET_CATALOG[
+            DatasetKind.STOCK_DIVIDEND
+        ].freshness.watermark_field,
+    ) == (date(2026, 8, 26), date(2026, 8, 27))
