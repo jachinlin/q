@@ -100,6 +100,11 @@ describe('independent factor study dashboard', () => {
     expect(wrapper.text()).toContain('因子处理')
     expect(wrapper.text()).toContain('方向统一')
     expect(wrapper.text()).toContain('理论远期收益')
+    expect(wrapper.text()).toContain('研究指标与曲线')
+    expect(wrapper.text()).not.toContain('候选矩阵')
+    expect(wrapper.text()).toContain('IC 与分层收益')
+    expect(wrapper.text()).toContain('换手与成本')
+    expect(wrapper.text()).toContain('质量与相关性')
     expect(wrapper.text()).toContain('Pearson IC 描述统计')
     expect(wrapper.text()).toContain('Rank IC HAC 推断')
     expect(wrapper.text()).toContain('多空收益 HAC 推断')
@@ -114,11 +119,12 @@ describe('independent factor study dashboard', () => {
     if (!candidate) throw new Error('missing Candidate action')
     await candidate.trigger('click')
     await vi.waitFor(() => expect(apiPut).toHaveBeenCalledWith('/api/v1/factor-studies/study-1/decisions', expect.objectContaining({ mark: 'CANDIDATE', horizon: 5 })))
-    const analysisTab = wrapper.findAll('.el-tabs__item').find((node) => node.text() === 'IC / 分层')
-    if (!analysisTab) throw new Error('missing analysis tab')
-    await analysisTab.trigger('click')
     await vi.waitFor(() => expect(apiGet).toHaveBeenCalledWith(expect.stringContaining('/artifacts/ic')))
     await flushPromises()
+    expect(wrapper.findAll('[data-curve-artifact]')).toHaveLength(10)
+    for (const artifactType of ['ic', 'quantile_returns', 'long_short_returns', 'monotonicity', 'turnover', 'cost_scenarios', 'coverage', 'label_quality', 'industry_coverage', 'correlation']) {
+      expect(apiGet).toHaveBeenCalledWith(expect.stringContaining(`/artifacts/${artifactType}`))
+    }
     const chart = wrapper.findComponent({ name: 'VChart' })
     expect(chart.exists()).toBe(true)
     expect(chart.props('option')).toMatchObject({

@@ -200,29 +200,31 @@ function filters(type: string) {
   if (horizonTypes.includes(type) && selectedHorizon.value) params.set('horizon', String(selectedHorizon.value))
   return params
 }
-const activeArtifact = computed(() => tab.value === 'analysis' ? analysisArtifact.value : tab.value === 'execution' ? executionArtifact.value : tab.value === 'quality' ? qualityArtifact.value : '')
-const artifact = useQuery({
-  queryKey: computed(() => ['factor-study-artifact', studyId.value, activeArtifact.value, selectedVariant.value, selectedLabel.value, selectedFactor.value, selectedHorizon.value]),
-  queryFn: () => api.get<{ items: RunRawArtifactRow[]; total: number }>(`/api/v1/factor-studies/${studyId.value}/artifacts/${activeArtifact.value}?${filters(activeArtifact.value)}`),
-  enabled: computed(() => detail.data.value?.status === 'SUCCEEDED' && Boolean(activeArtifact.value)),
-})
-const artifactRows = computed(() => artifact.data.value?.items ?? [])
-const artifactColumns = computed(() => Object.keys(artifactRows.value[0] ?? {}))
-const chartOption = computed(() => {
-  const rows = artifactRows.value
-  const type = activeArtifact.value
+const curveQueries = CURVE_DEFINITIONS.map((definition) => useQuery({
+  queryKey: computed(() => ['factor-study-artifact', studyId.value, definition.type, filters(definition.type).toString()]),
+  queryFn: () => api.get<{ items: RunRawArtifactRow[]; total: number }>(`/api/v1/factor-studies/${studyId.value}/artifacts/${definition.type}?${filters(definition.type)}`),
+  enabled: computed(() => detail.data.value?.status === 'SUCCEEDED'
+    && tab.value === 'research'
+    && Boolean(selectedVariant.value && selectedLabel.value && selectedFactor.value && selectedHorizon.value)),
+}))
+
+function buildChartOption(type: CurveArtifactType, rows: RunRawArtifactRow[]) {
   if (!rows.length) return null
   if (type === 'correlation') {
     const names = [...new Set(rows.flatMap((row) => [String(row.factor_x), String(row.factor_y)]))].sort()
     return { tooltip, grid: { left: 100, right: 25, top: 18, bottom: 80 }, xAxis: { type: 'category', data: names, ...axis }, yAxis: { type: 'category', data: names, ...axis }, visualMap: { min: -1, max: 1, calculable: true, orient: 'horizontal', left: 'center', bottom: 0 }, series: [{ type: 'heatmap', data: rows.map((row) => [names.indexOf(String(row.factor_x)), names.indexOf(String(row.factor_y)), row.rank_correlation]) }] }
   }
-  if (type === 'cost_scenarios') return lineOption(rows.map((row) => `${row.cost_bps}bps`), [{ name: '净 spread', field: 'net_spread_mean' }])
-  if (type === 'turnover') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: '秩自相关', field: 'rank_autocorrelation' }, { name: '高分位换手', field: 'high_quantile_turnover' }, { name: '低分位换手', field: 'low_quantile_turnover' }, { name: '总换手', field: 'total_turnover' }])
-  if (type === 'ic') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: 'Rank IC', field: 'rank_ic' }, { name: '滚动 IC', field: 'rank_ic_rolling_mean' }, { name: 'Pearson IC', field: 'pearson_ic' }])
+  if (type === 'cost_scenarios') return lineOption(rows.map((row) => `${row.cost_bps}bps`), [{ name: '净 Spread', field: 'net_spread_mean' }, { name: '毛 Spread', field: 'gross_spread_mean' }], rows)
+  if (type === 'turnover') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: '秩自相关', field: 'rank_autocorrelation' }, { name: '高分位换手', field: 'high_quantile_turnover' }, { name: '低分位换手', field: 'low_quantile_turnover' }, { name: '总换手', field: 'total_turnover' }], rows)
+  if (type === 'ic') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: 'Rank IC', field: 'rank_ic' }, { name: '滚动 Rank IC', field: 'rank_ic_rolling_mean' }, { name: 'Pearson IC', field: 'pearson_ic' }], rows)
+  if (type === 'long_short_returns') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: '多空收益', field: 'long_short_return' }], rows)
+  if (type === 'monotonicity') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: '分位秩相关', field: 'quantile_rank_correlation' }, { name: '趋势斜率', field: 'trend_slope' }, { name: '端点 Spread', field: 'terminal_spread' }], rows)
+  if (type === 'coverage') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: '因子覆盖率', field: 'coverage' }], rows)
+  if (type === 'industry_coverage') return lineOption(rows.map((row) => String(row.signal_date)), [{ name: '分类覆盖率', field: 'classified_coverage' }, { name: '可用覆盖率', field: 'usable_coverage' }], rows)
   if (type === 'quantile_returns') {
     const quantiles = [...new Set(rows.map((row) => Number(row.quantile)))].sort((a, b) => a - b)
     const dates = [...new Set(rows.map((row) => String(row.signal_date)))]
-    return { ...lineOption(dates, []), legend: { data: quantiles.map((q) => `Q${q}`), top: 2, left: 'center' }, series: quantiles.map((q) => ({ name: `Q${q}`, type: 'line', symbol: 'none', data: dates.map((date) => rows.find((row) => row.signal_date === date && Number(row.quantile) === q)?.mean_return ?? null) })) }
+    return { ...lineOption(dates, [], rows), legend: { data: quantiles.map((q) => `Q${q}`), top: 2, left: 'center' }, series: quantiles.map((q) => ({ name: `Q${q}`, type: 'line', symbol: 'none', data: dates.map((date) => rows.find((row) => row.signal_date === date && Number(row.quantile) === q)?.mean_return ?? null) })) }
   }
   if (type === 'label_quality') {
     const reasons = [...new Set(rows.map((row) => String(row.reason)))]
@@ -231,11 +233,23 @@ const chartOption = computed(() => {
   }
   const dateField = rows[0].signal_date != null ? 'signal_date' : Object.keys(rows[0])[0]
   const numeric = Object.keys(rows[0]).find((name) => typeof rows[0][name] === 'number') ?? ''
-  return lineOption(rows.map((row) => String(row[dateField])), [{ name: numeric, field: numeric }])
-})
-function lineOption(rows: string[], series: Array<{ name: string; field: string }>) {
-  return { tooltip, legend: { data: series.map((item) => item.name), top: 2, left: 'center' }, grid: { left: 55, right: 24, top: 50, bottom: 56, containLabel: true }, xAxis: { type: 'category', data: rows, ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }], series: series.map((item) => ({ name: item.name, type: 'line', symbol: 'none', data: artifactRows.value.map((row) => row[item.field]) })) }
+  return lineOption(rows.map((row) => String(row[dateField])), [{ name: numeric, field: numeric }], rows)
 }
+function lineOption(categories: string[], series: Array<{ name: string; field: string }>, rows: RunRawArtifactRow[]) {
+  return { tooltip, legend: { data: series.map((item) => item.name), top: 2, left: 'center' }, grid: { left: 55, right: 24, top: 50, bottom: 56, containLabel: true }, xAxis: { type: 'category', data: categories, ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }], series: series.map((item) => ({ name: item.name, type: 'line', symbol: 'none', data: rows.map((row) => row[item.field]) })) }
+}
+
+const curveGroups = computed(() => {
+  let queryIndex = 0
+  return CURVE_GROUPS.map((group) => ({
+    title: group.title,
+    curves: group.curves.map((definition) => {
+      const query = curveQueries[queryIndex++]
+      const rows = query.data.value?.items ?? []
+      return { ...definition, option: buildChartOption(definition.type, rows), isLoading: query.isLoading.value, error: query.error.value }
+    }),
+  }))
+})
 
 function summaryMetricGroups(row: FactorStudyMatrixRow) {
   const groups = SUMMARY_METRIC_GROUPS.map((group) => ({
@@ -287,12 +301,13 @@ const manifest = useQuery({ queryKey: computed(() => ['factor-study-manifest', s
       </section>
       <FactorStudyTaskProgress v-if="task.data.value" :task="task.data.value" mode="detail" />
       <section v-if="detail.data.value.status === 'FAILED'" class="panel failure-state"><strong>研究执行失败</strong><pre>{{ JSON.stringify(detail.data.value.error, null, 2) }}</pre></section>
-      <section v-else-if="['QUEUED','RUNNING'].includes(detail.data.value.status)" class="panel running-state"><StatusBadge :status="detail.data.value.status" /><div><strong>{{ detail.data.value.stage }}</strong><p>研究正在按固定阶段推进，发布成功后开放候选矩阵与人工结论。</p></div></section>
+      <section v-else-if="['QUEUED','RUNNING'].includes(detail.data.value.status)" class="panel running-state"><StatusBadge :status="detail.data.value.status" /><div><strong>{{ detail.data.value.stage }}</strong><p>研究正在按固定阶段推进，发布成功后开放研究指标、全部曲线与人工结论。</p></div></section>
       <template v-else-if="detail.data.value.status === 'SUCCEEDED'">
         <section class="panel global-filters" aria-label="全局研究选择器"><label><span>因子处理</span><el-select v-model="selectedVariant"><el-option v-for="item in variants" :key="item" :label="signalVariantLabel(item)" :value="item" /></el-select></label><label><span>收益标签</span><el-select v-model="selectedLabel"><el-option v-for="item in labels" :key="item" :label="returnLabel(item)" :value="item" /></el-select></label><label><span>因子</span><el-select v-model="selectedFactor"><el-option v-for="item in factors" :key="item" :label="item" :value="item" /></el-select></label><label><span>期限</span><el-select v-model="selectedHorizon"><el-option v-for="item in horizons" :key="item" :label="`${item}D`" :value="item" /></el-select></label></section>
-        <section class="section-tabs"><el-tabs v-model="tab"><el-tab-pane label="候选矩阵" name="matrix" /><el-tab-pane label="IC / 分层" name="analysis" /><el-tab-pane label="换手 / 成本" name="execution" /><el-tab-pane label="质量 / 相关" name="quality" /><el-tab-pane label="配置 / 产物" name="evidence" /></el-tabs>
-          <div v-if="tab === 'matrix'">
-            <el-table :data="filteredMatrix" empty-text="当前选择没有矩阵行"><el-table-column prop="factor_ref" label="因子" min-width="155" /><el-table-column prop="horizon" label="期限" width="70" /><el-table-column prop="rank_ic_mean" label="Rank IC" width="100" /><el-table-column prop="rank_ic_hac_t_stat" label="HAC t" width="90" /><el-table-column prop="rank_ic_adjusted_p_value" label="校正 p" width="100" /><el-table-column prop="monotonicity_mean" label="单调性" width="90" /><el-table-column prop="gross_spread_mean" label="毛 spread" width="105" /><el-table-column prop="break_even_cost_bps" label="盈亏平衡 bps" width="120" /><el-table-column prop="total_turnover_mean" label="换手" width="90" /><el-table-column label="结论与备注" min-width="330"><template #default="scope"><div class="decision-cell"><el-input v-model="notes[key(scope.row)]" size="small" placeholder="人工备注" aria-label="人工结论备注" /><el-button-group><el-button size="small" type="success" plain :disabled="scope.row.decision?.mark === 'CANDIDATE'" @click="decide.mutate({ row: scope.row, mark: 'CANDIDATE' })">Candidate</el-button><el-button size="small" type="danger" plain :disabled="scope.row.decision?.mark === 'DISCARDED'" @click="decide.mutate({ row: scope.row, mark: 'DISCARDED' })">Discarded</el-button><el-button size="small" @click="decide.mutate({ row: scope.row, mark: 'UNREVIEWED' })">清除</el-button></el-button-group></div></template></el-table-column></el-table>
+        <section class="section-tabs"><el-tabs v-model="tab"><el-tab-pane label="研究指标与曲线" name="research" /><el-tab-pane label="配置 / 产物" name="evidence" /></el-tabs>
+          <div v-if="tab === 'research'" class="research-stack">
+            <div class="panel-heading research-heading"><div><h2>指标摘要与人工结论</h2><p>当前四维研究单元的关键结果与完整 Summary 指标。</p></div></div>
+            <el-table :data="filteredMatrix" empty-text="当前选择没有研究指标"><el-table-column prop="factor_ref" label="因子" min-width="155" /><el-table-column prop="horizon" label="期限" width="70" /><el-table-column prop="rank_ic_mean" label="Rank IC" width="100" /><el-table-column prop="rank_ic_hac_t_stat" label="HAC t" width="90" /><el-table-column prop="rank_ic_adjusted_p_value" label="校正 p" width="100" /><el-table-column prop="monotonicity_mean" label="单调性" width="90" /><el-table-column prop="gross_spread_mean" label="毛 spread" width="105" /><el-table-column prop="break_even_cost_bps" label="盈亏平衡 bps" width="120" /><el-table-column prop="total_turnover_mean" label="换手" width="90" /><el-table-column label="结论与备注" min-width="330"><template #default="scope"><div class="decision-cell"><el-input v-model="notes[key(scope.row)]" size="small" placeholder="人工备注" aria-label="人工结论备注" /><el-button-group><el-button size="small" type="success" plain :disabled="scope.row.decision?.mark === 'CANDIDATE'" @click="decide.mutate({ row: scope.row, mark: 'CANDIDATE' })">Candidate</el-button><el-button size="small" type="danger" plain :disabled="scope.row.decision?.mark === 'DISCARDED'" @click="decide.mutate({ row: scope.row, mark: 'DISCARDED' })">Discarded</el-button><el-button size="small" @click="decide.mutate({ row: scope.row, mark: 'UNREVIEWED' })">清除</el-button></el-button-group></div></template></el-table-column></el-table>
             <section v-for="row in filteredMatrix" :key="key(row)" class="summary-detail" :aria-label="`${row.factor_ref} ${row.horizon}D 完整 Summary 指标`">
               <div class="summary-detail-heading"><div><h3>完整 Summary 指标</h3><p>{{ signalVariantLabel(row.signal_variant) }} · {{ returnLabel(row.label_kind) }} · {{ row.factor_ref }} · {{ row.horizon }}D</p></div><span>{{ Object.keys(row.summary_metrics).length }} 项</span></div>
               <div class="summary-groups">
@@ -306,11 +321,18 @@ const manifest = useQuery({ queryKey: computed(() => ['factor-study-manifest', s
                 </article>
               </div>
             </section>
+            <section v-for="group in curveGroups" :key="group.title" class="curve-section">
+              <div class="panel-heading"><div><h2>{{ group.title }}</h2><p>按当前全局研究选择器读取可信产物，所有曲线同时展开。</p></div></div>
+              <div class="curve-grid">
+                <div v-for="curve in group.curves" :key="curve.type" class="curve-card" :data-curve-artifact="curve.type">
+                  <ErrorState v-if="curve.error" :error="curve.error" />
+                  <div v-else-if="curve.isLoading" class="curve-loading">正在读取 {{ curve.title }}…</div>
+                  <ChartCard v-else :title="curve.title" :subtitle="curve.type" :empty="!curve.option"><VChart v-if="curve.option" class="artifact-chart" :option="curve.option" autoresize /></ChartCard>
+                </div>
+              </div>
+            </section>
           </div>
-          <div v-else-if="tab === 'analysis'"><div class="artifact-switch"><el-radio-group v-model="analysisArtifact" size="small"><el-radio-button value="ic">IC 时序</el-radio-button><el-radio-button value="quantile_returns">独立分层</el-radio-button><el-radio-button value="long_short_returns">多空收益</el-radio-button><el-radio-button value="monotonicity">单调性</el-radio-button></el-radio-group></div><ChartCard :title="analysisArtifact" :empty="!chartOption"><VChart v-if="chartOption" class="artifact-chart" :option="chartOption" autoresize /></ChartCard></div>
-          <div v-else-if="tab === 'execution'"><div class="artifact-switch"><el-radio-group v-model="executionArtifact" size="small"><el-radio-button value="turnover">换手与秩自相关</el-radio-button><el-radio-button value="cost_scenarios">bps—净 spread</el-radio-button></el-radio-group></div><ChartCard :title="executionArtifact" :empty="!chartOption"><VChart v-if="chartOption" class="artifact-chart" :option="chartOption" autoresize /></ChartCard></div>
-          <div v-else-if="tab === 'quality'"><div class="artifact-switch"><el-radio-group v-model="qualityArtifact" size="small"><el-radio-button value="coverage">因子覆盖率</el-radio-button><el-radio-button value="label_quality">标签失败原因</el-radio-button><el-radio-button value="industry_coverage">行业覆盖</el-radio-button><el-radio-button value="correlation">因子相关性</el-radio-button></el-radio-group></div><div class="quality-grid"><ChartCard :title="qualityArtifact" :empty="!chartOption"><VChart v-if="chartOption" class="artifact-chart" :option="chartOption" autoresize /></ChartCard><section class="panel raw-table"><div class="panel-heading"><div><h2>证据明细</h2><p>Manifest 复核后的原始行</p></div></div><el-table :data="artifactRows" max-height="420"><el-table-column v-for="column in artifactColumns" :key="column" :prop="column" :label="column" min-width="130" /></el-table></section></div></div>
-          <div v-else-if="tab === 'evidence'" class="evidence-grid"><section class="panel"><div class="panel-heading"><div><h2>规范配置</h2><p>{{ detail.data.value.config_hash }}</p></div></div><pre>{{ JSON.stringify(detail.data.value.definition, null, 2) }}</pre></section><section class="panel"><div class="panel-heading"><div><h2>任务与 Manifest</h2><p class="hash">TASK {{ detail.data.value.task_id }}</p></div></div><pre>{{ JSON.stringify(manifest.data.value ?? {}, null, 2) }}</pre></section><section class="panel artifact-register"><div class="panel-heading"><div><h2>产物登记</h2><p>类型、路径、行数和哈希</p></div></div><el-table :data="detail.data.value.artifacts"><el-table-column prop="artifact_type" label="类型" /><el-table-column prop="relative_path" label="路径" min-width="190" /><el-table-column prop="row_count" label="行数" width="80" /><el-table-column prop="content_hash" label="SHA-256" min-width="180" show-overflow-tooltip /></el-table></section></div>
+          <div v-else class="evidence-grid"><section class="panel"><div class="panel-heading"><div><h2>规范配置</h2><p>{{ detail.data.value.config_hash }}</p></div></div><pre>{{ JSON.stringify(detail.data.value.definition, null, 2) }}</pre></section><section class="panel"><div class="panel-heading"><div><h2>任务与 Manifest</h2><p class="hash">TASK {{ detail.data.value.task_id }}</p></div></div><pre>{{ JSON.stringify(manifest.data.value ?? {}, null, 2) }}</pre></section><section class="panel artifact-register"><div class="panel-heading"><div><h2>产物登记</h2><p>类型、路径、行数和哈希</p></div></div><el-table :data="detail.data.value.artifacts"><el-table-column prop="artifact_type" label="类型" /><el-table-column prop="relative_path" label="路径" min-width="190" /><el-table-column prop="row_count" label="行数" width="80" /><el-table-column prop="content_hash" label="SHA-256" min-width="180" show-overflow-tooltip /></el-table></section></div>
         </section>
       </template>
     </template>
@@ -318,5 +340,5 @@ const manifest = useQuery({ queryKey: computed(() => ['factor-study-manifest', s
 </template>
 
 <style scoped>
-.detail-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:26px;padding:24px;background:linear-gradient(120deg,#fff,#f3f7ff 60%,#eef9f7)}.detail-hero h2{margin:9px 0 7px;font-size:24px}.detail-hero p{margin:0;color:var(--muted)}.evidence-line{display:flex;gap:15px;margin-top:17px;color:var(--dim);font-size:11px}.hero-actions{width:310px;display:grid;gap:13px}.global-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;padding:15px 18px}.global-filters label{display:grid;gap:6px;color:var(--dim);font-size:10px}.decision-cell{display:grid;gap:7px;padding:5px 0}.summary-detail{margin-top:16px;padding:18px;border:1px solid var(--border);border-radius:10px;background:var(--surface-raised)}.summary-detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.summary-detail-heading h3{margin:0}.summary-detail-heading p{margin:5px 0 0;color:var(--muted);font-size:12px}.summary-detail-heading>span{color:var(--dim);font-size:12px}.summary-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}.summary-group{padding:14px;border:1px solid var(--border);border-radius:9px;background:var(--surface)}.summary-group h4{margin:0 0 10px}.summary-metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px 14px}.summary-metric{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 10px;padding:8px 0;border-bottom:1px solid var(--border)}.summary-metric span{color:var(--muted);font-size:12px}.summary-metric strong{text-align:right;font-size:13px}.summary-metric small{grid-column:1/-1;color:var(--dim);font:10px/1.3 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.artifact-switch{display:flex;justify-content:flex-end;margin:5px 0 12px}.artifact-chart{height:390px}.quality-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(440px,.8fr);gap:14px}.raw-table{padding-bottom:6px}.running-state{display:flex;align-items:center;gap:17px;padding:30px}.running-state p{margin:6px 0 0;color:var(--muted)}.failure-state{border-color:rgba(214,59,86,.3)}.failure-state pre,.evidence-grid pre{max-height:520px;overflow:auto;font:11px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap}.evidence-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact-register{grid-column:1/-1}@media(max-width:1360px){.quality-grid,.evidence-grid,.summary-groups{grid-template-columns:1fr}.artifact-register{grid-column:auto}}@media(max-width:760px){.summary-metric-grid{grid-template-columns:1fr}}
+.detail-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:26px;padding:24px;background:linear-gradient(120deg,#fff,#f3f7ff 60%,#eef9f7)}.detail-hero h2{margin:9px 0 7px;font-size:24px}.detail-hero p{margin:0;color:var(--muted)}.evidence-line{display:flex;gap:15px;margin-top:17px;color:var(--dim);font-size:11px}.hero-actions{width:310px;display:grid;gap:13px}.global-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;padding:15px 18px}.global-filters label{display:grid;gap:6px;color:var(--dim);font-size:10px}.decision-cell{display:grid;gap:7px;padding:5px 0}.research-stack{display:grid;gap:20px}.research-heading{margin-bottom:-8px}.summary-detail{padding:18px;border:1px solid var(--border);border-radius:10px;background:var(--surface-raised)}.summary-detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.summary-detail-heading h3{margin:0}.summary-detail-heading p{margin:5px 0 0;color:var(--muted);font-size:12px}.summary-detail-heading>span{color:var(--dim);font-size:12px}.summary-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}.summary-group{padding:14px;border:1px solid var(--border);border-radius:9px;background:var(--surface)}.summary-group h4{margin:0 0 10px}.summary-metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px 14px}.summary-metric{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 10px;padding:8px 0;border-bottom:1px solid var(--border)}.summary-metric span{color:var(--muted);font-size:12px}.summary-metric strong{text-align:right;font-size:13px}.summary-metric small{grid-column:1/-1;color:var(--dim);font:10px/1.3 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.curve-section{display:grid;gap:12px}.curve-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.curve-card{min-width:0}.curve-loading{display:grid;min-height:390px;place-items:center;border:1px solid var(--border);border-radius:10px;color:var(--muted);background:var(--surface)}.artifact-chart{height:390px}.running-state{display:flex;align-items:center;gap:17px;padding:30px}.running-state p{margin:6px 0 0;color:var(--muted)}.failure-state{border-color:rgba(214,59,86,.3)}.failure-state pre,.evidence-grid pre{max-height:520px;overflow:auto;font:11px/1.6 ui-monospace,Consolas,monospace;white-space:pre-wrap}.evidence-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact-register{grid-column:1/-1}@media(max-width:1360px){.evidence-grid,.summary-groups,.curve-grid{grid-template-columns:1fr}.artifact-register{grid-column:auto}}@media(max-width:760px){.summary-metric-grid{grid-template-columns:1fr}}
 </style>
