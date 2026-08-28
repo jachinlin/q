@@ -149,17 +149,17 @@ def test_batch_universe_preserves_daily_pit_reasons_and_identity() -> None:
     assert repository.suspension_calls == [(days[0], days[-1], (second, first))]
     assert repository.warning_calls == [(days[0], days[-1], (second, first))]
     assert eligible.rows() == [
-        (days[0], first.canonical(), False, ["RISK_WARNING", "SUSPENDED"]),
-        (days[0], second.canonical(), True, []),
-        (days[1], first.canonical(), True, []),
-        (days[1], second.canonical(), False, ["SUSPENDED"]),
-        (days[2], first.canonical(), True, []),
-        (days[2], second.canonical(), True, []),
+        (days[0], first.canonical(), False),
+        (days[0], second.canonical(), True),
+        (days[1], first.canonical(), True),
+        (days[1], second.canonical(), False),
+        (days[2], first.canonical(), True),
+        (days[2], second.canonical(), True),
     ]
     assert universe_ids == (first, second)
     membership = [
         {"signal_date": value.isoformat(), "instrument_id": instrument}
-        for value, instrument, is_eligible, _ in eligible.iter_rows()
+        for value, instrument, is_eligible in eligible.iter_rows()
         if is_eligible
     ]
     assert universe_hash == hashlib.sha256(

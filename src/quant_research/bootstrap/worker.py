@@ -60,8 +60,6 @@ from quant_research.factor_studies.analysis import (
     LABEL_KINDS,
     MARKET_CAP_NEUTRALIZED,
     THEORETICAL_FORWARD_RETURN,
-    analyze,
-    build_future_returns,
 )
 from quant_research.factor_studies.models import (
     FactorStudyDefinition,
@@ -72,10 +70,17 @@ from quant_research.factor_studies.models import (
 )
 from quant_research.factor_studies.progress import FactorStudyProgressReporter
 from quant_research.factor_studies.runner import FactorStudyHandler
+from quant_research.factor_studies.streaming import (
+    FactorStudyTemporaryStore,
+    SpilledFrame,
+    StreamingForwardReturnBuilder,
+    StreamingStudyAnalyzer,
+)
 from quant_research.factors import (
     FactorArtifact,
     FactorContext,
     FactorEngine,
+    FactorExecutionDescriptor,
     FactorRegistry,
 )
 from quant_research.factors.builtin import register_stock_factors
@@ -1288,6 +1293,209 @@ class _FactorStudySession:
             coverage,
         )
 
+    def _neutralization_analysis_inputs(
+        self,
+        eligible: pl.DataFrame,
+        universe_ids: tuple[InstrumentId, ...],
+        sessions: tuple[date, ...],
+        config: FactorStudyDefinition,
+    ) -> tuple[pl.DataFrame | None, pl.DataFrame]:
+        """一次读取 PIT 行业与市值并返回可跨因子复用的对齐表和覆盖证据。"""
+        industry = config.industry
+        market_cap = config.market_cap
+        empty = pl.DataFrame(
+            schema={
+                "signal_date": pl.Date,
+                "taxonomy": pl.String,
+                "unclassified_policy": pl.String,
+                "eligible_count": pl.Int64,
+                "classified_count": pl.Int64,
+                "tombstone_count": pl.Int64,
+                "missing_state_count": pl.Int64,
+                "usable_count": pl.Int64,
+                "classified_coverage": pl.Float64,
+                "usable_coverage": pl.Float64,
+            }
+        )
+        if industry is None and market_cap is None:
+            return None, empty
+        aligned = eligible.filter(pl.col("eligible")).select(
+            "signal_date", "instrument_id"
+        )
+        helper_columns: list[str] = []
+        coverage = empty
+        if industry is not None:
+            state = (
+                self._repository.industry_memberships_on_dates(universe_ids, sessions)
+                .collect()
+                .select(
+                    pl.col("query_date").alias("signal_date"),
+                    "instrument_id",
+                    pl.col("level1_code").alias("industry_code"),
+                    pl.lit(True).alias("is_classified"),
+                )
+                .with_columns(pl.lit(True).alias("_state_present"))
+            )
+            aligned = aligned.join(
+                state, on=["signal_date", "instrument_id"], how="left"
+            ).with_columns(
+                pl.col("_state_present").fill_null(False),
+                (
+                    pl.col("is_classified").fill_null(False)
+                    & pl.col("industry_code").is_not_null()
+                    & (pl.col("industry_code").str.len_chars() > 0)
+                ).alias("_classified"),
+            )
+            if (
+                industry.unclassified_policy
+                is IndustryUnclassifiedPolicy.UNCLASSIFIED
+            ):
+                aligned = aligned.with_columns(
+                    pl.when(pl.col("_classified"))
+                    .then(pl.col("industry_code"))
+                    .otherwise(pl.lit("__UNCLASSIFIED__"))
+                    .alias("_neutralization_industry")
+                )
+            else:
+                aligned = aligned.with_columns(
+                    pl.when(pl.col("_classified"))
+                    .then(pl.col("industry_code"))
+                    .otherwise(pl.lit(None, dtype=pl.String))
+                    .alias("_neutralization_industry")
+                )
+            coverage = (
+                aligned.group_by("signal_date")
+                .agg(
+                    pl.len().cast(pl.Int64).alias("eligible_count"),
+                    pl.col("_classified")
+                    .sum()
+                    .cast(pl.Int64)
+                    .alias("classified_count"),
+                    (pl.col("_state_present") & ~pl.col("_classified"))
+                    .sum()
+                    .cast(pl.Int64)
+                    .alias("tombstone_count"),
+                    (~pl.col("_state_present"))
+                    .sum()
+                    .cast(pl.Int64)
+                    .alias("missing_state_count"),
+                    pl.col("_neutralization_industry")
+                    .is_not_null()
+                    .sum()
+                    .cast(pl.Int64)
+                    .alias("usable_count"),
+                )
+                .with_columns(
+                    pl.lit(industry.taxonomy).alias("taxonomy"),
+                    pl.lit(industry.unclassified_policy.value).alias(
+                        "unclassified_policy"
+                    ),
+                    (pl.col("classified_count") / pl.col("eligible_count")).alias(
+                        "classified_coverage"
+                    ),
+                    (pl.col("usable_count") / pl.col("eligible_count")).alias(
+                        "usable_coverage"
+                    ),
+                )
+                .select(*empty.columns)
+                .sort("signal_date")
+            )
+            helper_columns.append("_neutralization_industry")
+
+        if market_cap is not None:
+            cutoffs = pl.DataFrame(
+                {
+                    "signal_date": sessions,
+                    "_pit_cutoff": [
+                        datetime.combine(value, time.max, tzinfo=_SHANGHAI).astimezone(
+                            UTC
+                        )
+                        for value in sessions
+                    ],
+                },
+                schema={
+                    "signal_date": pl.Date,
+                    "_pit_cutoff": pl.Datetime("us", "UTC"),
+                },
+            )
+            visible = (
+                self._repository.stock_daily_basics(
+                    universe_ids, sessions[0], sessions[-1]
+                )
+                .collect()
+                .rename({"trade_date": "signal_date"})
+                .join(cutoffs, on="signal_date", how="inner")
+                .filter(
+                    pl.col("pit_usable")
+                    & pl.col("available_at").is_not_null()
+                    & (pl.col("available_at") <= pl.col("_pit_cutoff"))
+                )
+                .select(
+                    "signal_date",
+                    "instrument_id",
+                    pl.col("total_market_value").alias(
+                        "_neutralization_market_cap"
+                    ),
+                )
+                .sort("signal_date", "instrument_id")
+            )
+            if visible.select("signal_date", "instrument_id").is_duplicated().any():
+                raise ValueError("factor study market-cap input has duplicate keys")
+            aligned = aligned.join(
+                visible, on=["signal_date", "instrument_id"], how="left"
+            )
+            helper_columns.append("_neutralization_market_cap")
+
+        return aligned.select("signal_date", "instrument_id", *helper_columns), coverage
+
+    @staticmethod
+    def _neutralized_factor_frame(
+        factor_frame: pl.DataFrame,
+        alignment: pl.DataFrame,
+        config: FactorStudyDefinition,
+    ) -> pl.DataFrame:
+        """对单个方向统一因子应用已对齐的行业和市值暴露。"""
+        joined = factor_frame.join(
+            alignment,
+            on=["signal_date", "instrument_id"],
+            how="left",
+        )
+        if config.industry is not None and config.market_cap is not None:
+            neutralized = neutralize_industry_market_cap(
+                joined,
+                "value",
+                "_neutralization_market_cap",
+                "_neutralization_industry",
+                ("signal_date", "factor_id"),
+            ).with_columns(
+                pl.lit(INDUSTRY_MARKET_CAP_NEUTRALIZED).alias("signal_variant")
+            )
+            helper_columns: tuple[str, ...] = (
+                "_neutralization_industry",
+                "_neutralization_market_cap",
+            )
+        elif config.industry is not None:
+            neutralized = neutralize_industry(
+                joined,
+                "value",
+                "_neutralization_industry",
+                ("signal_date", "factor_id"),
+            ).with_columns(pl.lit(INDUSTRY_NEUTRALIZED).alias("signal_variant"))
+            helper_columns = ("_neutralization_industry",)
+        elif config.market_cap is not None:
+            neutralized = neutralize_market_cap(
+                joined,
+                "value",
+                "_neutralization_market_cap",
+                ("signal_date", "factor_id"),
+            ).with_columns(pl.lit(MARKET_CAP_NEUTRALIZED).alias("signal_variant"))
+            helper_columns = ("_neutralization_market_cap",)
+        else:
+            raise ValueError("factor study neutralization is not configured")
+        return neutralized.drop(helper_columns).sort(
+            "signal_date", "instrument_id", "factor_id"
+        )
+
     def _executable_state(
         self,
         universe_ids: tuple[InstrumentId, ...],
@@ -1567,8 +1775,8 @@ class _FactorStudySession:
                 suspended,
                 warned,
             )
-            frames.append(batch)
             hasher.update(batch)
+            frames.append(batch.select("signal_date", "instrument_id", "eligible"))
             signal_date = sessions[batch_end - 1]
             progress.substage_progress(
                 "BUILD_UNIVERSE",
@@ -1598,63 +1806,51 @@ class _FactorStudySession:
         )
         return eligible, universe_ids, universe_hash
 
-    def _analyze(
+    def _streaming_analysis_tables(
         self,
+        *,
+        source: CanonicalRunData,
+        eligible: pl.DataFrame,
+        universe_ids: tuple[InstrumentId, ...],
+        universe_hash: str,
+        sessions: tuple[date, ...],
         progress: FactorStudyProgressReporter,
         cancellation: CancellationToken,
-    ) -> None:
+        temporary: FactorStudyTemporaryStore,
+    ) -> tuple[dict[str, pl.DataFrame], FactorExecutionDescriptor, pl.DataFrame]:
+        """逐因子和逐期限落盘，并以单分析单元峰值装配最终小表。"""
         config = self._study.definition
-        source = CanonicalRunData(self._repository, self._study.catalog_hash)
-        progress.substage_started(
-            "BUILD_UNIVERSE",
-            "正在准备逐日 PIT 股票池",
-            {
-                "start_date": config.start_date.isoformat(),
-                "end_date": config.end_date.isoformat(),
-            },
-        )
-        sessions = source._sessions(config.start_date, config.end_date)
-        if not sessions:
-            raise ValueError("factor study has no trading sessions")
-        eligible, universe_ids, universe_hash = self._build_factor_study_universe(
-            source._stock_ids,
-            sessions,
-            progress,
-            cancellation,
-        )
         progress.substage_started(
             "COMPUTE_FACTORS",
             "正在重新计算研究因子",
             {"requested_factor_count": len(config.factor_ids)},
         )
-        descriptor = source._factor_engine.execution_descriptor(
-            config.factor_ids
+        descriptor = source._factor_engine.execution_descriptor(config.factor_ids)
+        directions = {node.factor_ref: node.spec.direction for node in descriptor.plan}
+        context = FactorContext(
+            self._study.catalog_hash,
+            universe_hash,
+            config.start_date,
+            config.end_date,
         )
-        directions = {
-            node.factor_ref: node.spec.direction for node in descriptor.plan
-        }
-        artifacts_by_factor = source._factor_engine.compute(
-            config.factor_ids,
-            FactorContext(
-                self._study.catalog_hash,
-                universe_hash,
-                config.start_date,
-                config.end_date,
-            ),
-        )
-        factor_frame = self._analysis_factor_frame(
-            artifacts_by_factor,
-            config.factor_ids,
-            directions,
-            eligible,
-        )
+        raw_files: dict[str, SpilledFrame] = {}
+        factor_row_count = 0
+        for factor_id in sorted(config.factor_ids):
+            if cancellation.is_cancelled():
+                raise RuntimeError("factor study cancelled")
+            artifacts = source._factor_engine.compute((factor_id,), context)
+            artifact = artifacts[factor_id]
+            frame = artifact.lazy_frame().collect()
+            raw_files[factor_id] = temporary.write("factor", frame)
+            factor_row_count += frame.height
+            del frame, artifact, artifacts
         progress.substage_completed(
             "COMPUTE_FACTORS",
             "研究因子计算完成",
             {
                 "requested_factor_count": len(config.factor_ids),
                 "execution_factor_count": len(descriptor.plan),
-                "factor_row_count": len(factor_frame),
+                "factor_row_count": factor_row_count,
                 "factor_execution_descriptor_hash": descriptor.content_hash,
             },
         )
@@ -1666,23 +1862,72 @@ class _FactorStudySession:
                 "market_cap_enabled": config.market_cap is not None,
             },
         )
-        factor_frame, industry_coverage = self._signal_variants(
-            factor_frame, eligible, universe_ids, sessions, config
+        neutralization_alignment, industry_coverage = (
+            self._neutralization_analysis_inputs(
+                eligible, universe_ids, sessions, config
+            )
         )
+        neutralized_variant = (
+            INDUSTRY_MARKET_CAP_NEUTRALIZED
+            if config.industry is not None and config.market_cap is not None
+            else INDUSTRY_NEUTRALIZED
+            if config.industry is not None
+            else MARKET_CAP_NEUTRALIZED
+            if config.market_cap is not None
+            else None
+        )
+        signal_files: dict[tuple[str, str], SpilledFrame] = {}
+        signal_row_count = 0
+        for factor_id, raw_file in sorted(raw_files.items()):
+            if cancellation.is_cancelled():
+                raise RuntimeError("factor study cancelled")
+            raw = pl.read_parquet(raw_file.path)
+            base = (
+                raw.rename({"trade_date": "signal_date"})
+                .join(
+                    eligible.filter(pl.col("eligible")).select(
+                        "signal_date", "instrument_id"
+                    ),
+                    on=["signal_date", "instrument_id"],
+                    how="inner",
+                )
+                .with_columns(
+                    (pl.col("value") * directions[factor_id]).alias("value"),
+                    pl.lit(DIRECTION_ADJUSTED).alias("signal_variant"),
+                    pl.lit(None, dtype=pl.String).alias("invalid_reason"),
+                )
+                .sort("signal_date", "instrument_id", "factor_id")
+            )
+            signal_files[(DIRECTION_ADJUSTED, factor_id)] = temporary.write(
+                "signal", base
+            )
+            signal_row_count += base.height
+            if (
+                neutralization_alignment is not None
+                and neutralized_variant is not None
+            ):
+                neutralized = self._neutralized_factor_frame(
+                    base, neutralization_alignment, config
+                )
+                signal_files[(neutralized_variant, factor_id)] = temporary.write(
+                    "signal", neutralized
+                )
+                signal_row_count += neutralized.height
+                del neutralized
+            temporary.remove(raw_file)
+            del raw, base
+        del raw_files, neutralization_alignment
         progress.substage_completed(
             "BUILD_SIGNALS",
             "研究信号构建完成",
             {
-                "signal_row_count": len(factor_frame),
-                "signal_variant_count": factor_frame["signal_variant"].n_unique(),
+                "signal_row_count": signal_row_count,
+                "signal_variant_count": len(
+                    {variant for variant, _ in signal_files}
+                ),
                 "signal_variants": cast(
                     list[JsonValue],
-                    sorted(
-                        cast(
-                            list[str],
-                            factor_frame["signal_variant"].unique().to_list(),
-                        )
-                    ),
+                    sorted({variant for variant, _ in signal_files}),
                 ),
                 "industry_enabled": config.industry is not None,
                 "market_cap_enabled": config.market_cap is not None,
@@ -1720,19 +1965,25 @@ class _FactorStudySession:
             "正在构建理论与可执行远期收益标签",
             {"horizons": list(config.horizons)},
         )
-        future = build_future_returns(
-            bars,
-            all_sessions,
-            eligible,
-            config.horizons,
-            executable_state,
+        label_builder = StreamingForwardReturnBuilder(
+            bars, all_sessions, eligible, executable_state
         )
+        label_files: dict[int, SpilledFrame] = {}
+        label_row_count = 0
+        for horizon in config.horizons:
+            if cancellation.is_cancelled():
+                raise RuntimeError("factor study cancelled")
+            wide = label_builder.build(horizon)
+            label_files[horizon] = temporary.write("label", wide)
+            label_row_count += wide.height * len(LABEL_KINDS)
+            del wide
+        del label_builder, bars, executable_state
         progress.substage_completed(
             "BUILD_FORWARD_RETURNS",
             "远期收益标签构建完成",
             {
-                "label_table_count": len(future),
-                "label_row_count": sum(len(frame) for frame in future.values()),
+                "label_table_count": len(label_files) * len(LABEL_KINDS),
+                "label_row_count": label_row_count,
             },
         )
         progress.substage_started(
@@ -1743,23 +1994,61 @@ class _FactorStudySession:
                 "cost_scenario_count": len(config.cost_bps_scenarios),
             },
         )
-        self._tables = analyze(
-            factor_frame,
-            eligible,
-            future,
+        tables = StreamingStudyAnalyzer(
             quantiles=config.quantiles,
             cost_bps_scenarios=config.cost_bps_scenarios,
-        )
-        self._tables["industry_coverage"] = industry_coverage
+            cancellation=cancellation,
+            temporary=temporary,
+        ).run(signal_files, eligible, label_files)
+        tables["industry_coverage"] = industry_coverage
         progress.substage_completed(
             "ANALYZE_STATISTICS",
             "因子统计分析完成",
             {
                 "table_row_counts": {
-                    name: len(frame) for name, frame in sorted(self._tables.items())
+                    name: len(frame) for name, frame in sorted(tables.items())
                 }
             },
         )
+        return tables, descriptor, industry_coverage
+
+    def _analyze(
+        self,
+        progress: FactorStudyProgressReporter,
+        cancellation: CancellationToken,
+    ) -> None:
+        config = self._study.definition
+        source = CanonicalRunData(self._repository, self._study.catalog_hash)
+        progress.substage_started(
+            "BUILD_UNIVERSE",
+            "正在准备逐日 PIT 股票池",
+            {
+                "start_date": config.start_date.isoformat(),
+                "end_date": config.end_date.isoformat(),
+            },
+        )
+        sessions = source._sessions(config.start_date, config.end_date)
+        if not sessions:
+            raise ValueError("factor study has no trading sessions")
+        eligible, universe_ids, universe_hash = self._build_factor_study_universe(
+            source._stock_ids,
+            sessions,
+            progress,
+            cancellation,
+        )
+        with FactorStudyTemporaryStore(
+            self._artifact_root.parent, self._study.id
+        ) as temporary:
+            self._tables, descriptor, _ = self._streaming_analysis_tables(
+                source=source,
+                eligible=eligible,
+                universe_ids=universe_ids,
+                universe_hash=universe_hash,
+                sessions=sessions,
+                progress=progress,
+                cancellation=cancellation,
+                temporary=temporary,
+            )
         progress.substage_started(
             "BUILD_METRICS",
             "正在整理研究指标与分析身份",

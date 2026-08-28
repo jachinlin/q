@@ -705,6 +705,7 @@ class _StudyAnalyzer:
         valid_returns: pl.DataFrame,
         label_counts: pl.DataFrame,
         denominator: pl.DataFrame,
+        prepared_pairs: pl.DataFrame | None = None,
     ) -> pl.DataFrame:
         daily = self._ic_analyzer._daily_from_valid_inputs(
             factor_dates,
@@ -714,6 +715,7 @@ class _StudyAnalyzer:
             factor_counts_override=factor_counts,
             additional_valid_factors=additional_valid_factors,
             valid_factors_sorted=True,
+            prepared_pairs=prepared_pairs,
         )
         return (
             daily.join(denominator, on="signal_date", how="left")
@@ -1015,11 +1017,12 @@ class _StudyAnalyzer:
             )
             totals = prepared.group_by("signal_date").len().rename(
                 {"len": "eligible_count"}
-            )
+            ).with_columns(pl.col("eligible_count").cast(pl.Int64))
             frames.append(
                 prepared.group_by("signal_date", "reason")
                 .len()
                 .rename({"len": "count"})
+                .with_columns(pl.col("count").cast(pl.Int64))
                 .join(totals, on="signal_date", how="left")
                 .with_columns(
                     pl.lit(label_kind).alias("label_kind"),

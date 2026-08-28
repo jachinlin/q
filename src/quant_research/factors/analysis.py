@@ -168,6 +168,7 @@ class InformationCoefficientAnalyzer:
         factor_counts_override: dict[date, int] | None = None,
         additional_valid_factors: pl.DataFrame | None = None,
         valid_factors_sorted: bool = False,
+        prepared_pairs: pl.DataFrame | None = None,
     ) -> pl.DataFrame:
         """从已校验且已过滤的输入按连续日期分区计算 IC。"""
         prepared_factors = valid_factors.filter(
@@ -177,11 +178,17 @@ class InformationCoefficientAnalyzer:
             prepared_factors = prepared_factors.sort(
                 "signal_date", "instrument_id"
             )
-        pairs = prepared_factors.join(
-            valid_returns,
-            on=["signal_date", "instrument_id"],
-            how="inner",
-            maintain_order="left",
+        pairs = (
+            prepared_factors.join(
+                valid_returns,
+                on=["signal_date", "instrument_id"],
+                how="inner",
+                maintain_order="left",
+            )
+            if prepared_pairs is None
+            else prepared_pairs.select(
+                "signal_date", "instrument_id", "value", "future_return"
+            )
         )
         if (
             additional_valid_factors is not None
@@ -835,6 +842,16 @@ class _AnalysisSupport:
             on=["signal_date", "instrument_id"],
             how="left",
         )
+        return _AnalysisSupport._quantile_returns_from_joined(
+            joined, quantiles
+        )
+
+    @staticmethod
+    def _quantile_returns_from_joined(
+        joined: pl.DataFrame,
+        quantiles: int,
+    ) -> pl.DataFrame:
+        """从已完成一次标签连接的分位明细聚合分层收益。"""
         return (
             joined.group_by("signal_date", "quantile")
             .agg(
