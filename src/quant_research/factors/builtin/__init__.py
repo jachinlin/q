@@ -26,6 +26,7 @@ from quant_research.factors.builtin.valuation import (
     BookToPriceFactor,
     DailyBasicsCache,
     EarningsYieldFactor,
+    LogTotalMarketCapFactor,
 )
 from quant_research.factors.registry import FactorRegistry
 
@@ -42,6 +43,7 @@ STOCK_FACTOR_REFERENCES = (
     "book_to_price_mrq",
     "downside_volatility_60d",
     "earnings_yield_ttm",
+    "log_total_market_cap",
     "max_drawdown_120d",
     "momentum_120_20",
     "roe_pit",
@@ -178,6 +180,9 @@ def register_stock_factors(
     factors: tuple[Factor, ...] = (
         EarningsYieldFactor(bar_repository, instruments, daily_basics=daily_basics),
         BookToPriceFactor(bar_repository, instruments, daily_basics=daily_basics),
+        LogTotalMarketCapFactor(
+            bar_repository, instruments, daily_basics=daily_basics
+        ),
         RoePitFactor(financial_provider, instruments),
         Momentum12020Factor(price_service, instruments, market_bars=market_bars),
         Volatility60dFactor(price_service, instruments, market_bars=market_bars),

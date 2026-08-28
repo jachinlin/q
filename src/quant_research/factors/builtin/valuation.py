@@ -65,6 +65,7 @@ class DailyBasicsCache:
             "instrument_id": pl.String,
             "pe_ttm": pl.Float64,
             "pb": pl.Float64,
+            "total_market_value": pl.Float64,
             "available_at": pl.Datetime("us", "UTC"),
         }
         missing = sorted(set(required) - set(frame.columns))
@@ -137,6 +138,98 @@ class _ReciprocalMultipleFactor:
                 pl.lit(self.spec.factor_id, dtype=pl.String).alias("factor_id"),
                 pl.when(valid)
                 .then(1.0 / denominator)
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .cast(pl.Float64)
+                .alias("value"),
+                "available_at",
+                valid.alias("is_valid"),
+            )
+            .cast(FACTOR_OUTPUT_SCHEMA)
+            .sort("trade_date", "instrument_id")
+        )
+
+
+class LogTotalMarketCapFactor:
+    """以 PIT 可见总市值的自然对数计算股票市值因子。
+
+    入参：
+        repository：提供持久化访问的仓储，类型为 ``BarRepository``。
+        instruments：本次查询、计算或组合构建涉及的规范证券集合。
+        daily_basics：日频 ``basics`` 共享缓存。
+    返回值：
+        返回完成字段规范化和不变量校验的对象。
+    异常：
+        无；构造阶段只保存已提供的依赖或值对象。
+    """
+
+    def __init__(
+        self,
+        repository: BarRepository,
+        instruments: Sequence[InstrumentId],
+        *,
+        daily_basics: DailyBasicsCache | None = None,
+    ) -> None:
+        self._repository = repository
+        self._instruments = canonical_scope(instruments)
+        self._daily_basics = daily_basics
+        self._spec = FactorSpec(
+            factor_id="log_total_market_cap",
+            frequency="daily",
+            lookback_sessions=0,
+            dependencies=(),
+            direction=-1,
+            parameters={
+                "source_field": "total_market_value",
+                "formula": "ln(total_market_value)",
+                "positive_input_required": True,
+                "eligible_for_alpha": True,
+            },
+        )
+
+    @property
+    def spec(self) -> FactorSpec:
+        """返回市值因子的不可变计算规格。
+
+        入参：无。
+        返回值：因子频率、方向、公式和输入约束。
+        异常：无。
+        """
+        return self._spec
+
+    def compute(self, ctx: FactorContext) -> pl.LazyFrame:
+        """计算给定上下文内的对数总市值因子。
+
+        入参：
+            ctx：包含数据身份、股票池身份和计算日期区间的上下文。
+        返回值：
+            返回符合标准因子输出 Schema 的惰性数据表。
+        异常：
+            Daily Basics 输入违反字段、类型或唯一键契约时传播相应异常。
+        """
+        frame = (
+            self._daily_basics.load(ctx)
+            if self._daily_basics is not None
+            else DailyBasicsCache(self._repository, self._instruments).load(ctx)
+        )
+        market_value = pl.col("total_market_value")
+        known_on_day = pl.col("available_at").is_not_null() & (
+            pl.col("available_at").dt.convert_time_zone("Asia/Shanghai").dt.date()
+            <= pl.col("trade_date")
+        )
+        valid = (
+            market_value.is_not_null()
+            & market_value.is_finite()
+            & (market_value > 0.0)
+            & known_on_day
+        ).fill_null(False)
+        return (
+            frame.lazy()
+            .select(
+                "trade_date",
+                "instrument_id",
+                pl.lit(self.spec.factor_id, dtype=pl.String).alias("factor_id"),
+                pl.when(valid)
+                .then(market_value.log())
                 .otherwise(pl.lit(None, dtype=pl.Float64))
                 .cast(pl.Float64)
                 .alias("value"),

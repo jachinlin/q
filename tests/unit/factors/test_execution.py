@@ -79,6 +79,7 @@ def test_stock_factor_registration_has_no_industry_dependency() -> None:
         "book_to_price_mrq",
         "downside_volatility_60d",
         "earnings_yield_ttm",
+        "log_total_market_cap",
         "max_drawdown_120d",
         "momentum_120_20",
         "roe_pit",

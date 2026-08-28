@@ -25,6 +25,7 @@ from quant_research.factors.builtin.valuation import (
     BookToPriceFactor,
     DailyBasicsCache,
     EarningsYieldFactor,
+    LogTotalMarketCapFactor,
 )
 from tests.performance._process_memory import process_peak_rss_bytes
 
@@ -162,6 +163,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
         "instrument_id",
         pl.lit(10.0).alias("pe_ttm"),
         pl.lit(2.0).alias("pb"),
+        pl.lit(10_000_000.0).alias("total_market_value"),
         "available_at",
     )
     financial_rows = []
@@ -195,6 +197,7 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
     factors = (
         EarningsYieldFactor(inputs, instruments, daily_basics=basics_cache),
         BookToPriceFactor(inputs, instruments, daily_basics=basics_cache),
+        LogTotalMarketCapFactor(inputs, instruments, daily_basics=basics_cache),
         RoePitFactor(inputs, instruments),
         Momentum12020Factor(inputs, instruments, market_bars=market_cache),
         Volatility60dFactor(inputs, instruments, market_bars=market_cache),
