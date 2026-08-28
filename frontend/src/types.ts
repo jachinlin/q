@@ -62,6 +62,7 @@ export type TaskDiagnostic = {
   message: string | null
   exception_type: string | null
   stage: string | null
+  substage: string | null
   retryable: boolean | null
   remediation: string | null
   traceback: string | null
@@ -341,6 +342,7 @@ export type FactorStudyMatrixRow = {
   gross_spread_mean: number | null
   break_even_cost_bps: number | null
   total_turnover_mean: number | null
+  summary_metrics: Record<string, string | number | null>
   decision: FactorStudyDecision | null
 }
 

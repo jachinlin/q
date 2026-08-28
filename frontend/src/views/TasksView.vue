@@ -9,8 +9,10 @@ import { useRoute } from 'vue-router'
 import { api, DashboardApiError } from '../api'
 import DataTaskProgress from '../components/DataTaskProgress.vue'
 import ErrorState from '../components/ErrorState.vue'
+import FactorStudyTaskProgress from '../components/FactorStudyTaskProgress.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { isDataTask } from '../data-task-progress'
+import { factorStudyTaskProgress, isFactorStudyTask } from '../factor-study-task-progress'
 import { formatDuration, formatTime } from '../format'
 import type { DataUpdatePlan, DataUpdateWindow, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
 
@@ -179,6 +181,7 @@ const diagnosis = computed<TaskDiagnostic | null>(() => {
     message: textField(task.error, 'message'),
     exception_type: null,
     stage: taskStage(task),
+    substage: isFactorStudyTask(task) ? factorStudyTaskProgress(task).substage : null,
     retryable: boolField(task.error, 'retryable'),
     remediation: textField(task.error, 'remediation') ?? fallbackRemediation(task),
     traceback: null,
@@ -417,6 +420,7 @@ onUnmounted(() => {
           <el-table-column label="阶段与进度" min-width="340">
             <template #default="scope">
               <DataTaskProgress v-if="isDataTask(scope.row)" :task="scope.row" mode="compact" />
+              <FactorStudyTaskProgress v-else-if="isFactorStudyTask(scope.row)" :task="scope.row" mode="compact" />
               <div v-else class="progress-cell">
                 <span>{{ taskStage(scope.row) ?? '—' }}</span>
                 <el-progress :percentage="progress(scope.row)" :stroke-width="5" :show-text="false" />
@@ -468,6 +472,7 @@ onUnmounted(() => {
           <dl class="diagnostic-grid">
             <div><dt>错误码</dt><dd><code>{{ diagnosis.code ?? '—' }}</code></dd></div>
             <div><dt>失败阶段</dt><dd>{{ diagnosis.stage ?? '—' }}</dd></div>
+            <div><dt>失败子步骤</dt><dd>{{ diagnosis.substage ?? '—' }}</dd></div>
             <div><dt>异常类型</dt><dd class="hash">{{ diagnosis.exception_type ?? '—' }}</dd></div>
             <div class="wide"><dt>处理建议</dt><dd>{{ diagnosis.remediation ?? fallbackRemediation(detail.data.value) }}</dd></div>
           </dl>
@@ -480,6 +485,7 @@ onUnmounted(() => {
         <el-tabs v-model="activeTab" class="runtime-tabs">
           <el-tab-pane label="运行概况" name="overview">
             <DataTaskProgress v-if="isDataTask(detail.data.value)" :task="detail.data.value" mode="detail" />
+            <FactorStudyTaskProgress v-else-if="isFactorStudyTask(detail.data.value)" :task="detail.data.value" mode="detail" />
             <el-descriptions :column="2" border size="small">
               <el-descriptions-item label="Worker">{{ detail.data.value.worker_id ?? '—' }}</el-descriptions-item>
               <el-descriptions-item label="当前阶段">{{ taskStage(detail.data.value) ?? '—' }}</el-descriptions-item>

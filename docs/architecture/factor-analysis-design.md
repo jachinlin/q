@@ -37,6 +37,26 @@ VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PUBLISH
 
 失败、取消和失联恢复复用同一个 `FACTOR_STUDY` Task，并创建新的 attempt；成功研究不可重跑。
 
+### 任务进度与诊断日志
+
+任务 `progress.completed/progress.total` 始终表示上述四个公开阶段，阶段开始和完成分别写入
+一次进度，成功终态固定为 `PUBLISH 4/4`。`ANALYZE_FACTORS` 内部进度不得把顶层计数替换为
+交易日数量，而是在 `progress.context` 使用以下稳定字段：
+
+- `substage`：`BUILD_UNIVERSE`、`COMPUTE_FACTORS`、`BUILD_SIGNALS`、
+  `LOAD_LABEL_INPUTS`、`BUILD_FORWARD_RETURNS`、`ANALYZE_STATISTICS`、
+  `BUILD_METRICS`、`PUBLISH_ARTIFACTS` 或 `REGISTER_OUTPUTS`；
+- `substage_state`：`STARTED`、`PROGRESS` 或 `COMPLETED`；
+- `item_completed`、`item_total` 和 `signal_date`：仅用于可计数的股票池准备进度；
+- 行数、证券数、因子数、产物数、字节数和身份哈希等已脱敏规模证据；
+- `last_completed_substage` 与 `last_completed_evidence`：供 Dashboard 稳定显示最近完成节点。
+
+股票池逐日准备只记录首项、末项及跨越 5% 桶的确定性里程碑，长区间最多产生约 21 条
+中间进度。Task API 直接返回上述 `progress.context`；任务 JSON Lines 的 `task.progress` 将其
+保存于 `context.details`。失败事件 `task.handler_failed.context.last_progress` 保存最后一次安全
+进度，Dashboard 诊断同时暴露公开阶段和可空的 `substage`。因子研究详情与运行中心通过同一
+展示契约读取 `/api/v1/tasks/{task_id}`，终态后停止轮询。
+
 ## PIT 输入与分析口径
 
 行情、证券状态、行业和财务数据只经 `CanonicalResearchRepository` 读取。每次研究重新计算
@@ -76,5 +96,6 @@ CLI 使用 `quant factor-studies validate|submit|show|list`。Dashboard API 位�
 人工结论和可信产物读取。
 
 前端一级导航“因子研究”包含工作台、表单/YAML 双模式创建页和独立详情页。详情页围绕四维
-决策单元展示候选矩阵、IC/分层、换手/成本、质量/相关和配置/产物；全局选择器同步 URL query。
+决策单元展示候选矩阵、IC/分层、换手/成本、质量/相关和配置/产物；候选矩阵在摘要行下按主题
+持续展开 ``summary`` 的全部非主键指标，未知新增字段也不得静默隐藏。全局选择器同步 URL query。
 工作台只汇总研究数量和人工评审进度，不生成跨研究排行榜。

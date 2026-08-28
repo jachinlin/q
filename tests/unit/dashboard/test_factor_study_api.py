@@ -1,7 +1,7 @@
 """验证独立因子研究 API、矩阵合并、决策与可信产物边界。"""
 
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -84,11 +84,16 @@ def _published_record(tmp_path: Path) -> FactorStudyRecord:
             "factor_ref": ["book_to_price_mrq"],
             "horizon": [5],
             "rank_ic_mean": [0.06],
+            "pearson_ic_sample_std": [0.12],
+            "rank_ic_valid_date_count": [42],
+            "rank_ic_positive_streak_start": [date(2022, 1, 3)],
             "rank_ic_hac_t_stat": [2.4],
+            "rank_ic_hac_hac_invalid_reason": [None],
             "monotonicity_mean": [0.8],
             "long_short_mean": [0.02],
             "break_even_cost_bps": [18.0],
             "total_turnover_mean": [0.7],
+            "unexpected_summary_metric": ["kept"],
         }
     ).sort("signal_variant", "label_kind", "factor_ref", "horizon")
     path = directory / "summary.parquet"
@@ -162,6 +167,25 @@ def test_routes_validate_catalog_page_matrix_and_decision(tmp_path: Path) -> Non
     assert studies.list_filter == (FactorStudyStatus.SUCCEEDED, FactorDecisionMark.UNREVIEWED)
     matrix = client.get("/api/v1/factor-studies/study-1/matrix").json()
     assert matrix["items"][0]["rank_ic_adjusted_p_value"] == 0.04
+    summary_metrics = matrix["items"][0]["summary_metrics"]
+    assert summary_metrics["pearson_ic_sample_std"] == 0.12
+    assert summary_metrics["rank_ic_valid_date_count"] == 42
+    assert summary_metrics["rank_ic_positive_streak_start"] == "2022-01-03"
+    assert summary_metrics["rank_ic_hac_hac_invalid_reason"] is None
+    assert summary_metrics["unexpected_summary_metric"] == "kept"
+    assert set(summary_metrics) == {
+        "rank_ic_mean",
+        "pearson_ic_sample_std",
+        "rank_ic_valid_date_count",
+        "rank_ic_positive_streak_start",
+        "rank_ic_hac_t_stat",
+        "rank_ic_hac_hac_invalid_reason",
+        "monotonicity_mean",
+        "long_short_mean",
+        "break_even_cost_bps",
+        "total_turnover_mean",
+        "unexpected_summary_metric",
+    }
 
     decision = client.put(
         "/api/v1/factor-studies/study-1/decisions",

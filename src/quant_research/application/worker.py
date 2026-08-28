@@ -638,7 +638,11 @@ class Worker:
                 logger.emit(
                     "ERROR",
                     "task.handler_failed",
-                    context=_WorkerSupport._failure_log_context(task, handler_error),
+                    context=_WorkerSupport._failure_log_context(
+                        task,
+                        handler_error,
+                        latest.current(),
+                    ),
                     error_code=_WorkerSupport._failure_code(handler_error),
                     stage=latest.current().stage or None,
                 )
@@ -740,6 +744,7 @@ class _WorkerSupport:
     def _failure_log_context(
         task: ClaimedTask,
         error: Exception,
+        last_progress: TaskProgress,
     ) -> dict[str, object]:
         context: dict[str, object] = {
             "task_type": task.task_type,
@@ -748,6 +753,7 @@ class _WorkerSupport:
             "exception_message": str(error),
             "traceback": _WorkerSupport._full_traceback(error),
             "frames": _WorkerSupport._safe_frames(error),
+            "last_progress": last_progress.model_dump(mode="json"),
             "retryable": False,
             "remediation": "inspect the traceback and task inputs before retrying",
         }

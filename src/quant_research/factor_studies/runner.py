@@ -11,11 +11,11 @@ from quant_research.factor_studies.models import (
     FactorStudyStage,
     FactorStudyStatus,
 )
+from quant_research.factor_studies.progress import FactorStudyProgressReporter
 from quant_research.tasks.handlers import CancellationToken, ProgressSink
 from quant_research.tasks.models import (
     ClaimedTask,
     TaskOutcome,
-    TaskProgress,
     TaskStatus,
 )
 
@@ -60,7 +60,7 @@ class FactorStudyExecutionSession(Protocol):
     def execute(
         self,
         stage: FactorStudyStage,
-        progress: ProgressSink,
+        progress: FactorStudyProgressReporter,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
         """执行阶段。入参：阶段、进度和取消令牌。返回值：阶段证据。异常：计算或发布失败时抛出。"""
@@ -111,9 +111,10 @@ class FactorStudyHandler:
             stage=FactorStudyStage.VALIDATE,
         )
         session = self._executor.create(study)
+        reporter = FactorStudyProgressReporter(progress)
         result: dict[str, JsonValue] = {}
         try:
-            for index, stage in enumerate(FACTOR_STUDY_STAGES):
+            for stage in FACTOR_STUDY_STAGES:
                 self._catalog.assert_unchanged(study.catalog_hash)
                 if cancellation.is_cancelled():
                     session.abort()
@@ -125,18 +126,17 @@ class FactorStudyHandler:
                     )
                     return TaskOutcome(status=TaskStatus.CANCELLED)
                 self._registry.update_stage(study.id, stage)
-                progress.update(
-                    TaskProgress(
-                        stage=stage.value,
-                        completed=index,
-                        total=len(FACTOR_STUDY_STAGES),
-                        message=f"{stage.value.lower()} started",
-                    )
-                )
-                stage_result = session.execute(stage, progress, cancellation)
+                reporter.stage_started(stage)
+                stage_result = session.execute(stage, reporter, cancellation)
                 if stage_result:
                     result = stage_result
                 self._catalog.assert_unchanged(study.catalog_hash)
+                evidence: dict[str, JsonValue] = {}
+                if stage is FactorStudyStage.PUBLISH:
+                    manifest_hash = stage_result.get("manifest_hash")
+                    if isinstance(manifest_hash, str):
+                        evidence["manifest_hash"] = manifest_hash
+                reporter.stage_completed(stage, evidence)
             artifact_dir = result.get("artifact_dir")
             manifest_hash = result.get("manifest_hash")
             if not isinstance(artifact_dir, str) or not isinstance(
@@ -174,6 +174,7 @@ class FactorStudyHandler:
                 error={
                     "code": "FACTOR_STUDY_STAGE_FAILED",
                     "error_type": type(error).__name__,
+                    "substage": reporter.current_substage,
                 },
             )
             raise

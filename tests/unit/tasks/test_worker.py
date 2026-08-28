@@ -247,6 +247,29 @@ class _RaisingHandler:
         raise self._error
 
 
+class _ProgressThenRaisingHandler:
+    task_type = "BACKTEST"
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def run(self, task: Any, progress: Any, cancellation: Any) -> TaskOutcome:
+        del task, cancellation
+        progress.update(
+            TaskProgress(
+                stage="ANALYZE_FACTORS",
+                completed=2,
+                total=4,
+                message="正在重新计算研究因子",
+                context={
+                    "substage": "COMPUTE_FACTORS",
+                    "substage_state": "STARTED",
+                },
+            )
+        )
+        raise self._error
+
+
 class _UnsafeFailureHandler:
     task_type = "BACKTEST"
 
@@ -1479,7 +1502,7 @@ def test_task_diagnostic_log_records_complete_exception_without_redaction(
     worker = _worker_type()(
         queue,
         worker_id="worker-1",
-        handlers=(_RaisingHandler(RuntimeError(message)),),
+        handlers=(_ProgressThenRaisingHandler(RuntimeError(message)),),
         clock=lambda: NOW,
         task_logs=manager,
     )
@@ -1501,6 +1524,16 @@ def test_task_diagnostic_log_records_complete_exception_without_redaction(
     assert failure["context"]["remediation"] == (
         "inspect the traceback and task inputs before retrying"
     )
+    assert failure["context"]["last_progress"] == {
+        "stage": "ANALYZE_FACTORS",
+        "completed": 2,
+        "total": 4,
+        "message": "正在重新计算研究因子",
+        "context": {
+            "substage": "COMPUTE_FACTORS",
+            "substage_state": "STARTED",
+        },
+    }
 
 
 def test_task_diagnostic_log_keeps_structured_progress_details(

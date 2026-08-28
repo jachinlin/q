@@ -67,6 +67,7 @@ from quant_research.factor_studies.models import (
     FactorStudyStatus,
     IndustryUnclassifiedPolicy,
 )
+from quant_research.factor_studies.progress import FactorStudyProgressReporter
 from quant_research.factor_studies.runner import FactorStudyHandler
 from quant_research.factors import (
     FactorArtifact,
@@ -973,7 +974,7 @@ class _FactorStudySession:
     def execute(
         self,
         stage: FactorStudyStage,
-        progress: ProgressSink,
+        progress: FactorStudyProgressReporter,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
         """在 ANALYZE_FACTORS 计算并在 PERSIST 发布。
@@ -988,7 +989,7 @@ class _FactorStudySession:
             self._analyze(progress, cancellation)
             return {}
         if stage is FactorStudyStage.PUBLISH:
-            return self._persist(cancellation)
+            return self._persist(progress, cancellation)
         raise ValueError(f"unsupported factor stage: {stage.value}")
 
     def abort(self) -> None:
@@ -1308,10 +1309,20 @@ class _FactorStudySession:
         )
 
     def _analyze(
-        self, progress: ProgressSink, cancellation: CancellationToken
+        self,
+        progress: FactorStudyProgressReporter,
+        cancellation: CancellationToken,
     ) -> None:
         config = self._study.definition
         source = CanonicalRunData(self._repository, self._study.catalog_hash)
+        progress.substage_started(
+            "BUILD_UNIVERSE",
+            "正在准备逐日 PIT 股票池",
+            {
+                "start_date": config.start_date.isoformat(),
+                "end_date": config.end_date.isoformat(),
+            },
+        )
         sessions = source._sessions(config.start_date, config.end_date)
         if not sessions:
             raise ValueError("factor study has no trading sessions")
@@ -1322,13 +1333,12 @@ class _FactorStudySession:
             eligible_frames.append(
                 source.universe(signal_date).rename({"as_of": "signal_date"})
             )
-            progress.update(
-                TaskProgress(
-                    stage="ANALYZE_FACTORS",
-                    completed=index + 1,
-                    total=len(sessions),
-                    message=signal_date.isoformat(),
-                )
+            progress.substage_progress(
+                "BUILD_UNIVERSE",
+                f"正在准备 PIT 股票池（{index + 1}/{len(sessions)}）",
+                item_completed=index + 1,
+                item_total=len(sessions),
+                evidence={"signal_date": signal_date.isoformat()},
             )
         eligible = pl.concat(eligible_frames).sort("signal_date", "instrument_id")
         universe_ids = tuple(
@@ -1350,6 +1360,21 @@ class _FactorStudySession:
         universe_hash = hashlib.sha256(
             canonical_json_bytes(cast(list[JsonValue], universe_membership))
         ).hexdigest()
+        progress.substage_completed(
+            "BUILD_UNIVERSE",
+            "PIT 股票池准备完成",
+            {
+                "session_count": len(sessions),
+                "eligible_row_count": len(universe_membership),
+                "instrument_count": len(universe_ids),
+                "universe_hash": universe_hash,
+            },
+        )
+        progress.substage_started(
+            "COMPUTE_FACTORS",
+            "正在重新计算研究因子",
+            {"requested_factor_count": len(config.factor_ids)},
+        )
         descriptor = source._factor_engine.execution_descriptor(
             config.factor_ids
         )
@@ -1371,8 +1396,37 @@ class _FactorStudySession:
             directions,
             eligible,
         )
+        progress.substage_completed(
+            "COMPUTE_FACTORS",
+            "研究因子计算完成",
+            {
+                "requested_factor_count": len(config.factor_ids),
+                "execution_factor_count": len(descriptor.plan),
+                "factor_row_count": len(factor_frame),
+                "factor_execution_descriptor_hash": descriptor.content_hash,
+            },
+        )
+        progress.substage_started(
+            "BUILD_SIGNALS",
+            "正在构建方向统一与行业处理信号",
+            {"industry_enabled": config.industry is not None},
+        )
         factor_frame, industry_coverage = self._industry_variants(
             factor_frame, eligible, universe_ids, sessions, config
+        )
+        progress.substage_completed(
+            "BUILD_SIGNALS",
+            "研究信号构建完成",
+            {
+                "signal_row_count": len(factor_frame),
+                "signal_variant_count": factor_frame["signal_variant"].n_unique(),
+                "industry_coverage_row_count": len(industry_coverage),
+            },
+        )
+        progress.substage_started(
+            "LOAD_LABEL_INPUTS",
+            "正在加载远期收益标签输入",
+            {"horizon_count": len(config.horizons)},
         )
         horizon_tail = max(config.horizons)
         later = source._sessions(
@@ -1386,12 +1440,42 @@ class _FactorStudySession:
         executable_state = self._executable_state(
             universe_ids, all_sessions[0], all_sessions[-1]
         )
+        progress.substage_completed(
+            "LOAD_LABEL_INPUTS",
+            "远期收益标签输入加载完成",
+            {
+                "extended_session_count": len(all_sessions),
+                "bar_row_count": len(bars),
+                "executable_state_row_count": len(executable_state),
+            },
+        )
+        progress.substage_started(
+            "BUILD_FORWARD_RETURNS",
+            "正在构建理论与可执行远期收益标签",
+            {"horizons": list(config.horizons)},
+        )
         future = build_future_returns(
             bars,
             all_sessions,
             eligible,
             config.horizons,
             executable_state,
+        )
+        progress.substage_completed(
+            "BUILD_FORWARD_RETURNS",
+            "远期收益标签构建完成",
+            {
+                "label_table_count": len(future),
+                "label_row_count": sum(len(frame) for frame in future.values()),
+            },
+        )
+        progress.substage_started(
+            "ANALYZE_STATISTICS",
+            "正在计算 IC、分层、换手和成本统计",
+            {
+                "quantiles": config.quantiles,
+                "cost_scenario_count": len(config.cost_bps_scenarios),
+            },
         )
         self._tables = analyze(
             factor_frame,
@@ -1401,6 +1485,19 @@ class _FactorStudySession:
             cost_bps_scenarios=config.cost_bps_scenarios,
         )
         self._tables["industry_coverage"] = industry_coverage
+        progress.substage_completed(
+            "ANALYZE_STATISTICS",
+            "因子统计分析完成",
+            {
+                "table_row_counts": {
+                    name: len(frame) for name, frame in sorted(self._tables.items())
+                }
+            },
+        )
+        progress.substage_started(
+            "BUILD_METRICS",
+            "正在整理研究指标与分析身份",
+        )
         self._analysis_identity = {
             "universe_hash": universe_hash,
             "factor_execution_descriptor": descriptor.json_value(),
@@ -1431,8 +1528,17 @@ class _FactorStudySession:
             ),
         }
         self._metrics = _FactorPublisher.metrics(self._tables, config.correction)
+        progress.substage_completed(
+            "BUILD_METRICS",
+            "研究指标与分析身份整理完成",
+            {"metric_count": len(self._metrics)},
+        )
 
-    def _persist(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
+    def _persist(
+        self,
+        progress: FactorStudyProgressReporter,
+        cancellation: CancellationToken,
+    ) -> dict[str, JsonValue]:
         if (
             self._tables is None
             or self._metrics is None
@@ -1441,6 +1547,11 @@ class _FactorStudySession:
             raise RuntimeError("factor persistence requires completed analysis")
         if cancellation.is_cancelled():
             raise RuntimeError("factor persistence cancelled before publication")
+        progress.substage_started(
+            "PUBLISH_ARTIFACTS",
+            "正在写入并复核因子研究产物",
+            {"table_count": len(self._tables)},
+        )
         directory, manifest_hash, artifacts = _FactorPublisher(
             self._artifact_root, self._study.id
         ).publish(
@@ -1450,9 +1561,35 @@ class _FactorStudySession:
             self._analysis_identity,
         )
         self._published_dir = directory
+        progress.substage_completed(
+            "PUBLISH_ARTIFACTS",
+            "因子研究产物写入并复核完成",
+            {
+                "artifact_count": len(artifacts),
+                "artifact_row_count": sum(
+                    cast(int, item["row_count"])
+                    for item in artifacts
+                    if isinstance(item.get("row_count"), int)
+                ),
+                "artifact_byte_count": sum(
+                    cast(int, item["byte_count"])
+                    for item in artifacts
+                    if isinstance(item.get("byte_count"), int)
+                ),
+                "manifest_hash": manifest_hash,
+            },
+        )
         if cancellation.is_cancelled():
             self.abort()
             raise RuntimeError("factor persistence cancelled after publication")
+        progress.substage_started(
+            "REGISTER_OUTPUTS",
+            "正在登记因子研究指标与产物",
+            {
+                "metric_count": len(self._metrics),
+                "artifact_count": len(artifacts),
+            },
+        )
         try:
             self._registry.register_outputs(self._study.id, self._metrics, artifacts)
         except BaseException:
@@ -1460,6 +1597,14 @@ class _FactorStudySession:
                 shutil.rmtree(directory, ignore_errors=True)
             self._published_dir = None
             raise
+        progress.substage_completed(
+            "REGISTER_OUTPUTS",
+            "因子研究指标与产物登记完成",
+            {
+                "metric_count": len(self._metrics),
+                "artifact_count": len(artifacts),
+            },
+        )
         return {"artifact_dir": str(directory), "manifest_hash": manifest_hash}
 
 

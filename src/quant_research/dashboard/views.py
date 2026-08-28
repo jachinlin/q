@@ -1022,7 +1022,12 @@ class _ServicesSupport:
         progress: dict[str, JsonValue],
     ) -> dict[str, object] | None:
         stage = _ServicesSupport._text_value(progress.get("stage"))
-        fallback = _ServicesSupport._persisted_diagnostic(error, stage=stage)
+        substage = _ServicesSupport._progress_substage(progress)
+        fallback = _ServicesSupport._persisted_diagnostic(
+            error,
+            stage=stage,
+            substage=substage,
+        )
         for line in reversed(lines):
             try:
                 raw_record = json.loads(line)
@@ -1035,6 +1040,9 @@ class _ServicesSupport:
                 continue
             context = raw_record.get("context")
             values = context if isinstance(context, dict) else {}
+            logged_substage = _ServicesSupport._progress_substage(
+                values.get("last_progress")
+            )
             return {
                 "code": _ServicesSupport._text_value(raw_record.get("error_code"))
                 or (None if fallback is None else fallback["code"]),
@@ -1048,6 +1056,7 @@ class _ServicesSupport:
                     values.get("exception_type")
                 ),
                 "stage": _ServicesSupport._text_value(raw_record.get("stage")) or stage,
+                "substage": logged_substage or substage,
                 "retryable": _ServicesSupport._bool_value(values.get("retryable"))
                 if _ServicesSupport._bool_value(values.get("retryable")) is not None
                 else (
@@ -1071,6 +1080,7 @@ class _ServicesSupport:
         error: dict[str, JsonValue] | None,
         *,
         stage: str | None,
+        substage: str | None,
     ) -> dict[str, object] | None:
         if error is None:
             return None
@@ -1087,10 +1097,20 @@ class _ServicesSupport:
             "message": message,
             "exception_type": None,
             "stage": stage,
+            "substage": substage,
             "retryable": retryable,
             "remediation": remediation,
             "traceback": None,
         }
+
+    @staticmethod
+    def _progress_substage(value: object) -> str | None:
+        if not isinstance(value, dict):
+            return None
+        context = value.get("context")
+        if not isinstance(context, dict):
+            return None
+        return _ServicesSupport._text_value(context.get("substage"))
 
     @staticmethod
     def _text_value(value: object) -> str | None:

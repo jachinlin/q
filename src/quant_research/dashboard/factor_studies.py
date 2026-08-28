@@ -42,6 +42,12 @@ _ARTIFACT_TYPES = frozenset(
         "manifest",
     }
 )
+_MATRIX_DIMENSIONS = (
+    "signal_variant",
+    "label_kind",
+    "factor_ref",
+    "horizon",
+)
 _FILTERS: dict[str, frozenset[str]] = {
     "summary": frozenset({"signal_variant", "label_kind", "factor_ref", "horizon"}),
     "coverage": frozenset({"signal_variant", "factor_ref"}),
@@ -146,6 +152,9 @@ class FactorStudyDashboardService:
         """构造决策矩阵。入参：研究 ID。返回值：证据与结论 JSON。异常：可信产物非法时抛出。"""
         study = self._studies.show(study_id)
         frame = self._frame(study, "summary")
+        summary_metric_columns = tuple(
+            name for name in frame.columns if name not in _MATRIX_DIMENSIONS
+        )
         metrics = {item.name: item for item in study.metrics}
         decisions = {
             (
@@ -159,8 +168,7 @@ class FactorStudyDashboardService:
         rows: list[JsonValue] = []
         for row in cast(list[dict[str, JsonValue]], jsonable_encoder(frame.to_dicts())):
             dimensions = "/".join(
-                str(row[name])
-                for name in ("signal_variant", "label_kind", "factor_ref", "horizon")
+                str(row[name]) for name in _MATRIX_DIMENSIONS
             )
             rank_metric = metrics.get(f"rank_ic_mean/{dimensions}")
             decision = decisions.get(
@@ -186,6 +194,9 @@ class FactorStudyDashboardService:
                     "gross_spread_mean": row.get("long_short_mean"),
                     "break_even_cost_bps": row.get("break_even_cost_bps"),
                     "total_turnover_mean": row.get("total_turnover_mean"),
+                    "summary_metrics": {
+                        name: row.get(name) for name in summary_metric_columns
+                    },
                     "decision": (
                         decision.model_dump(mode="json") if decision else None
                     ),

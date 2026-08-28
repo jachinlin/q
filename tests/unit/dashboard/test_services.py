@@ -34,7 +34,7 @@ from quant_research.infrastructure.persistence.repositories import MetadataRepos
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 from quant_research.logging import MAX_TASK_LOG_BYTES, LogContext, TaskLogManager
-from quant_research.tasks.models import TaskOutcome, TaskStatus
+from quant_research.tasks.models import TaskOutcome, TaskProgress, TaskStatus
 
 _REPOSITORY = cast(ResearchDataRepository, object())
 
@@ -331,6 +331,21 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         attempt_id=claimed.attempt_id,
         worker_id=claimed.worker_id,
     )
+    queue.heartbeat(
+        claimed.attempt_id,
+        claimed.worker_id,
+        TaskProgress(
+            stage="ANALYZE_FACTORS",
+            completed=2,
+            total=4,
+            message="正在构建远期收益标签",
+            context={
+                "substage": "BUILD_FORWARD_RETURNS",
+                "substage_state": "STARTED",
+            },
+        ),
+        now,
+    )
     with manager.open(context) as task_log:
         queue.bind_log_path(
             claimed.attempt_id,
@@ -347,6 +362,16 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
                 "retryable": False,
                 "remediation": "run validate-all before retrying",
                 "traceback": "Traceback: catalog is stale",
+                "last_progress": {
+                    "stage": "ANALYZE_FACTORS",
+                    "completed": 2,
+                    "total": 4,
+                    "message": "正在重新计算研究因子",
+                    "context": {
+                        "substage": "COMPUTE_FACTORS",
+                        "substage_state": "STARTED",
+                    },
+                },
             },
             error_code="DATA_HASH_DRIFT",
             stage="VALIDATE",
@@ -430,6 +455,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
             "message": "validated catalog is stale",
             "exception_type": "quant_research.domain.errors.QuantError",
             "stage": "VALIDATE",
+            "substage": "COMPUTE_FACTORS",
             "retryable": False,
             "remediation": "run validate-all before retrying",
             "traceback": "Traceback: catalog is stale",
@@ -463,6 +489,21 @@ def test_task_log_degrades_for_missing_file_and_ignores_malformed_jsonl(
         task_id=claimed.id,
         attempt_id=claimed.attempt_id,
         worker_id=claimed.worker_id,
+    )
+    queue.heartbeat(
+        claimed.attempt_id,
+        claimed.worker_id,
+        TaskProgress(
+            stage="ANALYZE_FACTORS",
+            completed=2,
+            total=4,
+            message="正在构建远期收益标签",
+            context={
+                "substage": "BUILD_FORWARD_RETURNS",
+                "substage_state": "STARTED",
+            },
+        ),
+        now,
     )
     with manager.open(context) as task_log:
         queue.bind_log_path(
@@ -509,7 +550,8 @@ def test_task_log_degrades_for_missing_file_and_ignores_malformed_jsonl(
             "code": "WORKER_UNHANDLED_ERROR",
             "message": None,
             "exception_type": None,
-            "stage": "queued",
+            "stage": "ANALYZE_FACTORS",
+            "substage": "BUILD_FORWARD_RETURNS",
             "retryable": False,
             "remediation": "查看该次尝试日志，修复原因后再安全重试。",
             "traceback": None,

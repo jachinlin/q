@@ -77,7 +77,7 @@ function taskLog(available = true) {
     truncated: available,
     diagnostic: {
       code: 'DATA_HASH_DRIFT', message: 'validated catalog is stale',
-      exception_type: 'quant_research.domain.errors.QuantError', stage: 'VALIDATE', retryable: false,
+      exception_type: 'quant_research.domain.errors.QuantError', stage: 'VALIDATE', substage: 'COMPUTE_FACTORS', retryable: false,
       remediation: 'run validate-all before retrying', traceback: 'Traceback: catalog is stale',
     },
   }
@@ -227,6 +227,51 @@ describe('runtime center', () => {
     wrapper.unmount()
   }, 15_000)
 
+  it('shows the same factor-study substage in the task list and detail', async () => {
+    const taskOverrides: Record<string, unknown> = {
+      status: 'RUNNING',
+      error: null,
+      completed_at: null,
+      progress: {
+        stage: 'ANALYZE_FACTORS',
+        completed: 2,
+        total: 4,
+        message: '正在准备 PIT 股票池（250/1000）',
+        context: {
+          substage: 'BUILD_UNIVERSE',
+          substage_state: 'PROGRESS',
+          item_completed: 250,
+          item_total: 1000,
+          signal_date: '2022-01-05',
+          last_completed_substage: 'COMPUTE_FACTORS',
+          last_completed_evidence: { factor_row_count: 12345 },
+        },
+      },
+    }
+    const wrapper = await mountRuntimeCenter(
+      true,
+      { factor_study_id: 'study-1' },
+      'FACTOR_STUDY',
+      '/tasks',
+      taskOverrides,
+    )
+
+    const compact = wrapper.find('.factor-task-progress--compact')
+    expect(compact.attributes('data-task-stage')).toBe('ANALYZE_FACTORS')
+    expect(compact.attributes('data-task-substage')).toBe('BUILD_UNIVERSE')
+    expect(compact.attributes('data-task-percentage')).toBe('50')
+    expect(compact.text()).toContain('构建 PIT 股票池')
+    expect(compact.text()).toContain('250/1000')
+    expect(compact.text()).toContain('因子行 12,345')
+
+    await wrapper.find('.task-link').trigger('click')
+    await flushPromises()
+    const detailProgress = document.body.querySelector('.factor-task-progress--detail')
+    expect(detailProgress?.getAttribute('data-task-substage')).toBe('BUILD_UNIVERSE')
+    expect(detailProgress?.textContent).toContain('子步骤 25%')
+    wrapper.unmount()
+  })
+
   it('highlights failures and automatically diagnoses the latest failed attempt', async () => {
     const wrapper = await mountRuntimeCenter()
     expect(wrapper.text()).toContain('任务运行与异常诊断')
@@ -240,6 +285,7 @@ describe('runtime center', () => {
 
     expect(document.body.textContent).toContain('DATA_HASH_DRIFT')
     expect(document.body.textContent).toContain('validated catalog is stale')
+    expect(document.body.textContent).toContain('COMPUTE_FACTORS')
     expect(document.body.textContent).toContain('run validate-all before retrying')
     const traceback = document.body.querySelector('.traceback-details')
     expect(traceback).not.toBeNull()
