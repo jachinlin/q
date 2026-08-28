@@ -78,6 +78,12 @@ Newey–West/HAC 推断。多重检验按 Rank IC 与毛多空 spread 两个 fam
 `BONFERRONI` 或 `BH_FDR`。研究不包含 TRAIN/VALIDATION/TEST、test budget、分段稳定性或
 自动候选评分。
 
+统计内核对每个“信号版本 × 因子”只执行一次稳定分位分配，同一分位结果复用于换手和全部
+远期收益标签。日度 IC 先完成一次键对齐，再按有序日期分区调用相同的 NumPy Pearson 与平均
+秩算法；分层收益和标签质量使用 Polars 分组聚合。各标签保持确定性顺序逐张处理并释放连接
+中间表，禁止拼接为统一超大标签表。向量化不得改变输出 Schema、主键排序、空分位、有效性
+原因优先级或统计公式；浮点归约仅允许机器精度范围内的末位差异。
+
 ## 持久化与可信产物
 
 独立表为 `factor_study`、`factor_study_tag`、`factor_study_metric`、

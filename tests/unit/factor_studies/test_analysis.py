@@ -8,7 +8,9 @@ import polars as pl
 import pytest
 
 from quant_research.factor_studies.analysis import (
+    DIRECTION_ADJUSTED,
     EXECUTABLE_FORWARD_RETURN,
+    INDUSTRY_NEUTRALIZED,
     THEORETICAL_FORWARD_RETURN,
     HacMeanAnalyzer,
     analyze,
@@ -475,6 +477,113 @@ def test_analysis_emits_stable_one_five_twenty_day_ic_decay() -> None:
         return digest.hexdigest()
 
     assert output_hash(first) == output_hash(second)
+
+
+def test_vectorized_analysis_is_deterministic_for_shuffled_full_matrix() -> None:
+    """多因子、双信号和六标签输入乱序后仍生成相同可信表。"""
+    days = [date(2026, 2, 2) + timedelta(days=index) for index in range(4)]
+    instruments = [f"{index:06d}.SZ" for index in range(8)]
+    factor_rows: list[dict[str, object]] = []
+    eligible_rows: list[dict[str, object]] = []
+    return_rows: list[dict[str, object]] = []
+    for day_index, signal_date in enumerate(days):
+        for instrument_index, instrument_id in enumerate(instruments):
+            eligible_rows.append(
+                {
+                    "signal_date": signal_date,
+                    "instrument_id": instrument_id,
+                    "eligible": not (
+                        day_index == 2 and instrument_id == instruments[-1]
+                    ),
+                }
+            )
+            return_rows.append(
+                {
+                    "signal_date": signal_date,
+                    "instrument_id": instrument_id,
+                    "return_start": signal_date + timedelta(days=1),
+                    "return_end": signal_date + timedelta(days=20),
+                    "future_return": (
+                        None
+                        if day_index == 1 and instrument_index == 0
+                        else (instrument_index - day_index) / 100.0
+                    ),
+                }
+            )
+            for factor_ref in ("factor_a", "factor_b"):
+                for variant in (DIRECTION_ADJUSTED, INDUSTRY_NEUTRALIZED):
+                    factor_rows.append(
+                        {
+                            "signal_date": signal_date,
+                            "instrument_id": instrument_id,
+                            "factor_id": factor_ref,
+                            "signal_variant": variant,
+                            "value": float(
+                                (
+                                    instrument_index
+                                    if factor_ref == "factor_a"
+                                    else 7 - instrument_index
+                                )
+                                // 2
+                            ),
+                            "is_valid": not (
+                                day_index == 3 and instrument_index >= 6
+                            ),
+                        }
+                    )
+    factors = pl.DataFrame(factor_rows)
+    eligible = pl.DataFrame(eligible_rows)
+    base_returns = pl.DataFrame(return_rows)
+    labels = {
+        (horizon, label_kind): base_returns.with_columns(
+            pl.lit(horizon).alias("horizon"),
+            pl.lit(label_kind).alias("label_kind"),
+            pl.col("future_return").is_not_null().alias("is_valid"),
+            pl.when(pl.col("future_return").is_null())
+            .then(pl.lit("MISSING_EXIT_PRICE"))
+            .otherwise(pl.lit(None, dtype=pl.String))
+            .alias("invalid_reason"),
+        )
+        for horizon in (1, 5, 20)
+        for label_kind in (
+            THEORETICAL_FORWARD_RETURN,
+            EXECUTABLE_FORWARD_RETURN,
+        )
+    }
+
+    first = analyze(
+        factors,
+        eligible,
+        labels,
+        quantiles=5,
+        cost_bps_scenarios=(5, 10, 20),
+        minimum=3,
+    )
+    second = analyze(
+        factors.sample(fraction=1.0, shuffle=True, seed=11),
+        eligible.sample(fraction=1.0, shuffle=True, seed=12),
+        {
+            key: frame.sample(fraction=1.0, shuffle=True, seed=13 + index)
+            for index, (key, frame) in enumerate(reversed(tuple(labels.items())))
+        },
+        quantiles=5,
+        cost_bps_scenarios=(5, 10, 20),
+        minimum=3,
+    )
+
+    def output_hash(outputs: dict[str, pl.DataFrame]) -> str:
+        digest = hashlib.sha256()
+        for name in sorted(outputs):
+            buffer = BytesIO()
+            outputs[name].write_parquet(buffer, compression="zstd")
+            digest.update(name.encode("utf-8"))
+            digest.update(buffer.getvalue())
+        return digest.hexdigest()
+
+    assert output_hash(first) == output_hash(second)
+    assert first["summary"].height == 24
+    assert first["ic"].height == 96
+    assert first["quantile_returns"].height == 480
 
 
 def test_analysis_invalidates_factor_correlation_with_too_few_common_pairs() -> None:
