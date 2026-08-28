@@ -8,10 +8,11 @@ import os
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import polars as pl
 from sqlalchemy import Engine
@@ -93,6 +94,8 @@ from quant_research.strategies.base import DecisionData
 from quant_research.strategies.registry import StrategyRegistry
 from quant_research.tasks.handlers import CancellationToken, ProgressSink, TaskHandler
 from quant_research.tasks.models import TaskProgress, TaskStatus
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 _MARKET_SCHEMA = {
     "instrument_id": pl.String,
@@ -948,6 +951,72 @@ class IndependentFactorStudyExecutor:
         )
 
 
+class _CanonicalUniverseHasher:
+    """按有序批次计算与完整 canonical JSON 成员列表相同的身份。"""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._digest.update(b"[")
+        self._row_count = 0
+        self._instrument_ids: set[str] = set()
+        self._finished = False
+
+    @property
+    def row_count(self) -> int:
+        """返回已经纳入哈希的合格成员行数。"""
+        return self._row_count
+
+    @property
+    def instrument_ids(self) -> tuple[InstrumentId, ...]:
+        """返回至少一个交易日合格的稳定证券集合。"""
+        return tuple(
+            InstrumentId.parse(value) for value in sorted(self._instrument_ids)
+        )
+
+    def update(self, eligible: pl.DataFrame) -> None:
+        """把一个已按日期和证券排序的合格成员批次追加到身份。"""
+        if self._finished:
+            raise ValueError("universe hasher is already finalized")
+        membership = (
+            eligible.filter(pl.col("eligible"))
+            .select("signal_date", "instrument_id")
+            .sort("signal_date", "instrument_id")
+        )
+        if membership.is_empty():
+            return
+        batch_ids = membership["instrument_id"].unique().sort().to_list()
+        for value in batch_ids:
+            InstrumentId.parse(cast(str, value))
+        serialized = (
+            membership.select(
+                pl.concat_str(
+                    pl.lit('{"instrument_id":"'),
+                    pl.col("instrument_id"),
+                    pl.lit('","signal_date":"'),
+                    pl.col("signal_date").cast(pl.String),
+                    pl.lit('"}'),
+                ).alias("_canonical_member")
+            )["_canonical_member"]
+            .str.join(",")
+            .item()
+        )
+        if not isinstance(serialized, str):
+            raise TypeError("universe member serialization must be a string")
+        if self._row_count:
+            self._digest.update(b",")
+        self._digest.update(serialized.encode("utf-8"))
+        self._row_count += membership.height
+        self._instrument_ids.update(cast(str, value) for value in batch_ids)
+
+    def finish(self) -> str:
+        """封闭列表并返回 SHA-256；同一实例只允许完成一次。"""
+        if self._finished:
+            raise ValueError("universe hasher is already finalized")
+        self._digest.update(b"]")
+        self._finished = True
+        return self._digest.hexdigest()
+
+
 class _FactorStudySession:
     """保存独立因子研究的分析表和待发布指标。"""
 
@@ -1308,6 +1377,184 @@ class _FactorStudySession:
             .sort("trade_date", "instrument_id")
         )
 
+    @staticmethod
+    def _universe_batch_ends(item_total: int) -> tuple[int, ...]:
+        """返回首项及最早跨越每个 5% 桶的确定性批次终点。"""
+        if item_total <= 0:
+            raise ValueError("universe item total must be positive")
+        return tuple(
+            sorted(
+                {
+                    1,
+                    *(
+                        (item_total * bucket + 19) // 20
+                        for bucket in range(1, 21)
+                    ),
+                }
+            )
+        )
+
+    @staticmethod
+    def _pit_status_keys(
+        events: pl.DataFrame,
+        cutoffs: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """按每个交易日上海日终过滤并去重股票状态键。"""
+        required = {"instrument_id", "trade_date", "available_at", "pit_usable"}
+        if not required.issubset(events.schema):
+            raise ValueError("factor study stock status schema is invalid")
+        return (
+            events.join(cutoffs, on="trade_date", how="inner")
+            .filter(
+                pl.col("pit_usable")
+                & pl.col("available_at").is_not_null()
+                & (pl.col("available_at") <= pl.col("_pit_cutoff"))
+            )
+            .select(
+                pl.col("trade_date").alias("signal_date"),
+                "instrument_id",
+            )
+            .unique()
+            .sort("signal_date", "instrument_id")
+        )
+
+    @staticmethod
+    def _universe_batch(
+        instruments: pl.DataFrame,
+        signal_dates: Sequence[date],
+        suspended: pl.DataFrame,
+        warned: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """向量化生成一个连续日期批次的股票池资格表。"""
+        dates = pl.DataFrame(
+            {"signal_date": signal_dates},
+            schema={"signal_date": pl.Date},
+        )
+        batch_suspended = suspended.join(dates, on="signal_date", how="inner")
+        batch_warned = warned.join(dates, on="signal_date", how="inner")
+        status = (
+            dates.join(instruments, how="cross")
+            .join(
+                batch_warned.with_columns(pl.lit(True).alias("_is_warned")),
+                on=["signal_date", "instrument_id"],
+                how="left",
+            )
+            .join(
+                batch_suspended.with_columns(
+                    pl.lit(True).alias("_is_suspended")
+                ),
+                on=["signal_date", "instrument_id"],
+                how="left",
+            )
+            .with_columns(
+                pl.col("_is_warned").fill_null(False),
+                pl.col("_is_suspended").fill_null(False),
+            )
+        )
+        reason_codes = pl.concat_list(
+            [
+                pl.when(pl.col("_is_warned"))
+                .then(pl.lit("RISK_WARNING"))
+                .otherwise(pl.lit(None, dtype=pl.String)),
+                pl.when(pl.col("_is_suspended"))
+                .then(pl.lit("SUSPENDED"))
+                .otherwise(pl.lit(None, dtype=pl.String)),
+            ]
+        ).list.drop_nulls()
+        return status.select(
+            "signal_date",
+            "instrument_id",
+            (~(pl.col("_is_warned") | pl.col("_is_suspended"))).alias(
+                "eligible"
+            ),
+            reason_codes.alias("reason_codes"),
+        ).sort("signal_date", "instrument_id")
+
+    def _build_factor_study_universe(
+        self,
+        stock_ids: Sequence[InstrumentId],
+        sessions: Sequence[date],
+        progress: FactorStudyProgressReporter,
+        cancellation: CancellationToken,
+    ) -> tuple[pl.DataFrame, tuple[InstrumentId, ...], str]:
+        """批量读取 PIT 状态并按确定性日期批次构建因子研究股票池。"""
+        if not sessions:
+            raise ValueError("factor study has no trading sessions")
+        if cancellation.is_cancelled():
+            raise RuntimeError("factor study cancelled")
+        first_session, last_session = sessions[0], sessions[-1]
+        suspended_events = self._repository.stock_suspensions(
+            first_session, last_session, stock_ids
+        ).collect()
+        if cancellation.is_cancelled():
+            raise RuntimeError("factor study cancelled")
+        warned_events = self._repository.stock_risk_warnings(
+            first_session, last_session, stock_ids
+        ).collect()
+        cutoffs = pl.DataFrame(
+            {
+                "trade_date": sessions,
+                "_pit_cutoff": [
+                    datetime.combine(value, time.max, tzinfo=_SHANGHAI).astimezone(
+                        UTC
+                    )
+                    for value in sessions
+                ],
+            },
+            schema={
+                "trade_date": pl.Date,
+                "_pit_cutoff": pl.Datetime("us", "UTC"),
+            },
+        )
+        suspended = self._pit_status_keys(suspended_events, cutoffs)
+        warned = self._pit_status_keys(warned_events, cutoffs)
+        instruments = pl.DataFrame(
+            {"instrument_id": [item.canonical() for item in stock_ids]},
+            schema={"instrument_id": pl.String},
+        ).sort("instrument_id")
+        frames: list[pl.DataFrame] = []
+        hasher = _CanonicalUniverseHasher()
+        previous = 0
+        for batch_end in self._universe_batch_ends(len(sessions)):
+            if cancellation.is_cancelled():
+                raise RuntimeError("factor study cancelled")
+            batch = self._universe_batch(
+                instruments,
+                sessions[previous:batch_end],
+                suspended,
+                warned,
+            )
+            frames.append(batch)
+            hasher.update(batch)
+            signal_date = sessions[batch_end - 1]
+            progress.substage_progress(
+                "BUILD_UNIVERSE",
+                f"正在准备 PIT 股票池（{batch_end}/{len(sessions)}）",
+                item_completed=batch_end,
+                item_total=len(sessions),
+                evidence={"signal_date": signal_date.isoformat()},
+            )
+            previous = batch_end
+        if cancellation.is_cancelled():
+            raise RuntimeError("factor study cancelled")
+        eligible = pl.concat(frames)
+        universe_hash = hasher.finish()
+        universe_ids = hasher.instrument_ids
+        progress.substage_completed(
+            "BUILD_UNIVERSE",
+            "PIT 股票池准备完成",
+            {
+                "session_count": len(sessions),
+                "eligible_row_count": hasher.row_count,
+                "instrument_count": len(universe_ids),
+                "batch_count": len(frames),
+                "suspension_row_count": suspended.height,
+                "risk_warning_row_count": warned.height,
+                "universe_hash": universe_hash,
+            },
+        )
+        return eligible, universe_ids, universe_hash
+
     def _analyze(
         self,
         progress: FactorStudyProgressReporter,
@@ -1326,49 +1573,11 @@ class _FactorStudySession:
         sessions = source._sessions(config.start_date, config.end_date)
         if not sessions:
             raise ValueError("factor study has no trading sessions")
-        eligible_frames: list[pl.DataFrame] = []
-        for index, signal_date in enumerate(sessions):
-            if cancellation.is_cancelled():
-                raise RuntimeError("factor study cancelled")
-            eligible_frames.append(
-                source.universe(signal_date).rename({"as_of": "signal_date"})
-            )
-            progress.substage_progress(
-                "BUILD_UNIVERSE",
-                f"正在准备 PIT 股票池（{index + 1}/{len(sessions)}）",
-                item_completed=index + 1,
-                item_total=len(sessions),
-                evidence={"signal_date": signal_date.isoformat()},
-            )
-        eligible = pl.concat(eligible_frames).sort("signal_date", "instrument_id")
-        universe_ids = tuple(
-            InstrumentId.parse(value)
-            for value in sorted(
-                set(eligible.filter(pl.col("eligible"))["instrument_id"].to_list())
-            )
-        )
-        universe_membership = [
-            {
-                "signal_date": cast(date, row["signal_date"]).isoformat(),
-                "instrument_id": cast(str, row["instrument_id"]),
-            }
-            for row in eligible.filter(pl.col("eligible"))
-            .select("signal_date", "instrument_id")
-            .sort("signal_date", "instrument_id")
-            .iter_rows(named=True)
-        ]
-        universe_hash = hashlib.sha256(
-            canonical_json_bytes(cast(list[JsonValue], universe_membership))
-        ).hexdigest()
-        progress.substage_completed(
-            "BUILD_UNIVERSE",
-            "PIT 股票池准备完成",
-            {
-                "session_count": len(sessions),
-                "eligible_row_count": len(universe_membership),
-                "instrument_count": len(universe_ids),
-                "universe_hash": universe_hash,
-            },
+        eligible, universe_ids, universe_hash = self._build_factor_study_universe(
+            source._stock_ids,
+            sessions,
+            progress,
+            cancellation,
         )
         progress.substage_started(
             "COMPUTE_FACTORS",

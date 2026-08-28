@@ -1,6 +1,6 @@
 # 独立因子研究设计
 
-文档状态：当前有效设计　·　日期：2026-08-24
+文档状态：当前有效设计　·　日期：2026-08-28
 
 因子研究是独立的 `FactorStudy` 任务，不属于 Experiment，也不存在 Run、Baseline、派生 Run
 或 Run 比较。实验中心只承载策略回测。一次成功研究的配置、数据身份和产物永久冻结；参数变化
@@ -56,6 +56,12 @@ VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PUBLISH
 保存于 `context.details`。失败事件 `task.handler_failed.context.last_progress` 保存最后一次安全
 进度，Dashboard 诊断同时暴露公开阶段和可空的 `substage`。因子研究详情与运行中心通过同一
 展示契约读取 `/api/v1/tasks/{task_id}`，终态后停止轮询。
+
+`BUILD_UNIVERSE` 对研究区间内的停牌和风险警示各执行一次范围读取，再按每行交易日对应的
+上海日终重新应用 `available_at` 截止，禁止把区间末日才可见的状态带回历史日期。交易日与股票
+通过 Polars 按上述 5% 里程碑分批向量化连接；批次只承担进度与取消边界，拼接结果仍按
+`signal_date, instrument_id` 稳定排序。股票池成员的 SHA-256 必须与完整 canonical JSON 成员
+列表逐字节一致，不得因批量化改变数据身份。
 
 ## PIT 输入与分析口径
 
