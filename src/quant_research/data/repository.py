@@ -208,7 +208,17 @@ class ResearchDataRepository(Protocol):
         instruments: Sequence[InstrumentId] | None = None,
         dates: Sequence[date] = (),
     ) -> pl.LazyFrame:
-        """读取行业成员。入参：股票和日期。返回值：成员帧。异常：门禁失败时抛出。"""
+        """读取每个查询日、每只股票唯一的 PIT 行业成员状态。
+
+        入参：
+            instruments：可选的股票范围；为空时读取全市场。
+            dates：需要重建行业状态的查询日期。
+        返回值：
+            返回按查询日和证券唯一、确定性排序的行业成员帧。重叠的可见关系按最新
+            生效日、进入事件可用时间及记录可用时间依次裁决。
+        异常：
+            目录门禁、可信路径或底层读取失败时传播对应异常。
+        """
         ...
 
     def stock_suspensions(
@@ -804,9 +814,16 @@ class CanonicalResearchRepository:
         query = (
             "SELECT query_date, "
             + columns
-            + " FROM data CROSS JOIN requested WHERE "
+            + " FROM (SELECT requested.query_date AS query_date, "
+            + columns
+            + ", ROW_NUMBER() OVER ("
+            + "PARTITION BY requested.query_date, instrument_id "
+            + "ORDER BY in_date DESC, in_available_at DESC, "
+            + "available_at DESC, ingested_at DESC, level1_code ASC"
+            + ") AS _state_rank FROM data CROSS JOIN requested WHERE "
             + " AND ".join(predicates)
-            + " ORDER BY query_date, instrument_id, level1_code"
+            + ") WHERE _state_rank = 1 "
+            + "ORDER BY query_date, instrument_id, level1_code"
         )
         _, leases = self._verify_current_dataset(DatasetKind.INDUSTRY_MEMBERSHIP)
         source_query, source_parameters = self._parquet_sources(

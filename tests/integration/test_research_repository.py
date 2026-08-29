@@ -328,11 +328,55 @@ class _ResearchRepositoryHarness:
     def _industry_batch() -> CanonicalBatch:
         dataset = DatasetKind.INDUSTRY_MEMBERSHIP
         memberships = (
-            ("600000.SH", "J66", date(2026, 1, 5), date(2026, 1, 12)),
-            ("600000.SH", "C39", date(2026, 1, 12), None),
-            ("600001.SH", "C39", date(2026, 1, 5), date(2026, 1, 13)),
-            ("600002.SH", "J66", date(2026, 1, 12), None),
-            ("600003.SH", "I65", date(2026, 1, 6), None),
+            (
+                "600000.SH",
+                "J66",
+                date(2026, 1, 5),
+                date(2026, 1, 12),
+                datetime(2026, 1, 5, tzinfo=UTC),
+            ),
+            (
+                "600000.SH",
+                "C39",
+                date(2026, 1, 12),
+                None,
+                datetime(2026, 1, 12, tzinfo=UTC),
+            ),
+            (
+                "600001.SH",
+                "C39",
+                date(2026, 1, 5),
+                date(2026, 1, 13),
+                datetime(2026, 1, 5, tzinfo=UTC),
+            ),
+            (
+                "600002.SH",
+                "J66",
+                date(2026, 1, 12),
+                None,
+                datetime(2026, 1, 12, 8, tzinfo=UTC),
+            ),
+            (
+                "600002.SH",
+                "C39",
+                date(2026, 1, 12),
+                None,
+                datetime(2026, 1, 12, 9, tzinfo=UTC),
+            ),
+            (
+                "600003.SH",
+                "I65",
+                date(2026, 1, 6),
+                None,
+                datetime(2026, 1, 6, tzinfo=UTC),
+            ),
+            (
+                "600003.SH",
+                "C39",
+                date(2026, 1, 12),
+                None,
+                datetime(2026, 1, 12, tzinfo=UTC),
+            ),
         )
         frame = _canonical_frame(
             dataset,
@@ -345,7 +389,7 @@ class _ResearchRepositoryHarness:
                     "in_date": in_date,
                     "out_date": out_date,
                     "is_current": out_date is None,
-                    "in_available_at": datetime(2026, 1, 5, tzinfo=UTC),
+                    "in_available_at": in_available_at,
                     "out_available_at": (
                         datetime(
                             out_date.year,
@@ -362,7 +406,7 @@ class _ResearchRepositoryHarness:
                     "pit_usable": True,
                     "ingested_at": _NOW,
                 }
-                for instrument_id, industry, in_date, out_date in memberships
+                for instrument_id, industry, in_date, out_date, in_available_at in memberships
             ],
         )
         return CanonicalBatch(dataset, frame, ("e" * 64,))
@@ -606,6 +650,7 @@ def test_industry_single_and_batch_queries_rebuild_identical_tombstone_state(
             instruments, query_dates
         ).collect()
 
+        assert not batch.select("query_date", "instrument_id").is_duplicated().any()
         assert {
             (row["query_date"], row["instrument_id"]): row["level1_code"]
             for row in batch.iter_rows(named=True)
@@ -620,11 +665,11 @@ def test_industry_single_and_batch_queries_rebuild_identical_tombstone_state(
             (date(2026, 1, 11), "600003.SH"): "I65",
             (date(2026, 1, 12), "600000.SH"): "C39",
             (date(2026, 1, 12), "600001.SH"): "C39",
-            (date(2026, 1, 12), "600002.SH"): "J66",
-            (date(2026, 1, 12), "600003.SH"): "I65",
+            (date(2026, 1, 12), "600002.SH"): "C39",
+            (date(2026, 1, 12), "600003.SH"): "C39",
             (date(2026, 1, 13), "600000.SH"): "C39",
-            (date(2026, 1, 13), "600002.SH"): "J66",
-            (date(2026, 1, 13), "600003.SH"): "I65",
+            (date(2026, 1, 13), "600002.SH"): "C39",
+            (date(2026, 1, 13), "600003.SH"): "C39",
         }
 
         empty = harness.repository.industry_memberships_on_dates(

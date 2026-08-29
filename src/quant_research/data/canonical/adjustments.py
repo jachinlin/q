@@ -153,7 +153,7 @@ class _PriceAdjustmentEngine:
         """在价格链计算前移除供应商生成的合法停牌占位行。"""
         if not {"volume", "amount"}.issubset(frame.columns):
             raise ValueError("daily bars are missing trading activity columns")
-        return frame.filter(~(pl.col("volume").is_null() & pl.col("amount").is_null()))
+        return frame.filter(~_PriceAdjustmentSupport._is_untraded_placeholder())
 
 
 class _PriceAdjustmentSupport:
@@ -225,7 +225,7 @@ class _PriceAdjustmentSupport:
             "instrument_id",
             "trade_date",
             pl.lit(True).alias("_has_observation"),
-            (pl.col("volume").is_null() & pl.col("amount").is_null()).alias(
+            _PriceAdjustmentSupport._is_untraded_placeholder().alias(
                 "_is_suspended"
             ),
             pl.col("available_at").alias("_raw_available_at"),
@@ -267,6 +267,13 @@ class _PriceAdjustmentSupport:
             )
             .cast(FACTOR_LOG_RETURN_SCHEMA)
             .sort("instrument_id", "trade_date")
+        )
+
+    @staticmethod
+    def _is_untraded_placeholder() -> pl.Expr:
+        """返回与 Canonical 行情质量规则一致的零成交占位条件。"""
+        return (pl.col("volume").fill_null(0) == 0) & (
+            pl.col("amount").fill_null(0.0) == 0.0
         )
 
     @staticmethod
