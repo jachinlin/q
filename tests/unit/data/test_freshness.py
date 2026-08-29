@@ -97,6 +97,44 @@ def test_calendar_horizon_changes_at_beijing_1800() -> None:
     assert after[DatasetKind.TRADE_CALENDAR] is FreshnessStatus.STALE
 
 
+def test_calendar_event_freshness_uses_successful_localize_watermark() -> None:
+    evaluator = FreshnessEvaluator(
+        DATASET_CATALOG,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    result = evaluator.evaluate(
+        canonical=(
+            _canonical(DatasetKind.STOCK_DIVIDEND, date(2026, 8, 28)),
+            _canonical(DatasetKind.FUND_DIVIDEND, date(2026, 8, 28)),
+        ),
+        operational=(
+            _operational(
+                DatasetKind.STOCK_DIVIDEND,
+                datetime(2026, 8, 29, 11, tzinfo=UTC),
+                date(2026, 8, 29),
+            ),
+            _operational(
+                DatasetKind.FUND_DIVIDEND,
+                datetime(2026, 8, 29, 11, tzinfo=UTC),
+                date(2026, 8, 28),
+            ),
+        ),
+        evaluated_at=datetime(
+            2026, 8, 29, 23, tzinfo=ZoneInfo("Asia/Shanghai")
+        ),
+        latest_complete_session=date(2026, 8, 28),
+    )
+    by_dataset = {item.dataset: item for item in result}
+
+    stock = by_dataset[DatasetKind.STOCK_DIVIDEND]
+    assert stock.status is FreshnessStatus.CURRENT
+    assert stock.actual_watermark == date(2026, 8, 29)
+    assert stock.expected_watermark == date(2026, 8, 29)
+    fund = by_dataset[DatasetKind.FUND_DIVIDEND]
+    assert fund.status is FreshnessStatus.STALE
+    assert fund.actual_watermark == date(2026, 8, 28)
+
+
 def test_calendar_refresh_and_missing_evidence_cover_all_states() -> None:
     evaluated_at = datetime(2026, 8, 15, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
     statuses = _evaluate(

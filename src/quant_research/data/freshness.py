@@ -7,7 +7,8 @@ from datetime import date, datetime, timedelta
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
-from quant_research.data.catalog import DatasetCatalog, FreshnessBasis
+from quant_research.data.availability import CalendarDataCompletion
+from quant_research.data.catalog import DatasetCatalog, FetchPlan, FreshnessBasis
 from quant_research.data.sources.financials import FinancialDisclosureSchedule
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.persistence.repositories import (
@@ -64,7 +65,7 @@ class FreshnessEvaluator:
         catalog: DatasetCatalog,
         *,
         timezone: ZoneInfo,
-        completion_hour: int = 18,
+        completion_hour: int = CalendarDataCompletion.DEFAULT_HOUR,
     ) -> None:
         if not 0 <= completion_hour <= 23:
             raise ValueError("completion_hour must be from 0 through 23")
@@ -96,7 +97,11 @@ class FreshnessEvaluator:
             raise ValueError("evaluated_at must be timezone-aware")
         current = {item.dataset: item for item in canonical}
         states = {item.dataset: item for item in operational}
-        cutoff = self._cutoff_date(evaluated_at)
+        cutoff = CalendarDataCompletion.cutoff_date(
+            evaluated_at,
+            timezone=self._timezone,
+            completion_hour=self._completion_hour,
+        )
         return tuple(
             self._evaluate_one(
                 dataset,
@@ -128,9 +133,37 @@ class FreshnessEvaluator:
                 evaluated_at,
                 "canonical dataset is missing",
             )
-        policy = self._catalog[dataset].freshness
+        spec = self._catalog[dataset]
+        policy = spec.freshness
         if policy.basis is FreshnessBasis.CALENDAR_HORIZON:
             expected = cutoff + timedelta(days=policy.tolerance_days)
+            if spec.fetch_plan is FetchPlan.CALENDAR_EVENT_DATE:
+                if operational is None or operational.last_localized_at is None:
+                    return self._record(
+                        dataset,
+                        FreshnessStatus.UNKNOWN,
+                        None,
+                        expected,
+                        None,
+                        evaluated_at,
+                        "no successful localize evidence",
+                    )
+                if operational.localized_through is None:
+                    return self._record(
+                        dataset,
+                        FreshnessStatus.UNKNOWN,
+                        None,
+                        expected,
+                        None,
+                        evaluated_at,
+                        "localize target watermark is unavailable",
+                    )
+                return self._watermark_record(
+                    dataset,
+                    operational.localized_through,
+                    expected,
+                    evaluated_at,
+                )
             return self._watermark_record(
                 dataset, canonical.end_date, expected, evaluated_at
             )
@@ -316,12 +349,4 @@ class FreshnessEvaluator:
             reason=reason,
             trigger_date=trigger_date,
             update_required=update_required,
-        )
-
-    def _cutoff_date(self, evaluated_at: datetime) -> date:
-        local = evaluated_at.astimezone(self._timezone)
-        return (
-            local.date()
-            if local.hour >= self._completion_hour
-            else local.date() - timedelta(days=1)
         )

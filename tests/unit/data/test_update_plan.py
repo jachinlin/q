@@ -149,6 +149,26 @@ def test_auto_plan_freezes_each_dataset_window_without_null_parameters() -> None
     assert DataUpdatePlan.from_payload(payload) == plan
 
 
+@pytest.mark.parametrize(
+    ("planned_at", "expected_end"),
+    (
+        (datetime(2026, 8, 29, 9, 59, tzinfo=UTC), date(2026, 8, 28)),
+        (datetime(2026, 8, 29, 10, tzinfo=UTC), date(2026, 8, 29)),
+    ),
+)
+def test_calendar_event_plan_uses_shared_1800_completion_cutoff(
+    planned_at: datetime,
+    expected_end: date,
+) -> None:
+    plan = _planner(_Repository(), planned_at).plan(
+        start=None,
+        end=None,
+        datasets=(DatasetKind.STOCK_DIVIDEND, DatasetKind.FUND_DIVIDEND),
+    )
+
+    assert {item.end for item in plan.dataset_windows} == {expected_end}
+
+
 def test_plan_hash_excludes_generation_time_but_covers_resolved_windows() -> None:
     first = _planner(_Repository()).plan(start=None, end=None)
     second = _planner(_Repository(), datetime(2026, 8, 15, 1, tzinfo=UTC)).plan(

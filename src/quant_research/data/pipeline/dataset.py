@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from quant_research.data.availability import CalendarDataCompletion
 from quant_research.data.canonical.mapper import CanonicalMapper
 from quant_research.data.catalog import (
     DATASET_CATALOG,
@@ -873,6 +874,10 @@ class DataUpdatePlanner:
             raise ValueError("bootstrap years must be a positive integer")
         planned_at = self._clock() if frozen_planned_at is None else frozen_planned_at
         planning_date = planned_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        complete_calendar_day = CalendarDataCompletion.cutoff_date(
+            planned_at,
+            timezone=ZoneInfo("Asia/Shanghai"),
+        )
         start, end = (
             self._calendar.bootstrap_window(years)
             if frozen_window is None
@@ -887,7 +892,7 @@ class DataUpdatePlanner:
                 actual = (planning_date, planning_date)
                 basis = DataUpdateWindowBasis.SNAPSHOT_REFRESH
             elif dataset in _EVENT_DATE_DATASETS:
-                actual = (start, planning_date - timedelta(days=1))
+                actual = (start, complete_calendar_day)
                 basis = DataUpdateWindowBasis.BOOTSTRAP
             else:
                 actual = _DatasetPipelineSupport._calendar_horizon(
@@ -930,6 +935,10 @@ class DataUpdatePlanner:
         """
         planned_at = self._clock()
         planning_date = planned_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        complete_calendar_day = CalendarDataCompletion.cutoff_date(
+            planned_at,
+            timezone=ZoneInfo("Asia/Shanghai"),
+        )
         if (start is None) != (end is None):
             raise ValueError("start and end must be supplied together")
         executable = tuple(
@@ -1063,7 +1072,7 @@ class DataUpdatePlanner:
                     trigger_date = batch.disclosure_deadline
                 else:
                     latest_for_dataset = (
-                        planning_date - timedelta(days=1)
+                        complete_calendar_day
                         if dataset in _EVENT_DATE_DATASETS
                         else latest
                     )
