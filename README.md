@@ -1,6 +1,6 @@
 # Quant Research
 
-Quant Research 是一个单用户、Windows 本地运行的 A 股量化研究平台。它把数据采集、
+Quant Research 是一个单用户、本地运行的跨平台 A 股量化研究平台。它把数据采集、
 PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashboard 放在同一个可审计的
 研究闭环中。
 
@@ -20,14 +20,20 @@ PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashbo
 
 ## 运行要求
 
-- Windows；
+- Windows、macOS 或 Linux；
 - Python 3.12；
 - [`uv`](https://docs.astral.sh/uv/)；
 - Node.js 和 npm，仅构建或开发 Dashboard 前端时需要。
 
-数据根必须位于源码目录之外。默认位置为 `~/qlab-data`，也可以在 PowerShell 中显式设置：
+数据根必须位于源码目录之外。默认位置为 `~/qlab-data`。Linux/macOS 可以这样设置：
 
-```powershell
+```sh
+export QUANT_DATA_ROOT="$HOME/quant-data"
+```
+
+Windows PowerShell 可以这样设置：
+
+```console
 $env:QUANT_DATA_ROOT = "D:\quant-data"
 ```
 
@@ -53,23 +59,22 @@ LOCALIZE 默认同时抓取 4 个逻辑请求，可在 Dashboard 设置为 1–3
 
 ### 1. 安装后端依赖
 
-```powershell
+```console
 uv sync --group notebook
 uv run quant --help
 ```
 
 ### 2. 构建 Dashboard 前端
 
-```powershell
-Push-Location frontend
+```console
+cd frontend
 npm ci
 npm run build
-Pop-Location
 ```
 
 ### 3. 初始化数据
 
-```powershell
+```console
 uv run quant data bootstrap --years 5
 ```
 
@@ -80,13 +85,13 @@ uv run quant data bootstrap --years 5
 
 如果已经存在本地数据，可以使用增量命令：
 
-```powershell
+```console
 uv run quant data update
 ```
 
 ### 4. 一次启动 Dashboard、Worker 与 Notebook
 
-```powershell
+```console
 uv run quant start
 ```
 
@@ -115,7 +120,7 @@ Dashboard 数据中心会显示当前阶段、数据集和正在处理的 Tushar
 
 常用命令：
 
-```powershell
+```console
 # 查看完整数据命令
 uv run quant data --help
 
@@ -134,7 +139,7 @@ uv run quant data validate-all
 
 单数据集诊断：
 
-```powershell
+```console
 uv run quant data localize daily_bar --from 2026-01-01 --to 2026-01-31
 uv run quant data curate daily_bar --from 2026-01-01 --to 2026-01-31
 uv run quant data validate daily_bar
@@ -146,20 +151,20 @@ uv run quant data validate daily_bar
 
 提交实验只创建不可变实验和后台任务，不在 CLI 进程中同步执行：
 
-```powershell
+```console
 uv run quant experiments submit configs/experiments/examples/etf_rotation.yaml
 uv run quant worker once
 ```
 
 查看实验：
 
-```powershell
+```console
 uv run quant experiments show <experiment-id>
 ```
 
 因子研究使用独立的扁平配置和命令组：
 
-```powershell
+```console
 uv run quant factor-studies validate configs/factor_studies/examples/factor_study.yaml
 uv run quant factor-studies submit configs/factor_studies/examples/factor_study.yaml
 uv run quant factor-studies show <factor-study-id>
@@ -168,7 +173,7 @@ uv run quant factor-studies list
 
 管理任务：
 
-```powershell
+```console
 uv run quant tasks list
 uv run quant tasks list --status FAILED --limit 50
 uv run quant tasks cancel <task-id>
@@ -207,17 +212,20 @@ uv run quant tasks retry <task-id>
 
 ## 前端开发
 
-先启动 API，并显式允许 Vite 开发地址：
+先启动 API，并显式允许 Vite 开发地址。Linux/macOS：
 
-```powershell
-$env:QUANT_DASHBOARD_DEV_ORIGIN = "http://127.0.0.1:5173"
+```sh
+export QUANT_DASHBOARD_DEV_ORIGIN="http://127.0.0.1:5173"
 uv run quant dashboard --port 8000
 ```
 
+Windows PowerShell 中对应使用
+`$env:QUANT_DASHBOARD_DEV_ORIGIN = "http://127.0.0.1:5173"`。
+
 另一个终端启动 Vite：
 
-```powershell
-Push-Location frontend
+```console
+cd frontend
 npm run dev
 ```
 
@@ -273,29 +281,25 @@ Canonical 路径。实验提交时捕获当前 Catalog、源码、锁文件和�
 
 后端：
 
-```powershell
+```console
 uv run ruff check src tests benchmarks
 uv run mypy --show-error-codes
-
-$testTemp = Join-Path $env:TEMP "quant-pytest-$PID"
-uv run pytest --basetemp $testTemp
-
-$acceptanceTemp = Join-Path $env:TEMP "quant-acceptance-$PID"
-uv run pytest --run-performance --run-acceptance --basetemp $acceptanceTemp
+uv run pytest
+uv run pytest --run-performance --run-acceptance
 ```
 
 前端：
 
-```powershell
-Push-Location frontend
+```console
+cd frontend
 npm test
 npm run typecheck
 npm run build
-Pop-Location
 ```
 
-Windows 下建议始终把 pytest `--basetemp` 放在源码目录之外，并使用短路径，以避免数据根
-边界、SQLite 文件锁和长路径产生假失败。
+如果当前平台的默认临时目录路径过长或位于源码树内，应用
+`--basetemp` 显式指向源码树之外的短临时路径。
+CI 会在 Windows、macOS 和 Linux 上分别运行完整后端测试。
 
 ## 架构文档
 

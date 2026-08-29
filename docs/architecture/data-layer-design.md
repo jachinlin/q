@@ -652,9 +652,11 @@ Dashboard 分别读取股票、基金和指数。它可以在响应层组合展�
 首次运行前设置数据根和 Tushare Token。数据根必须位于源码目录之外；未设置
 `QUANT_DATA_ROOT` 时默认使用 `~/qlab-data`：
 
-```powershell
-$env:QUANT_DATA_ROOT = "D:\quant-data"
+```sh
+export QUANT_DATA_ROOT="$HOME/quant-data"
 ```
+
+Windows PowerShell 中可使用 `$env:QUANT_DATA_ROOT = "D:\quant-data"`。
 
 数据源 Token 通过 Dashboard「设置」页维护，或直接写入数据根下的明文
 `$QUANT_DATA_ROOT/.env`：
@@ -691,19 +693,19 @@ SQLite 和更新任务进度，因此网络响应逆序完成不会改变产物�
 
 首次构建最近五年数据：
 
-```powershell
+```console
 uv run quant data bootstrap --years 5
 ```
 
 日常自动增量更新：
 
-```powershell
+```console
 uv run quant data update
 ```
 
 开发或排障时，可以分阶段运行：
 
-```powershell
+```console
 uv run quant data localize stock_daily_bar --from 2026-08-01 --to 2026-08-25
 uv run quant data curate stock_daily_bar --from 2026-08-01 --to 2026-08-25
 uv run quant data validate stock_daily_bar
@@ -717,6 +719,10 @@ uv run quant data validate-all
 流水线同时发布持久化任务进度和 JSON Lines 结构化日志。Dashboard「数据中心」展示当前
 阶段、数据集以及内部活动；「任务 → 尝试与日志」保留 Worker 收到的每次进度事件。
 CLI 和独立流水线日志写入 `$QUANT_DATA_ROOT/logs/data_pipeline.log`。
+
+同一数据根的写操作由固定锁文件串行化。Windows 使用字节范围锁，Linux/macOS
+使用 `flock` 建议锁；两者都在争用时立即返回
+`DATA_PIPELINE_ALREADY_RUNNING`，并由操作系统在进程退出或崩溃后自动释放所有权。
 
 进度从粗到细分为三层：
 

@@ -114,7 +114,7 @@ cost_bps_scenarios: [5, 10, 20]
 
 ### 2.2 校验与提交
 
-```powershell
+```console
 uv run quant factor-studies validate configs/factor_studies/examples/factor_study.yaml
 uv run quant factor-studies submit configs/factor_studies/examples/factor_study.yaml
 uv run quant worker once

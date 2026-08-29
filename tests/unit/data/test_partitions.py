@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -21,19 +19,8 @@ from quant_research.domain.errors import QuantError
 def _create_directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        if os.name != "nt":
-            raise
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"New-Item -ItemType Junction -Path '{link}' -Target '{target}' | Out-Null",
-            ],
-            check=True,
-            capture_output=True,
-        )
+    except OSError as error:
+        pytest.skip(f"directory symbolic links are unavailable: {type(error).__name__}")
 
 
 def make_batch(

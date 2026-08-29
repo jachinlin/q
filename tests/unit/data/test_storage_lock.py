@@ -14,8 +14,6 @@ import pytest
 from quant_research.data.storage.paths import DataRootExecutionLock
 from quant_research.domain.errors import QuantError
 
-pytestmark = pytest.mark.skipif(os.name != "nt", reason="项目仅支持 Windows 本地运行")
-
 
 class _ProcessEvent(Protocol):
     """描述多进程测试所需的最小事件接口。"""

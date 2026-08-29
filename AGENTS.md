@@ -2,7 +2,8 @@
 
 ## 项目定位
 
-本项目是单用户、Windows 本地运行的 A 股量化研究平台。Python 包名为
+本项目是单用户、本地运行的跨平台 A 股量化研究平台，支持 Windows、
+macOS 和 Linux。Python 包名为
 `quant_research`，安装后的命令为 `quant`。项目尚未发布，不兼容旧接口、旧包、
 旧数据库或旧产物；设计变化应直接落实到最终结构，不创建兼容转发层。
 
@@ -41,41 +42,36 @@ docs/architecture/     # 当前有效架构文档
 
 项目要求 Python 3.12，使用 `uv` 管理环境：
 
-```powershell
+```console
 uv sync
 uv run quant --help
 ```
 
 后端验证：
 
-```powershell
+```console
 uv run ruff check src tests benchmarks
 uv run mypy --show-error-codes
-
-$testTemp = Join-Path $env:TEMP "quant-pytest-$PID"
-uv run pytest --basetemp $testTemp
-
-$acceptanceTemp = Join-Path $env:TEMP "quant-acceptance-$PID"
-uv run pytest --run-performance --run-acceptance --basetemp $acceptanceTemp
+uv run pytest
+uv run pytest --run-performance --run-acceptance
 ```
 
-Windows pytest 必须优先使用源码目录之外的短临时路径，避免数据根边界、SQLite、
-文件锁和长路径造成假失败。
+各平台 pytest 都应使用源码目录之外的系统临时目录；如果默认路径过长或不符合
+数据根边界，使用 `--basetemp` 指向源码树之外的短路径。
 
 前端验证：
 
-```powershell
-Push-Location frontend
+```console
+cd frontend
 npm ci
 npm test
 npm run typecheck
 npm run build
-Pop-Location
 ```
 
 常用运行命令：
 
-```powershell
+```console
 uv run quant data --help
 uv run quant data bootstrap
 uv run quant data update

@@ -7,7 +7,7 @@
 
 ## 数据命令
 
-```powershell
+```console
 quant data bootstrap --years <正整数>
 quant data update
 quant data localize [--dataset <name>] [--start YYYY-MM-DD --end YYYY-MM-DD]
@@ -22,7 +22,7 @@ quant data validate-all
 
 ## 实验与策略命令
 
-```powershell
+```console
 quant experiments validate <experiment-yaml>
 quant experiments submit <experiment-yaml>
 quant experiments run <experiment_id> <run-yaml>
@@ -39,7 +39,7 @@ quant strategies list
 
 ## Worker 与 Dashboard
 
-```powershell
+```console
 quant worker once
 quant worker run
 quant dashboard --port 8000

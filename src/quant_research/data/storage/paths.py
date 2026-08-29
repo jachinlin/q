@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import errno
+import importlib
 import os
 import stat
 import threading
 from pathlib import Path
-from typing import BinaryIO, ClassVar, Never, Self
+from typing import BinaryIO, ClassVar, Never, Protocol, Self, cast
 
 from quant_research.domain.enums import Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
@@ -22,6 +23,25 @@ class _DataRootLockState:
         self.stream: BinaryIO | None = None
 
 
+class _WindowsFileLockModule(Protocol):
+    """描述 Windows 标准库字节范围锁的最小接口。"""
+
+    LK_NBLCK: int
+    LK_UNLCK: int
+
+    def locking(self, file_descriptor: int, mode: int, byte_count: int) -> None: ...
+
+
+class _PosixFileLockModule(Protocol):
+    """描述 POSIX 标准库建议锁的最小接口。"""
+
+    LOCK_EX: int
+    LOCK_NB: int
+    LOCK_UN: int
+
+    def flock(self, file_descriptor: int, operation: int) -> None: ...
+
+
 class DataRootExecutionLock:
     """串行化同一数据根上的本机数据流水线写操作。
 
@@ -30,12 +50,13 @@ class DataRootExecutionLock:
     返回值：
         构造可重复进入的上下文管理器；同线程嵌套调用只持有一份 OS 锁。
     异常：
-        QuantError：同进程其他线程或其他 Windows 进程正在运行数据流水线时抛出。
-        RuntimeError：在非 Windows 平台使用该 Windows 本地平台锁时抛出。
+        QuantError：同进程其他线程或其他本机进程正在运行数据流水线时抛出。
+        RuntimeError：当前操作系统不提供受支持的文件锁时抛出。
 
     锁语义：
-        固定锁文件可以永久存在，所有权由 Windows 字节范围锁决定。进程退出或崩溃
-        时操作系统自动释放所有权，因此不需要 PID 探测、owner token 或陈旧锁回收。
+        固定锁文件可以永久存在，Windows 使用字节范围锁，POSIX 使用
+        ``flock`` 建议锁。进程退出或崩溃时操作系统自动释放所有权，
+        因此不需要 PID 探测、owner token 或陈旧锁回收。
     """
 
     _states: ClassVar[dict[str, _DataRootLockState]] = {}
@@ -49,7 +70,7 @@ class DataRootExecutionLock:
             self._state = self._states.setdefault(key, _DataRootLockState())
 
     def __enter__(self) -> Self:
-        """立即取得进程内和 Windows 跨进程锁。
+        """立即取得进程内和跨进程锁。
 
         入参：
             无。
@@ -58,15 +79,13 @@ class DataRootExecutionLock:
         异常：
             QuantError：同一数据根已有其他执行者时抛出
             ``DATA_PIPELINE_ALREADY_RUNNING``。
-            RuntimeError：当前平台不是 Windows 时抛出。
+            RuntimeError：当前操作系统不提供受支持的文件锁时抛出。
         """
-        if os.name != "nt":
-            raise RuntimeError("data pipeline execution lock requires Windows")
         if not self._state.guard.acquire(blocking=False):
             self._raise_busy()
         try:
             if self._state.depth == 0:
-                self._state.stream = self._acquire_windows_lock()
+                self._state.stream = self._acquire_os_lock()
             self._state.depth += 1
         except BaseException:
             self._state.guard.release()
@@ -74,7 +93,7 @@ class DataRootExecutionLock:
         return self
 
     def __exit__(self, *_: object) -> None:
-        """释放当前嵌套层，并在最外层退出时释放 Windows 锁。
+        """释放当前嵌套层，并在最外层退出时释放 OS 锁。
 
         入参：
             退出上下文传入的异常信息；本实现不抑制异常。
@@ -88,13 +107,11 @@ class DataRootExecutionLock:
                 raise RuntimeError("data pipeline execution lock is not held")
             self._state.depth -= 1
             if self._state.depth == 0:
-                self._release_windows_lock()
+                self._release_os_lock()
         finally:
             self._state.guard.release()
 
-    def _acquire_windows_lock(self) -> BinaryIO:
-        import msvcrt
-
+    def _acquire_os_lock(self) -> BinaryIO:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         validate_storage_path(self._root, self._path.parent)
         stream = self._path.open("a+b", buffering=0)
@@ -102,26 +119,59 @@ class DataRootExecutionLock:
             if self._path.stat().st_size == 0:
                 stream.write(b"\0")
             stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            self._lock_stream(stream)
         except OSError as error:
             stream.close()
-            if error.errno in {errno.EACCES, errno.EDEADLK}:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                 self._raise_busy()
+            raise
+        except BaseException:
+            stream.close()
             raise
         return stream
 
-    def _release_windows_lock(self) -> None:
-        import msvcrt
-
+    def _release_os_lock(self) -> None:
         stream = self._state.stream
         if stream is None:
             raise RuntimeError("data pipeline OS lock handle is missing")
         self._state.stream = None
         try:
             stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            self._unlock_stream(stream)
         finally:
             stream.close()
+
+    @staticmethod
+    def _lock_stream(stream: BinaryIO) -> None:
+        if os.name == "nt":
+            windows_lock = cast(
+                _WindowsFileLockModule, importlib.import_module("msvcrt")
+            )
+            windows_lock.locking(
+                stream.fileno(), windows_lock.LK_NBLCK, 1
+            )
+            return
+        if os.name == "posix":
+            posix_lock = cast(_PosixFileLockModule, importlib.import_module("fcntl"))
+            posix_lock.flock(
+                stream.fileno(), posix_lock.LOCK_EX | posix_lock.LOCK_NB
+            )
+            return
+        raise RuntimeError("data pipeline execution lock requires Windows or POSIX")
+
+    @staticmethod
+    def _unlock_stream(stream: BinaryIO) -> None:
+        if os.name == "nt":
+            windows_lock = cast(
+                _WindowsFileLockModule, importlib.import_module("msvcrt")
+            )
+            windows_lock.locking(stream.fileno(), windows_lock.LK_UNLCK, 1)
+            return
+        if os.name == "posix":
+            posix_lock = cast(_PosixFileLockModule, importlib.import_module("fcntl"))
+            posix_lock.flock(stream.fileno(), posix_lock.LOCK_UN)
+            return
+        raise RuntimeError("data pipeline execution lock requires Windows or POSIX")
 
     @staticmethod
     def _raise_busy() -> Never:
