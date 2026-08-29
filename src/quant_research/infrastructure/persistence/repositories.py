@@ -347,7 +347,7 @@ class CanonicalPublishResult:
     入参：
         record：记录。
         changed：控制是否启用``changed``规则的布尔开关。
-        orphan_paths：参与本次处理的失联任务``paths``；调用方不得依赖未声明的顺序。
+        orphan_paths：指针切换后不再被当前目录引用、但仍需保留给既有惰性查询的路径。
     返回值：
         返回完成字段规范化和不变量校验的对象。
     异常：
@@ -581,26 +581,30 @@ class MetadataRepository:
             供应商会话、请求或响应校验失败时传播对应适配器异常。
         """
         with Session(self._engine) as session:
-            query = select(RawRequestORM).order_by(
-                RawRequestORM.source,
-                RawRequestORM.endpoint,
-                RawRequestORM.request_hash,
+            query = (
+                select(RawRequestORM, RawObjectORM)
+                .outerjoin(
+                    RawObjectORM,
+                    (RawObjectORM.source == RawRequestORM.source)
+                    & (RawObjectORM.endpoint == RawRequestORM.endpoint)
+                    & (RawObjectORM.request_hash == RawRequestORM.request_hash)
+                    & (
+                        RawObjectORM.content_hash
+                        == RawRequestORM.current_content_hash
+                    ),
+                )
+                .order_by(
+                    RawRequestORM.source,
+                    RawRequestORM.endpoint,
+                    RawRequestORM.request_hash,
+                )
             )
             if source is not None:
                 query = query.where(RawRequestORM.source == source)
             if endpoint is not None:
                 query = query.where(RawRequestORM.endpoint == endpoint)
             records: list[RawPartitionRecord] = []
-            for request in session.scalars(query):
-                obj = session.get(
-                    RawObjectORM,
-                    (
-                        request.source,
-                        request.endpoint,
-                        request.request_hash,
-                        request.current_content_hash,
-                    ),
-                )
+            for request, obj in session.execute(query):
                 if obj is None:
                     _RepositoriesSupport._raise_repository_conflict(
                         "raw request head has no raw object"

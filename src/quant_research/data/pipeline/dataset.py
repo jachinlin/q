@@ -3161,6 +3161,7 @@ class DataPipeline:
                     f"no canonical data for {item.value}",
                 )
             records[item] = current
+            self._curated_store.verify_dataset(current)
             self._validate_log(
                 "validate.dataset_resolved",
                 scope=scope,

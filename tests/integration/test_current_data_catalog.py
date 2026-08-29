@@ -9,7 +9,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import event, inspect
 
 from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import CanonicalBatch, canonical_json_bytes
@@ -428,6 +428,58 @@ def test_canonical_commit_rejects_a_changed_raw_head_snapshot(tmp_path: Path) ->
 
     assert caught.value.detail.code == "DATA_CURATE_INPUT_CHANGED"
     assert repository.find_canonical_dataset(DatasetKind.STOCK_DAILY_BAR) is None
+    engine.dispose()
+
+
+def test_list_raw_partitions_loads_all_current_heads_with_one_select(
+    tmp_path: Path,
+) -> None:
+    """Raw 当前头批量读取不得退化为逐请求查询。"""
+    database = tmp_path / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    repository = MetadataRepository(engine)
+    for index in range(3):
+        request = {"date": f"2026-08-{index + 1:02d}"}
+        repository.register_raw_partition(
+            RawPartitionSpec(
+                source="tushare",
+                endpoint="daily",
+                request=request,
+                request_hash=hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest(),
+                content_hash=f"{index + 1:064x}",
+                data_path=tmp_path / f"raw-{index}.parquet",
+                manifest_path=tmp_path / f"manifest-{index}.json",
+                schema_fingerprint=SCHEMA_HASH,
+                row_count=index + 1,
+                retrieved_at=NOW,
+            )
+        )
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        records = repository.list_raw_partitions(
+            source="tushare", endpoint="daily"
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert len(records) == 3
+    assert len(statements) == 1
     engine.dispose()
 
 

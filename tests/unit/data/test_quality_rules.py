@@ -659,3 +659,26 @@ def test_quality_runner_records_fail_and_schema_dependency_skips() -> None:
     assert "canonical_schema" in (
         malformed_by_rule["required_value_null"].skip_reason or ""
     )
+
+
+def test_quality_runner_materializes_each_dataset_source_once() -> None:
+    """质量规则应复用单次物化结果，避免反复扫描同一 Parquet 数据集。"""
+    frame = _daily_bar()
+    executions = 0
+
+    def count_execution(batch: pl.DataFrame) -> pl.DataFrame:
+        nonlocal executions
+        executions += 1
+        return batch
+
+    source = frame.lazy().map_batches(
+        count_execution,
+        schema=frame.schema,
+        predicate_pushdown=False,
+        projection_pushdown=False,
+        slice_pushdown=False,
+    )
+
+    QualityRunner().evaluate({DatasetKind.STOCK_DAILY_BAR: (source,)})
+
+    assert executions == 1

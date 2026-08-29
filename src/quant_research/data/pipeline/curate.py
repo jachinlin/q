@@ -296,7 +296,6 @@ class CuratedPartitionStore:
             updated_at=datetime.now(UTC),
             expected_raw_heads=expected_raw_heads,
         )
-        self._cleanup_orphans(published.orphan_paths)
         if logger is not None:
             for event in events:
                 event["pointer_changed"] = published.changed
@@ -330,7 +329,6 @@ class CuratedPartitionStore:
                         },
                     },
                 )
-        self._cleanup_unreferenced(repository.list_canonical_datasets())
         return published.record
 
     def publish(
@@ -547,7 +545,6 @@ class CuratedPartitionStore:
             )
             record = published.record
             records[dataset.value] = record
-            self._cleanup_orphans(published.orphan_paths)
             frames_by_dataset[dataset] = tuple(
                 pl.scan_parquet(spec.path) for spec in specs
             )
@@ -578,12 +575,13 @@ class CuratedPartitionStore:
                             _CanonicalCurateSupport._partition_record_context(partition)
                             for partition in record.partitions
                         ],
-                        "orphan_paths": [str(path) for path in published.orphan_paths],
+                        "retained_unreferenced_paths": [
+                            str(path) for path in published.orphan_paths
+                        ],
                         "updated_at": record.updated_at.isoformat(),
                     },
                 )
         heartbeat()
-        self._cleanup_unreferenced(repository.list_canonical_datasets())
         return CuratedResult(records, frames_by_dataset)
 
     def read_dataset(self, record: CanonicalDatasetRecord) -> tuple[pl.DataFrame, ...]:
@@ -814,31 +812,6 @@ class CuratedPartitionStore:
             ),
             written_new,
         )
-
-    def _cleanup_orphans(self, paths: Sequence[Path]) -> None:
-        for path in paths:
-            try:
-                managed_path = validate_storage_path(self._root, path)
-                managed_path.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                # Windows can keep a Parquet file open while a LazyFrame is alive.
-                # A later Curate pass will make another cleanup attempt.
-                continue
-
-    def _cleanup_unreferenced(self, records: Iterable[CanonicalDatasetRecord]) -> None:
-        referenced = {
-            partition.path.resolve()
-            for record in records
-            for partition in record.partitions
-        }
-        for path in self._root.rglob("*.parquet"):
-            try:
-                resolved = path.resolve(strict=True)
-            except OSError:
-                continue
-            if resolved in referenced:
-                continue
-            self._cleanup_orphans((resolved,))
 
     def _verify_existing(
         self,

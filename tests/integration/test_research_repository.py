@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import polars as pl
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 from sqlalchemy import Engine
 
@@ -14,8 +16,11 @@ import quant_research.data.repository as repository_module
 from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.contracts import CanonicalBatch
 from quant_research.data.pipeline.curate import CuratedPartitionStore
+from quant_research.data.pipeline.dataset import DataPipeline
 from quant_research.data.quality.models import QualityRunSpec
+from quant_research.data.quality.runner import QualityRunner
 from quant_research.data.repository import CanonicalResearchRepository
+from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
 from quant_research.domain.errors import QuantError
 from quant_research.domain.identifiers import IndexId, InstrumentId
@@ -29,6 +34,7 @@ from quant_research.infrastructure.persistence.repositories import (
     DataCatalogState,
     MetadataRepository,
 )
+from quant_research.infrastructure.tushare.routing import TUSHARE_ROUTES
 
 _NOW = datetime(2026, 8, 11, tzinfo=UTC)
 
@@ -916,6 +922,121 @@ def test_repeated_read_reuses_verified_partition_lease(
         assert harness.repository.stocks().collect().height == 1
         assert harness.repository.stocks().collect().height == 1
         assert calls == 1
+    finally:
+        harness.close()
+
+
+def test_validate_rejects_quality_valid_partition_with_changed_bytes(
+    tmp_path: Path,
+) -> None:
+    """VALIDATE 必须把实际 Parquet 字节绑定到当前目录身份。"""
+    harness = _ResearchRepositoryHarness(tmp_path)
+    try:
+        partition = harness.record.partitions[0]
+        changed = harness._instrument_batch().frame.with_columns(
+            pl.lit("600001.SH").alias("instrument_id"),
+            pl.lit("600001").alias("symbol"),
+        )
+        pq.write_table(changed.to_arrow(), partition.path, compression="zstd")
+        pipeline = DataPipeline(
+            source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+            mapper=object(),  # type: ignore[arg-type]
+            calendar=object(),  # type: ignore[arg-type]
+            raw_store=RawPartitionStore(tmp_path / "raw"),
+            curated_store=harness.store,
+            repository=harness.metadata,
+            quality_runner=QualityRunner(),
+            routes=TUSHARE_ROUTES,
+        )
+
+        with pytest.raises(ValueError, match="integrity checks"):
+            pipeline.validate(DatasetKind.STOCK_MASTER)
+    finally:
+        harness.close()
+
+
+def test_lazy_bar_query_survives_canonical_pointer_change(tmp_path: Path) -> None:
+    """已返回的惰性查询必须继续读取发布时绑定的不可变文件。"""
+    harness = _ResearchRepositoryHarness(tmp_path)
+    try:
+        dataset = DatasetKind.STOCK_DAILY_BAR
+        instrument = (InstrumentId.parse("600000.SH"),)
+        query_date = date(2026, 8, 11)
+        old_record = harness.metadata.get_canonical_dataset(dataset)
+        old_path = old_record.partitions[0].path
+        lazy = harness.repository.stock_bars(instrument, query_date, query_date)
+        original = harness._daily_bar_batch()
+        changed = CanonicalBatch(
+            dataset,
+            original.frame.with_columns((pl.col("amount") + 1.0).alias("amount")),
+            ("9" * 64,),
+        )
+
+        harness.store.publish(
+            (changed,),
+            previous_datasets={dataset.value: old_record},
+            run_id="lazy-reader-pointer-change",
+            source="tushare",
+            start=query_date,
+            end=query_date,
+            repository=harness.metadata,
+        )
+
+        assert old_path.is_file()
+        assert lazy.collect().get_column("amount").to_list() == [12_000.0]
+    finally:
+        harness.close()
+
+
+def test_partition_lease_cache_verifies_each_physical_path(tmp_path: Path) -> None:
+    """相同内容身份位于不同路径时，每个物理路径仍须独立验证。"""
+    dataset = DatasetKind.STOCK_RISK_WARNING
+    store = CuratedPartitionStore(tmp_path / "canonical")
+    empty = pl.DataFrame(schema=CANONICAL_SCHEMAS[dataset].columns)
+    first, _ = store._publish_partition(dataset, "year=2006", empty)
+    second, _ = store._publish_partition(dataset, "year=2007", empty)
+    second.path.write_bytes(b"not parquet")
+    repository = CanonicalResearchRepository(
+        _UnusedCatalog(),
+        trusted_curated_root=store.root,
+    )
+
+    repository._partition_leases.acquire(
+        CanonicalPartitionRecord(
+            partition_key=first.partition_key,
+            content_hash=first.content_hash,
+            path=first.path,
+            schema_fingerprint=first.schema_fingerprint,
+            input_hash="1" * 64,
+            row_count=first.row_count,
+        ),
+        max_bytes=1024 * 1024,
+    )
+    with pytest.raises(ValueError, match="unavailable"):
+        repository._partition_leases.acquire(
+            CanonicalPartitionRecord(
+                partition_key=second.partition_key,
+                content_hash=second.content_hash,
+                path=second.path,
+                schema_fingerprint=second.schema_fingerprint,
+                input_hash="2" * 64,
+                row_count=second.row_count,
+            ),
+            max_bytes=1024 * 1024,
+        )
+
+
+def test_financial_query_remains_a_parquet_lazy_plan(tmp_path: Path) -> None:
+    """财务查询返回前不得先物化为内存 DataFrame。"""
+    harness = _FinancialRepositoryHarness(tmp_path)
+    try:
+        plan = harness.repository.stock_financial_indicators(
+            date(2026, 4, 30),
+            (InstrumentId.parse("600000.SH"),),
+        )
+
+        assert "Parquet SCAN" in plan.explain()
+        assert plan.select("roe").collect().get_column("roe").to_list() == [0.11]
     finally:
         harness.close()
 

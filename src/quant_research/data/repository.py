@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
 from pathlib import Path
-from typing import Never, Protocol, cast
+from typing import Never, Protocol
 from zoneinfo import ZoneInfo
 
-import duckdb
 import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 from sqlalchemy import Engine
 
 from quant_research.data.canonical.adjustments import _PriceAdjustmentEngine
-from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS, CanonicalSchema
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.storage.verified_files import open_verified_file
 from quant_research.domain.enums import DatasetKind, Severity
 from quant_research.domain.errors import ErrorDetail, QuantError
@@ -398,15 +397,15 @@ class CanonicalResearchRepository:
 
     def stocks(self) -> pl.LazyFrame:
         """读取股票。入参：无。返回值：股票帧。异常：门禁失败时抛出。"""
-        return self._read(DatasetKind.STOCK_MASTER, "TRUE", [])
+        return self._read(DatasetKind.STOCK_MASTER, pl.lit(True))
 
     def funds(self) -> pl.LazyFrame:
         """读取基金。入参：无。返回值：基金帧。异常：门禁失败时抛出。"""
-        return self._read(DatasetKind.FUND_MASTER, "TRUE", [])
+        return self._read(DatasetKind.FUND_MASTER, pl.lit(True))
 
     def indexes(self) -> pl.LazyFrame:
         """读取指数。入参：无。返回值：指数帧。异常：门禁失败时抛出。"""
-        return self._read(DatasetKind.INDEX_MASTER, "TRUE", [])
+        return self._read(DatasetKind.INDEX_MASTER, pl.lit(True))
 
     def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
         """读取指定闭区间内的交易日历。
@@ -423,8 +422,7 @@ class CanonicalResearchRepository:
             raise ValueError("start must not follow end")
         return self._read(
             DatasetKind.TRADE_CALENDAR,
-            "trade_date >= ? AND trade_date <= ?",
-            [start, end],
+            pl.col("trade_date").is_between(start, end, closed="both"),
         )
 
     def stock_bars(
@@ -458,7 +456,6 @@ class CanonicalResearchRepository:
     ) -> pl.LazyFrame:
         if start > end:
             raise ValueError("start must not follow end")
-        _, leases = self._verify_current_dataset(dataset)
         definition = CANONICAL_SCHEMAS[dataset]
         instrument_ids = [instrument.canonical() for instrument in instruments]
         scope = (
@@ -467,7 +464,7 @@ class CanonicalResearchRepository:
             else pl.lit(False)
         )
         return (
-            pl.scan_parquet([lease.path for lease in leases])
+            self._scan(dataset)
             .select(list(definition.columns))
             .filter(
                 scope
@@ -478,7 +475,6 @@ class CanonicalResearchRepository:
             )
             .cast(definition.columns)
             .sort(list(definition.sort_key))
-            .map_batches(self._partition_leases.retain(leases))
         )
 
     def _stock_adjustment_factors(
@@ -510,17 +506,14 @@ class CanonicalResearchRepository:
     ) -> pl.LazyFrame:
         if start > end:
             raise ValueError("start must not follow end")
-        predicates, parameters = self._instrument_predicate(instruments)
-        predicates.extend(
-            (
-                "trade_date <= ?",
-                "pit_usable = TRUE",
-                "available_at IS NOT NULL",
-                "available_at <= ?",
-            )
+        return self._read(
+            dataset,
+            self._instrument_scope(instruments)
+            & (pl.col("trade_date") <= end)
+            & pl.col("pit_usable")
+            & pl.col("available_at").is_not_null()
+            & (pl.col("available_at") <= self._shanghai_day_end_utc(end)),
         )
-        parameters.extend((end, self._shanghai_day_end_utc(end)))
-        return self._read(dataset, " AND ".join(predicates), parameters)
 
     def adjusted_stock_bars(
         self,
@@ -593,12 +586,11 @@ class CanonicalResearchRepository:
         """
         if start > end:
             raise ValueError("start must not follow end")
-        _, leases = self._verify_current_dataset(DatasetKind.INDEX_DAILY_BAR)
         definition = CANONICAL_SCHEMAS[DatasetKind.INDEX_DAILY_BAR]
         index_ids = [index.canonical() for index in indexes]
         scope = pl.col("index_id").is_in(index_ids) if index_ids else pl.lit(False)
         return (
-            pl.scan_parquet([lease.path for lease in leases])
+            self._scan(DatasetKind.INDEX_DAILY_BAR)
             .select(list(definition.columns))
             .filter(
                 scope
@@ -609,7 +601,6 @@ class CanonicalResearchRepository:
             )
             .cast(definition.columns)
             .sort(list(definition.sort_key))
-            .map_batches(self._partition_leases.retain(leases))
         )
 
     def stock_daily_basics(
@@ -631,7 +622,6 @@ class CanonicalResearchRepository:
         """
         if start > end:
             raise ValueError("start must not follow end")
-        _, leases = self._verify_current_dataset(DatasetKind.STOCK_DAILY_BASIC)
         definition = CANONICAL_SCHEMAS[DatasetKind.STOCK_DAILY_BASIC]
         instrument_ids = [instrument.canonical() for instrument in instruments]
         scope = (
@@ -640,7 +630,7 @@ class CanonicalResearchRepository:
             else pl.lit(False)
         )
         return (
-            pl.scan_parquet([lease.path for lease in leases])
+            self._scan(DatasetKind.STOCK_DAILY_BASIC)
             .select(list(definition.columns))
             .filter(
                 scope
@@ -651,7 +641,6 @@ class CanonicalResearchRepository:
             )
             .cast(definition.columns)
             .sort(list(definition.sort_key))
-            .map_batches(self._partition_leases.retain(leases))
         )
 
     def stock_financial_indicators(
@@ -660,26 +649,11 @@ class CanonicalResearchRepository:
         instruments: Sequence[InstrumentId] | None = None,
     ) -> pl.LazyFrame:
         """读取财务指标。入参：观察日和股票。返回值：指标帧。异常：门禁失败时抛出。"""
-        predicates, parameters = self._instrument_predicate(instruments)
-        predicates.extend(
-            ("pit_usable = TRUE", "available_at IS NOT NULL", "available_at <= ?")
-        )
-        parameters.append(self._shanghai_day_end_utc(as_of))
-        definition = CANONICAL_SCHEMAS[DatasetKind.STOCK_FINANCIAL_INDICATOR]
-        columns = self._columns(definition)
-        query = (
-            "SELECT "
-            + columns
-            + " FROM (SELECT "
-            + columns
-            + ", ROW_NUMBER() OVER (PARTITION BY instrument_id, report_period "
-            "ORDER BY available_at DESC, revision DESC) AS _pit_rank FROM data WHERE "
-            + " AND ".join(predicates)
-            + ") WHERE _pit_rank = 1 ORDER BY "
-            + self._order(definition)
-        )
-        return self._read_query(
-            DatasetKind.STOCK_FINANCIAL_INDICATOR, query, parameters
+        return self._latest_visible_revisions(
+            DatasetKind.STOCK_FINANCIAL_INDICATOR,
+            as_of,
+            instruments,
+            ("instrument_id", "report_period"),
         )
 
     def stock_income_statements(
@@ -754,32 +728,30 @@ class CanonicalResearchRepository:
         instruments: Sequence[InstrumentId] | None,
         business_key: tuple[str, ...],
     ) -> pl.LazyFrame:
-        predicates, parameters = self._instrument_predicate(instruments)
-        predicates.extend(
-            ("pit_usable = TRUE", "available_at IS NOT NULL", "available_at <= ?")
-        )
-        parameters.append(self._shanghai_day_end_utc(as_of))
         definition = CANONICAL_SCHEMAS[dataset]
-        columns = self._columns(definition)
-        partition = ", ".join(self._quoted(item) for item in business_key)
-        query = (
-            "SELECT "
-            + columns
-            + " FROM (SELECT "
-            + columns
-            + ", ROW_NUMBER() OVER (PARTITION BY "
-            + partition
-            + " ORDER BY available_at DESC, revision DESC) AS _pit_rank "
-            + "FROM data WHERE "
-            + " AND ".join(predicates)
-            + ") WHERE _pit_rank = 1 ORDER BY "
-            + self._order(definition)
+        ranking = [*business_key, "available_at", "revision"]
+        return (
+            self._scan(dataset)
+            .select(list(definition.columns))
+            .filter(
+                self._instrument_scope(instruments)
+                & pl.col("pit_usable")
+                & pl.col("available_at").is_not_null()
+                & (pl.col("available_at") <= self._shanghai_day_end_utc(as_of))
+            )
+            .sort(ranking)
+            .unique(
+                subset=list(business_key),
+                keep="last",
+                maintain_order=True,
+            )
+            .cast(definition.columns)
+            .sort(list(definition.sort_key))
         )
-        return self._read_query(dataset, query, parameters)
 
     def industry_catalog(self) -> pl.LazyFrame:
         """读取行业目录。入参：无。返回值：目录帧。异常：门禁失败时抛出。"""
-        return self._read(DatasetKind.INDUSTRY_CATALOG, "TRUE", [])
+        return self._read(DatasetKind.INDUSTRY_CATALOG, pl.lit(True))
 
     def industry_memberships_on_dates(
         self,
@@ -792,62 +764,57 @@ class CanonicalResearchRepository:
         requested_dates = tuple(sorted(set(dates)))
         if not requested_dates:
             return pl.DataFrame(schema=output_schema).lazy()
-        predicates, instrument_parameters = self._instrument_predicate(instruments)
-        predicates.extend(
-            (
-                "pit_usable = TRUE",
-                "available_at IS NOT NULL",
-                "in_date <= requested.query_date",
-                "in_available_at <= requested.cutoff",
-                (
-                    "(out_date IS NULL OR out_date > requested.query_date "
-                    "OR out_available_at IS NULL "
-                    "OR out_available_at > requested.cutoff)"
+        requested = pl.DataFrame(
+            {
+                "query_date": requested_dates,
+                "cutoff": tuple(
+                    self._shanghai_day_end_utc(value) for value in requested_dates
                 ),
+            },
+            schema={
+                "query_date": pl.Date,
+                "cutoff": pl.Datetime("us", "UTC"),
+            },
+        )
+        ranking = (
+            "query_date",
+            "instrument_id",
+            "in_date",
+            "in_available_at",
+            "available_at",
+            "ingested_at",
+            "level1_code",
+        )
+        return (
+            self._scan(DatasetKind.INDUSTRY_MEMBERSHIP)
+            .select(list(definition.columns))
+            .join(requested.lazy(), how="cross")
+            .filter(
+                self._instrument_scope(instruments)
+                & pl.col("pit_usable")
+                & pl.col("available_at").is_not_null()
+                & (pl.col("in_date") <= pl.col("query_date"))
+                & (pl.col("in_available_at") <= pl.col("cutoff"))
+                & (
+                    pl.col("out_date").is_null()
+                    | (pl.col("out_date") > pl.col("query_date"))
+                    | pl.col("out_available_at").is_null()
+                    | (pl.col("out_available_at") > pl.col("cutoff"))
+                )
             )
+            .sort(
+                ranking,
+                descending=(False, False, False, False, False, False, True),
+            )
+            .unique(
+                subset=["query_date", "instrument_id"],
+                keep="last",
+                maintain_order=True,
+            )
+            .select("query_date", *definition.columns.names())
+            .cast(output_schema)
+            .sort("query_date", "instrument_id", "level1_code")
         )
-        values = ", ".join("(?, ?)" for _ in requested_dates)
-        date_parameters: list[object] = []
-        for query_date in requested_dates:
-            date_parameters.extend((query_date, self._shanghai_day_end_utc(query_date)))
-        columns = self._columns(definition)
-        query = (
-            "SELECT query_date, "
-            + columns
-            + " FROM (SELECT requested.query_date AS query_date, "
-            + columns
-            + ", ROW_NUMBER() OVER ("
-            + "PARTITION BY requested.query_date, instrument_id "
-            + "ORDER BY in_date DESC, in_available_at DESC, "
-            + "available_at DESC, ingested_at DESC, level1_code ASC"
-            + ") AS _state_rank FROM data CROSS JOIN requested WHERE "
-            + " AND ".join(predicates)
-            + ") WHERE _state_rank = 1 "
-            + "ORDER BY query_date, instrument_id, level1_code"
-        )
-        _, leases = self._verify_current_dataset(DatasetKind.INDUSTRY_MEMBERSHIP)
-        source_query, source_parameters = self._parquet_sources(
-            [lease.path for lease in leases]
-        )
-        connection = duckdb.connect(":memory:")
-        try:
-            result = connection.execute(
-                "WITH data AS ("
-                + source_query
-                + "), requested(query_date, cutoff) AS (VALUES "
-                + values
-                + ") "
-                + query,
-                [
-                    *source_parameters,
-                    *date_parameters,
-                    *instrument_parameters,
-                ],
-            ).to_arrow_table()
-        finally:
-            connection.close()
-        frame = cast(pl.DataFrame, pl.from_arrow(result))
-        return frame.cast(output_schema).lazy()
 
     def stock_suspensions(
         self,
@@ -880,60 +847,33 @@ class CanonicalResearchRepository:
     ) -> pl.LazyFrame:
         if start > end:
             raise ValueError("start must not follow end")
-        predicates, parameters = self._instrument_predicate(instruments)
-        predicates.extend(
-            (
-                "trade_date >= ?",
-                "trade_date <= ?",
-                "pit_usable = TRUE",
-                "available_at IS NOT NULL",
-                "available_at <= ?",
-            )
-        )
-        parameters.extend((start, end, self._shanghai_day_end_utc(end)))
         return self._read(
             dataset,
-            " AND ".join(predicates),
-            parameters,
+            self._instrument_scope(instruments)
+            & pl.col("trade_date").is_between(start, end, closed="both")
+            & pl.col("pit_usable")
+            & pl.col("available_at").is_not_null()
+            & (pl.col("available_at") <= self._shanghai_day_end_utc(end)),
         )
 
     def _read(
         self,
         dataset: DatasetKind,
-        predicate: str,
-        parameters: Sequence[object],
+        predicate: pl.Expr,
     ) -> pl.LazyFrame:
         definition = CANONICAL_SCHEMAS[dataset]
-        query = (
-            "SELECT "
-            + self._columns(definition)
-            + " FROM data WHERE "
-            + predicate
-            + " ORDER BY "
-            + self._order(definition)
+        return (
+            self._scan(dataset)
+            .select(list(definition.columns))
+            .filter(predicate)
+            .cast(definition.columns)
+            .sort(list(definition.sort_key))
         )
-        return self._read_query(dataset, query, parameters)
 
-    def _read_query(
-        self,
-        dataset: DatasetKind,
-        query: str,
-        parameters: Sequence[object],
-    ) -> pl.LazyFrame:
+    def _scan(self, dataset: DatasetKind) -> pl.LazyFrame:
+        """返回绑定当前已验证内容寻址路径的真正惰性 Parquet 扫描。"""
         _, leases = self._verify_current_dataset(dataset)
-        source_query, source_parameters = self._parquet_sources(
-            [lease.path for lease in leases]
-        )
-        connection = duckdb.connect(":memory:")
-        try:
-            result = connection.execute(
-                "WITH data AS (" + source_query + ") " + query,
-                [*source_parameters, *parameters],
-            ).to_arrow_table()
-        finally:
-            connection.close()
-        frame = cast(pl.DataFrame, pl.from_arrow(result))
-        return frame.cast(CANONICAL_SCHEMAS[dataset].columns).lazy()
+        return pl.scan_parquet([lease.path for lease in leases])
 
     def _dataset_record(self, dataset: DatasetKind) -> CanonicalDatasetRecord:
         return self._current_dataset_record(self._catalog, dataset)
@@ -971,54 +911,14 @@ class CanonicalResearchRepository:
         cls._validate_catalog_partition_identities(dataset, record)
         return record
 
-    @classmethod
-    def _instrument_predicate(
-        cls,
+    @staticmethod
+    def _instrument_scope(
         instruments: Sequence[InstrumentId] | None,
-    ) -> tuple[list[str], list[object]]:
+    ) -> pl.Expr:
         if instruments is None:
-            return [], []
-        return cls._value_predicate(
-            "instrument_id", [item.canonical() for item in instruments]
-        )
-
-    @classmethod
-    def _value_predicate(
-        cls, column: str, values: Sequence[str]
-    ) -> tuple[list[str], list[object]]:
-        cls._validate_column(column)
-        if not values:
-            return ["FALSE"], []
-        return [column + " IN (" + ", ".join("?" for _ in values) + ")"], list(values)
-
-    @staticmethod
-    def _parquet_sources(paths: Sequence[Path]) -> tuple[str, list[object]]:
-        if not paths:
-            raise ValueError("canonical dataset must contain at least one partition")
-        return (
-            " UNION ALL ".join("SELECT * FROM read_parquet(?)" for _ in paths),
-            [path.as_posix() for path in paths],
-        )
-
-    @classmethod
-    def _columns(cls, definition: CanonicalSchema) -> str:
-        return ", ".join(cls._quoted(column) for column in definition.columns)
-
-    @classmethod
-    def _order(cls, definition: CanonicalSchema) -> str:
-        return ", ".join(cls._quoted(column) for column in definition.sort_key)
-
-    @classmethod
-    def _quoted(cls, column: str) -> str:
-        cls._validate_column(column)
-        return f'"{column}"'
-
-    @staticmethod
-    def _validate_column(column: str) -> None:
-        if not any(
-            column in definition.columns for definition in CANONICAL_SCHEMAS.values()
-        ):
-            raise ValueError("column is not in the canonical schema allowlist")
+            return pl.lit(True)
+        values = [item.canonical() for item in instruments]
+        return pl.col("instrument_id").is_in(values) if values else pl.lit(False)
 
     @staticmethod
     def _shanghai_day_end_utc(value: date) -> datetime:
@@ -1147,7 +1047,9 @@ class _CanonicalPartitionLeasePool:
     def __init__(self, verifier: _CanonicalPartitionVerifier) -> None:
         self._lock = threading.Lock()
         self._verifier = verifier
-        self._leases: dict[tuple[str, str, int], _CanonicalPartitionLease] = {}
+        self._leases: dict[
+            tuple[Path, str, str, int], _CanonicalPartitionLease
+        ] = {}
 
     def acquire(
         self,
@@ -1156,6 +1058,7 @@ class _CanonicalPartitionLeasePool:
         max_bytes: int,
     ) -> _CanonicalPartitionLease:
         key = (
+            partition.path.absolute(),
             partition.content_hash,
             partition.schema_fingerprint,
             partition.row_count,
@@ -1174,16 +1077,3 @@ class _CanonicalPartitionLeasePool:
                     "canonical partition exceeds the configured size limit"
                 )
             return lease
-
-    @staticmethod
-    def retain(
-        leases: tuple[_CanonicalPartitionLease, ...],
-    ) -> Callable[[pl.DataFrame], pl.DataFrame]:
-        """Keep verified mirror pointers bound to every execution of the lazy plan."""
-
-        def retain(frame: pl.DataFrame) -> pl.DataFrame:
-            if not leases:
-                raise ValueError("daily-bar dataset must contain a partition")
-            return frame
-
-        return retain

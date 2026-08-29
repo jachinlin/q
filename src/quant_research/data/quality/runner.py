@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import polars as pl
 
+from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
 from quant_research.data.quality.catalog import (
     QUALITY_RULE_CATALOG,
     QualityRuleDefinition,
@@ -18,6 +19,7 @@ from quant_research.data.quality.models import (
     QualityRuleStatus,
 )
 from quant_research.data.quality.rules import (
+    CanonicalFrame,
     CanonicalPartitions,
     canonical_conforming_partitions,
     canonical_schema_issues,
@@ -61,22 +63,57 @@ class QualityRunner:
         异常：
             实现可传播参数校验、供应商访问、目录状态或文件完整性异常。
         """
-        heartbeat()
-        issues = required_dataset_issues(inputs, frozenset(inputs))
-        issues.extend(canonical_schema_issues(inputs))
+        issues = canonical_schema_issues(inputs)
         conforming_inputs = canonical_conforming_partitions(inputs)
-        for rule in (
+        evidence: dict[
+            tuple[DatasetKind, str], tuple[QualityJsonValue, QualityJsonValue]
+        ] = {}
+        coverage_inputs: dict[DatasetKind, tuple[pl.DataFrame, ...]] = {}
+        local_rules = (
             primary_key_issues,
             required_value_issues,
             instrument_identifier_issues,
             daily_bar_value_issues,
             dividend_event_issues,
-            coverage_issues,
             financial_availability_issues,
             industry_state_issues,
-        ):
+        )
+        for dataset in sorted(inputs, key=lambda item: item.value):
             heartbeat()
-            issues.extend(rule(conforming_inputs))
+            materialized = self._materialize(inputs[dataset])
+            materialized_input = {dataset: materialized}
+            issues.extend(
+                required_dataset_issues(materialized_input, frozenset({dataset}))
+            )
+            evidence[(dataset, "required_dataset_missing")] = (
+                len(materialized),
+                1,
+            )
+            evidence[(dataset, "required_dataset_empty")] = (
+                sum(frame.height for frame in materialized),
+                1,
+            )
+            if dataset is DatasetKind.TRADE_CALENDAR:
+                trading_days = sum(
+                    int(frame.get_column("is_trading_day").fill_null(False).sum())
+                    for frame in materialized
+                    if "is_trading_day" in frame.columns
+                )
+                evidence[(dataset, "trading_window_empty")] = (trading_days, 1)
+            conforming = tuple(
+                frame
+                for frame in materialized
+                if frame.schema == CANONICAL_SCHEMAS[dataset].columns
+            )
+            local_input = {dataset: conforming}
+            for rule in local_rules:
+                heartbeat()
+                issues.extend(rule(local_input))
+            coverage = self._coverage_projection(dataset, conforming)
+            if coverage:
+                coverage_inputs[dataset] = coverage
+        heartbeat()
+        issues.extend(coverage_issues(coverage_inputs))
         heartbeat()
         issues.extend(cross_partition_schema_issues(inputs))
         heartbeat()
@@ -84,7 +121,12 @@ class QualityRunner:
             sorted(issues, key=lambda issue: (issue.dataset.value, issue.rule_id))
         )
         return QualityEvaluation(
-            rule_results=self._rule_results(inputs, ordered_issues),
+            rule_results=self._rule_results(
+                inputs,
+                ordered_issues,
+                evidence=evidence,
+                conforming_datasets=frozenset(conforming_inputs),
+            ),
             issues=ordered_issues,
         )
 
@@ -92,6 +134,11 @@ class QualityRunner:
     def _rule_results(
         inputs: CanonicalPartitions,
         issues: tuple[QualityIssue, ...],
+        *,
+        evidence: Mapping[
+            tuple[DatasetKind, str], tuple[QualityJsonValue, QualityJsonValue]
+        ],
+        conforming_datasets: frozenset[DatasetKind],
     ) -> tuple[QualityRuleResult, ...]:
         """把问题集合扩展成每个适用规则与数据集的完整结果。"""
         issue_by_key = {(issue.dataset, issue.rule_id): issue for issue in issues}
@@ -104,7 +151,10 @@ class QualityRunner:
                     continue
                 issue = issue_by_key.get((dataset, definition.rule_id))
                 skip_reason = QualityRunner._skip_reason(
-                    definition, dataset, inputs, status_by_key
+                    definition,
+                    dataset,
+                    conforming_datasets,
+                    status_by_key,
                 )
                 status = (
                     QualityRuleStatus.FAIL
@@ -117,7 +167,10 @@ class QualityRunner:
                     (None, None)
                     if status is QualityRuleStatus.SKIPPED
                     else QualityRunner._evidence(
-                        definition.rule_id, dataset, inputs, issue
+                        definition.rule_id,
+                        dataset,
+                        issue,
+                        evidence,
                     )
                 )
                 result = QualityRuleResult(
@@ -141,7 +194,7 @@ class QualityRunner:
     def _skip_reason(
         definition: QualityRuleDefinition,
         dataset: DatasetKind,
-        inputs: CanonicalPartitions,
+        conforming_datasets: frozenset[DatasetKind],
         statuses: dict[tuple[DatasetKind, str], QualityRuleStatus],
     ) -> str | None:
         failed_prerequisites = tuple(
@@ -154,7 +207,7 @@ class QualityRunner:
         missing_datasets = tuple(
             item.value
             for item in definition.prerequisite_datasets
-            if item not in inputs or item not in canonical_conforming_partitions(inputs)
+            if item not in conforming_datasets
         )
         if missing_datasets:
             return "缺少可用依赖数据集：" + ", ".join(missing_datasets)
@@ -164,40 +217,41 @@ class QualityRunner:
     def _evidence(
         rule_id: str,
         dataset: DatasetKind,
-        inputs: CanonicalPartitions,
         issue: QualityIssue | None,
+        evidence: Mapping[
+            tuple[DatasetKind, str], tuple[QualityJsonValue, QualityJsonValue]
+        ],
     ) -> tuple[QualityJsonValue, QualityJsonValue]:
         if issue is not None:
             return issue.actual, issue.threshold
-        partitions = inputs.get(dataset, ())
-        if rule_id == "required_dataset_missing":
-            return len(partitions), 1
-        if rule_id == "required_dataset_empty":
-            rows = 0
-            for partition_frame in partitions:
-                lazy = (
-                    partition_frame.lazy()
-                    if isinstance(partition_frame, pl.DataFrame)
-                    else partition_frame
-                )
-                rows += int(lazy.select(pl.len()).collect().item())
-            return rows, 1
-        if rule_id == "trading_window_empty":
-            conforming_partitions = canonical_conforming_partitions(inputs).get(
-                dataset, ()
-            )
-            count = 0
-            for partition in conforming_partitions:
-                lazy = (
-                    partition.lazy()
-                    if isinstance(partition, pl.DataFrame)
-                    else partition
-                )
-                count += int(
-                    lazy.filter(pl.col("is_trading_day"))
-                    .select(pl.len())
-                    .collect()
-                    .item()
-                )
-            return count, 1
-        return 0, 0
+        return evidence.get((dataset, rule_id), (0, 0))
+
+    @staticmethod
+    def _materialize(
+        partitions: Sequence[CanonicalFrame],
+    ) -> tuple[pl.DataFrame, ...]:
+        """每个质量运行只从物理分区收集一次数据。"""
+        lazy = tuple(
+            frame.lazy() if isinstance(frame, pl.DataFrame) else frame
+            for frame in partitions
+        )
+        if not lazy:
+            return ()
+        return tuple(pl.collect_all(lazy))
+
+    @staticmethod
+    def _coverage_projection(
+        dataset: DatasetKind,
+        partitions: Sequence[pl.DataFrame],
+    ) -> tuple[pl.DataFrame, ...]:
+        """保留跨数据集覆盖规则需要的小型去重投影。"""
+        columns = {
+            DatasetKind.STOCK_DAILY_BAR: ("trade_date", "instrument_id"),
+            DatasetKind.FUND_DAILY_BAR: ("instrument_id",),
+            DatasetKind.TRADE_CALENDAR: ("trade_date", "is_trading_day"),
+            DatasetKind.STOCK_MASTER: ("instrument_id",),
+            DatasetKind.FUND_MASTER: ("instrument_id",),
+        }.get(dataset)
+        if columns is None:
+            return ()
+        return tuple(frame.select(columns).unique() for frame in partitions)
