@@ -615,9 +615,9 @@ VALIDATE → UNIVERSE → FACTOR_COMPUTE → BACKTEST → ANALYTICS → ARTIFACT
 
 `ANALYTICS` 阶段调用分析层，从回测产物（nav/holdings/fills/costs）计算绩效（累计/年化收益、波动、
 Sharpe/Sortino/Calmar、最大回撤与恢复、IR、beta/alpha）、交易质量、风险与暴露、归因（期间/风格/个股；
-多空分腿与 gross/net 敞口为 P3b-2）。因子研究则计算双标签质量、IC/HAC、分层、单调性、
-毛多空、稳定性、换手、日频成本代理与相关性
-（见[总体设计](design.md) `§5.7-5.8`）。全部统计公式字面量 oracle；首日 0 收益口径明确
+多空分腿与 gross/net 敞口为 P3b-2）。独立因子研究不进入实验的 `ANALYTICS` 阶段，其双标签、
+IC/HAC、分层、单调性、毛多空、换手、成本代理与相关性口径见
+[因子研究与分析设计](factor-analysis-design.md)。全部统计公式使用字面量 oracle；首日 0 收益口径明确
 （见[总体设计](design.md) `§8.4`、[实现级细化](implemention.md) `§5.8`）。
 
 ### 4.9 防过拟合治理（保留）
@@ -648,7 +648,7 @@ EXPERIMENT_STATE_CONFLICT 乐观并发状态冲突
 
 ```text
 src/quant_research/experiments/
-├── models.py      # Experiment/Run、治理、两种判别式 RunConfig、阶段图
+├── models.py      # Experiment/Run、治理、策略回测 RunConfig、阶段图
 ├── config.py      # 严格实验与 Run YAML 解析、规范化和配置哈希
 ├── runner.py      # 唯一 EXPERIMENT_RUN handler 与 CAS 生命周期
 └── statistics.py  # Bonferroni / BH-FDR 多重检验校正
@@ -682,13 +682,13 @@ bootstrap → application → experiments → strategies → {alpha,risk,costs,p
 - **阶段**：失败/取消不留半成品；`SUCCEEDED` 前产物已落地。
 - **指标 oracle**：Sharpe/Sortino/Calmar/回撤/IR/beta；首日 0 口径；undefined 显式记录。
 - **治理**：`uses_test_region` 标记、test 预算计数、多重检验记账。
-- **kind 复用**：FACTOR\_STUDY 与 STRATEGY\_BACKTEST 共用同一 runner。
+- **能力边界**：实验 runner 只处理 `EXPERIMENT_RUN`；独立因子研究使用 `FACTOR_STUDY` 任务处理器。
 
 ### 4.16 完成定义
 
-> 因子研究与策略回测共享同一 `Experiment→Run` 追踪主脊与比较视图；每阶段前后校验数据版本
-> （运行内一致性）；产物原子发布、`SUCCEEDED` 前落地；绩效指标字面量 oracle；样本外使用与
-> 试验次数可审计。
+> 策略回测使用 `Experiment→Run` 追踪主脊与比较视图；每阶段前后校验数据身份（运行内一致性）；
+> 产物原子发布、`SUCCEEDED` 前落地；绩效指标使用字面量 oracle；样本外使用与试验次数可审计。
+> 因子研究使用独立 `FactorStudy` 主脊，不进入本完成定义。
 
 ***
 
@@ -962,7 +962,9 @@ long_weight/target_tolerance`，不伪装成 Alpha 因子组合。
 - [股票多因子](../../configs/experiments/examples/multifactor.yaml)
 - [ETF 轮动](../../configs/experiments/examples/etf_rotation.yaml)
 - [双均线趋势](../../configs/experiments/examples/dual_ma_trend.yaml)
-- [独立因子研究](../../configs/factor_studies/examples/factor_study.yaml)
+
+独立因子研究使用另一套扁平配置和生命周期，示例见
+[因子研究配置](../../configs/factor_studies/examples/factor_study.yaml)。
 
 ### 5.7 CLI 与 HTTP
 
@@ -998,12 +1000,15 @@ GET  /api/v1/runs/{run_id}/artifacts/{artifact_type}?page=1&page_size=100
 
 ### 5.8 Dashboard
 
-- `/experiments`：统一列表，展示 kind、最新 Run 状态、Run/TEST 使用次数和 baseline。
-- `/experiments/new`：三个策略模板和因子模板；后端组件 JSON Schema 是字段与能力规则的唯一来源，
+- `/experiments`：策略实验列表，展示最新 Run 状态、Run/TEST 使用次数和 baseline。
+- `/experiments/new`：三个策略模板；后端组件 JSON Schema 是字段与能力规则的唯一来源，
   组件选择与 YAML 双向同步，提交前必须由后端规范化校验。
 - `/experiments/:experimentId`：协议、Run 时间线、派生 Run、比较、baseline/mark、取消、重试以及
-  信号/持仓/成交/成本/绩效或覆盖率/IC/相关性/显著性和 Manifest。
-- `/tasks`：通用运行中心，以 `subject_kind=EXPERIMENT_RUN, subject_id=run_id` 关联实验任务。
+  信号、持仓、成交、成本、绩效、归因和 Manifest。
+- `/factor-studies`、`/factor-studies/new` 和 `/factor-studies/:studyId`：独立因子研究工作台、创建页与
+  详情页，具体契约见[因子研究与分析设计](factor-analysis-design.md)。
+- `/tasks`：通用运行中心；策略任务使用 `subject_kind=EXPERIMENT_RUN`，因子研究任务使用
+  `subject_kind=FACTOR_STUDY`。
 
 旧 `/research`、`/factors`、`/api/v1/research/*`、`quant research` 和 `quant components` 不存在。
 
@@ -1012,4 +1017,5 @@ GET  /api/v1/runs/{run_id}/artifacts/{artifact_type}?page=1&page_size=100
 Alembic `0007_experiment_runs` 删除旧 `research_family*`、`research_variant`、旧 research/factor study
 元数据，创建 `experiment/experiment_tag/run/run_tag/run_metric/run_artifact/audit_event` 并把任务关联统一为
 `subject_kind/subject_id`。Raw、Canonical、质量、数据目录和数据任务表及数据不变。旧研究产物文件不由
-迁移删除，但不再登记、读取或展示。
+迁移删除，但不再登记、读取或展示。后续 `0008_independent_factor_studies` 删除实验中的旧因子 kind，
+并创建当前独立 `factor_study*` 表；它不恢复旧记录或旧产物。
