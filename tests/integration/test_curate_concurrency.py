@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import polars as pl
 import pyarrow as pa  # type: ignore[import-untyped]
 
-from quant_research.data.contracts import PublishedPartition, RawBatch
+from quant_research.data.contracts import JsonValue, PublishedPartition, RawBatch
 from quant_research.data.pipeline.curate import CuratedPartitionStore
 from quant_research.data.pipeline.dataset import DataPipeline
+from quant_research.data.quality.models import QualityRunSpec
 from quant_research.data.quality.runner import QualityRunner
+from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
+from quant_research.domain.identifiers import InstrumentId
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
@@ -89,21 +93,24 @@ def _register_raw(
     repository: MetadataRepository,
     *,
     endpoint: str,
-    row: dict[str, object],
+    row: dict[str, JsonValue] | None = None,
+    rows: tuple[dict[str, JsonValue], ...] = (),
     request_discriminator: str | None = None,
+    retrieved_at: datetime = datetime(2026, 8, 27, tzinfo=UTC),
 ) -> None:
     fields = _FIELDS[endpoint]
     request = {"endpoint": endpoint, "fields": ",".join(fields)}
     if request_discriminator is not None:
         request["scope"] = request_discriminator
+    payload_rows = rows or (() if row is None else (row,))
     published = raw_store.publish(
         RawBatch(
             source="tushare",
             endpoint=endpoint,
             request=request,
-            retrieved_at=datetime(2026, 8, 27, tzinfo=UTC),
+            retrieved_at=retrieved_at,
             schema=fields,
-            rows=(dict.fromkeys(fields) | row,),
+            rows=tuple(dict.fromkeys(fields) | item for item in payload_rows),
         )
     )
     repository.register_raw_partition(
@@ -160,7 +167,7 @@ def test_curate_builds_datasets_concurrently_and_publishes_serially(
     )
     datasets = (DatasetKind.STOCK_MASTER, DatasetKind.FUND_MASTER)
     pipeline = DataPipeline(
-        source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+        source=SimpleNamespace(provider="tushare"),
         mapper=_ConcurrentMapper(),
         calendar=object(),  # type: ignore[arg-type]
         raw_store=raw_store,
@@ -189,7 +196,7 @@ def test_curate_builds_datasets_concurrently_and_publishes_serially(
     assert raw_store.read_calls == 2
 
     retry = DataPipeline(
-        source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+        source=SimpleNamespace(provider="tushare"),
         mapper=TushareMapper(),
         calendar=object(),  # type: ignore[arg-type]
         raw_store=raw_store,
@@ -252,7 +259,7 @@ def test_curate_content_is_identical_at_one_four_and_eight_workers(
         )
         datasets = (DatasetKind.STOCK_MASTER, DatasetKind.FUND_MASTER)
         results = DataPipeline(
-            source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+            source=SimpleNamespace(provider="tushare"),
             mapper=TushareMapper(),
             calendar=object(),  # type: ignore[arg-type]
             raw_store=raw_store,
@@ -271,6 +278,124 @@ def test_curate_content_is_identical_at_one_four_and_eight_workers(
         return hashes
 
     assert build(1) == build(4) == build(8)
+
+
+def test_industry_curate_replays_raw_history_when_snapshot_content_changes(
+    tmp_path: Path,
+) -> None:
+    """同行业切片变化时，未变化成员仍须保留首次可见证据。"""
+    database = tmp_path / "state" / "quant.db"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    repository = MetadataRepository(engine)
+    raw_store = RawPartitionStore(tmp_path / "raw")
+    curated_store = CuratedPartitionStore(tmp_path / "canonical")
+    entered_at = datetime(2024, 1, 1, tzinfo=UTC)
+    refreshed_at = datetime(2025, 1, 1, tzinfo=UTC)
+    target: dict[str, JsonValue] = {
+        "l1_code": "801010.SI",
+        "l1_name": "农林牧渔",
+        "ts_code": "600000.SH",
+        "name": "浦发银行",
+        "in_date": "20200101",
+        "is_new": "Y",
+    }
+    _register_raw(
+        raw_store,
+        repository,
+        endpoint="index_member_all",
+        request_discriminator="801010.SI-Y",
+        rows=(target,),
+        retrieved_at=entered_at,
+    )
+    pipeline = DataPipeline(
+        source=SimpleNamespace(provider="tushare"),
+        mapper=TushareMapper(),
+        calendar=object(),  # type: ignore[arg-type]
+        raw_store=raw_store,
+        curated_store=curated_store,
+        repository=repository,
+        quality_runner=QualityRunner(),
+        routes=TUSHARE_ROUTES,
+        max_concurrent_curate_datasets=1,
+    )
+
+    def validated_repository(validated_at: datetime) -> CanonicalResearchRepository:
+        state = repository.catalog_state()
+        records = repository.list_canonical_datasets()
+        quality = repository.register_quality_run(
+            QualityRunSpec(
+                dataset_hashes={
+                    record.dataset.value: record.content_hash for record in records
+                },
+                input_hash=state.catalog_hash,
+                scope="ALL",
+                started_at=validated_at,
+                completed_at=validated_at,
+                issues=(),
+            )
+        )
+        repository.mark_catalog_validated(quality.id, validated_at=validated_at)
+        return CanonicalResearchRepository(
+            repository,
+            trusted_curated_root=curated_store.root,
+        )
+
+    first = pipeline._curate_datasets(
+        (DatasetKind.INDUSTRY_MEMBERSHIP,),
+        windows={DatasetKind.INDUSTRY_MEMBERSHIP: (None, None)},
+        observer=None,
+    )
+    query_date = date(2024, 6, 30)
+    instrument = (InstrumentId.parse("600000.SH"),)
+    before_refresh = validated_repository(entered_at).industry_memberships_on_dates(
+        instrument, (query_date,)
+    ).collect()
+    _register_raw(
+        raw_store,
+        repository,
+        endpoint="index_member_all",
+        request_discriminator="801010.SI-Y",
+        rows=(
+            target,
+            target
+            | {
+                "ts_code": "600001.SH",
+                "name": "新增成员",
+                "in_date": "20250101",
+            },
+        ),
+        retrieved_at=refreshed_at,
+    )
+    second = pipeline._curate_datasets(
+        (DatasetKind.INDUSTRY_MEMBERSHIP,),
+        windows={DatasetKind.INDUSTRY_MEMBERSHIP: (None, None)},
+        observer=None,
+    )
+    after_refresh = validated_repository(refreshed_at).industry_memberships_on_dates(
+        instrument, (query_date,)
+    ).collect()
+
+    record = repository.find_canonical_dataset(DatasetKind.INDUSTRY_MEMBERSHIP)
+    assert record is not None
+    frame = curated_store.read_partition(
+        DatasetKind.INDUSTRY_MEMBERSHIP, record.partitions[0]
+    )
+    lifecycle = frame.filter(pl.col("instrument_id") == "600000.SH").row(
+        0, named=True
+    )
+
+    assert first[0].raw_inputs_read == 1
+    assert second[0].raw_inputs_read == 2
+    assert lifecycle["in_available_at"] == entered_at
+    assert lifecycle["available_at"] == entered_at
+    assert lifecycle["ingested_at"] == refreshed_at
+    assert before_refresh.select(
+        "query_date", "instrument_id", "level1_code"
+    ).rows() == after_refresh.select(
+        "query_date", "instrument_id", "level1_code"
+    ).rows()
+    engine.dispose()
 
 
 def test_curate_raw_progress_is_throttled_and_finishes_with_exact_count(
@@ -329,7 +454,7 @@ def test_curate_raw_progress_is_throttled_and_finishes_with_exact_count(
         )
     observer = Observer()
     pipeline = DataPipeline(
-        source=SimpleNamespace(provider="tushare"),  # type: ignore[arg-type]
+        source=SimpleNamespace(provider="tushare"),
         mapper=TushareMapper(),
         calendar=object(),  # type: ignore[arg-type]
         raw_store=raw_store,

@@ -627,6 +627,60 @@ def test_analysis_invalidates_factor_correlation_with_too_few_common_pairs() -> 
     assert cross.select("rank_correlation", "is_valid").row(0) == (None, False)
 
 
+def test_analysis_correlation_retains_factors_without_any_valid_value() -> None:
+    day = date(2026, 1, 5)
+    instruments = [f"{index:06d}.SZ" for index in range(30)]
+    factors = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "factor_id": factor_ref,
+                "value": float(index),
+                "is_valid": factor_ref == "valid_factor",
+            }
+            for factor_ref in ("invalid_factor", "valid_factor")
+            for index, instrument_id in enumerate(instruments)
+        ]
+    )
+    eligible = pl.DataFrame(
+        {
+            "signal_date": [day] * 30,
+            "instrument_id": instruments,
+            "eligible": [True] * 30,
+        }
+    )
+    future = pl.DataFrame(
+        {
+            "signal_date": [day] * 30,
+            "instrument_id": instruments,
+            "return_start": [date(2026, 1, 6)] * 30,
+            "return_end": [date(2026, 1, 6)] * 30,
+            "future_return": [index / 100.0 for index in range(30)],
+        }
+    )
+
+    correlation = run_analysis(factors, eligible, {1: future})["correlation"]
+
+    assert correlation.select("factor_x", "factor_y").rows() == [
+        ("invalid_factor", "invalid_factor"),
+        ("invalid_factor", "valid_factor"),
+        ("valid_factor", "invalid_factor"),
+        ("valid_factor", "valid_factor"),
+    ]
+    invalid = correlation.filter(
+        (pl.col("factor_x") == "invalid_factor")
+        | (pl.col("factor_y") == "invalid_factor")
+    )
+    assert invalid.select(
+        "date_count",
+        "pair_count",
+        "pearson_correlation",
+        "rank_correlation",
+        "is_valid",
+    ).rows() == [(0, 0, None, None, False)] * 3
+
+
 def test_hac_uses_horizon_overlap_lag_and_literal_mean() -> None:
     summary = HacMeanAnalyzer.summarize([0.01, 0.02, 0.03, 0.04], 3)
 
@@ -638,6 +692,177 @@ def test_hac_uses_horizon_overlap_lag_and_literal_mean() -> None:
     assert summary.ci_lower == pytest.approx(0.013335881234904616)
     assert summary.ci_upper == pytest.approx(0.036664118765095385)
     assert summary.invalid_reason is None
+
+
+def test_hac_preserves_invalid_signal_session_in_lag_pairs() -> None:
+    summary = HacMeanAnalyzer.summarize([2.0, None, 0.0], 2)
+
+    assert summary.mean == pytest.approx(1.0)
+    assert summary.valid_count == 2
+    assert summary.lag == 1
+    assert summary.standard_error == pytest.approx(0.7071067811865476)
+    assert summary.t_stat == pytest.approx(1.414213562373095)
+    assert summary.p_value == pytest.approx(0.1572992070502852)
+
+
+def test_hac_preserves_leading_trailing_and_multiple_session_gaps() -> None:
+    """首尾和连续缺口不得把真实相隔两个会话的样本压缩为相邻样本。"""
+    summary = HacMeanAnalyzer.summarize([None, 2.0, None, 0.0, None], 3)
+
+    assert summary.mean == pytest.approx(1.0)
+    assert summary.valid_count == 2
+    assert summary.lag == 2
+    assert summary.standard_error == pytest.approx(0.5773502691896257)
+
+
+def test_hac_zero_one_observation_and_horizon_one_boundaries() -> None:
+    """零/单样本原因码和 horizon=1 的零滞后语义必须稳定。"""
+    empty = HacMeanAnalyzer.summarize([None, None], 2)
+    single = HacMeanAnalyzer.summarize([None, 2.0, None], 5)
+    no_lag = HacMeanAnalyzer.summarize([2.0, None, 0.0], 1)
+
+    assert (empty.valid_count, empty.lag, empty.invalid_reason) == (
+        0,
+        1,
+        "NO_VALID_OBSERVATIONS",
+    )
+    assert (single.mean, single.valid_count, single.lag, single.invalid_reason) == (
+        2.0,
+        1,
+        2,
+        "INSUFFICIENT_OBSERVATIONS",
+    )
+    assert no_lag.lag == 0
+    assert no_lag.standard_error == pytest.approx(0.7071067811865476)
+
+
+def test_analysis_hac_left_aligns_invalid_ic_to_complete_signal_dates() -> None:
+    days = [date(2026, 1, 5) + timedelta(days=index) for index in range(3)]
+    instruments = ["000001.SZ", "000002.SZ", "000003.SZ"]
+    factors = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "factor_id": "gap_factor",
+                "value": float(index),
+                "is_valid": True,
+            }
+            for day in days
+            for index, instrument_id in enumerate(instruments)
+        ]
+    )
+    eligible = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "eligible": True,
+            }
+            for day in days
+            for instrument_id in instruments
+        ]
+    )
+    future = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "return_start": day + timedelta(days=1),
+                "return_end": day + timedelta(days=2),
+                "future_return": (
+                    None
+                    if day_index == 1 and index == 2
+                    else float(index if day_index < 2 else 2 - index)
+                ),
+            }
+            for day_index, day in enumerate(days)
+            for index, instrument_id in enumerate(instruments)
+        ]
+    )
+
+    summary = analyze(
+        factors,
+        eligible,
+        study_labels({2: future}),
+        quantiles=2,
+        cost_bps_scenarios=(5,),
+        minimum=3,
+    )["summary"].row(0, named=True)
+
+    assert summary["rank_ic_hac_mean"] == pytest.approx(0.0)
+    assert summary["rank_ic_hac_valid_count"] == 2
+    assert summary["rank_ic_hac_hac_lag"] == 1
+    assert summary["rank_ic_hac_hac_standard_error"] == pytest.approx(
+        0.7071067811865476
+    )
+
+
+def test_cost_hac_left_aligns_invalid_days_and_turnover_boundary() -> None:
+    days = [date(2026, 1, 5) + timedelta(days=index) for index in range(4)]
+    instruments = [f"{index:06d}.SZ" for index in range(30)]
+    factors = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "factor_id": "cost_gap_factor",
+                "value": float(index),
+                "is_valid": True,
+            }
+            for day in days
+            for index, instrument_id in enumerate(instruments)
+        ]
+    )
+    eligible = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "eligible": True,
+            }
+            for day in days
+            for instrument_id in instruments
+        ]
+    )
+    future = pl.DataFrame(
+        [
+            {
+                "signal_date": day,
+                "instrument_id": instrument_id,
+                "return_start": day + timedelta(days=1),
+                "return_end": day + timedelta(days=2),
+                "future_return": (
+                    None
+                    if day_index == 2 and index == 29
+                    else (
+                        float(min(index // 6, 4 - index // 6))
+                        if day_index == 3
+                        else float(index) / 12.0
+                    )
+                ),
+            }
+            for day_index, day in enumerate(days)
+            for index, instrument_id in enumerate(instruments)
+        ]
+    )
+
+    costs = analyze(
+        factors,
+        eligible,
+        study_labels({2: future}),
+        quantiles=5,
+        cost_bps_scenarios=(5,),
+        minimum=30,
+    )["cost_scenarios"].row(0, named=True)
+
+    assert costs["aligned_date_count"] == 2
+    assert costs["net_spread_mean"] == pytest.approx(1.0)
+    assert costs["net_spread_valid_count"] == 2
+    assert costs["net_spread_hac_lag"] == 1
+    assert costs["net_spread_hac_standard_error"] == pytest.approx(
+        0.7071067811865476
+    )
 
 
 def test_monotonicity_turnover_and_cost_use_literal_oracles() -> None:

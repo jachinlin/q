@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
 
+from quant_research.backtest.rulebook import AShareRuleBook
 from quant_research.bootstrap.worker import _FactorPublisher, _FactorStudySession
 from quant_research.domain.enums import MultipleTestingMethod
 from quant_research.domain.identifiers import InstrumentId
@@ -18,6 +19,7 @@ from quant_research.factor_studies.models import (
     FactorStudyUniverse,
     IndustryUnclassifiedPolicy,
 )
+from quant_research.factor_studies.streaming import StreamingForwardReturnBuilder
 from quant_research.factors import FACTOR_OUTPUT_SCHEMA, FactorArtifact
 
 
@@ -118,6 +120,87 @@ class _EmptyExecutableRepository:
             .unique()
             .lazy()
         )
+
+
+class _ExecutableRepository:
+    """提供可核对真实上市序号与精确涨停价的最小行情。"""
+
+    def __init__(
+        self,
+        listing: date,
+        sessions: tuple[date, ...],
+        price: float,
+        *,
+        preclose: float,
+        warned: bool = False,
+    ) -> None:
+        self._listing = listing
+        self._sessions = sessions
+        self._price = price
+        self._preclose = preclose
+        self._warned = warned
+
+    def stocks(self) -> pl.LazyFrame:
+        """返回固定主板股票。"""
+        return pl.DataFrame(
+            {
+                "instrument_id": ["000001.SZ"],
+                "board": ["MAIN"],
+                "list_date": [self._listing],
+                "delist_date": pl.Series([None], dtype=pl.Date),
+            }
+        ).lazy()
+
+    def stock_bars(self, _: object, start: date, end: date) -> pl.LazyFrame:
+        """返回请求区间内固定为涨停价的最低价。"""
+        selected = [day for day in self._sessions if start <= day <= end]
+        return pl.DataFrame(
+            {
+                "instrument_id": ["000001.SZ"] * len(selected),
+                "trade_date": selected,
+                "low": [self._price] * len(selected),
+                "preclose": [self._preclose] * len(selected),
+            },
+            schema={
+                "instrument_id": pl.String,
+                "trade_date": pl.Date,
+                "low": pl.Float64,
+                "preclose": pl.Float64,
+            },
+        ).lazy()
+
+    def stock_suspensions(self, _: date, __: date, ___: object) -> pl.LazyFrame:
+        """返回空停牌状态。"""
+        return pl.DataFrame(
+            schema={"instrument_id": pl.String, "trade_date": pl.Date}
+        ).lazy()
+
+    def stock_risk_warnings(self, _: date, __: date, ___: object) -> pl.LazyFrame:
+        """按配置返回风险警示状态。"""
+        if not self._warned:
+            return pl.DataFrame(
+                schema={"instrument_id": pl.String, "trade_date": pl.Date}
+            ).lazy()
+        return pl.DataFrame(
+            {
+                "instrument_id": ["000001.SZ"] * len(self._sessions),
+                "trade_date": self._sessions,
+            },
+            schema={"instrument_id": pl.String, "trade_date": pl.Date},
+        ).lazy()
+
+    def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
+        """返回覆盖上市日起真实序号的工作日历。"""
+        values: list[date] = []
+        current = start
+        while current <= end:
+            if current.weekday() < 5:
+                values.append(current)
+            current += timedelta(days=1)
+        return pl.DataFrame(
+            {"trade_date": values, "is_trading_day": [True] * len(values)},
+            schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
+        ).lazy()
 
 
 def test_factor_study_maps_date_applies_direction_and_pit_scope() -> None:
@@ -395,3 +478,95 @@ def test_empty_security_status_keeps_executable_state_fixed_schema() -> None:
         "is_suspended": pl.Boolean,
         "entry_limit_up": pl.Boolean,
     }
+
+
+def test_executable_state_uses_global_listing_sessions_and_exact_half_up() -> None:
+    """老股在窗口首日仍须按精确 HALF_UP 上限识别一字涨停。"""
+    sessions = (date(2026, 1, 5), date(2026, 1, 6), date(2026, 1, 7))
+    repository = _ExecutableRepository(
+        date(2025, 12, 1), sessions, 1.05, preclose=0.95
+    )
+    session = _FactorStudySession(
+        cast(Any, object()),
+        cast(Any, repository),
+        cast(Any, object()),
+        AShareRuleBook.load(Path("configs/rules/a_share.yaml")),
+        Path("."),
+    )
+
+    state = session._executable_state(
+        (InstrumentId.parse("000001.SZ"),), sessions[0], sessions[-1]
+    )
+
+    assert state["entry_limit_up"].to_list() == [True, True, True]
+    adjusted_bars = pl.DataFrame(
+        {
+            "instrument_id": ["000001.SZ"] * 3,
+            "trade_date": sessions,
+            "open": [1.05, 1.05, 1.05],
+            "close": [1.05, 1.05, 1.05],
+        }
+    )
+    labels = StreamingForwardReturnBuilder(
+        adjusted_bars,
+        sessions,
+        pl.DataFrame(
+            {
+                "signal_date": [sessions[0]],
+                "instrument_id": ["000001.SZ"],
+                "eligible": [True],
+            }
+        ),
+        state,
+    ).build(2)
+    assert labels["executable_invalid_reason"].item() == "ENTRY_LIMIT_UP"
+
+
+def test_executable_state_exempts_only_first_five_true_listing_sessions() -> None:
+    """上市初期豁免必须以真实上市日起的交易日序号为准。"""
+    sessions = tuple(
+        day
+        for offset in range(8)
+        if (day := date(2026, 1, 1) + timedelta(days=offset)).weekday() < 5
+    )
+    repository = _ExecutableRepository(
+        sessions[0], sessions, 11.0, preclose=10.0
+    )
+    session = _FactorStudySession(
+        cast(Any, object()),
+        cast(Any, repository),
+        cast(Any, object()),
+        AShareRuleBook.load(Path("configs/rules/a_share.yaml")),
+        Path("."),
+    )
+
+    state = session._executable_state(
+        (InstrumentId.parse("000001.SZ"),), sessions[0], sessions[-1]
+    )
+
+    assert state["entry_limit_up"].to_list() == [False] * 5 + [True]
+
+
+def test_executable_state_uses_exact_st_half_up_boundary() -> None:
+    """ST 的 1.90×105% 半分边界必须舍入为 2.00 并识别一字板。"""
+    sessions = (date(2026, 1, 5),)
+    repository = _ExecutableRepository(
+        date(2025, 1, 1),
+        sessions,
+        2.0,
+        preclose=1.9,
+        warned=True,
+    )
+    session = _FactorStudySession(
+        cast(Any, object()),
+        cast(Any, repository),
+        cast(Any, object()),
+        AShareRuleBook.load(Path("configs/rules/a_share.yaml")),
+        Path("."),
+    )
+
+    state = session._executable_state(
+        (InstrumentId.parse("000001.SZ"),), sessions[0], sessions[0]
+    )
+
+    assert state["entry_limit_up"].item() is True

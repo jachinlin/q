@@ -21,6 +21,7 @@ from quant_research.factor_studies.streaming import (
     StreamingForwardReturnBuilder,
     StreamingStudyAnalyzer,
 )
+from quant_research.factors.analysis import factor_rank_correlation_matrix
 
 
 class _Cancellation:
@@ -301,3 +302,75 @@ def test_streaming_keeps_distinct_executable_label_statistics(
             rel_tol=1e-12,
             abs_tol=1e-12,
         )
+
+
+def test_streaming_correlation_keeps_invalid_factor_domain_and_empty_schema(
+    tmp_path: Path,
+) -> None:
+    _, _, _, _, factors = _inputs()
+    valid = factors.filter(pl.col("factor_id") == "alpha")
+    invalid = factors.filter(pl.col("factor_id") == "beta").with_columns(
+        pl.lit(False).alias("is_valid")
+    )
+    combined = pl.concat([valid, invalid])
+
+    with FactorStudyTemporaryStore(
+        tmp_path, "01M14STREAMINGCORRELATE1"
+    ) as temporary:
+        files = {
+            (DIRECTION_ADJUSTED, factor_ref): temporary.write(
+                "signal",
+                combined.filter(pl.col("factor_id") == factor_ref).sort(
+                    "signal_date", "instrument_id", "factor_id"
+                ),
+            )
+            for factor_ref in ("alpha", "beta")
+        }
+        analyzer = StreamingStudyAnalyzer(
+            quantiles=3,
+            cost_bps_scenarios=(5,),
+            minimum=3,
+            cancellation=_Cancellation(),
+            temporary=temporary,
+        )
+
+        actual = analyzer._correlations(files)
+        empty = analyzer._correlations({})
+
+    expected = factor_rank_correlation_matrix(
+        combined, minimum_pairs=3
+    ).with_columns(pl.lit(DIRECTION_ADJUSTED).alias("signal_variant"))
+    assert_frame_equal(actual, expected, check_row_order=True)
+    assert empty.is_empty()
+    assert empty.schema == actual.schema
+
+
+def test_streaming_correlation_all_invalid_returns_invalid_diagonal(
+    tmp_path: Path,
+) -> None:
+    _, _, _, _, factors = _inputs()
+    invalid = factors.filter(pl.col("factor_id") == "alpha").with_columns(
+        pl.lit(False).alias("is_valid")
+    )
+
+    with FactorStudyTemporaryStore(
+        tmp_path, "01M14STREAMINGCORRELATE2"
+    ) as temporary:
+        spilled = temporary.write("signal", invalid)
+        correlation = StreamingStudyAnalyzer(
+            quantiles=3,
+            cost_bps_scenarios=(5,),
+            minimum=3,
+            cancellation=_Cancellation(),
+            temporary=temporary,
+        )._correlations({(DIRECTION_ADJUSTED, "alpha"): spilled})
+
+    assert correlation.select(
+        "factor_x",
+        "factor_y",
+        "date_count",
+        "pair_count",
+        "pearson_correlation",
+        "rank_correlation",
+        "is_valid",
+    ).row(0) == ("alpha", "alpha", 0, 0, None, None, False)

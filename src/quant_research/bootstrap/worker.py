@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import tempfile
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
@@ -105,8 +106,11 @@ from quant_research.strategies.base import DecisionData
 from quant_research.strategies.registry import StrategyRegistry
 from quant_research.tasks.handlers import CancellationToken, ProgressSink, TaskHandler
 from quant_research.tasks.models import TaskProgress, TaskStatus
+from quant_research.universe.builder import UniverseBatchEvaluator
+from quant_research.universe.rules import UniverseRules
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_CN_STOCK_STANDARD_RULES = UniverseRules()
 
 _MARKET_SCHEMA = {
     "instrument_id": pl.String,
@@ -1496,6 +1500,66 @@ class _FactorStudySession:
             "signal_date", "instrument_id", "factor_id"
         )
 
+    def _stock_metadata_and_sessions(
+        self,
+        universe_ids: Sequence[InstrumentId],
+        start: date,
+        end: date,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """加载股票元数据及带全局序号的研究区间交易日。"""
+        identifiers = sorted({item.canonical() for item in universe_ids})
+        requested = pl.DataFrame(
+            {"instrument_id": identifiers},
+            schema={"instrument_id": pl.String},
+        )
+        catalog = self._repository.stocks().collect()
+        required = {"instrument_id", "list_date", "delist_date", "board"}
+        if not required.issubset(catalog.schema):
+            raise ValueError("factor study stock metadata schema is invalid")
+        catalog = catalog.select(*sorted(required)).filter(
+            pl.col("instrument_id").is_in(identifiers)
+        )
+        if catalog["instrument_id"].is_duplicated().any():
+            raise ValueError("factor study stock metadata has duplicate keys")
+        metadata = requested.join(
+            catalog.with_columns(pl.lit(True).alias("metadata_present")),
+            on="instrument_id",
+            how="left",
+        ).with_columns(pl.col("metadata_present").fill_null(False))
+        listing_dates = [
+            value
+            for value in metadata["list_date"].drop_nulls().to_list()
+            if isinstance(value, date) and value <= end
+        ]
+        calendar_start = min(listing_dates) if listing_dates else start
+        calendar = self._repository.trade_calendar(calendar_start, end).collect()
+        if not {"trade_date", "is_trading_day"}.issubset(calendar.schema):
+            raise ValueError("factor study trade calendar schema is invalid")
+        if calendar["trade_date"].is_duplicated().any():
+            raise ValueError("factor study trade calendar has duplicate keys")
+        trading = (
+            calendar.filter(
+                pl.col("is_trading_day")
+                & pl.col("trade_date").is_between(calendar_start, end)
+            )
+            .select("trade_date")
+            .sort("trade_date")
+            .with_row_index("session_ordinal", offset=1)
+            .with_columns(pl.col("session_ordinal").cast(pl.Int64))
+        )
+        trading_dates = cast(list[date], trading["trade_date"].to_list())
+        listing_ordinals: list[int | None] = []
+        for value in metadata["list_date"].to_list():
+            if not isinstance(value, date):
+                listing_ordinals.append(None)
+                continue
+            index = bisect_left(trading_dates, value)
+            listing_ordinals.append(index + 1 if index < len(trading_dates) else None)
+        metadata = metadata.with_columns(
+            pl.Series("listing_ordinal", listing_ordinals, dtype=pl.Int64)
+        ).sort("instrument_id")
+        return metadata, trading.filter(pl.col("trade_date").is_between(start, end))
+
     def _executable_state(
         self,
         universe_ids: tuple[InstrumentId, ...],
@@ -1503,11 +1567,20 @@ class _FactorStudySession:
         end: date,
     ) -> pl.DataFrame:
         """使用未复权行情和规则簿向量化判定可执行标签入场涨停。"""
-        metadata = self._repository.stocks().collect().filter(
-            pl.col("instrument_id").is_in(
-                [item.canonical() for item in universe_ids]
+        if not universe_ids:
+            return pl.DataFrame(
+                schema={
+                    "instrument_id": pl.String,
+                    "trade_date": pl.Date,
+                    "is_listed": pl.Boolean,
+                    "is_suspended": pl.Boolean,
+                    "entry_limit_up": pl.Boolean,
+                }
             )
-        ).select("instrument_id", "list_date", "delist_date", "board").with_columns(
+        metadata, sessions = self._stock_metadata_and_sessions(
+            universe_ids, start, end
+        )
+        metadata = metadata.with_columns(
             pl.lit("STOCK").alias("instrument_type")
         )
         raw_bars = self._repository.stock_bars(
@@ -1525,9 +1598,6 @@ class _FactorStudySession:
         ).collect().select("instrument_id", "trade_date").unique().with_columns(
             pl.lit(True).alias("is_st")
         )
-        sessions = self._repository.trade_calendar(start, end).collect().filter(
-            pl.col("is_trading_day")
-        ).select("trade_date").unique()
         base = (
             metadata.join(sessions, how="cross")
             .join(raw_bars, on=["instrument_id", "trade_date"], how="left")
@@ -1550,8 +1620,11 @@ class _FactorStudySession:
             )
             .sort("instrument_id", "trade_date")
             .with_columns(
-                pl.int_range(1, pl.len() + 1)
-                .over("instrument_id")
+                (
+                    pl.col("session_ordinal")
+                    - pl.col("listing_ordinal")
+                    + 1
+                )
                 .alias("_listing_session")
             )
         )
@@ -1579,7 +1652,7 @@ class _FactorStudySession:
                 Board(cast(str, row["board"])),
                 trade_date,
             )
-            rate, tick = self._rulebook.price_limit_parameters(
+            limit = self._rulebook.price_limit_parameters(
                 profile,
                 trade_date,
                 SecurityStatus.ST if row["is_st"] is True else SecurityStatus.NORMAL,
@@ -1590,19 +1663,33 @@ class _FactorStudySession:
                     "instrument_type": row["instrument_type"],
                     "board": row["board"],
                     "is_st": row["is_st"],
-                    "_limit_rate": rate,
-                    "_price_tick": tick,
+                    "_limit_rate_numerator": limit.rate_numerator,
+                    "_limit_rate_denominator": limit.rate_denominator,
+                    "_price_scale": limit.price_scale,
+                    "_tick_units": limit.tick_units,
                 }
             )
         parameters = pl.DataFrame(parameter_rows)
-        upper = (
+        preclose_units = (
+            pl.col("preclose") * pl.col("_price_scale")
+        ).round(0).cast(pl.Int64, strict=False)
+        low_units = (
+            pl.col("low") * pl.col("_price_scale")
+        ).round(0).cast(pl.Int64, strict=False)
+        upper_numerator = preclose_units * (
+            pl.col("_limit_rate_denominator")
+            + pl.col("_limit_rate_numerator")
+        )
+        upper_denominator = (
+            pl.col("_limit_rate_denominator") * pl.col("_tick_units")
+        )
+        upper_units = (
             (
-                pl.col("preclose")
-                * (1.0 + pl.col("_limit_rate"))
-                / pl.col("_price_tick")
-                + 0.5
-            ).floor()
-            * pl.col("_price_tick")
+                upper_numerator * 2
+                + upper_denominator
+            )
+            // (upper_denominator * 2)
+            * pl.col("_tick_units")
         )
         return (
             base.join(
@@ -1620,7 +1707,7 @@ class _FactorStudySession:
                     &
                     pl.col("low").is_not_null()
                     & pl.col("preclose").is_not_null()
-                    & (pl.col("low") >= upper - 1e-9)
+                    & (low_units >= upper_units)
                 )
                 .fill_null(False)
                 .alias("entry_limit_up"),
@@ -1672,54 +1759,14 @@ class _FactorStudySession:
     @staticmethod
     def _universe_batch(
         instruments: pl.DataFrame,
-        signal_dates: Sequence[date],
+        signal_sessions: pl.DataFrame,
         suspended: pl.DataFrame,
         warned: pl.DataFrame,
     ) -> pl.DataFrame:
-        """向量化生成一个连续日期批次的股票池资格表。"""
-        dates = pl.DataFrame(
-            {"signal_date": signal_dates},
-            schema={"signal_date": pl.Date},
+        """按 CN_STOCK_STANDARD 向量化生成连续日期批次资格表。"""
+        return UniverseBatchEvaluator(_CN_STOCK_STANDARD_RULES).evaluate(
+            instruments, signal_sessions, suspended, warned
         )
-        batch_suspended = suspended.join(dates, on="signal_date", how="inner")
-        batch_warned = warned.join(dates, on="signal_date", how="inner")
-        status = (
-            dates.join(instruments, how="cross")
-            .join(
-                batch_warned.with_columns(pl.lit(True).alias("_is_warned")),
-                on=["signal_date", "instrument_id"],
-                how="left",
-            )
-            .join(
-                batch_suspended.with_columns(
-                    pl.lit(True).alias("_is_suspended")
-                ),
-                on=["signal_date", "instrument_id"],
-                how="left",
-            )
-            .with_columns(
-                pl.col("_is_warned").fill_null(False),
-                pl.col("_is_suspended").fill_null(False),
-            )
-        )
-        reason_codes = pl.concat_list(
-            [
-                pl.when(pl.col("_is_warned"))
-                .then(pl.lit("RISK_WARNING"))
-                .otherwise(pl.lit(None, dtype=pl.String)),
-                pl.when(pl.col("_is_suspended"))
-                .then(pl.lit("SUSPENDED"))
-                .otherwise(pl.lit(None, dtype=pl.String)),
-            ]
-        ).list.drop_nulls()
-        return status.select(
-            "signal_date",
-            "instrument_id",
-            (~(pl.col("_is_warned") | pl.col("_is_suspended"))).alias(
-                "eligible"
-            ),
-            reason_codes.alias("reason_codes"),
-        ).sort("signal_date", "instrument_id")
 
     def _build_factor_study_universe(
         self,
@@ -1759,10 +1806,12 @@ class _FactorStudySession:
         )
         suspended = self._pit_status_keys(suspended_events, cutoffs)
         warned = self._pit_status_keys(warned_events, cutoffs)
-        instruments = pl.DataFrame(
-            {"instrument_id": [item.canonical() for item in stock_ids]},
-            schema={"instrument_id": pl.String},
-        ).sort("instrument_id")
+        instruments, study_sessions = self._stock_metadata_and_sessions(
+            stock_ids, first_session, last_session
+        )
+        expected_sessions = list(sessions)
+        if study_sessions["trade_date"].to_list() != expected_sessions:
+            raise ValueError("factor study sessions do not match canonical calendar")
         frames: list[pl.DataFrame] = []
         hasher = _CanonicalUniverseHasher()
         previous = 0
@@ -1771,7 +1820,7 @@ class _FactorStudySession:
                 raise RuntimeError("factor study cancelled")
             batch = self._universe_batch(
                 instruments,
-                sessions[previous:batch_end],
+                study_sessions.slice(previous, batch_end - previous),
                 suspended,
                 warned,
             )
@@ -2075,7 +2124,7 @@ class _FactorStudySession:
                 else None,
             ),
             "hac_kernel": "BARTLETT",
-            "hac_lag": "min(horizon-1, valid_count-1)",
+            "hac_lag": "min(horizon-1, signal_date_count-1)",
             "turnover_formula": "0.5*sum(abs(weight_t-weight_t_minus_1)) per leg",
             "cost_formula": "gross_spread-total_turnover*bps/10000",
             "cost_bps_scenarios": list(

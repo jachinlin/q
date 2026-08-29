@@ -11,6 +11,7 @@ from quant_research.factors.analysis import (
     assign_quantiles,
     coverage_by_date,
     factor_correlation_matrix,
+    factor_rank_correlation_matrix,
     long_short_returns,
     quantile_future_returns,
     spearman_rank_ic,
@@ -616,6 +617,36 @@ def test_factor_correlations_pair_same_security_within_each_date() -> None:
     cross = result.filter((pl.col("factor_x") == "f1") & (pl.col("factor_y") == "f2"))
     assert cross["correlation"].item() == pytest.approx(0.0)
     assert cross["pair_count"].item() == 4
+
+
+def test_factor_correlations_keep_all_invalid_factor_and_empty_rank_schema() -> None:
+    """相关矩阵域必须来自全部输入因子，空输入也须保持固定 Schema。"""
+    invalid = _factors([(0, "A", 1.0, False)]).with_columns(
+        pl.lit("invalid_factor").alias("factor_id")
+    )
+
+    plain = factor_correlation_matrix(invalid)
+    ranked = factor_rank_correlation_matrix(invalid)
+    empty = factor_rank_correlation_matrix(invalid.head(0))
+
+    assert plain.row(0) == (
+        "invalid_factor",
+        "invalid_factor",
+        0,
+        None,
+        False,
+    )
+    assert ranked.row(0) == (
+        "invalid_factor",
+        "invalid_factor",
+        0,
+        0,
+        None,
+        None,
+        False,
+    )
+    assert empty.is_empty()
+    assert empty.schema == ranked.schema
 
 
 @pytest.mark.parametrize(

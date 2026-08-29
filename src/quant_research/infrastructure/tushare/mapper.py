@@ -217,6 +217,9 @@ _EXCHANGE_INSTRUMENT_DATASETS = frozenset(
 _REVISION_DATASETS = frozenset(
     {DatasetKind.STOCK_FINANCIAL_INDICATOR, *_STATEMENT_DATASETS, *_DIVIDEND_DATASETS}
 )
+_RAW_HISTORY_DATASETS = frozenset(
+    {*_REVISION_DATASETS, DatasetKind.INDUSTRY_MEMBERSHIP}
+)
 _AUDIT_FIELDS = frozenset(
     {"source", "available_at", "availability_source", "pit_usable", "ingested_at"}
 )
@@ -404,8 +407,8 @@ class TushareMapper:
         return _ENDPOINT_DATASET.get(endpoint) is dataset
 
     def requires_raw_history(self, dataset: DatasetKind) -> bool:
-        """声明历史需求。入参：数据集。返回值：修订型数据集为真。异常：无。"""
-        return dataset in _REVISION_DATASETS
+        """声明历史需求。入参：数据集。返回值：需要重放历史观测时为真。异常：无。"""
+        return dataset in _RAW_HISTORY_DATASETS
 
     def consolidate_partition(
         self, dataset: DatasetKind, frames: Sequence[pl.DataFrame]
@@ -415,6 +418,8 @@ class TushareMapper:
         if not frames:
             return pl.DataFrame(schema=schema.columns)
         frame = pl.concat(frames, how="vertical_relaxed")
+        if dataset is DatasetKind.INDUSTRY_MEMBERSHIP:
+            return self._consolidate_industry_membership(frame)
         if dataset in _REVISION_DATASETS:
             rows = cast(list[dict[str, object | None]], frame.to_dicts())
             rows = self._deduplicate_and_assign(dataset, rows)
@@ -422,6 +427,39 @@ class TushareMapper:
         return frame.unique(subset=schema.primary_key, keep="last").sort(
             schema.sort_key
         )
+
+    @staticmethod
+    def _consolidate_industry_membership(frame: pl.DataFrame) -> pl.DataFrame:
+        """按首次事件证据和最新业务观测折叠行业成员生命周期。"""
+        schema = CANONICAL_SCHEMAS[DatasetKind.INDUSTRY_MEMBERSHIP]
+        primary_key = list(schema.primary_key)
+        observed = frame.with_row_index("_observation_order")
+        first_entry = observed.group_by(primary_key).agg(
+            pl.col("in_available_at").min().alias("_first_in_available_at")
+        )
+        first_exit = (
+            observed.filter(pl.col("out_date").is_not_null())
+            .group_by([*primary_key, "out_date"])
+            .agg(pl.col("out_available_at").min().alias("_first_out_available_at"))
+        )
+        latest = (
+            observed.sort(["ingested_at", "_observation_order"])
+            .unique(subset=primary_key, keep="last", maintain_order=True)
+            .join(first_entry, on=primary_key, how="left", validate="1:1")
+            .join(
+                first_exit,
+                on=[*primary_key, "out_date"],
+                how="left",
+                validate="m:1",
+            )
+            .with_columns(
+                pl.col("_first_in_available_at").alias("in_available_at"),
+                pl.col("_first_out_available_at").alias("out_available_at"),
+                pl.col("_first_in_available_at").alias("available_at"),
+                pl.col("_first_in_available_at").is_not_null().alias("pit_usable"),
+            )
+        )
+        return latest.select(schema.columns.names()).sort(schema.sort_key)
 
     def transform_hash(self, dataset: DatasetKind) -> str:
         """返回转换身份。入参：数据集。返回值：哈希。异常：读取源码失败时传播。"""

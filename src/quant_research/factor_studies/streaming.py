@@ -32,6 +32,17 @@ from quant_research.factors.analysis import (
 )
 from quant_research.tasks.handlers import CancellationToken
 
+_CORRELATION_SCHEMA = {
+    "factor_x": pl.String,
+    "factor_y": pl.String,
+    "date_count": pl.Int64,
+    "pair_count": pl.Int64,
+    "pearson_correlation": pl.Float64,
+    "rank_correlation": pl.Float64,
+    "is_valid": pl.Boolean,
+    "signal_variant": pl.String,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class SpilledFrame:
@@ -450,6 +461,9 @@ class StreamingStudyAnalyzer:
             .len()
             .rename({"len": "eligible_count"})
         )
+        signal_dates = (
+            eligible.select("signal_date").unique().sort("signal_date")
+        )
         prepare_started = time.perf_counter()
         prepared_by_key = {
             key: self._prepare_signal(*key, signal_files[key], denominator)
@@ -617,6 +631,7 @@ class StreamingStudyAnalyzer:
                         valid_returns,
                         label_counts,
                         denominator,
+                        signal_dates,
                         assigned,
                         joined,
                     )
@@ -929,6 +944,7 @@ class StreamingStudyAnalyzer:
         valid_returns: pl.DataFrame,
         label_counts: pl.DataFrame,
         denominator: pl.DataFrame,
+        signal_dates: pl.DataFrame,
         assigned: pl.DataFrame,
         joined: pl.DataFrame,
     ) -> dict[str, pl.DataFrame]:
@@ -1011,6 +1027,7 @@ class StreamingStudyAnalyzer:
         costs, break_even = self._analyzer._costs(
             long_short,
             item.turnover,
+            signal_dates,
             horizon,
             item.variant,
             item.factor_ref,
@@ -1021,6 +1038,7 @@ class StreamingStudyAnalyzer:
             long_short,
             monotonicity,
             item.turnover,
+            signal_dates,
             horizon,
             item.variant,
             item.factor_ref,
@@ -1048,7 +1066,7 @@ class StreamingStudyAnalyzer:
                 for item_variant, factor_ref in sorted(signal_files)
                 if item_variant == variant
             ]
-            active_refs: list[str] = []
+            factor_refs = [factor_ref for factor_ref, _ in paths]
             long_frames: list[pl.DataFrame] = []
             for factor_ref, path in paths:
                 self._check_cancelled()
@@ -1076,81 +1094,81 @@ class StreamingStudyAnalyzer:
                 )
                 if factor_values.is_empty():
                     continue
-                active_refs.append(factor_ref)
                 long_frames.append(factor_values)
-            if not long_frames:
-                continue
-            aligned = (
-                pl.concat(long_frames)
-                .pivot(
-                    on="_factor_ref",
-                    index=["signal_date", "instrument_id"],
-                    values="value",
-                )
-                .sort("signal_date", "instrument_id")
-            )
-            del long_frames
             totals: dict[tuple[str, str], list[float]] = {
                 (left, right): [0.0, 0.0, 0.0, 0.0]
-                for left in active_refs
-                for right in active_refs
+                for left in factor_refs
+                for right in factor_refs
             }
-            offset = 0
-            grouped = aligned.group_by(
-                "signal_date", maintain_order=True
-            ).len()
-            for day_index, (_, count) in enumerate(grouped.iter_rows()):
-                if day_index % 20 == 0:
-                    self._check_cancelled()
-                size = int(count)
-                group = aligned.slice(offset, size)
-                offset += size
-                if group.is_empty():
-                    continue
-                arrays = {
-                    factor_ref: (
-                        group[factor_ref].to_numpy()
-                        if factor_ref in group.columns
-                        else np.full(group.height, np.nan, dtype=np.float64)
+            if long_frames:
+                aligned = (
+                    pl.concat(long_frames)
+                    .pivot(
+                        on="_factor_ref",
+                        index=["signal_date", "instrument_id"],
+                        values="value",
                     )
-                    for factor_ref in active_refs
-                }
-                rank_cache: dict[tuple[str, bytes], np.ndarray] = {}
-                for left in active_refs:
-                    left_values = arrays[left]
-                    for right in active_refs:
-                        right_values = arrays[right]
-                        mask = np.isfinite(left_values) & np.isfinite(right_values)
-                        pair_count = int(np.sum(mask))
-                        if pair_count < self._minimum:
-                            continue
-                        paired_left = left_values[mask]
-                        paired_right = right_values[mask]
-                        pearson = _AnalysisSupport._correlation(
-                            paired_left, paired_right
+                    .sort("signal_date", "instrument_id")
+                )
+                del long_frames
+                offset = 0
+                grouped = aligned.group_by(
+                    "signal_date", maintain_order=True
+                ).len()
+                for day_index, (_, count) in enumerate(grouped.iter_rows()):
+                    if day_index % 20 == 0:
+                        self._check_cancelled()
+                    size = int(count)
+                    group = aligned.slice(offset, size)
+                    offset += size
+                    if group.is_empty():
+                        continue
+                    arrays = {
+                        factor_ref: (
+                            group[factor_ref].to_numpy()
+                            if factor_ref in group.columns
+                            else np.full(group.height, np.nan, dtype=np.float64)
                         )
-                        mask_key = mask.tobytes()
-                        left_key = (left, mask_key)
-                        right_key = (right, mask_key)
-                        left_ranks = rank_cache.get(left_key)
-                        if left_ranks is None:
-                            left_ranks = _AnalysisSupport._ranks(paired_left)
-                            rank_cache[left_key] = left_ranks
-                        right_ranks = rank_cache.get(right_key)
-                        if right_ranks is None:
-                            right_ranks = _AnalysisSupport._ranks(paired_right)
-                            rank_cache[right_key] = right_ranks
-                        rank = _AnalysisSupport._correlation(
-                            left_ranks, right_ranks
-                        )
-                        if pearson is None or rank is None:
-                            continue
-                        aggregate = totals[(left, right)]
-                        aggregate[0] += 1
-                        aggregate[1] += pair_count
-                        aggregate[2] += pearson
-                        aggregate[3] += rank
-            del aligned
+                        for factor_ref in factor_refs
+                    }
+                    rank_cache: dict[tuple[str, bytes], np.ndarray] = {}
+                    for left in factor_refs:
+                        left_values = arrays[left]
+                        for right in factor_refs:
+                            right_values = arrays[right]
+                            mask = np.isfinite(left_values) & np.isfinite(
+                                right_values
+                            )
+                            pair_count = int(np.sum(mask))
+                            if pair_count < self._minimum:
+                                continue
+                            paired_left = left_values[mask]
+                            paired_right = right_values[mask]
+                            pearson = _AnalysisSupport._correlation(
+                                paired_left, paired_right
+                            )
+                            mask_key = mask.tobytes()
+                            left_key = (left, mask_key)
+                            right_key = (right, mask_key)
+                            left_ranks = rank_cache.get(left_key)
+                            if left_ranks is None:
+                                left_ranks = _AnalysisSupport._ranks(paired_left)
+                                rank_cache[left_key] = left_ranks
+                            right_ranks = rank_cache.get(right_key)
+                            if right_ranks is None:
+                                right_ranks = _AnalysisSupport._ranks(paired_right)
+                                rank_cache[right_key] = right_ranks
+                            rank = _AnalysisSupport._correlation(
+                                left_ranks, right_ranks
+                            )
+                            if pearson is None or rank is None:
+                                continue
+                            aggregate = totals[(left, right)]
+                            aggregate[0] += 1
+                            aggregate[1] += pair_count
+                            aggregate[2] += pearson
+                            aggregate[3] += rank
+                del aligned
             rows: list[tuple[object, ...]] = []
             for (left, right), aggregate in sorted(totals.items()):
                 date_count = int(aggregate[0])
@@ -1169,20 +1187,15 @@ class StreamingStudyAnalyzer:
             frames.append(
                 pl.DataFrame(
                     rows,
-                    schema={
-                        "factor_x": pl.String,
-                        "factor_y": pl.String,
-                        "date_count": pl.Int64,
-                        "pair_count": pl.Int64,
-                        "pearson_correlation": pl.Float64,
-                        "rank_correlation": pl.Float64,
-                        "is_valid": pl.Boolean,
-                        "signal_variant": pl.String,
-                    },
+                    schema=_CORRELATION_SCHEMA,
                     orient="row",
                 )
             )
-        return pl.concat(frames)
+        return (
+            pl.concat(frames)
+            if frames
+            else pl.DataFrame(schema=_CORRELATION_SCHEMA)
+        )
 
     @staticmethod
     def _sort_outputs(

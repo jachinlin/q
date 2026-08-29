@@ -32,6 +32,8 @@ class _EmptyStatusRepository:
     def __init__(self) -> None:
         self.suspension_calls = 0
         self.warning_calls = 0
+        self.metadata_calls = 0
+        self.calendar_calls = 0
         self._empty = pl.DataFrame(
             schema={
                 "instrument_id": pl.String,
@@ -40,6 +42,34 @@ class _EmptyStatusRepository:
                 "pit_usable": pl.Boolean,
             }
         )
+
+    def stocks(self) -> pl.LazyFrame:
+        """返回全部已满足上市时长的主板股票。"""
+        self.metadata_calls += 1
+        return pl.DataFrame(
+            {
+                "instrument_id": [
+                    f"{index + 1:06d}.SZ" for index in range(_INSTRUMENT_COUNT)
+                ],
+                "list_date": [date(2010, 1, 1)] * _INSTRUMENT_COUNT,
+                "delist_date": pl.Series([None] * _INSTRUMENT_COUNT, dtype=pl.Date),
+                "board": ["MAIN"] * _INSTRUMENT_COUNT,
+            }
+        ).lazy()
+
+    def trade_calendar(self, start: date, end: date) -> pl.LazyFrame:
+        """返回覆盖全局上市序号的工作日历。"""
+        self.calendar_calls += 1
+        values: list[date] = []
+        current = start
+        while current <= end:
+            if current.weekday() < 5:
+                values.append(current)
+            current += timedelta(days=1)
+        return pl.DataFrame(
+            {"trade_date": values, "is_trading_day": [True] * len(values)},
+            schema={"trade_date": pl.Date, "is_trading_day": pl.Boolean},
+        ).lazy()
 
     def stock_suspensions(self, *_: object) -> pl.LazyFrame:
         """返回空停牌状态。"""
@@ -132,6 +162,8 @@ def test_full_scale_factor_study_universe_meets_resource_budget() -> None:
     assert len(universe_hash) == 64
     assert repository.suspension_calls == 1
     assert repository.warning_calls == 1
+    assert repository.metadata_calls == 1
+    assert repository.calendar_calls == 1
     assert len(progress_events) <= 21
     assert elapsed <= _MAX_BUILD_SECONDS
     assert peak_rss <= _MAX_PEAK_RSS_BYTES

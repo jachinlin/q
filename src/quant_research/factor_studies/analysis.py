@@ -117,20 +117,32 @@ class HacMeanAnalyzer:
     """
 
     @staticmethod
-    def summarize(values: list[float], horizon: int) -> HacMetricSummary:
-        """按 ``min(horizon-1,n-1)`` 滞后输出 HAC 均值推断。
+    def summarize(
+        values: list[float | None], horizon: int
+    ) -> HacMetricSummary:
+        """按完整信号会话轴和固定持有期滞后输出 HAC 均值推断。
 
         入参：
-            values：按信号日排序的观测值。
+            values：按连续信号会话排序的观测值，无效会话以 ``None`` 占位。
             horizon：收益持有期，用于确定固定滞后阶数。
         返回值：
             返回包含均值、HAC 标准误和正态近似推断的冻结对象。
         异常：
             无；样本不足或长期方差非正时返回明确原因码。
         """
-        finite = np.asarray([value for value in values if isfinite(value)], dtype=float)
+        samples = np.asarray(
+            [
+                value
+                if value is not None and isfinite(value)
+                else float("nan")
+                for value in values
+            ],
+            dtype=float,
+        )
+        finite_mask = np.isfinite(samples)
+        finite = samples[finite_mask]
         count = len(finite)
-        lag = min(max(horizon - 1, 0), max(count - 1, 0))
+        lag = min(max(horizon - 1, 0), max(len(samples) - 1, 0))
         if count == 0:
             return HacMetricSummary(
                 None,
@@ -156,11 +168,16 @@ class HacMeanAnalyzer:
                 None,
                 "INSUFFICIENT_OBSERVATIONS",
             )
-        centered = finite - mean
+        centered = np.where(finite_mask, samples - mean, 0.0)
         long_run_variance = float(np.dot(centered, centered) / count)
         for offset in range(1, lag + 1):
+            pair_mask = finite_mask[offset:] & finite_mask[:-offset]
             covariance = float(
-                np.dot(centered[offset:], centered[:-offset]) / count
+                np.dot(
+                    centered[offset:][pair_mask],
+                    centered[:-offset][pair_mask],
+                )
+                / count
             )
             long_run_variance += (
                 2.0 * (1.0 - offset / (lag + 1.0)) * covariance
@@ -422,6 +439,9 @@ class _StudyAnalyzer:
             .len()
             .rename({"len": "eligible_count"})
         )
+        signal_dates = (
+            eligible.select("signal_date").unique().sort("signal_date")
+        )
         coverage_rows: list[dict[str, object]] = []
         summary_rows: list[dict[str, object]] = []
         ic_frames: list[pl.DataFrame] = []
@@ -598,6 +618,7 @@ class _StudyAnalyzer:
                     costs, break_even = self._costs(
                         long_short,
                         turnover,
+                        signal_dates,
                         horizon,
                         variant,
                         factor_ref,
@@ -610,6 +631,7 @@ class _StudyAnalyzer:
                             long_short,
                             monotonicity,
                             turnover,
+                            signal_dates,
                             horizon,
                             variant,
                             factor_ref,
@@ -735,6 +757,7 @@ class _StudyAnalyzer:
         long_short: pl.DataFrame,
         monotonicity: pl.DataFrame,
         turnover: pl.DataFrame,
+        signal_dates: pl.DataFrame,
         horizon: int,
         variant: str,
         factor_ref: str,
@@ -743,7 +766,6 @@ class _StudyAnalyzer:
     ) -> dict[str, object]:
         pearson = self._ic_analyzer.summarize(ic, "pearson_ic")
         rank = self._ic_analyzer.summarize(ic, "rank_ic")
-        valid_ic = ic.filter(pl.col("is_valid"))
         valid_ls = cast(
             list[float],
             long_short.filter(pl.col("is_valid"))[
@@ -765,21 +787,26 @@ class _StudyAnalyzer:
             **pearson.columns("pearson_ic"),
             **rank.columns("rank_ic"),
             **HacMeanAnalyzer.summarize(
-                cast(
-                    list[float],
-                    valid_ic["pearson_ic"].drop_nulls().to_list(),
+                self._hac_axis_values(
+                    signal_dates, ic, "pearson_ic", "is_valid"
                 ),
                 horizon,
             ).columns("pearson_ic_hac"),
             **HacMeanAnalyzer.summarize(
-                cast(
-                    list[float], valid_ic["rank_ic"].drop_nulls().to_list()
+                self._hac_axis_values(
+                    signal_dates, ic, "rank_ic", "is_valid"
                 ),
                 horizon,
             ).columns("rank_ic_hac"),
-            **HacMeanAnalyzer.summarize(valid_ls, horizon).columns(
-                "long_short"
-            ),
+            **HacMeanAnalyzer.summarize(
+                self._hac_axis_values(
+                    signal_dates,
+                    long_short,
+                    "long_short_return",
+                    "is_valid",
+                ),
+                horizon,
+            ).columns("long_short"),
             "long_short_positive_rate": self._positive_rate(valid_ls),
             "monotonicity_mean": self._mean(valid_mono),
             "monotonic_day_rate": self._positive_rate(valid_mono),
@@ -942,23 +969,38 @@ class _StudyAnalyzer:
         self,
         long_short: pl.DataFrame,
         turnover: pl.DataFrame,
+        signal_dates: pl.DataFrame,
         horizon: int,
         variant: str,
         factor_ref: str,
         label_kind: str,
     ) -> tuple[list[dict[str, object]], float | None]:
-        aligned = long_short.filter(pl.col("is_valid")).select(
-            "signal_date", "long_short_return"
-        ).join(
-            turnover.filter(pl.col("turnover_is_valid")).select(
-                "signal_date", "total_turnover"
-            ),
-            on="signal_date",
-            how="inner",
+        aligned = (
+            signal_dates.join(
+                long_short.filter(pl.col("is_valid")).select(
+                    "signal_date", "long_short_return"
+                ),
+                on="signal_date",
+                how="left",
+            )
+            .join(
+                turnover.filter(pl.col("turnover_is_valid")).select(
+                    "signal_date", "total_turnover"
+                ),
+                on="signal_date",
+                how="left",
+            )
+            .sort("signal_date")
         )
-        gross = cast(list[float], aligned["long_short_return"].to_list())
+        valid_aligned = aligned.filter(
+            pl.col("long_short_return").is_not_null()
+            & pl.col("long_short_return").is_finite()
+            & pl.col("total_turnover").is_not_null()
+            & pl.col("total_turnover").is_finite()
+        )
+        gross = cast(list[float], valid_aligned["long_short_return"].to_list())
         turnover_values = cast(
-            list[float], aligned["total_turnover"].to_list()
+            list[float], valid_aligned["total_turnover"].to_list()
         )
         gross_sum, turnover_sum = sum(gross), sum(turnover_values)
         break_even = (
@@ -968,10 +1010,23 @@ class _StudyAnalyzer:
         )
         rows: list[dict[str, object]] = []
         for bps in self._cost_bps_scenarios:
-            net = [
-                value - turn * bps / 10_000.0
-                for value, turn in zip(gross, turnover_values, strict=True)
-            ]
+            net = cast(
+                list[float | None],
+                aligned.select(
+                    pl.when(
+                        pl.col("long_short_return").is_not_null()
+                        & pl.col("long_short_return").is_finite()
+                        & pl.col("total_turnover").is_not_null()
+                        & pl.col("total_turnover").is_finite()
+                    )
+                    .then(
+                        pl.col("long_short_return")
+                        - pl.col("total_turnover") * bps / 10_000.0
+                    )
+                    .otherwise(None)
+                    .alias("net_spread")
+                )["net_spread"].to_list(),
+            )
             summary = HacMeanAnalyzer.summarize(net, horizon)
             rows.append(
                 {
@@ -1004,6 +1059,32 @@ class _StudyAnalyzer:
                 }
             )
         return rows, break_even
+
+    @staticmethod
+    def _hac_axis_values(
+        signal_dates: pl.DataFrame,
+        frame: pl.DataFrame,
+        value_column: str,
+        valid_column: str,
+    ) -> list[float | None]:
+        """把有效指标左对齐到完整信号会话轴并保留无效日占位。
+
+        入参：完整日期轴、指标表、数值列和有效性列。
+        返回值：返回按信号会话排序且以空值保留缺口的数值序列。
+        异常：输入缺列或日期键重复时传播 Polars 对应异常。
+        """
+        return cast(
+            list[float | None],
+            signal_dates.join(
+                frame.filter(
+                    pl.col(valid_column)
+                    & pl.col(value_column).is_not_null()
+                    & pl.col(value_column).is_finite()
+                ).select("signal_date", value_column),
+                on="signal_date",
+                how="left",
+            ).sort("signal_date")[value_column].to_list(),
+        )
 
     def _label_quality(
         self,

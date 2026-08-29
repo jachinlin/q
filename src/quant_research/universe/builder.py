@@ -133,6 +133,144 @@ class UniverseBuilder:
         return pl.DataFrame(rows, schema=_OUTPUT_SCHEMA, strict=False)
 
 
+class UniverseBatchEvaluator:
+    """按同一 ``UniverseRules`` 向量化判定多个交易日的股票池资格。
+
+    入参：
+        rules：上市时长、板块、风险警示、停牌和流动性准入规则；批量模式不接受
+        日均成交额门槛，因为调用方必须先提供完整的滚动流动性证据。
+    返回值：
+        返回绑定规则的批量判定器。
+    异常：
+        ValueError：规则启用了批量输入未提供的成交额门槛时抛出。
+    """
+
+    def __init__(self, rules: UniverseRules) -> None:
+        if not isinstance(rules, UniverseRules):
+            raise TypeError("rules must be UniverseRules")
+        if rules.min_avg_amount_20d is not None:
+            raise ValueError("batch universe requires explicit liquidity evidence")
+        self._rules = rules
+
+    def evaluate(
+        self,
+        instruments: pl.DataFrame,
+        signal_sessions: pl.DataFrame,
+        suspended: pl.DataFrame,
+        warned: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """生成按日期和证券稳定排序的批量资格与原因码。
+
+        入参：
+            instruments：证券元数据及 ``metadata_present``、``listing_ordinal``。
+            signal_sessions：交易日及其全局 ``session_ordinal``。
+            suspended、warned：已按每日 PIT 截止过滤的状态主键。
+        返回值：
+            返回 ``signal_date, instrument_id, eligible, reason_codes``。
+        异常：
+            ValueError：任一输入缺少必需列时抛出。
+        """
+        instrument_columns = {
+            "instrument_id",
+            "list_date",
+            "delist_date",
+            "board",
+            "metadata_present",
+            "listing_ordinal",
+        }
+        session_columns = {"trade_date", "session_ordinal"}
+        status_columns = {"signal_date", "instrument_id"}
+        if not instrument_columns.issubset(instruments.schema):
+            raise ValueError("batch universe instrument schema is invalid")
+        if not session_columns.issubset(signal_sessions.schema):
+            raise ValueError("batch universe session schema is invalid")
+        if not status_columns.issubset(suspended.schema) or not status_columns.issubset(
+            warned.schema
+        ):
+            raise ValueError("batch universe status schema is invalid")
+        dates = signal_sessions.rename({"trade_date": "signal_date"})
+        status_dates = dates.select("signal_date")
+        batch_suspended = suspended.join(
+            status_dates, on="signal_date", how="inner"
+        )
+        batch_warned = warned.join(status_dates, on="signal_date", how="inner")
+        status = (
+            dates.join(instruments, how="cross")
+            .join(
+                batch_warned.with_columns(pl.lit(True).alias("_is_warned")),
+                on=["signal_date", "instrument_id"],
+                how="left",
+            )
+            .join(
+                batch_suspended.with_columns(
+                    pl.lit(True).alias("_is_suspended")
+                ),
+                on=["signal_date", "instrument_id"],
+                how="left",
+            )
+            .with_columns(
+                pl.col("_is_warned").fill_null(False),
+                pl.col("_is_suspended").fill_null(False),
+            )
+        )
+        metadata_missing = ~pl.col("metadata_present")
+        history_missing = metadata_missing | pl.col("list_date").is_null()
+        not_listed = (
+            pl.col("list_date").is_not_null()
+            & (pl.col("list_date") > pl.col("signal_date"))
+        )
+        delisted = (
+            pl.col("delist_date").is_not_null()
+            & (pl.col("delist_date") <= pl.col("signal_date"))
+        )
+        listing_session = (
+            pl.col("session_ordinal") - pl.col("listing_ordinal") + 1
+        )
+        insufficient_listing = (
+            pl.col("list_date").is_not_null()
+            & (pl.col("list_date") <= pl.col("signal_date"))
+            & (listing_session < self._rules.min_listing_days)
+        ).fill_null(False)
+        warned_out = (
+            pl.col("_is_warned")
+            if self._rules.exclude_st
+            else pl.lit(False)
+        )
+        suspended_out = (
+            pl.col("_is_suspended")
+            if self._rules.exclude_suspended
+            else pl.lit(False)
+        )
+        allowed_boards = sorted(board.value for board in self._rules.allowed_boards)
+        board_not_allowed = ~pl.col("board").is_in(allowed_boards).fill_null(False)
+        conditions = (
+            (history_missing, "INSTRUMENT_HISTORY_MISSING"),
+            (not_listed, "NOT_LISTED_YET"),
+            (delisted, "DELISTED"),
+            (insufficient_listing, "INSUFFICIENT_LISTING_DAYS"),
+            (warned_out, "RISK_WARNING"),
+            (suspended_out, "SUSPENDED"),
+            (board_not_allowed, "BOARD_NOT_ALLOWED"),
+        )
+        reason_codes = pl.concat_list(
+            [
+                pl.when(condition)
+                .then(pl.lit(reason))
+                .otherwise(pl.lit(None, dtype=pl.String))
+                for condition, reason in conditions
+            ]
+        ).list.drop_nulls()
+        excluded = conditions[0][0]
+        for condition, _ in conditions[1:]:
+            excluded = excluded | condition
+        return status.select(
+            "signal_date",
+            "instrument_id",
+            (~excluded).fill_null(False).alias("eligible"),
+            reason_codes.alias("reason_codes"),
+        ).sort("signal_date", "instrument_id")
+
+
 class _BuilderSupport:
     """集中承载本模块的私有实现逻辑。"""
 

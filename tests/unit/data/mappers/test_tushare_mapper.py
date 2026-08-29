@@ -8,7 +8,12 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 from quant_research.data.canonical.schemas import CANONICAL_SCHEMAS
-from quant_research.data.contracts import CanonicalBatch, PublishedPartition, RawBatch
+from quant_research.data.contracts import (
+    CanonicalBatch,
+    JsonValue,
+    PublishedPartition,
+    RawBatch,
+)
 from quant_research.data.storage.partitions import RawPartitionStore
 from quant_research.domain.enums import DatasetKind
 from quant_research.infrastructure.tushare.client import _FIELDS
@@ -588,3 +593,91 @@ def test_revision_consolidation_deduplicates_supplier_content() -> None:
     assert consolidated.height == 2
     assert consolidated.get_column("revision").to_list() == [0, 1]
     assert consolidated.get_column("total_revenue").to_list() == [200.0, 100.0]
+
+
+def test_industry_consolidation_preserves_first_entry_and_exit_observations(
+    tmp_path: Path,
+) -> None:
+    """成员生命周期事件时间不得随同切片后续全量刷新向后漂移。"""
+    fields = _FIELDS["index_member_all"]
+    store = RawPartitionStore(tmp_path)
+    base = dict.fromkeys(fields, None) | {
+        "l1_code": "801010.SI",
+        "l1_name": "农林牧渔",
+        "ts_code": "600000.SH",
+        "name": "浦发银行",
+        "in_date": "20200101",
+    }
+
+    def observation(
+        retrieved_at: datetime,
+        *,
+        is_new: str,
+        out_date: str | None,
+        extra_rows: tuple[dict[str, JsonValue], ...] = (),
+    ) -> pl.DataFrame:
+        raw = store.publish(
+            RawBatch(
+                source="tushare",
+                endpoint="index_member_all",
+                request={
+                    "endpoint": "index_member_all",
+                    "fields": ",".join(fields),
+                    "l1_code": "801010.SI",
+                    "is_new": is_new,
+                },
+                retrieved_at=retrieved_at,
+                schema=fields,
+                rows=(
+                    base | {"out_date": out_date, "is_new": is_new},
+                    *extra_rows,
+                ),
+            )
+        )
+        return _normalize_raw(raw).frame
+
+    entered_at = datetime(2024, 1, 1, tzinfo=UTC)
+    exited_at = datetime(2025, 1, 1, tzinfo=UTC)
+    refreshed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    entered = observation(entered_at, is_new="Y", out_date=None)
+    exited = observation(exited_at, is_new="N", out_date="20241231")
+    refreshed = observation(
+        refreshed_at,
+        is_new="N",
+        out_date="20241231",
+        extra_rows=(
+            base
+            | {
+                "ts_code": "600001.SH",
+                "name": "新成员",
+                "in_date": "20250101",
+                "out_date": "20251231",
+                "is_new": "N",
+            },
+        ),
+    )
+
+    mapper = TushareMapper()
+    consolidated = mapper.consolidate_partition(
+        DatasetKind.INDUSTRY_MEMBERSHIP,
+        (refreshed, entered, exited),
+    )
+    lifecycle = consolidated.filter(pl.col("instrument_id") == "600000.SH").row(
+        0, named=True
+    )
+    bootstrap_history = consolidated.filter(
+        pl.col("instrument_id") == "600001.SH"
+    ).row(0, named=True)
+
+    assert mapper.requires_raw_history(DatasetKind.INDUSTRY_MEMBERSHIP)
+    assert lifecycle["is_current"] is False
+    assert lifecycle["out_date"] == date(2024, 12, 31)
+    assert lifecycle["in_available_at"] == entered_at
+    assert lifecycle["out_available_at"] == exited_at
+    assert lifecycle["available_at"] == entered_at
+    assert lifecycle["ingested_at"] == refreshed_at
+    assert bootstrap_history["in_available_at"] == refreshed_at
+    assert bootstrap_history["out_available_at"] == refreshed_at
+    assert not consolidated.select(
+        "level1_code", "instrument_id", "in_date"
+    ).is_duplicated().any()

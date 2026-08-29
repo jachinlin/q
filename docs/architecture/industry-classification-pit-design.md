@@ -11,6 +11,14 @@ Tushare 指数代码（例如 `801010.SI`），不能省略 `.SI`。每个一级
 可用时间。查询日状态要求进入事件当时已知，并仅在退出事件当时已知且已经生效时
 排除该成员，避免用后来获取的信息回写历史。
 
+行业成员的全量响应按请求保留全部 Raw 历史观测，不能只使用最新 Raw head 重建。
+CURATE 按 `(level1_code, instrument_id, in_date)` 折叠一个成员生命周期：业务字段和
+`is_current/out_date` 取最新观测，`in_available_at` 取该生命周期首次被观测的时间，
+`out_available_at` 取当前 `out_date` 首次被观测的时间，`ingested_at` 保留最新观测
+时间，通用审计列 `available_at` 与 `in_available_at` 对齐。历史响应中首次见到的已
+退出成员，其进入和退出可用时间都只能从首次本地观测开始。这样同一一级行业切片中
+其他成员发生变化或后续重复刷新时，既有关系的 PIT 事件时间不会向后漂移。
+
 研究仓库提供 `industry_catalog()` 和 `industry_memberships_on_dates()`。股票池、因子
 研究和 Dashboard 在内存中按查询日组合成员关系，不持久化跨数据集聚合视图。
 仓库对每个“查询日 × 证券”只返回一个 PIT 行业状态。供应商全量刷新留下未闭合的旧

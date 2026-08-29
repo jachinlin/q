@@ -1,6 +1,7 @@
 """回测市场切片、交易画像、执行精度与账户交收的契约测试。"""
 
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
@@ -16,8 +17,10 @@ from quant_research.backtest import (
     ExecutionReason,
     FeeBreakdown,
     FillResult,
+    InstrumentTradingProfile,
     MarketSlice,
     PortfolioAccount,
+    PriceLimitParameters,
     SecurityStatus,
     Side,
     SimulatedFill,
@@ -40,8 +43,45 @@ _ETF_T0 = InstrumentId.parse("513100.SH")
 _STAR_ETF = InstrumentId.parse("588000.SH")
 _STAR_STOCK = InstrumentId.parse("688001.SH")
 _MISSING_ETF = InstrumentId.parse("512999.SH")
+_MAIN_STOCK = InstrumentId.parse("000001.SZ")
 _DAY_ONE = date(2026, 7, 30)
 _DAY_TWO = date(2026, 7, 31)
+
+
+def test_price_limit_parameters_preserve_exact_integer_rounding_contract() -> None:
+    """批量参数必须与 Decimal HALF_UP 规则使用同一精确比例和价格单位。"""
+    rulebook = AShareRuleBook.load(_RULES)
+    profile = rulebook.trading_profile(
+        _MAIN_STOCK, "STOCK", Board.MAIN, _DAY_ONE
+    )
+
+    parameters = rulebook.price_limit_parameters(
+        profile, _DAY_ONE, SecurityStatus.NORMAL
+    )
+
+    assert parameters == PriceLimitParameters(1, 10, 100, 1)
+    assert rulebook.price_limits(
+        profile, _DAY_ONE, 0.95, SecurityStatus.NORMAL
+    ).upper == 1.05
+    five_cent_profile = InstrumentTradingProfile(
+        profile_id="FIVE_CENT",
+        instrument_type="STOCK",
+        price_tick=Decimal("0.05"),
+        buy_minimum=100,
+        buy_increment=100,
+        sell_minimum=100,
+        sell_increment=100,
+        allow_full_odd_lot_sell=True,
+        settlement_sessions=1,
+        price_limit_group="MAIN",
+        fee_group="STOCK",
+    )
+    assert rulebook.price_limit_parameters(
+        five_cent_profile, _DAY_ONE, SecurityStatus.NORMAL
+    ) == PriceLimitParameters(1, 10, 100, 5)
+    assert rulebook.price_limits(
+        five_cent_profile, _DAY_ONE, 1.02, SecurityStatus.NORMAL
+    ).upper == 1.1
 
 
 def _market(

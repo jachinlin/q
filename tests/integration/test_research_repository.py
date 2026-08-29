@@ -378,9 +378,7 @@ class _ResearchRepositoryHarness:
                 datetime(2026, 1, 12, tzinfo=UTC),
             ),
         )
-        frame = _canonical_frame(
-            dataset,
-            [
+        rows: list[dict[str, object]] = [
                 {
                     "level1_code": industry,
                     "level1_name": industry,
@@ -406,9 +404,27 @@ class _ResearchRepositoryHarness:
                     "pit_usable": True,
                     "ingested_at": _NOW,
                 }
-                for instrument_id, industry, in_date, out_date, in_available_at in memberships
-            ],
+            for instrument_id, industry, in_date, out_date, in_available_at in memberships
+        ]
+        rows.append(
+            {
+                "level1_code": "J66",
+                "level1_name": "J66",
+                "instrument_id": "600004.SH",
+                "instrument_name": "600004.SH",
+                "in_date": date(2026, 1, 5),
+                "out_date": date(2026, 1, 10),
+                "is_current": False,
+                "in_available_at": datetime(2026, 1, 5, tzinfo=UTC),
+                "out_available_at": datetime(2026, 1, 12, 17, tzinfo=UTC),
+                "source": "tushare",
+                "available_at": datetime(2026, 1, 5, tzinfo=UTC),
+                "availability_source": "retrieved_at_no_supplier_announcement",
+                "pit_usable": True,
+                "ingested_at": _NOW,
+            }
         )
+        frame = _canonical_frame(dataset, rows)
         return CanonicalBatch(dataset, frame, ("e" * 64,))
 
 
@@ -677,6 +693,23 @@ def test_industry_single_and_batch_queries_rebuild_identical_tombstone_state(
         ).collect()
         assert empty.is_empty()
         assert empty.columns[0] == "query_date"
+    finally:
+        harness.close()
+
+
+def test_industry_exit_only_applies_after_its_first_observation(tmp_path: Path) -> None:
+    """已生效但尚未被观测的退出事件不得回写此前查询日。"""
+    harness = _ResearchRepositoryHarness(tmp_path)
+    try:
+        instrument = (InstrumentId.parse("600004.SH"),)
+        query_dates = tuple(date(2026, 1, day) for day in (9, 10, 11, 12, 13))
+
+        rows = harness.repository.industry_memberships_on_dates(
+            instrument, query_dates
+        ).collect()
+
+        assert rows.get_column("query_date").to_list() == list(query_dates[:-1])
+        assert rows.get_column("level1_code").to_list() == ["J66"] * 4
     finally:
         harness.close()
 

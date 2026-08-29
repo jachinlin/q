@@ -632,8 +632,8 @@ def factor_correlation_matrix(factors: pl.DataFrame) -> pl.DataFrame:
         pl.struct("signal_date", "instrument_id", "factor_id").is_duplicated().any()
     ).item():
         raise ValueError("duplicate factor correlation key")
+    ids = sorted(set(factors["factor_id"].drop_nulls().to_list()))
     valid = _AnalysisSupport._valid_factors(factors)
-    ids = sorted(set(valid["factor_id"].to_list()))
     rows = []
     for left in ids:
         for right in ids:
@@ -697,8 +697,8 @@ def factor_rank_correlation_matrix(
         pl.struct("signal_date", "instrument_id", "factor_id").is_duplicated().any()
     ).item():
         raise ValueError("duplicate factor correlation key")
+    ids = sorted(set(factors["factor_id"].drop_nulls().to_list()))
     valid = _AnalysisSupport._valid_factors(factors)
-    ids = sorted(set(valid["factor_id"].to_list()))
     rows = []
     for left in ids:
         for right in ids:

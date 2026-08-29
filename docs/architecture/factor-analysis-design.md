@@ -65,6 +65,11 @@ VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PUBLISH
 `signal_date, instrument_id` 稳定排序。股票池成员的 SHA-256 必须与完整 canonical JSON 成员
 列表逐字节一致，不得因批量化改变数据身份。
 
+`CN_STOCK_STANDARD` 固定复用 `UniverseRules` 默认口径：至少 120 个真实上市交易日，只允许
+主板、创业板和科创板，并排除未上市、已退市、元数据缺失、风险警示和停牌证券。批量判定与
+逐日 `UniverseBuilder` 保持原因码及优先级一致；上市交易日数以 `list_date` 起的完整 Canonical
+交易日历计算，禁止从研究起点重新编号。
+
 股票池哈希流式吸收包含原因码的完整批次；哈希完成后，常驻股票池只保留
 `signal_date, instrument_id, eligible`，原因码不得继续占用分析阶段内存。
 
@@ -86,10 +91,15 @@ VALIDATE → PREPARE_INPUTS → ANALYZE_FACTORS → PUBLISH
 - 缺失、非有限或非正市值、行业缺失、单成员行业、截面不足和市值暴露零方差都生成稳定
   无效原因；不得用原因子值回填。计算按证券稳定排序并使用确定性求和。
 
+一字涨停使用未复权 `preclose`、真实全局上市交易日序号和规则簿的历史涨跌幅；比例与价格
+使用精确整数单位执行 `ROUND_HALF_UP`，批量结果必须与 `AShareRuleBook.price_limits` 的
+Decimal 口径一致，不允许用 Float64 近似半分边界。
+
 Pearson IC、Rank IC、毛多空 spread 和成本情景净 spread 使用 Bartlett kernel 的
-Newey–West/HAC 推断。多重检验按 Rank IC 与毛多空 spread 两个 family 分别应用
-`BONFERRONI` 或 `BH_FDR`。研究不包含 TRAIN/VALIDATION/TEST、test budget、分段稳定性或
-自动候选评分。
+Newey–West/HAC 推断。HAC 保留完整信号交易会话轴，无效日以空值占位，只累计真实相隔
+`k` 个信号会话且两端有效的配对，滞后阶数为 `min(horizon-1, signal_date_count-1)`。
+多重检验按 Rank IC 与毛多空 spread 两个 family 分别应用 `BONFERRONI` 或 `BH_FDR`。
+研究不包含 TRAIN/VALIDATION/TEST、test budget、分段稳定性或自动候选评分。
 
 统计内核对每个“信号版本 × 因子”只执行一次稳定分位分配，同一分位结果复用于换手和全部
 远期收益标签。日度 IC 先完成一次键对齐，再按有序日期分区调用相同的 NumPy Pearson 与平均
@@ -111,8 +121,9 @@ PIT 状态各只读取并对齐一次。流式统计直接复用已过滤的有�
 逐行完全相同时才复用分位、换手和统计结果；任一值、有效性或原因不同即分别计算。
 
 多因子相关矩阵按 20 个交易日的确定性批次加载信号，批次间检查取消，再以有效日期数和配对
-数恢复双向矩阵。临时文件不进入 Manifest、不可跨任务复用；开始重试前先清理同研究残留，
-成功、失败和取消退出时均删除整个可信临时目录。文件名由内部序号生成，不接受配置或用户路径。
+数恢复全部输入因子的完整 N×N 双向矩阵；无共同有效样本的组合保留零计数、空相关值和无效状态。
+临时文件不进入 Manifest、不可跨任务复用；开始重试前先清理同研究残留，成功、失败和取消退出时
+均删除整个可信临时目录。文件名由内部序号生成，不接受配置或用户路径。
 `label_quality.count` 与 `eligible_count` 固定为 `Int64`。
 
 ## 持久化与可信产物

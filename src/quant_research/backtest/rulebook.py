@@ -70,6 +70,45 @@ class PriceBand:
 
 
 @dataclass(frozen=True, slots=True)
+class PriceLimitParameters:
+    """表示可供向量化计算使用的精确涨跌停参数。
+
+    入参：
+        rate_numerator、rate_denominator：涨跌幅比例的最简整数分数。
+        price_scale：把以元计价的价格转换为整数价格单位的十进制倍数。
+        tick_units：一个最小报价变动包含的整数价格单位数。
+    返回值：
+        构造并返回不含二进制浮点近似的不可变参数。
+    异常：
+        TypeError：字段不是整数时抛出。
+        ValueError：分子为负或分母、价格倍数、报价单位数不是正数时抛出。
+    """
+
+    rate_numerator: int
+    rate_denominator: int
+    price_scale: int
+    tick_units: int
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.rate_numerator, "rate_numerator"),
+            (self.rate_denominator, "rate_denominator"),
+            (self.price_scale, "price_scale"),
+            (self.tick_units, "tick_units"),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer")
+        if self.rate_numerator < 0:
+            raise ValueError("rate_numerator must be nonnegative")
+        if self.rate_denominator <= 0:
+            raise ValueError("rate_denominator must be positive")
+        if self.price_scale <= 0:
+            raise ValueError("price_scale must be positive")
+        if self.tick_units <= 0:
+            raise ValueError("tick_units must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class FeeBreakdown:
     """表示全部以分计价的成交费用分项。
 
@@ -354,10 +393,10 @@ class MarketRuleBook(Protocol):
         profile: InstrumentTradingProfile,
         trade_date: date,
         status: SecurityStatus,
-    ) -> tuple[float, float]:
-        """返回向量化涨跌停判定所需的历史比例和价格步长。
+    ) -> PriceLimitParameters:
+        """返回向量化涨跌停判定所需的精确整数参数。
 
-        入参：交易画像、交易日和风险状态。返回值：涨跌幅比例和价格步长。
+        入参：交易画像、交易日和风险状态。返回值：整数比例和价格单位倍数。
         异常：画像、日期、状态或规则覆盖非法时传播对应异常。
         """
 
@@ -591,11 +630,17 @@ class AShareRuleBook:
             ) from error
         rate = _RulebookSupport.matching_rate(rules, trade_date)
         close = _RulebookSupport.decimal_price(prev_close)
-        upper = (close * (Decimal(1) + rate)).quantize(
-            profile.price_tick, rounding=ROUND_HALF_UP
+        upper = (
+            (close * (Decimal(1) + rate) / profile.price_tick).quantize(
+                Decimal(1), rounding=ROUND_HALF_UP
+            )
+            * profile.price_tick
         )
-        lower = (close * (Decimal(1) - rate)).quantize(
-            profile.price_tick, rounding=ROUND_HALF_UP
+        lower = (
+            (close * (Decimal(1) - rate) / profile.price_tick).quantize(
+                Decimal(1), rounding=ROUND_HALF_UP
+            )
+            * profile.price_tick
         )
         return PriceBand(float(upper), float(lower))
 
@@ -604,10 +649,10 @@ class AShareRuleBook:
         profile: InstrumentTradingProfile,
         trade_date: date,
         status: SecurityStatus,
-    ) -> tuple[float, float]:
-        """返回向量化涨跌停判定所需的历史比例和价格步长。
+    ) -> PriceLimitParameters:
+        """返回向量化涨跌停判定所需的精确整数参数。
 
-        入参：交易画像、交易日和风险状态。返回值：涨跌幅比例和价格步长。
+        入参：交易画像、交易日和风险状态。返回值：整数比例和价格单位倍数。
         异常：画像、日期、状态或规则覆盖非法时抛出 ``TypeError`` 或 ``ValueError``。
         """
         _RulebookSupport.validate_profile_and_date(profile, trade_date)
@@ -620,7 +665,15 @@ class AShareRuleBook:
                 "price limit group does not cover security status"
             ) from error
         rate = _RulebookSupport.matching_rate(rules, trade_date)
-        return float(rate), float(profile.price_tick)
+        numerator, denominator = rate.as_integer_ratio()
+        exponent = profile.price_tick.as_tuple().exponent
+        if not isinstance(exponent, int):
+            raise TypeError("price tick exponent must be an integer")
+        price_scale = 10 ** max(0, -exponent)
+        tick_units = int(profile.price_tick * price_scale)
+        return PriceLimitParameters(
+            numerator, denominator, price_scale, tick_units
+        )
 
     def fees(
         self, fill: SimulatedFill, profile: InstrumentTradingProfile
