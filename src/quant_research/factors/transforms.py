@@ -278,94 +278,284 @@ class _TransformsSupport:
         if industry_col is not None and frame.schema[industry_col] != pl.String:
             raise ValueError("industry column must have String dtype")
 
-        state = _TransformsSupport._initial_state(frame, value_col)
-        market_caps = frame[market_cap_col].to_list()
-        industries = (
-            frame[industry_col].to_list() if industry_col is not None else None
+        temporary = _TransformsSupport._temporary_columns(
+            frame,
+            (
+                "value",
+                "exposure",
+                "reason",
+                "active",
+                "count",
+                "base_value",
+                "base_exposure",
+                "value_scale",
+                "exposure_scale",
+                "scaled_value",
+                "scaled_exposure",
+                "value_mean",
+                "exposure_mean",
+                "value_deviation",
+                "exposure_deviation",
+                "numerator",
+                "denominator",
+            ),
         )
-        exposures = [0.0] * frame.height
-        for index, source in enumerate(market_caps):
-            if not state.valid[index]:
-                continue
-            if source is None:
-                _TransformsSupport._invalidate(state, (index,), _MISSING_MARKET_CAP)
-                continue
-            numeric = float(cast(int | float, source))
-            if not math.isfinite(numeric):
-                _TransformsSupport._invalidate(
-                    state, (index,), _NONFINITE_MARKET_CAP
-                )
-                continue
-            if numeric <= 0.0:
-                _TransformsSupport._invalidate(
-                    state, (index,), _NONPOSITIVE_MARKET_CAP
-                )
-                continue
-            if industries is not None:
-                industry = industries[index]
-                if not isinstance(industry, str) or not industry:
-                    _TransformsSupport._invalidate(
-                        state, (index,), _MISSING_INDUSTRY
-                    )
-                    continue
-            exposures[index] = math.log(numeric)
+        (
+            numeric_name,
+            exposure_name,
+            reason_name,
+            active_name,
+            count_name,
+            base_value_name,
+            base_exposure_name,
+            value_scale_name,
+            exposure_scale_name,
+            scaled_value_name,
+            scaled_exposure_name,
+            value_mean_name,
+            exposure_mean_name,
+            value_deviation_name,
+            exposure_deviation_name,
+            numerator_name,
+            denominator_name,
+        ) = temporary
+        numeric = pl.col(value_col).cast(pl.Float64)
+        market_cap = pl.col(market_cap_col).cast(pl.Float64)
+        source_valid = (
+            pl.col("is_valid").fill_null(False)
+            if "is_valid" in frame.columns
+            else pl.lit(True)
+        )
+        source_reason = (
+            pl.col("invalid_reason")
+            if "invalid_reason" in frame.columns
+            else pl.lit(None, dtype=pl.String)
+        )
+        industry_missing = (
+            ~(
+                pl.col(industry_col).is_not_null()
+                & (pl.col(industry_col).str.len_chars() > 0)
+            ).fill_null(False)
+            if industry_col is not None
+            else pl.lit(False)
+        )
+        reason = (
+            pl.when(~source_valid)
+            .then(source_reason.fill_null(_INPUT_INVALID))
+            .when(numeric.is_null())
+            .then(pl.lit(_MISSING_VALUE))
+            .when(~numeric.is_finite())
+            .then(pl.lit(_NONFINITE_VALUE))
+            .when(market_cap.is_null())
+            .then(pl.lit(_MISSING_MARKET_CAP))
+            .when(~market_cap.is_finite())
+            .then(pl.lit(_NONFINITE_MARKET_CAP))
+            .when(market_cap <= 0.0)
+            .then(pl.lit(_NONPOSITIVE_MARKET_CAP))
+            .when(industry_missing)
+            .then(pl.lit(_MISSING_INDUSTRY))
+            .otherwise(pl.lit(None, dtype=pl.String))
+        )
 
-        if industries is not None:
-            industry_groups = _TransformsSupport._candidate_groups(
-                frame, (*grouping, cast(str, industry_col)), state.valid
+        work = (
+            frame.lazy()
+            .with_columns(
+                numeric.alias(numeric_name),
+                pl.when(market_cap.is_not_null() & market_cap.is_finite())
+                .then(market_cap.log())
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .alias(exposure_name),
+                reason.alias(reason_name),
             )
-            for indices in industry_groups.values():
-                if len(indices) < 2:
-                    _TransformsSupport._invalidate(
-                        state, indices, _SINGLE_MEMBER_INDUSTRY
-                    )
-
-        cross_sections = _TransformsSupport._candidate_groups(
-            frame, grouping, state.valid
+            .with_columns(pl.col(reason_name).is_null().alias(active_name))
         )
-        for indices in cross_sections.values():
-            if len(indices) < MIN_CROSS_SECTION_SIZE:
-                _TransformsSupport._invalidate(
-                    state, indices, _INSUFFICIENT_CROSS_SECTION
+        if industry_col is not None:
+            industry_partition = (*grouping, industry_col)
+            work = work.with_columns(
+                _TransformsSupport._window(
+                    pl.col(active_name).cast(pl.Int64).sum(), industry_partition
+                ).alias(count_name)
+            ).with_columns(
+                pl.when(pl.col(active_name) & (pl.col(count_name) < 2))
+                .then(pl.lit(_SINGLE_MEMBER_INDUSTRY))
+                .otherwise(pl.col(reason_name))
+                .alias(reason_name)
+            )
+        work = (
+            work.with_columns(pl.col(reason_name).is_null().alias(active_name))
+            .with_columns(
+                _TransformsSupport._window(
+                    pl.col(active_name).cast(pl.Int64).sum(), grouping
+                ).alias(count_name)
+            )
+            .with_columns(
+                pl.when(
+                    pl.col(active_name)
+                    & (pl.col(count_name) < MIN_CROSS_SECTION_SIZE)
                 )
-                continue
-            values = [state.values[index] for index in indices]
-            exposure_values = [exposures[index] for index in indices]
-            if industries is None:
-                residuals = _TransformsSupport._linear_residuals(
-                    values, exposure_values
+                .then(pl.lit(_INSUFFICIENT_CROSS_SECTION))
+                .otherwise(pl.col(reason_name))
+                .alias(reason_name)
+            )
+            .with_columns(pl.col(reason_name).is_null().alias(active_name))
+        )
+
+        if industry_col is None:
+            work = work.with_columns(
+                pl.col(numeric_name).alias(base_value_name),
+                pl.col(exposure_name).alias(base_exposure_name),
+            )
+        else:
+            industry_partition = (*grouping, industry_col)
+            work = work.with_columns(
+                (
+                    pl.col(numeric_name)
+                    - _TransformsSupport._window(
+                        pl.when(pl.col(active_name))
+                        .then(pl.col(numeric_name))
+                        .otherwise(None)
+                        .mean(),
+                        industry_partition,
+                    )
+                ).alias(base_value_name),
+                (
+                    pl.col(exposure_name)
+                    - _TransformsSupport._window(
+                        pl.when(pl.col(active_name))
+                        .then(pl.col(exposure_name))
+                        .otherwise(None)
+                        .mean(),
+                        industry_partition,
+                    )
+                ).alias(base_exposure_name),
+            )
+        work = work.with_columns(
+            _TransformsSupport._window(
+                pl.when(pl.col(active_name))
+                .then(pl.col(base_value_name).abs())
+                .otherwise(None)
+                .max(),
+                grouping,
+            ).alias(value_scale_name),
+            _TransformsSupport._window(
+                pl.when(pl.col(active_name))
+                .then(pl.col(base_exposure_name).abs())
+                .otherwise(None)
+                .max(),
+                grouping,
+            ).alias(exposure_scale_name),
+        ).with_columns(
+            pl.when(pl.col(value_scale_name) > 0.0)
+            .then(pl.col(base_value_name) / pl.col(value_scale_name))
+            .otherwise(pl.lit(0.0))
+            .alias(scaled_value_name),
+            pl.when(pl.col(exposure_scale_name) > 0.0)
+            .then(pl.col(base_exposure_name) / pl.col(exposure_scale_name))
+            .otherwise(pl.lit(0.0))
+            .alias(scaled_exposure_name),
+        )
+        if industry_col is None:
+            work = work.with_columns(
+                _TransformsSupport._window(
+                    pl.when(pl.col(active_name))
+                    .then(pl.col(scaled_value_name))
+                    .otherwise(None)
+                    .mean(),
+                    grouping,
+                ).alias(value_mean_name),
+                _TransformsSupport._window(
+                    pl.when(pl.col(active_name))
+                    .then(pl.col(scaled_exposure_name))
+                    .otherwise(None)
+                    .mean(),
+                    grouping,
+                ).alias(exposure_mean_name),
+            ).with_columns(
+                (pl.col(scaled_value_name) - pl.col(value_mean_name)).alias(
+                    value_deviation_name
+                ),
+                (pl.col(scaled_exposure_name) - pl.col(exposure_mean_name)).alias(
+                    exposure_deviation_name
+                ),
+            )
+        else:
+            work = work.with_columns(
+                pl.col(scaled_value_name).alias(value_deviation_name),
+                pl.col(scaled_exposure_name).alias(exposure_deviation_name),
+            )
+        work = work.with_columns(
+            _TransformsSupport._window(
+                pl.when(pl.col(active_name))
+                .then(
+                    pl.col(exposure_deviation_name)
+                    * pl.col(value_deviation_name)
                 )
-            else:
-                centered_values = [0.0] * len(indices)
-                centered_exposures = [0.0] * len(indices)
-                positions: dict[str, list[int]] = defaultdict(list)
-                for position, index in enumerate(indices):
-                    positions[cast(str, industries[index])].append(position)
-                for group_positions in positions.values():
-                    value_mean = math.fsum(
-                        values[position] for position in group_positions
-                    ) / len(group_positions)
-                    exposure_mean = math.fsum(
-                        exposure_values[position] for position in group_positions
-                    ) / len(group_positions)
-                    for position in group_positions:
-                        centered_values[position] = values[position] - value_mean
-                        centered_exposures[position] = (
-                            exposure_values[position] - exposure_mean
-                        )
-                residuals = _TransformsSupport._linear_residuals(
-                    centered_values,
-                    centered_exposures,
-                    centered=True,
+                .otherwise(None)
+                .sum(),
+                grouping,
+            ).alias(numerator_name),
+            _TransformsSupport._window(
+                pl.when(pl.col(active_name))
+                .then(pl.col(exposure_deviation_name).pow(2))
+                .otherwise(None)
+                .sum(),
+                grouping,
+            ).alias(denominator_name),
+        )
+        regression_valid = (
+            pl.col(active_name)
+            & pl.col(denominator_name).is_finite()
+            & (pl.col(denominator_name) > 0.0)
+        )
+        return (
+            work.with_columns(
+                pl.when(regression_valid)
+                .then(
+                    (
+                        pl.col(value_deviation_name)
+                        - pl.col(numerator_name)
+                        / pl.col(denominator_name)
+                        * pl.col(exposure_deviation_name)
+                    )
+                    * pl.col(value_scale_name)
                 )
-            if residuals is None:
-                _TransformsSupport._invalidate(
-                    state, indices, _ZERO_MARKET_CAP_VARIANCE
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .alias(value_col),
+                regression_valid.alias("is_valid"),
+                pl.when(
+                    pl.col(active_name)
+                    & (
+                        ~pl.col(denominator_name).is_finite()
+                        | (pl.col(denominator_name) <= 0.0)
+                    )
                 )
-                continue
-            for index, residual in zip(indices, residuals, strict=True):
-                state.values[index] = residual
-        return _TransformsSupport._result(frame, value_col, state)
+                .then(pl.lit(_ZERO_MARKET_CAP_VARIANCE))
+                .otherwise(pl.col(reason_name))
+                .alias("invalid_reason"),
+            )
+            .drop(temporary, strict=False)
+            .collect()
+        )
+
+    @staticmethod
+    def _temporary_columns(
+        frame: pl.DataFrame, stems: Sequence[str]
+    ) -> tuple[str, ...]:
+        """生成不会覆盖调用方列名的确定性临时列。"""
+        existing = set(frame.columns)
+        result: list[str] = []
+        for stem in stems:
+            candidate = f"__quant_neutralize_{stem}"
+            while candidate in existing:
+                candidate = f"_{candidate}"
+            existing.add(candidate)
+            result.append(candidate)
+        return tuple(result)
+
+    @staticmethod
+    def _window(expression: pl.Expr, grouping: Sequence[str]) -> pl.Expr:
+        """将聚合表达式广播到分组行；空分组表示整个数据帧。"""
+        return expression.over(list(grouping)) if grouping else expression
 
     @staticmethod
     def _linear_residuals(

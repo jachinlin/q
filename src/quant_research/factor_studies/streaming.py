@@ -28,7 +28,6 @@ from quant_research.factor_studies.analysis import (
 from quant_research.factors.analysis import (
     InformationCoefficientAnalyzer,
     _AnalysisSupport,
-    assign_quantiles,
     long_short_returns,
 )
 from quant_research.tasks.handlers import CancellationToken
@@ -728,6 +727,7 @@ class StreamingStudyAnalyzer:
                 }
             )
         valid_factors = _AnalysisSupport._valid_factors(frame)
+        factor_dates = frame.select("signal_date").unique()
         factor_counts = {
             cast(date, signal_date): int(count)
             for signal_date, count in valid_factors.group_by("signal_date")
@@ -740,15 +740,22 @@ class StreamingStudyAnalyzer:
         additional = valid_factors.join(
             removed_dates, on="signal_date", how="inner"
         ).select("signal_date", "instrument_id", "value")
-        assigned = assign_quantiles(
-            self._analyzer._minimum_mask(frame), self._quantiles
+        assigned = _AnalysisSupport._assign_quantiles_from_valid(
+            factor_dates,
+            valid_factors.join(
+                counts.filter(pl.col("valid_count") >= self._minimum).select(
+                    "signal_date"
+                ),
+                on="signal_date",
+                how="inner",
+            ),
+            self._quantiles,
         )
         spilled = self._temporary.write("assigned", assigned)
         turnover = self._turnover(assigned).with_columns(
             pl.lit(variant).alias("signal_variant"),
             pl.lit(factor_ref).alias("factor_ref"),
         )
-        factor_dates = frame.select("signal_date").unique()
         del frame, valid_factors, assigned
         return _PreparedSignal(
             variant=variant,

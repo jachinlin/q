@@ -530,49 +530,11 @@ def assign_quantiles(factors: pl.DataFrame, quantiles: int) -> pl.DataFrame:
     if type(quantiles) is not int or quantiles < 2:
         raise ValueError("quantiles must be an integer of at least 2")
     _AnalysisSupport._unique(factors, "factors")
-    ordered = _AnalysisSupport._valid_factors(factors).sort(
-        "signal_date", "value", "instrument_id"
+    return _AnalysisSupport._assign_quantiles_from_valid(
+        factors.select("signal_date").unique(),
+        _AnalysisSupport._valid_factors(factors),
+        quantiles,
     )
-    assigned = ordered.with_columns(
-        pl.int_range(0, pl.len(), dtype=pl.Int64)
-        .over("signal_date")
-        .alias("_row_index"),
-        pl.len().over("signal_date").cast(pl.Int64).alias("_row_count"),
-    ).select(
-        "signal_date",
-        "instrument_id",
-        pl.col("value").cast(pl.Float64),
-        ((pl.col("_row_index") * quantiles) // pl.col("_row_count") + 1)
-        .cast(pl.Int64)
-        .alias("quantile"),
-        pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
-        pl.lit(1, dtype=pl.Int64).alias("bucket_count"),
-        pl.lit(False).alias("is_empty"),
-    )
-    domain = (
-        factors.select("signal_date")
-        .unique()
-        .join(
-            pl.DataFrame(
-                {"quantile": pl.Series(range(1, quantiles + 1), dtype=pl.Int64)}
-            ),
-            how="cross",
-        )
-    )
-    empty = domain.join(
-        assigned.select("signal_date", "quantile").unique(),
-        on=["signal_date", "quantile"],
-        how="anti",
-    ).select(
-        "signal_date",
-        pl.lit(None, dtype=pl.String).alias("instrument_id"),
-        pl.lit(None, dtype=pl.Float64).alias("value"),
-        "quantile",
-        pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
-        pl.lit(0, dtype=pl.Int64).alias("bucket_count"),
-        pl.lit(True).alias("is_empty"),
-    )
-    return pl.concat([assigned, empty]).sort("signal_date", "quantile", "instrument_id")
 
 
 def quantile_future_returns(
@@ -820,6 +782,53 @@ class _AnalysisSupport:
             pl.col("is_valid")
             & pl.col("value").is_not_null()
             & pl.col("value").is_finite()
+        )
+
+    @staticmethod
+    def _assign_quantiles_from_valid(
+        factor_dates: pl.DataFrame,
+        valid_factors: pl.DataFrame,
+        quantiles: int,
+    ) -> pl.DataFrame:
+        """从已验证且已过滤的因子行分配分位并补齐空桶。"""
+        ordered = valid_factors.sort("signal_date", "value", "instrument_id")
+        assigned = ordered.with_columns(
+            pl.int_range(0, pl.len(), dtype=pl.Int64)
+            .over("signal_date")
+            .alias("_row_index"),
+            pl.len().over("signal_date").cast(pl.Int64).alias("_row_count"),
+        ).select(
+            "signal_date",
+            "instrument_id",
+            pl.col("value").cast(pl.Float64),
+            ((pl.col("_row_index") * quantiles) // pl.col("_row_count") + 1)
+            .cast(pl.Int64)
+            .alias("quantile"),
+            pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
+            pl.lit(1, dtype=pl.Int64).alias("bucket_count"),
+            pl.lit(False).alias("is_empty"),
+        )
+        domain = factor_dates.select("signal_date").unique().join(
+            pl.DataFrame(
+                {"quantile": pl.Series(range(1, quantiles + 1), dtype=pl.Int64)}
+            ),
+            how="cross",
+        )
+        empty = domain.join(
+            assigned.select("signal_date", "quantile").unique(),
+            on=["signal_date", "quantile"],
+            how="anti",
+        ).select(
+            "signal_date",
+            pl.lit(None, dtype=pl.String).alias("instrument_id"),
+            pl.lit(None, dtype=pl.Float64).alias("value"),
+            "quantile",
+            pl.lit(quantiles, dtype=pl.Int64).alias("quantiles"),
+            pl.lit(0, dtype=pl.Int64).alias("bucket_count"),
+            pl.lit(True).alias("is_empty"),
+        )
+        return pl.concat([assigned, empty]).sort(
+            "signal_date", "quantile", "instrument_id"
         )
 
     @staticmethod

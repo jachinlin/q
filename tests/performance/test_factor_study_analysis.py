@@ -13,6 +13,7 @@ import pytest
 from quant_research.factor_studies.analysis import (
     DIRECTION_ADJUSTED,
     EXECUTABLE_FORWARD_RETURN,
+    INDUSTRY_MARKET_CAP_NEUTRALIZED,
     INDUSTRY_NEUTRALIZED,
     THEORETICAL_FORWARD_RETURN,
     analyze,
@@ -24,6 +25,7 @@ from quant_research.factor_studies.streaming import (
     TemporaryEvidence,
 )
 from quant_research.factors.analysis import assign_quantiles
+from quant_research.factors.transforms import neutralize_industry_market_cap
 from tests.performance._process_memory import process_peak_rss_bytes
 
 pytestmark = pytest.mark.performance
@@ -295,6 +297,7 @@ def test_full_scale_streaming_factor_study_records_bounded_evidence(
     pipeline_started = time.perf_counter()
     with FactorStudyTemporaryStore(tmp_path, study_id) as temporary:
         signal_files = {}
+        signal_started = time.perf_counter()
         for factor_index in range(factor_count):
             factor_ref = f"stream_factor_{factor_index}"
             factor = scope.select(
@@ -309,14 +312,46 @@ def test_full_scale_streaming_factor_study_records_bounded_evidence(
                 ).alias("value"),
                 pl.lit(True).alias("is_valid"),
                 pl.lit(None, dtype=pl.String).alias("invalid_reason"),
+                (pl.col("_instrument_rank") % 31)
+                .cast(pl.String)
+                .str.pad_start(2, "0")
+                .alias("_neutralization_industry"),
+                ((pl.col("_instrument_rank") + 1).cast(pl.Float64) * 1_000_000.0)
+                .alias("_neutralization_market_cap"),
             )
-            for variant in (DIRECTION_ADJUSTED, INDUSTRY_NEUTRALIZED):
-                signal_files[(variant, factor_ref)] = temporary.write(
-                    "signal",
-                    factor.with_columns(
-                        pl.lit(variant).alias("signal_variant")
-                    ),
-                )
+            direction_adjusted = factor.select(
+                "signal_date",
+                "instrument_id",
+                "factor_id",
+                "value",
+                "is_valid",
+                "invalid_reason",
+                pl.lit(DIRECTION_ADJUSTED).alias("signal_variant"),
+            )
+            neutralized = neutralize_industry_market_cap(
+                factor,
+                "value",
+                "_neutralization_market_cap",
+                "_neutralization_industry",
+                ("signal_date", "factor_id"),
+            ).select(
+                "signal_date",
+                "instrument_id",
+                "factor_id",
+                "value",
+                "is_valid",
+                "invalid_reason",
+                pl.lit(INDUSTRY_MARKET_CAP_NEUTRALIZED).alias("signal_variant"),
+            )
+            signal_files[(DIRECTION_ADJUSTED, factor_ref)] = temporary.write(
+                "signal", direction_adjusted
+            )
+            signal_files[(
+                INDUSTRY_MARKET_CAP_NEUTRALIZED,
+                factor_ref,
+            )] = temporary.write("signal", neutralized)
+            del factor, direction_adjusted, neutralized
+        signal_seconds = time.perf_counter() - signal_started
         label_files = {
             horizon: temporary.write("label", wide)
             for horizon in (1, 5, 20)
@@ -345,6 +380,7 @@ def test_full_scale_streaming_factor_study_records_bounded_evidence(
         "pipeline_seconds": pipeline_seconds,
         "peak_rss_bytes": peak_rss_bytes,
         "temporary_peak_bytes": temporary_peak_bytes,
+        "signal_generation_seconds": signal_seconds,
         "stage_seconds": analyzer.performance_evidence,
         "output_row_counts": {
             name: frame.height for name, frame in sorted(outputs.items())
@@ -357,6 +393,6 @@ def test_full_scale_streaming_factor_study_records_bounded_evidence(
     assert outputs["summary"].height == factor_count * 2 * 6
     assert outputs["ic"].height == factor_count * 2 * 6 * _FULL_SESSION_COUNT
     assert peak_rss_bytes <= int(8.5 * 1024**3)
+    assert signal_seconds <= (15.0 if factor_count == 1 else 60.0)
     assert analysis_seconds <= (60.0 if factor_count == 1 else 300.0)
-    if factor_count == 1:
-        assert pipeline_seconds <= 120.0
+    assert pipeline_seconds <= (120.0 if factor_count == 1 else 300.0)

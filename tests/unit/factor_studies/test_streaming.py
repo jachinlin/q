@@ -135,14 +135,22 @@ def test_streaming_analysis_matches_in_memory_for_five_factors(
         minimum=3,
     )
     assignment_count = 0
-    original_assign = streaming_module.assign_quantiles
+    original_assign = streaming_module._AnalysisSupport._assign_quantiles_from_valid
 
-    def counted_assign(frame: pl.DataFrame, quantiles: int) -> pl.DataFrame:
+    def counted_assign(
+        factor_dates: pl.DataFrame,
+        valid_factors: pl.DataFrame,
+        quantiles: int,
+    ) -> pl.DataFrame:
         nonlocal assignment_count
         assignment_count += 1
-        return original_assign(frame, quantiles)
+        return original_assign(factor_dates, valid_factors, quantiles)
 
-    monkeypatch.setattr(streaming_module, "assign_quantiles", counted_assign)
+    monkeypatch.setattr(
+        streaming_module._AnalysisSupport,
+        "_assign_quantiles_from_valid",
+        counted_assign,
+    )
     with FactorStudyTemporaryStore(
         tmp_path, "01M14STREAMINGANALYSIS001"
     ) as temporary:

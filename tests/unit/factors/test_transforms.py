@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from quant_research.factors.transforms import (
     MIN_CROSS_SECTION_SIZE,
@@ -266,6 +267,41 @@ def test_joint_neutralization_matches_industry_fixed_effect_reference() -> None:
     slope = np.sum(x_centered * y_centered) / np.sum(x_centered**2)
     expected = y_centered - slope * x_centered
     np.testing.assert_allclose(result["value"].to_numpy(), expected, atol=1e-12)
+
+
+def test_joint_neutralization_is_deterministic_under_input_order() -> None:
+    source = _frame(
+        day=[1] * 6 + [2] * 6,
+        industry=["A", "A", "A", "B", "B", "B"] * 2,
+        value=[1.0, 5.0, 4.0, 10.0, 8.0, 15.0, 2.0, 7.0, 3.0, 9.0, 6.0, 14.0],
+        total_market_value=[
+            1.0,
+            np.e,
+            np.e**2,
+            np.e,
+            np.e**2,
+            np.e**3,
+        ]
+        * 2,
+        marker=list(range(12)),
+    )
+
+    original = neutralize_industry_market_cap(
+        source, "value", "total_market_value", "industry", ("day",)
+    )
+    reordered = neutralize_industry_market_cap(
+        source.reverse(), "value", "total_market_value", "industry", ("day",)
+    )
+
+    assert original["marker"].to_list() == list(range(12))
+    assert_frame_equal(
+        original.sort("marker"),
+        reordered.sort("marker"),
+        check_row_order=True,
+        check_column_order=True,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    )
 
 
 def test_market_cap_neutralization_has_stable_invalid_reasons() -> None:
