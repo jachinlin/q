@@ -1,6 +1,6 @@
 # 因子研究与分析设计：从信号到可信结论
 
-文档状态：当前有效设计　·　日期：2026-08-29
+文档状态：当前有效设计　·　日期：2026-08-30
 
 本文既是本项目独立因子研究的权威设计，也是写给第一次接触量化研究的后端工程师的入门说明。
 读者不需要预先理解金融统计，但应熟悉 Python、命令行、数据库和 API 等一般开发概念。
@@ -173,6 +173,33 @@ trade_date, instrument_id, factor_id, value, available_at, is_valid
 
 系统先把因子值乘以 `FactorSpec.direction`，使后续分析统一遵循：调整后分数越高，越被当作多头端；
 分数越低，越被当作空头端。方向调整不会自动让因子有效，也不会把缺失或无效值补成零。
+
+内置股票因子目录固定为以下 18 项，其中 `avg_amount_20d` 只用于流动性辅助，其余 17 项可进入
+Alpha 研究。窗口、源字段、口径、方向和有效值约束均写入对应 `FactorSpec.parameters`：
+
+| `factor_id` | 公式或 Canonical 源值 | 方向 | 关键约束 |
+|---|---|---:|---|
+| `earnings_yield_ttm` | `1 / pe_ttm` | +1 | 分母有限且非零 |
+| `book_to_price_mrq` | `1 / pb` | +1 | 分母有限且非零 |
+| `sales_yield` | `1 / ps_ttm` | +1 | TTM；分母有限且非零 |
+| `dividend_yield` | `dividend_yield_ttm` | +1 | TTM；非负且有限 |
+| `log_total_market_cap` | `ln(total_market_value)` | -1 | 输入为正且有限 |
+| `roe` | 最新可见 `roe` | +1 | 最新报告期及修订；190 日时效 |
+| `revenue_growth` | 最新可见 `tr_yoy` | +1 | YoY；允许合法负值；190 日时效 |
+| `profit_growth` | 最新可见 `netprofit_yoy` | +1 | YoY；允许合法负值；190 日时效 |
+| `roa` | 最新可见 `roa` | +1 | 允许合法负值；190 日时效 |
+| `gross_margin` | 最新可见 `grossprofit_margin` | +1 | 允许合法负值；190 日时效 |
+| `cash_quality` | 最新可见 `ocf_to_opincome` | +1 | 允许合法负值；190 日时效 |
+| `leverage` | 最新可见 `debt_to_assets` | -1 | 非负且有限；190 日时效 |
+| `momentum_120_20` | T-120 至 T-20 的前复权累计收益 | +1 | 完整交易会话窗口 |
+| `volatility_60d` | 60 日对数收益年化样本波动率 | -1 | 完整交易会话窗口 |
+| `downside_volatility_60d` | 60 日负对数收益年化均方根 | -1 | 完整交易会话窗口 |
+| `max_drawdown_120d` | 120 日前复权价格最大回撤 | -1 | 完整交易会话窗口 |
+| `turnover_20d` | 20 个自由流通换手率观测的算术均值 | -1 | 全部非负、有限且在信号日可见 |
+| `avg_amount_20d` | 20 日成交额算术均值 | +1 | 流动性辅助，不允许进入 Alpha 组合 |
+
+财务类因子在一个 `FactorContext` 内共享一次交易日历和一次完整修订历史读取。信号日选择最新可见
+报告期的最新修订；若该最新记录的目标字段无效，不回退到旧报告。
 
 ### 3.3 构造两类未来收益
 

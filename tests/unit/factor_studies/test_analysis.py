@@ -375,7 +375,7 @@ def test_analysis_invalidates_horizon_with_too_few_future_pairs() -> None:
         {
             "signal_date": [day] * 30,
             "instrument_id": instruments,
-            "factor_id": ["roe_pit"] * 30,
+            "factor_id": ["roe"] * 30,
             "value": [float(index) for index in range(30)],
             "is_valid": [True] * 30,
         }
@@ -590,7 +590,7 @@ def test_analysis_invalidates_factor_correlation_with_too_few_common_pairs() -> 
     day = date(2026, 1, 5)
     instruments = [f"{index:06d}.SZ" for index in range(31)]
     rows = []
-    for factor_ref in ("roe_pit", "book_to_price_mrq"):
+    for factor_ref in ("roe", "book_to_price_mrq"):
         for index, instrument_id in enumerate(instruments):
             rows.append(
                 {
@@ -598,7 +598,7 @@ def test_analysis_invalidates_factor_correlation_with_too_few_common_pairs() -> 
                     "instrument_id": instrument_id,
                     "factor_id": factor_ref,
                     "value": float(index),
-                    "is_valid": index != (30 if factor_ref == "roe_pit" else 0),
+                    "is_valid": index != (30 if factor_ref == "roe" else 0),
                 }
             )
     factors = pl.DataFrame(rows)
@@ -621,7 +621,7 @@ def test_analysis_invalidates_factor_correlation_with_too_few_common_pairs() -> 
 
     result = run_analysis(factors, eligible, {1: future})
     cross = result["correlation"].filter(
-        (pl.col("factor_x") == "roe_pit") & (pl.col("factor_y") == "book_to_price_mrq")
+        (pl.col("factor_x") == "roe") & (pl.col("factor_y") == "book_to_price_mrq")
     )
 
     assert cross.select("rank_correlation", "is_valid").row(0) == (None, False)

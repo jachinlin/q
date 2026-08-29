@@ -16,17 +16,25 @@ from quant_research.factors.builtin.momentum import (
     ReturnFactor,
     Trend120dFactor,
 )
-from quant_research.factors.builtin.quality import FinancialProvider, RoePitFactor
+from quant_research.factors.builtin.quality import (
+    FinancialIndicatorsCache,
+    FinancialMetricFactor,
+    FinancialProvider,
+    RoeFactor,
+)
 from quant_research.factors.builtin.risk import (
     DownsideVolatility60dFactor,
     MaxDrawdown120dFactor,
     Volatility60dFactor,
 )
+from quant_research.factors.builtin.turnover import Turnover20dFactor
 from quant_research.factors.builtin.valuation import (
     BookToPriceFactor,
     DailyBasicsCache,
+    DividendYieldFactor,
     EarningsYieldFactor,
     LogTotalMarketCapFactor,
+    SalesYieldFactor,
 )
 from quant_research.factors.registry import FactorRegistry
 
@@ -41,12 +49,21 @@ _RUNTIME_DEPENDENCY_ATTRIBUTES = (
 STOCK_FACTOR_REFERENCES = (
     "avg_amount_20d",
     "book_to_price_mrq",
+    "cash_quality",
+    "dividend_yield",
     "downside_volatility_60d",
     "earnings_yield_ttm",
+    "gross_margin",
+    "leverage",
     "log_total_market_cap",
     "max_drawdown_120d",
     "momentum_120_20",
-    "roe_pit",
+    "profit_growth",
+    "revenue_growth",
+    "roa",
+    "roe",
+    "sales_yield",
+    "turnover_20d",
     "volatility_60d",
 )
 
@@ -177,19 +194,94 @@ def register_stock_factors(
     """
     market_bars = _InitSupport._market_bars_for(registry, price_service, instruments)
     daily_basics = DailyBasicsCache(bar_repository, instruments)
+    financial_fields = (
+        "debt_to_assets",
+        "grossprofit_margin",
+        "netprofit_yoy",
+        "ocf_to_opincome",
+        "roa",
+        "roe",
+        "tr_yoy",
+    )
+    financials = FinancialIndicatorsCache(
+        financial_provider, instruments, financial_fields
+    )
     factors: tuple[Factor, ...] = (
         EarningsYieldFactor(bar_repository, instruments, daily_basics=daily_basics),
         BookToPriceFactor(bar_repository, instruments, daily_basics=daily_basics),
+        SalesYieldFactor(bar_repository, instruments, daily_basics=daily_basics),
+        DividendYieldFactor(bar_repository, instruments, daily_basics=daily_basics),
         LogTotalMarketCapFactor(
             bar_repository, instruments, daily_basics=daily_basics
         ),
-        RoePitFactor(financial_provider, instruments),
+        RoeFactor(financial_provider, instruments, cache=financials),
+        FinancialMetricFactor(
+            financial_provider,
+            instruments,
+            factor_id="revenue_growth",
+            field="tr_yoy",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="year_over_year",
+            cache=financials,
+        ),
+        FinancialMetricFactor(
+            financial_provider,
+            instruments,
+            factor_id="profit_growth",
+            field="netprofit_yoy",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="year_over_year",
+            cache=financials,
+        ),
+        FinancialMetricFactor(
+            financial_provider,
+            instruments,
+            factor_id="roa",
+            field="roa",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="point_in_time",
+            cache=financials,
+        ),
+        FinancialMetricFactor(
+            financial_provider,
+            instruments,
+            factor_id="gross_margin",
+            field="grossprofit_margin",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="point_in_time",
+            cache=financials,
+        ),
+        FinancialMetricFactor(
+            financial_provider,
+            instruments,
+            factor_id="cash_quality",
+            field="ocf_to_opincome",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="point_in_time",
+            cache=financials,
+        ),
+        FinancialMetricFactor(
+            financial_provider,
+            instruments,
+            factor_id="leverage",
+            field="debt_to_assets",
+            direction=-1,
+            value_domain="nonnegative_finite",
+            measurement="point_in_time",
+            cache=financials,
+        ),
         Momentum12020Factor(price_service, instruments, market_bars=market_bars),
         Volatility60dFactor(price_service, instruments, market_bars=market_bars),
         DownsideVolatility60dFactor(
             price_service, instruments, market_bars=market_bars
         ),
         MaxDrawdown120dFactor(price_service, instruments, market_bars=market_bars),
+        Turnover20dFactor(bar_repository, instruments),
         AvgAmount20dFactor(bar_repository, instruments),
     )
     for factor in factors:

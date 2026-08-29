@@ -65,6 +65,8 @@ class DailyBasicsCache:
             "instrument_id": pl.String,
             "pe_ttm": pl.Float64,
             "pb": pl.Float64,
+            "ps_ttm": pl.Float64,
+            "dividend_yield_ttm": pl.Float64,
             "total_market_value": pl.Float64,
             "available_at": pl.Datetime("us", "UTC"),
         }
@@ -105,6 +107,8 @@ class _ReciprocalMultipleFactor:
                 "formula": f"1/{field}",
                 "signed_denominator": True,
                 "invalid_denominator": "zero_or_nonfinite",
+                "value_domain": "signed_finite",
+                "direction": 1,
                 "eligible_for_alpha": True,
             },
         )
@@ -296,4 +300,147 @@ class BookToPriceFactor(_ReciprocalMultipleFactor):
             factor_id="book_to_price_mrq",
             field="pb",
             daily_basics=daily_basics,
+        )
+
+
+class SalesYieldFactor(_ReciprocalMultipleFactor):
+    """以 PIT 可见 TTM 市销率倒数计算销售收益率。
+
+    入参：
+        repository：提供 Daily Basic 数据的研究仓储。
+        instruments：参与计算的规范证券集合。
+        daily_basics：可选的共享 Daily Basic 缓存。
+    返回值：
+        完成销售收益率规格绑定的因子。
+    异常：
+        输入范围或共享缓存违反契约时传播相应异常。
+    """
+
+    def __init__(
+        self,
+        repository: BarRepository,
+        instruments: Sequence[InstrumentId],
+        *,
+        daily_basics: DailyBasicsCache | None = None,
+    ) -> None:
+        super().__init__(
+            repository,
+            instruments,
+            factor_id="sales_yield",
+            field="ps_ttm",
+            daily_basics=daily_basics,
+        )
+        self._spec = FactorSpec(
+            factor_id="sales_yield",
+            frequency="daily",
+            lookback_sessions=0,
+            dependencies=(),
+            direction=1,
+            parameters={
+                "source_field": "ps_ttm",
+                "formula": "1/ps_ttm",
+                "measurement": "ttm",
+                "signed_denominator": True,
+                "invalid_denominator": "zero_or_nonfinite",
+                "value_domain": "signed_finite",
+                "direction": 1,
+                "eligible_for_alpha": True,
+            },
+        )
+
+
+class DividendYieldFactor:
+    """直接使用 PIT 可见的 TTM 股息率计算股息收益率因子。
+
+    入参：
+        repository：提供 Daily Basic 数据的研究仓储。
+        instruments：参与计算的规范证券集合。
+        daily_basics：可选的共享 Daily Basic 缓存。
+    返回值：
+        完成股息收益率规格绑定的因子。
+    异常：
+        输入范围或共享缓存违反契约时传播相应异常。
+    """
+
+    def __init__(
+        self,
+        repository: BarRepository,
+        instruments: Sequence[InstrumentId],
+        *,
+        daily_basics: DailyBasicsCache | None = None,
+    ) -> None:
+        self._repository = repository
+        self._instruments = canonical_scope(instruments)
+        self._daily_basics = daily_basics
+        self._spec = FactorSpec(
+            factor_id="dividend_yield",
+            frequency="daily",
+            lookback_sessions=0,
+            dependencies=(),
+            direction=1,
+            parameters={
+                "source_field": "dividend_yield_ttm",
+                "formula": "dividend_yield_ttm",
+                "measurement": "ttm",
+                "value_domain": "nonnegative_finite",
+                "direction": 1,
+                "eligible_for_alpha": True,
+            },
+        )
+
+    @property
+    def spec(self) -> FactorSpec:
+        """返回股息收益率因子的不可变规格。
+
+        入参：
+            无。
+        返回值：
+            因子口径、方向、源字段和有效值约束。
+        异常：
+            无。
+        """
+        return self._spec
+
+    def compute(self, ctx: FactorContext) -> pl.LazyFrame:
+        """计算给定上下文内的 TTM 股息收益率。
+
+        入参：
+            ctx：因子运行的精确 PIT 上下文。
+        返回值：
+            符合标准因子输出 Schema 的惰性数据表。
+        异常：
+            Daily Basics 输入违反缓存契约时传播相应异常。
+        """
+        frame = (
+            self._daily_basics.load(ctx)
+            if self._daily_basics is not None
+            else DailyBasicsCache(self._repository, self._instruments).load(ctx)
+        )
+        value = pl.col("dividend_yield_ttm")
+        known_on_day = pl.col("available_at").is_not_null() & (
+            pl.col("available_at").dt.convert_time_zone("Asia/Shanghai").dt.date()
+            <= pl.col("trade_date")
+        )
+        valid = (
+            value.is_not_null()
+            & value.is_finite()
+            & (value >= 0.0)
+            & known_on_day
+        ).fill_null(False)
+        return (
+            frame.lazy()
+            .select(
+                "trade_date",
+                "instrument_id",
+                pl.lit(self.spec.factor_id, dtype=pl.String).alias("factor_id"),
+                pl.when(valid)
+                .then(value)
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .cast(pl.Float64)
+                .alias("value"),
+                "available_at",
+                valid.alias("is_valid"),
+            )
+            .cast(FACTOR_OUTPUT_SCHEMA)
+            .sort("trade_date", "instrument_id")
         )

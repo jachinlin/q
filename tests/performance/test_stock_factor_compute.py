@@ -15,17 +15,24 @@ from quant_research.domain.identifiers import InstrumentId
 from quant_research.factors.base import FactorContext
 from quant_research.factors.builtin.auxiliary import AvgAmount20dFactor
 from quant_research.factors.builtin.momentum import MarketBarsCache, Momentum12020Factor
-from quant_research.factors.builtin.quality import RoePitFactor
+from quant_research.factors.builtin.quality import (
+    FinancialIndicatorsCache,
+    FinancialMetricFactor,
+    RoeFactor,
+)
 from quant_research.factors.builtin.risk import (
     DownsideVolatility60dFactor,
     MaxDrawdown120dFactor,
     Volatility60dFactor,
 )
+from quant_research.factors.builtin.turnover import Turnover20dFactor
 from quant_research.factors.builtin.valuation import (
     BookToPriceFactor,
     DailyBasicsCache,
+    DividendYieldFactor,
     EarningsYieldFactor,
     LogTotalMarketCapFactor,
+    SalesYieldFactor,
 )
 from tests.performance._process_memory import process_peak_rss_bytes
 
@@ -163,6 +170,9 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
         "instrument_id",
         pl.lit(10.0).alias("pe_ttm"),
         pl.lit(2.0).alias("pb"),
+        pl.lit(4.0).alias("ps_ttm"),
+        pl.lit(0.02).alias("dividend_yield_ttm"),
+        pl.lit(0.03).alias("turnover_rate_free_float"),
         pl.lit(10_000_000.0).alias("total_market_value"),
         "available_at",
     )
@@ -174,6 +184,12 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
                     "instrument_id": instrument.canonical(),
                     "report_period": session,
                     "roe": 0.10 + (revision % 5) / 100.0,
+                    "roa": 0.05,
+                    "grossprofit_margin": 0.30,
+                    "ocf_to_opincome": 0.80,
+                    "debt_to_assets": 0.40,
+                    "tr_yoy": 0.12,
+                    "netprofit_yoy": 0.15,
                     "revision": revision,
                     "available_at": datetime(
                         session.year, session.month, session.day, 8, tzinfo=UTC
@@ -186,6 +202,12 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
             "instrument_id": pl.String,
             "report_period": pl.Date,
             "roe": pl.Float64,
+            "roa": pl.Float64,
+            "grossprofit_margin": pl.Float64,
+            "ocf_to_opincome": pl.Float64,
+            "debt_to_assets": pl.Float64,
+            "tr_yoy": pl.Float64,
+            "netprofit_yoy": pl.Float64,
             "revision": pl.Int64,
             "available_at": pl.Datetime("us", "UTC"),
         },
@@ -194,15 +216,90 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
     context = FactorContext("a" * 64, "b" * 64, sessions[0], sessions[-1])
     market_cache = MarketBarsCache(inputs, instruments, max_lookback_sessions=120)
     basics_cache = DailyBasicsCache(inputs, instruments)
+    financial_fields = (
+        "debt_to_assets",
+        "grossprofit_margin",
+        "netprofit_yoy",
+        "ocf_to_opincome",
+        "roa",
+        "roe",
+        "tr_yoy",
+    )
+    financials_cache = FinancialIndicatorsCache(
+        inputs, instruments, financial_fields
+    )
     factors = (
         EarningsYieldFactor(inputs, instruments, daily_basics=basics_cache),
         BookToPriceFactor(inputs, instruments, daily_basics=basics_cache),
+        SalesYieldFactor(inputs, instruments, daily_basics=basics_cache),
+        DividendYieldFactor(inputs, instruments, daily_basics=basics_cache),
         LogTotalMarketCapFactor(inputs, instruments, daily_basics=basics_cache),
-        RoePitFactor(inputs, instruments),
+        RoeFactor(inputs, instruments, cache=financials_cache),
+        FinancialMetricFactor(
+            inputs,
+            instruments,
+            factor_id="revenue_growth",
+            field="tr_yoy",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="year_over_year",
+            cache=financials_cache,
+        ),
+        FinancialMetricFactor(
+            inputs,
+            instruments,
+            factor_id="profit_growth",
+            field="netprofit_yoy",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="year_over_year",
+            cache=financials_cache,
+        ),
+        FinancialMetricFactor(
+            inputs,
+            instruments,
+            factor_id="roa",
+            field="roa",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="point_in_time",
+            cache=financials_cache,
+        ),
+        FinancialMetricFactor(
+            inputs,
+            instruments,
+            factor_id="gross_margin",
+            field="grossprofit_margin",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="point_in_time",
+            cache=financials_cache,
+        ),
+        FinancialMetricFactor(
+            inputs,
+            instruments,
+            factor_id="cash_quality",
+            field="ocf_to_opincome",
+            direction=1,
+            value_domain="signed_finite",
+            measurement="point_in_time",
+            cache=financials_cache,
+        ),
+        FinancialMetricFactor(
+            inputs,
+            instruments,
+            factor_id="leverage",
+            field="debt_to_assets",
+            direction=-1,
+            value_domain="nonnegative_finite",
+            measurement="point_in_time",
+            cache=financials_cache,
+        ),
         Momentum12020Factor(inputs, instruments, market_bars=market_cache),
         Volatility60dFactor(inputs, instruments, market_bars=market_cache),
         DownsideVolatility60dFactor(inputs, instruments, market_bars=market_cache),
         MaxDrawdown120dFactor(inputs, instruments, market_bars=market_cache),
+        Turnover20dFactor(inputs, instruments),
         AvgAmount20dFactor(inputs, instruments),
     )
 
@@ -225,6 +322,6 @@ def test_twenty_year_max_partition_stock_factors_record_evidence() -> None:
     print(f"stock_factor_performance={json.dumps(evidence, sort_keys=True)}")
     assert inputs.market_reads == 1
     assert inputs.bar_reads == 2
-    assert inputs.basics_reads == 1
+    assert inputs.basics_reads == 3
     assert inputs.calendar_reads == 1
     assert inputs.financial_reads == 1

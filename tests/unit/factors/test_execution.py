@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 
 import polars as pl
+import pytest
 
 from quant_research.data.contracts import ProviderCapabilities
 from quant_research.domain.enums import DatasetKind
@@ -11,7 +12,11 @@ from quant_research.factors.base import (
     FactorContext,
     FactorSpec,
 )
-from quant_research.factors.builtin import register_stock_factors
+from quant_research.factors.builtin import (
+    STOCK_FACTOR_REFERENCES,
+    register_stock_factors,
+)
+from quant_research.factors.builtin.code_hash import builtin_source_hash
 from quant_research.factors.registry import FactorEngine, FactorRegistry
 
 
@@ -74,17 +79,38 @@ def test_stock_factor_registration_has_no_industry_dependency() -> None:
         price_service=provider,
     )
 
-    assert registry.registered_references() == (
+    assert registry.registered_references() == STOCK_FACTOR_REFERENCES == (
         "avg_amount_20d",
         "book_to_price_mrq",
+        "cash_quality",
+        "dividend_yield",
         "downside_volatility_60d",
         "earnings_yield_ttm",
+        "gross_margin",
+        "leverage",
         "log_total_market_cap",
         "max_drawdown_120d",
         "momentum_120_20",
-        "roe_pit",
+        "profit_growth",
+        "revenue_growth",
+        "roa",
+        "roe",
+        "sales_yield",
+        "turnover_20d",
         "volatility_60d",
     )
+    assert len(STOCK_FACTOR_REFERENCES) == 18
+    assert tuple(sorted(STOCK_FACTOR_REFERENCES)) == STOCK_FACTOR_REFERENCES
+    with pytest.raises(ValueError, match="unknown factor"):
+        registry.resolve("roe_pit")
+    hashes = tuple(
+        registry.code_hash(reference) for reference in STOCK_FACTOR_REFERENCES
+    )
+    assert hashes == tuple(
+        builtin_source_hash(registry.spec(reference))
+        for reference in STOCK_FACTOR_REFERENCES
+    )
+    assert len(set(hashes)) == len(STOCK_FACTOR_REFERENCES)
     assert all(
         not registry.spec(reference).required_datasets
         for reference in registry.registered_references()

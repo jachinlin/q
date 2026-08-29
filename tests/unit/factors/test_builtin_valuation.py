@@ -11,8 +11,10 @@ from quant_research.factors.base import FACTOR_OUTPUT_SCHEMA, FactorContext
 from quant_research.factors.builtin.valuation import (
     BookToPriceFactor,
     DailyBasicsCache,
+    DividendYieldFactor,
     EarningsYieldFactor,
     LogTotalMarketCapFactor,
+    SalesYieldFactor,
 )
 
 _SCHEMA = {
@@ -20,6 +22,8 @@ _SCHEMA = {
     "instrument_id": pl.String,
     "pe_ttm": pl.Float64,
     "pb": pl.Float64,
+    "ps_ttm": pl.Float64,
+    "dividend_yield_ttm": pl.Float64,
     "total_market_value": pl.Float64,
     "available_at": pl.Datetime("us", "UTC"),
 }
@@ -64,6 +68,8 @@ def test_daily_basic_factors_share_one_input_read() -> None:
             "instrument_id": ["000001.SZ"] * 3,
             "pe_ttm": [10.0, -5.0, 0.0],
             "pb": [2.0, -4.0, float("inf")],
+            "ps_ttm": [4.0, -2.0, float("nan")],
+            "dividend_yield_ttm": [0.02, 0.0, -0.01],
             "total_market_value": [e, e**2, e**3],
             "available_at": [_available(day) for day in days],
         },
@@ -74,6 +80,8 @@ def test_daily_basic_factors_share_one_input_read() -> None:
     cache = DailyBasicsCache(repository, (instrument,))
     earnings = EarningsYieldFactor(repository, (instrument,), daily_basics=cache)
     book = BookToPriceFactor(repository, (instrument,), daily_basics=cache)
+    sales = SalesYieldFactor(repository, (instrument,), daily_basics=cache)
+    dividend = DividendYieldFactor(repository, (instrument,), daily_basics=cache)
     market_cap = LogTotalMarketCapFactor(
         repository, (instrument,), daily_basics=cache
     )
@@ -81,12 +89,22 @@ def test_daily_basic_factors_share_one_input_read() -> None:
 
     earnings_result = earnings.compute(context).collect()
     book_result = book.compute(context).collect()
+    sales_result = sales.compute(context).collect()
+    dividend_result = dividend.compute(context).collect()
     market_cap_result = market_cap.compute(context).collect()
 
     assert earnings_result["value"].to_list() == [0.1, -0.2, None]
     assert book_result["value"].to_list() == [0.5, -0.25, None]
+    assert sales_result["value"].to_list() == [0.25, -0.5, None]
+    assert dividend_result["value"].to_list() == [0.02, 0.0, None]
     assert earnings_result["is_valid"].to_list() == [True, True, False]
     assert book_result["is_valid"].to_list() == [True, True, False]
+    assert sales_result["is_valid"].to_list() == [True, True, False]
+    assert dividend_result["is_valid"].to_list() == [True, True, False]
+    assert sales.spec.parameters["measurement"] == "ttm"
+    assert sales.spec.parameters["source_field"] == "ps_ttm"
+    assert dividend.spec.parameters["value_domain"] == "nonnegative_finite"
+    assert dividend.spec.parameters["direction"] == 1
     assert market_cap_result["value"].to_list() == pytest.approx([1.0, 2.0, 3.0])
     assert market_cap.spec.direction == -1
     assert market_cap.spec.parameters == {
@@ -106,6 +124,8 @@ def test_valuation_rejects_nonfinite_and_future_availability() -> None:
             "instrument_id": ["000001.SZ"] * 2,
             "pe_ttm": [float("nan"), 10.0],
             "pb": [1.0, 1.0],
+            "ps_ttm": [1.0, 1.0],
+            "dividend_yield_ttm": [0.0, 0.0],
             "total_market_value": [1.0, 1.0],
             "available_at": [_available(days[0]), _available(date(2026, 4, 29))],
         },
@@ -131,6 +151,8 @@ def test_valuation_cache_rejects_duplicate_keys() -> None:
             "instrument_id": ["000001.SZ", "000001.SZ"],
             "pe_ttm": [10.0, 11.0],
             "pb": [2.0, 2.0],
+            "ps_ttm": [3.0, 3.0],
+            "dividend_yield_ttm": [0.0, 0.0],
             "total_market_value": [1.0, 1.0],
             "available_at": [_available(day), _available(day)],
         },
@@ -160,6 +182,8 @@ def test_log_total_market_cap_rejects_invalid_or_future_values() -> None:
             ],
             "pe_ttm": [1.0] * 6,
             "pb": [1.0] * 6,
+            "ps_ttm": [1.0] * 6,
+            "dividend_yield_ttm": [0.0] * 6,
             "total_market_value": [0.0, -1.0, float("nan"), float("inf"), None, e],
             "available_at": [
                 _available(days[0]),
