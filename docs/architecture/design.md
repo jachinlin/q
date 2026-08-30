@@ -2,6 +2,7 @@
 
 本地单用户 A 股研究平台采用 `bootstrap → interfaces → application → capabilities`
 依赖方向，SQLite 保存任务和目录元数据，Raw/Canonical Parquet 保存市场数据。
+平台以快速迭代新策略为核心目标，降低新策略从开发、回测到比较验证的成本。
 
 数据层的权威设计见 [data-layer-design.md](data-layer-design.md)，包与组合根边界见
 [package-layout.md](package-layout.md)。实验固定捕获 Canonical `catalog_hash`、规则、
