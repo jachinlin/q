@@ -1,9 +1,10 @@
 """验证单一 StrategyStudy 与任务、指标和产物的事务主脊。"""
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
@@ -18,6 +19,7 @@ from quant_research.strategy_studies.models import (
     StrategyStudyStage,
     StrategyStudyStatus,
 )
+from quant_research.tasks.models import TaskOutcome, TaskStatus
 from tests.unit.strategy_studies.test_models import strategy_study_yaml
 
 
@@ -119,4 +121,50 @@ def test_delete_rejects_active_and_preserves_detached_task(tmp_path: Path) -> No
         registry.get(study_id)
     task = queue.get(task_id)
     assert (task.subject_kind, task.subject_id) == (None, None)
+    engine.dispose()
+
+
+def test_delete_succeeds_after_terminal_task_was_deleted(tmp_path: Path) -> None:
+    """任务中心先删终态任务后，研究删除审计应保留主体并将任务关联置空。"""
+    registry, queue, engine = _registry(tmp_path)
+    resolved = StrategyStudyConfigParser().parse(strategy_study_yaml())
+    study_id, task_id = registry.create(
+        resolved.definition, resolved.config_hash, "a" * 64, actor="test"
+    )
+    claimed = queue.claim("worker", datetime(2099, 1, 1, tzinfo=UTC))
+    assert claimed is not None and claimed.id == task_id
+    registry.transition(
+        study_id,
+        StrategyStudyStatus.QUEUED,
+        StrategyStudyStatus.RUNNING,
+        stage=StrategyStudyStage.VALIDATE,
+    )
+    registry.transition(
+        study_id,
+        StrategyStudyStatus.RUNNING,
+        StrategyStudyStatus.CANCELLED,
+        stage=StrategyStudyStage.VALIDATE,
+    )
+    queue.finish(
+        claimed.attempt_id,
+        "worker",
+        TaskOutcome(status=TaskStatus.CANCELLED),
+    )
+    queue.delete(task_id, actor="test")
+
+    registry.delete(study_id, actor="test")
+
+    with pytest.raises(KeyError, match="strategy study does not exist"):
+        registry.get(study_id)
+    with engine.connect() as connection:
+        audit_task_id = connection.execute(
+            text(
+                "SELECT task_id FROM audit_event "
+                "WHERE subject_kind = 'STRATEGY_STUDY' "
+                "AND subject_id = :study_id "
+                "AND event_type = 'STRATEGY_STUDY_DELETED'"
+            ),
+            {"study_id": study_id},
+        ).scalar_one()
+    assert audit_task_id is None
     engine.dispose()

@@ -129,6 +129,55 @@ def test_atomic_create_retry_reuses_task_and_creates_attempt(tmp_path: Path) -> 
     engine.dispose()
 
 
+def test_delete_succeeds_after_terminal_task_was_deleted(tmp_path: Path) -> None:
+    """任务中心先删终态任务后，因子研究仍应删除并写入无任务外键的审计。"""
+    database = tmp_path / "state.sqlite3"
+    upgrade_database(database)
+    engine = create_sqlite_engine(database)
+    registry = FactorStudyRegistry(engine)
+    queue = TaskQueue(engine, task_log_root=tmp_path / "logs")
+    study_id, task_id = registry.create(
+        _definition(), "b" * 64, "a" * 64, actor="test"
+    )
+    claimed = queue.claim("worker", datetime(2099, 1, 1, tzinfo=UTC))
+    assert claimed is not None and claimed.id == task_id
+    registry.transition(
+        study_id,
+        FactorStudyStatus.QUEUED,
+        FactorStudyStatus.RUNNING,
+        stage=FactorStudyStage.VALIDATE,
+    )
+    registry.transition(
+        study_id,
+        FactorStudyStatus.RUNNING,
+        FactorStudyStatus.CANCELLED,
+        stage=FactorStudyStage.VALIDATE,
+    )
+    queue.finish(
+        claimed.attempt_id,
+        "worker",
+        TaskOutcome(status=TaskStatus.CANCELLED),
+    )
+    queue.delete(task_id, actor="test")
+
+    registry.delete(study_id, actor="test")
+
+    with pytest.raises(KeyError, match="factor study does not exist"):
+        registry.get(study_id)
+    with engine.connect() as connection:
+        audit_task_id = connection.execute(
+            text(
+                "SELECT task_id FROM audit_event "
+                "WHERE subject_kind = 'FACTOR_STUDY' "
+                "AND subject_id = :study_id "
+                "AND event_type = 'FACTOR_STUDY_DELETED'"
+            ),
+            {"study_id": study_id},
+        ).scalar_one()
+    assert audit_task_id is None
+    engine.dispose()
+
+
 def test_decisions_are_idempotent_and_validate_dimensions(tmp_path: Path) -> None:
     """四维决策键应支持更新、清除并拒绝配置外维度。"""
     database = tmp_path / "state.sqlite3"

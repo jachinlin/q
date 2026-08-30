@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import cast
 
-from sqlalchemy import Engine, delete, select, update
+from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session
 
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
@@ -376,20 +376,20 @@ class FactorStudyRegistry:
             row = self._row(session, study_id)
             if row.status not in _TERMINAL:
                 raise ValueError("active factor study cannot be deleted")
+            task = session.get(TaskORM, row.task_id)
             self._audit(
                 session,
                 study_id,
-                row.task_id,
+                task.id if task is not None else None,
                 "FACTOR_STUDY_DELETED",
                 actor,
                 {},
                 instant,
             )
-            session.execute(
-                update(TaskORM)
-                .where(TaskORM.id == row.task_id)
-                .values(subject_kind=None, subject_id=None, idempotency_key=None)
-            )
+            if task is not None:
+                task.subject_kind = None
+                task.subject_id = None
+                task.idempotency_key = None
             session.delete(row)
 
     def retry(self, study_id: str, *, actor: str = "system") -> str:
