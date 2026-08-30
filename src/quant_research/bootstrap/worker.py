@@ -44,7 +44,7 @@ from quant_research.data.contracts import (
     canonical_json_bytes,
 )
 from quant_research.data.repository import CanonicalResearchRepository
-from quant_research.domain.enums import Board, MultipleTestingMethod
+from quant_research.domain.enums import Board, DatasetKind, MultipleTestingMethod
 from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.factor_studies.analysis import (
     DIRECTION_ADJUSTED,
@@ -232,15 +232,20 @@ class CanonicalStrategyStudyData:
     """将只读 Canonical Repository 适配为回测行情和 PIT 决策工厂。
 
     入参：
-        repository：唯一 Canonical 数据读取入口；catalog_hash：Run 冻结数据身份。
+        repository：唯一 Canonical 数据读取入口；catalog_hash：研究冻结数据身份；
+        strategy：可选策略规格，用于限定证券类型和显式标的池。
     返回值：
-        创建可提供交易日历、逐日行情和信号日数据的 Run 数据源。
+        创建可提供交易日历、逐日行情和信号日数据的策略研究数据源。
     异常：
-        证券目录不可读或因子注册冲突时在构造阶段抛出。
+        证券目录不可读、策略标的未登记或因子注册冲突时在构造阶段抛出。
     """
 
     def __init__(
-        self, repository: CanonicalResearchRepository, catalog_hash: str
+        self,
+        repository: CanonicalResearchRepository,
+        catalog_hash: str,
+        *,
+        strategy: Strategy | None = None,
     ) -> None:
         self._repository = repository
         self._catalog_hash = catalog_hash
@@ -251,6 +256,25 @@ class CanonicalStrategyStudyData:
             pl.lit("FUND").alias("instrument_type"),
             pl.lit("MAIN").alias("board"),
         )
+        if strategy is not None:
+            dependencies = set(strategy.spec.data_dependencies)
+            if DatasetKind.STOCK_DAILY_BAR not in dependencies:
+                stocks = stocks.head(0)
+            if DatasetKind.FUND_DAILY_BAR not in dependencies:
+                funds = funds.head(0)
+            explicit = self._explicit_market_instruments(strategy)
+            if explicit is not None:
+                allowed = [item.canonical() for item in explicit]
+                stocks = stocks.filter(pl.col("instrument_id").is_in(allowed))
+                funds = funds.filter(pl.col("instrument_id").is_in(allowed))
+                known = set(stocks["instrument_id"].to_list()) | set(
+                    funds["instrument_id"].to_list()
+                )
+                missing = sorted(set(allowed) - known)
+                if missing:
+                    raise ValueError(
+                        f"strategy market instrument is not registered: {missing[0]}"
+                    )
         self._instruments = pl.concat(
             [stocks, funds], how="diagonal_relaxed"
         ).sort("instrument_id")
@@ -279,6 +303,36 @@ class CanonicalStrategyStudyData:
         self._factor_engine = FactorEngine(
             registry, capabilities=ProviderCapabilities.complete()
         )
+
+    @staticmethod
+    def _explicit_market_instruments(
+        strategy: Strategy,
+    ) -> tuple[InstrumentId, ...] | None:
+        spec = strategy.spec
+        if spec.strategy_id == "dual_ma_trend":
+            raw = spec.parameters.get("instrument_id")
+            if not isinstance(raw, str):
+                raise TypeError("dual_ma_trend instrument_id must be a string")
+            return (InstrumentId.parse(raw),)
+        if spec.strategy_id != "etf_rotation":
+            return None
+        pipeline = spec.parameters.get("pipeline")
+        if not isinstance(pipeline, Mapping):
+            raise TypeError("etf_rotation pipeline must be a mapping")
+        alpha = pipeline.get("alpha")
+        if not isinstance(alpha, Mapping):
+            raise TypeError("etf_rotation alpha must be a mapping")
+        params = alpha.get("params")
+        if not isinstance(params, Mapping):
+            raise TypeError("etf_rotation alpha params must be a mapping")
+        pool = params.get("etf_pool")
+        if (
+            not isinstance(pool, list)
+            or not pool
+            or any(not isinstance(item, str) for item in pool)
+        ):
+            raise TypeError("etf_rotation etf_pool must be a nonempty string list")
+        return tuple(InstrumentId.parse(cast(str, item)) for item in pool)
 
     def calendar(
         self, start: date, end: date, *, include_next_session: bool
@@ -353,11 +407,16 @@ class CanonicalStrategyStudyData:
             metadata = self._metadata.get(identifier)
             if metadata is None:
                 continue
+            listing = metadata.get("list_date")
+            delisting = metadata.get("delist_date")
+            if isinstance(listing, date) and trade_date < listing:
+                continue
+            if isinstance(delisting, date) and trade_date > delisting:
+                continue
             board = str(metadata.get("board") or "MAIN")
             if board not in {"MAIN", "CHINEXT", "STAR", "BSE"}:
                 board = "MAIN"
             raw_volume = row.get("volume")
-            listing = metadata.get("list_date")
             no_limit = (
                 metadata.get("instrument_type") == "STOCK"
                 and isinstance(listing, date)
@@ -767,7 +826,9 @@ class _StrategyStudySession:
             cast(Mapping[str, JsonValue], definition.strategy.parameters),
         )
         self._source = CanonicalStrategyStudyData(
-            self._repository, self._study.catalog_hash
+            self._repository,
+            self._study.catalog_hash,
+            strategy=self._strategy,
         )
 
     def _backtest_strategy(
