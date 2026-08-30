@@ -1,4 +1,4 @@
-"""验证当前 Run Schema 的唯一原子发布路径。"""
+"""验证策略研究产物 Schema 的唯一原子发布路径。"""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ from pathlib import Path
 
 import polars as pl
 
-from quant_research.backtest.run_artifacts import RunArtifactPublisher
+from quant_research.backtest.study_artifacts import StrategyStudyArtifactPublisher
 
 
 def test_publisher_writes_and_rechecks_the_complete_artifact_set(
     tmp_path: Path,
 ) -> None:
-    tables = RunArtifactPublisher.canonical_tables(
+    tables = StrategyStudyArtifactPublisher.canonical_tables(
         {
             "nav": pl.DataFrame(
                 {
@@ -30,7 +30,7 @@ def test_publisher_writes_and_rechecks_the_complete_artifact_set(
             )
         }
     )
-    publisher = RunArtifactPublisher(tmp_path, "experiment-1", "run-1")
+    publisher = StrategyStudyArtifactPublisher(tmp_path, "study-1")
 
     final, manifest_hash, entries = publisher.publish(
         tables,
@@ -61,7 +61,7 @@ def test_publisher_writes_and_rechecks_the_complete_artifact_set(
     }
     assert {entry["artifact_type"] for entry in entries} == expected
     assert len(manifest_hash) == 64
-    assert final == tmp_path / "experiments" / "experiment-1" / "run-1"
+    assert final == tmp_path / "strategy-studies" / "study-1"
     assert json.loads((final / "quality_disclosure.json").read_bytes()) == {
         "undefined_metrics": {"sharpe_ratio": "insufficient observations"}
     }

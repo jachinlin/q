@@ -20,7 +20,7 @@ macOS 和 Linux。Python 包名为
 
 ```text
 src/quant_research/
-├── application/       # 数据、实验、因子研究、任务与 Worker 用例
+├── application/       # 数据、策略研究、因子研究、任务与 Worker 用例
 ├── domain/            # 稳定领域枚举、标识和值对象
 ├── data/              # 数据目录、schema、流水线和研究读取契约
 ├── factors/           # 因子定义、注册、计算与统计内核
@@ -30,7 +30,7 @@ src/quant_research/
 ├── strategies/        # 策略定义
 ├── backtest/          # 回测与执行
 ├── analytics/         # 绩效和归因
-├── experiments/       # 实验配置、身份、状态机和产物登记
+├── strategy_studies/  # 策略研究配置、身份和四阶段状态机
 ├── tasks/             # 任务模型与处理端口
 ├── infrastructure/    # SQLite、SQLAlchemy、Alembic、BaoStock 适配器
 ├── cli/               # Typer 输入输出适配器
@@ -38,7 +38,7 @@ src/quant_research/
 └── bootstrap/         # CLI、Dashboard、Worker 组合根
 
 frontend/              # Vue Dashboard
-configs/               # 应用配置、实验示例和交易规则
+configs/               # 应用配置、研究示例和交易规则
 tests/                 # unit、integration、performance、acceptance、e2e
 docs/architecture/     # 当前有效架构文档
 ```
@@ -83,7 +83,7 @@ uv run qlab data update
 uv run qlab data localize-all
 uv run qlab data curate-all
 uv run qlab data validate-all
-uv run qlab experiments submit configs/experiments/examples/etf_rotation.yaml
+uv run qlab strategy-studies submit configs/strategy_studies/examples/etf_rotation.yaml
 uv run qlab worker once
 uv run qlab worker run
 uv run qlab dashboard --port 8000
@@ -135,7 +135,7 @@ LOCALIZE → CURATE → VALIDATE
 - 只有 Canonical 内容变化才切换数据身份并使全局校验失效。
 - `validate <dataset>` 只诊断；只有 `validate-all` 可以开放研究读取。
 - `data_catalog_state.catalog_hash` 是全部当前 Canonical 数据集 `data_hash` 的目录身份。
-- 实验和因子运行提交时捕获 `catalog_hash`；运行阶段发现漂移立即失败。
+- 策略研究和因子研究提交时捕获 `catalog_hash`；运行阶段发现漂移立即失败。
 - 没有 dataset version、数据发布 Snapshot 或 `snapshot_id`；`AccountSnapshot` 仅表示
   账户状态对象。
 - 研究代码只能通过 `CanonicalResearchRepository` 读取，不得直接扫描 Raw 或
@@ -155,7 +155,7 @@ ingested_at
 证券标识使用 `600000.SH`、`000300.SH`；风险标记为 `is_st`；估值数据集为
 `daily_basic`。
 
-## 因子、策略与实验不变量
+## 因子与策略研究不变量
 
 - 因子使用唯一 `factor_id`，不使用 `id@version`。
 - 因子输出列固定为 `trade_date`、`instrument_id`、`factor_id`、`value`、
@@ -164,11 +164,12 @@ ingested_at
 - 因子产物在运行内绑定 `catalog_hash`、股票池哈希、配置和代码哈希。
 - 因子研究、策略信号和策略回测是不同产物，不得用其中一个替代另一个。
 - 策略使用唯一 `strategy_id`。
-- 交易规则只使用 `configs/rules/a_share.yaml`，其内容哈希进入实验身份。
-- 实验 YAML 日期必须是明确的 `YYYY-MM-DD`，不接受 selector 或格式版本字段。
-- 实验固定七阶段：
-  `VALIDATE → UNIVERSE → FACTOR_COMPUTE → BACKTEST → ANALYTICS → ARTIFACT_VERIFY → REGISTER`。
-- 每一阶段都必须检查捕获的数据身份；失败、取消和重试不得覆盖旧产物。
+- 交易规则只使用 `configs/rules/a_share.yaml`，其内容哈希进入策略研究身份。
+- 策略研究 YAML 日期必须是明确的 `YYYY-MM-DD`，不接受 selector 或格式版本字段。
+- 每个 `StrategyStudy` 只提交、执行和产出一次，不存在子 Run、baseline、研究标记或比较。
+- 策略研究固定四阶段：`VALIDATE → BACKTEST → ANALYTICS → PUBLISH`。
+- 每一阶段前后都必须检查捕获的数据身份；失败或取消不得保留未登记产物。
+- 再次执行必须复制冻结定义并创建独立策略研究，不复用原任务。
 
 ## 持久化与产物
 
@@ -202,7 +203,7 @@ ingested_at
 - Localize 记录完整供应商 request 和 Raw 发布证据。
 - Curate 记录 Canonical 分区、输入身份、行数、内容哈希和指针结果。
 - Validate 记录目录、规则、质量问题和门禁结果。
-- Task、Worker 与 Experiment 记录各自 payload、attempt、progress 和 outcome。
+- Task、Worker 与 StrategyStudy 记录各自 payload、attempt、progress 和 outcome。
 - 不强制所有日志伪造统一 request 对象。
 - CLI stdout 只输出成功 JSON；受控错误和日志写入 stderr。
 - 未知异常必须在进程边界转换为结构化错误，不泄露 traceback 或敏感上下文。

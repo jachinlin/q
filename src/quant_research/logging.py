@@ -26,7 +26,7 @@ _CORE_FIELDS = (
 )
 _OPTIONAL_FIELDS = (
     "request_id",
-    "experiment_id",
+    "strategy_study_id",
     "task_id",
     "attempt_id",
     "worker_id",
@@ -128,7 +128,7 @@ class LogContext:
 
     入参：
         request_id：用于关联一次跨边界调用及其日志的请求标识。
-        experiment_id：目标实验标识，类型为 ``str | None``。
+        strategy_study_id：目标策略研究标识，类型为 ``str | None``。
         task_id：目标任务标识，类型为 ``str | None``。
         attempt_id：一次任务执行尝试的 UUID 标识。
         worker_id：当前 Worker 实例的稳定所有者标识。
@@ -141,7 +141,7 @@ class LogContext:
     """
 
     request_id: str | None = None
-    experiment_id: str | None = None
+    strategy_study_id: str | None = None
     task_id: str | None = None
     attempt_id: str | None = None
     worker_id: str | None = None
@@ -246,7 +246,7 @@ class StructuredLogger:
         }
         optional_values = {
             "request_id": self._context.request_id,
-            "experiment_id": self._context.experiment_id,
+            "strategy_study_id": self._context.strategy_study_id,
             "task_id": self._context.task_id,
             "attempt_id": self._context.attempt_id,
             "worker_id": self._context.worker_id,
@@ -486,7 +486,7 @@ class TaskLogManager:
             )
         self._diagnostic_root = diagnostic_root.resolve()
         self._artifact_root = artifact_root.resolve()
-        self._staging_root = self._artifact_root / ".experiment-staging"
+        self._staging_root = self._artifact_root / ".task-staging"
         self._sensitive_values = tuple(sensitive_values)
         self._max_log_bytes = max_log_bytes
         self._sessions: dict[tuple[str, str], TaskLogSession] = {}
@@ -643,7 +643,7 @@ class TaskLogManager:
         resolved_staging = Path(os.path.abspath(staging_dir))
         expected_root = self._staging_root
         if not resolved_staging.is_relative_to(expected_root):
-            raise ValueError("staging_dir must be inside controlled experiment staging")
+            raise ValueError("staging_dir must be inside controlled task staging")
         try:
             _LoggingSupport._require_no_reparse_between(expected_root, resolved_staging)
         except ValueError as error:
@@ -1031,7 +1031,7 @@ class _LoggingSupport:
             if context is not None:
                 expected = {
                     "request_id": context.request_id,
-                    "experiment_id": context.experiment_id,
+                    "strategy_study_id": context.strategy_study_id,
                     "task_id": context.task_id,
                     "attempt_id": context.attempt_id,
                     "worker_id": context.worker_id,
@@ -1051,7 +1051,7 @@ class _LoggingSupport:
         }
         optional_values = {
             "request_id": context.request_id,
-            "experiment_id": context.experiment_id,
+            "strategy_study_id": context.strategy_study_id,
             "task_id": context.task_id,
             "attempt_id": context.attempt_id,
             "worker_id": context.worker_id,

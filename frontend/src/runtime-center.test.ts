@@ -23,9 +23,9 @@ vi.mock('./api', () => ({
 
 const failedTask = {
   id: 'task-failed-0001',
-  subject_kind: 'EXPERIMENT_RUN',
-  subject_id: 'research-run-0001',
-  task_type: 'EXPERIMENT_RUN',
+  subject_kind: 'STRATEGY_STUDY',
+  subject_id: 'strategy-study-0001',
+  task_type: 'STRATEGY_STUDY',
   status: 'FAILED',
   priority: 10,
   progress: { stage: 'VALIDATE', completed: 1, total: 7, message: '正在校验实验', context: {} },
@@ -45,7 +45,7 @@ const defaultPayload = {
   note: '<img src=x onerror=alert(1)>',
 }
 
-function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType = 'EXPERIMENT_RUN') {
+function taskDetail(payload: Record<string, unknown> = defaultPayload, taskType = 'STRATEGY_STUDY') {
   return {
     ...failedTask,
     task_type: taskType,
@@ -86,7 +86,7 @@ function taskLog(available = true) {
 async function mountRuntimeCenter(
   logAvailable = true,
   payload: Record<string, unknown> = defaultPayload,
-  taskType = 'EXPERIMENT_RUN',
+  taskType = 'STRATEGY_STUDY',
   initialPath = '/tasks',
   taskOverrides: Record<string, unknown> = {},
 ) {
@@ -113,7 +113,7 @@ async function mountRuntimeCenter(
     history: createMemoryHistory(),
     routes: [
       { path: '/tasks', component: TasksView },
-      { path: '/experiments/:experimentId', name: 'experiment-detail', component: { template: '<div />' } },
+      { path: '/strategy-studies/:strategyStudyId', name: 'strategy-study-detail', component: { template: '<div />' } },
       { path: '/factor-studies/:factorStudyId', name: 'factor-study-detail', component: { template: '<div class="factor-study-detail-target" />' } },
     ],
   })
@@ -150,8 +150,9 @@ describe('runtime center', () => {
     expect(headers).not.toContain('失败原因')
     expect(wrapper.find('.task-link').element.closest('td'))
       .not.toBe(wrapper.find('.association-cell').element.closest('td'))
-    expect(wrapper.find('.association-cell').text()).toContain('EXPERIMENT_RUN · research')
-    expect(wrapper.find('.task-link strong').text()).toBe('实验运行')
+    expect(wrapper.find('.association-cell').text()).toContain('策略研究 · strategy')
+    expect(wrapper.find('.association-link').attributes('href')).toBe('/strategy-studies/strategy-study-0001')
+    expect(wrapper.find('.task-link strong').text()).toBe('策略研究')
     wrapper.unmount()
   })
 
@@ -327,7 +328,7 @@ describe('runtime center', () => {
     expect(traceback).not.toBeNull()
     expect(traceback?.hasAttribute('open')).toBe(false)
     expect(document.body.textContent).toContain('当前仅显示尾部 500 行')
-    expect(document.body.textContent).toContain('重试')
+    expect(wrapper.findAll('button').filter((item) => item.text() === '重试')).toHaveLength(0)
     expect(document.body.textContent).not.toContain('取消')
     expect(document.body.textContent).toContain('任务参数')
     expect(document.body.textContent).toContain('direct-task-value')
@@ -403,11 +404,11 @@ describe('runtime center', () => {
     wrapper.unmount()
   })
 
-  it('shows the generic research subject in task detail', async () => {
-    const wrapper = await mountRuntimeCenter(true, { run_id: 'research-run-0001' })
+  it('links the strategy study subject in task detail', async () => {
+    const wrapper = await mountRuntimeCenter(true, { strategy_study_id: 'strategy-study-0001' })
     await wrapper.find('.task-link').trigger('click')
     await flushPromises()
-    expect(document.body.textContent).toContain('EXPERIMENT_RUN · research-run-0001')
+    expect(document.body.textContent).toContain('策略研究 · strategy-study-0001')
     wrapper.unmount()
   })
 

@@ -69,6 +69,6 @@ describe('DATA task progress', () => {
       completed: 0, total: 0, percentage: 0, waiting: true, datasetPosition: null,
     })
     expect(isDataTask(task({ task_type: 'DATA_VALIDATION' }))).toBe(true)
-    expect(isDataTask(task({ task_type: 'EXPERIMENT_RUN' }))).toBe(false)
+    expect(isDataTask(task({ task_type: 'STRATEGY_STUDY' }))).toBe(false)
   })
 })

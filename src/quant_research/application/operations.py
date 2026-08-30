@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Protocol
 
-from quant_research.application.experiments import ExperimentService
 from quant_research.application.factor_studies import FactorStudyService
 from quant_research.data.contracts import JsonValue
 from quant_research.data.pipeline.publish import DataUpdatePlan
@@ -146,12 +145,10 @@ class OperationalCommandService:
         self,
         queue: OperationalTaskQueue,
         planner: DataUpdatePlanningPort,
-        experiments: ExperimentService,
         factor_studies: FactorStudyService | None = None,
     ) -> None:
         self._queue = queue
         self._planner = planner
-        self._experiments = experiments
         self._factor_studies = factor_studies
 
     def preview_data_update(
@@ -332,7 +329,7 @@ class OperationalCommandService:
         confirm_orphaned: bool,
         request_id: str,
     ) -> dict[str, JsonValue]:
-        """数据任务创建新任务；研究任务创建全新 execution。
+        """数据任务创建新任务；因子研究任务创建全新 execution。
 
         入参：
             参数和字段含义由公开签名及类型声明给出。
@@ -344,14 +341,10 @@ class OperationalCommandService:
         task = self._queue.get(task_id)
         if task.status is TaskStatus.ORPHANED and not confirm_orphaned:
             raise ValueError("orphaned task retry requires explicit confirmation")
-        if task.subject_kind == "EXPERIMENT_RUN" and task.subject_id is not None:
-            aggregate = self._experiments.rerun(task.subject_id, actor="dashboard")
-            newest = aggregate.runs[-1]
-            return {
-                "experiment_id": aggregate.experiment.id,
-                "run_id": newest.id,
-                "task_id": newest.task_id,
-            }
+        if task.subject_kind == "STRATEGY_STUDY":
+            raise ValueError(
+                "strategy study tasks cannot be retried; copy the study instead"
+            )
         if task.subject_kind == "FACTOR_STUDY" and task.subject_id is not None:
             if self._factor_studies is None:
                 raise ValueError("factor study service is unavailable")

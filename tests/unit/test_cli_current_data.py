@@ -60,6 +60,21 @@ def test_data_cli_exposes_validate_gate_without_snapshot_commands() -> None:
     assert "snapshot" not in result.stdout.lower()
 
 
+def test_cli_exposes_only_single_strategy_study_workflow() -> None:
+    """策略 CLI 只保留校验、提交、查询和列表。"""
+    app = create_app(_unexpected_services)
+    root = CliRunner().invoke(app, ["--help"])
+    assert root.exit_code == 0
+    assert "strategy-studies" in root.stdout
+    assert "experiments" not in root.stdout
+    group = CliRunner().invoke(app, ["strategy-studies", "--help"])
+    assert group.exit_code == 0
+    for command in ("validate", "submit", "show", "list"):
+        assert command in group.stdout
+    for removed in ("run", "rerun", "compare", "mark"):
+        assert removed not in group.stdout
+
+
 def test_data_commands_do_not_expose_full_and_bootstrap_requires_years() -> None:
     app = create_app(_unexpected_services)
 

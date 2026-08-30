@@ -559,7 +559,6 @@ class FactorStudyRegistry:
     ) -> None:
         session.add(
             AuditEventORM(
-                run_id=None,
                 subject_kind="FACTOR_STUDY",
                 subject_id=study_id,
                 task_id=task_id,

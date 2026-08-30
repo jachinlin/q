@@ -2,8 +2,8 @@
 
 文档状态：当前有效设计　·　日期：2026-08-30
 
-安装命令为 `qlab`。stdout 只输出成功 JSON；受控错误和结构化日志写 stderr。实验配置只接受
-明确路径下的严格 YAML，不接受旧 research、components 或 factor-studies 命令。
+安装命令为 `qlab`。stdout 只输出成功 JSON；受控错误和结构化日志写 stderr。
+研究配置只接受 `configs/` 可信根中的严格 YAML。
 
 ## 数据命令
 
@@ -16,26 +16,26 @@ qlab data curate-all
 qlab data validate-all
 ```
 
-- `bootstrap` 仅在没有 Canonical 数据时使用，必须指定年数。
-- 底层 `localize/localize_all` 不支持隐式日期或 `full`；CLI 可先生成更新计划并把明确日期传入底层。
-- `update` 固定执行 `LOCALIZE → CURATE → VALIDATE`，任务 payload 保存提交时固化计划。
+`update` 固定执行 `LOCALIZE → CURATE → VALIDATE`，任务 payload 保存提交时冻结的计划。
 
-## 实验与策略命令
+## 策略研究与因子研究
 
 ```console
-qlab experiments validate <experiment-yaml>
-qlab experiments submit <experiment-yaml>
-qlab experiments run <experiment_id> <run-yaml>
-qlab experiments rerun <run_id>
-qlab experiments list
-qlab experiments show <experiment_id>
+qlab strategy-studies validate <study-yaml>
+qlab strategy-studies submit <study-yaml>
+qlab strategy-studies show <strategy-study-id>
+qlab strategy-studies list
 qlab strategies list
+
+qlab factor-studies validate <study-yaml>
+qlab factor-studies submit <study-yaml>
+qlab factor-studies show <factor-study-id>
+qlab factor-studies list
 ```
 
-- `submit` 原子创建 Experiment、首个 Run 和 `EXPERIMENT_RUN` 任务。
-- `run` 显式追加一个参数 Run；不自动展开搜索空间，也不自动选择 TEST。
-- `rerun` 复制历史冻结配置并创建新 Run、新任务和新产物目录，绝不覆盖。
-- `strategies list` 返回三个策略 ID 以及截面五模块目录。
+策略研究的 `submit` 原子创建一个 `StrategyStudy` 和一个 `STRATEGY_STUDY` 任务。
+每项研究只执行一次；CLI 不提供追加 Run、重跑、标记或比较命令。需要调整或再次执行时，
+复制原 YAML 并提交一项独立研究。因子研究保持独立生命周期和统计校正。
 
 ## Worker 与 Dashboard
 
@@ -46,5 +46,5 @@ qlab dashboard --port 8000
 qlab start
 ```
 
-`worker once` 至多领取一个可见任务；`worker run` 持续轮询。策略回测与因子研究都使用唯一
-`EXPERIMENT_RUN` handler，数据更新和全量校验保留各自任务类型。
+`worker once` 至多领取一个可见任务；`worker run` 持续轮询。策略研究任务固定执行
+`VALIDATE → BACKTEST → ANALYTICS → PUBLISH`，因子研究和数据任务使用各自处理器。

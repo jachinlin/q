@@ -1,4 +1,4 @@
-"""原子发布固定 Schema 的 Run 回测产物。"""
+"""原子发布固定 Schema 的策略研究回测产物。"""
 
 from __future__ import annotations
 
@@ -21,30 +21,25 @@ from quant_research.backtest.run_schema import (
 from quant_research.data.contracts import JsonValue, canonical_json_bytes
 
 
-class RunArtifactPublisher:
-    """在同一文件系统暂存、复核并一次性发布 Run 产物。
+class StrategyStudyArtifactPublisher:
+    """原子发布研究产物。入参：可信根和研究 ID。返回值：发布器实例。异常：路径逃逸或目录已存在时抛出。"""
 
-    入参：产物根、实验 ID 和 Run ID。返回值：最终目录、Manifest 哈希及登记项。异常：路径越界、目录冲突或完整性失败时抛出错误。
-    """
-
-    def __init__(self, root: Path, experiment_id: str, run_id: str) -> None:
-        self._final = (root / "experiments" / experiment_id / run_id).resolve()
+    def __init__(self, root: Path, study_id: str) -> None:
+        self._final = (root / "strategy-studies" / study_id).resolve()
         trusted = root.resolve()
         if trusted not in self._final.parents:
             raise ValueError("artifact directory escaped trusted root")
         if self._final.exists():
-            raise FileExistsError("immutable Run artifact directory already exists")
+            raise FileExistsError("immutable strategy study directory already exists")
         self._final.parent.mkdir(parents=True, exist_ok=True)
         self._staging = Path(
-            tempfile.mkdtemp(prefix=f".staging-{run_id}-", dir=self._final.parent)
+            tempfile.mkdtemp(prefix=f".staging-{study_id}-", dir=self._final.parent)
         )
 
     @property
     def staging_dir(self) -> Path:
-        """返回失败时可安全清理的同文件系统暂存目录。
+        """读取暂存目录。入参：无。返回值：受控路径。异常：无。"""
 
-        入参：无。返回值：尚未发布的暂存路径。异常：无。
-        """
         return self._staging
 
     def publish(
@@ -56,10 +51,8 @@ class RunArtifactPublisher:
         quality_disclosure: Mapping[str, JsonValue],
         identities: Mapping[str, JsonValue],
     ) -> tuple[Path, str, tuple[dict[str, JsonValue], ...]]:
-        """写入全部固定产物、生成 Manifest、原子发布并从最终目录复核。
+        """发布固定产物。入参：表、配置、指标、披露和身份。返回值：目录、Manifest 哈希和登记项。异常：写入或复核失败时传播。"""
 
-        入参：固定类型表、冻结配置、指标和输入身份。返回值：最终目录、Manifest 哈希和产物登记元组。异常：Schema、写入、原子发布或复核失败时清理暂存并重抛。
-        """
         try:
             entries: list[dict[str, JsonValue]] = []
             for name, schema in RUN_PARQUET_SCHEMAS.items():
@@ -83,17 +76,13 @@ class RunArtifactPublisher:
                 entries.append(self._entry(path, name, None))
             manifest = cast(
                 dict[str, JsonValue],
-                {
-                    "identities": dict(identities),
-                    "artifacts": entries,
-                },
+                {"identities": dict(identities), "artifacts": entries},
             )
             manifest_path = self._staging / "manifest.json"
             manifest_path.write_bytes(canonical_json_bytes(manifest))
             manifest_hash = self._hash(manifest_path)
             os.replace(self._staging, self._final)
-            final_manifest = self._final / "manifest.json"
-            if self._hash(final_manifest) != manifest_hash:
+            if self._hash(self._final / "manifest.json") != manifest_hash:
                 raise ValueError("manifest changed during atomic publication")
             for entry in entries:
                 path = self._final / cast(str, entry["relative_path"])
@@ -106,11 +95,10 @@ class RunArtifactPublisher:
                     frame = pl.read_parquet(path)
                     if len(frame) != entry["row_count"]:
                         raise ValueError("artifact row count changed after publication")
-                    expected_schema = entry["schema"]
                     actual_schema = {
                         name: str(dtype) for name, dtype in frame.schema.items()
                     }
-                    if actual_schema != expected_schema:
+                    if actual_schema != entry["schema"]:
                         raise ValueError("artifact schema changed after publication")
                     artifact_type = cast(str, entry["artifact_type"])
                     keys = RUN_PRIMARY_KEYS[artifact_type]
@@ -132,11 +120,8 @@ class RunArtifactPublisher:
     def canonical_tables(
         tables: Mapping[str, Sequence[Mapping[str, object]] | pl.DataFrame],
     ) -> dict[str, pl.DataFrame]:
-        """按最终 Run 产物 Schema 规范化全部固定表。
+        """规范化研究表。入参：表映射。返回值：固定 Schema 数据帧。异常：Schema 或键非法时抛出值错误。"""
 
-        入参：内存中的回测和分析表。返回值：按产物名稳定排序的规范化表。
-        异常：缺列、类型或唯一键不满足固定契约时抛出 ``ValueError``。
-        """
         return RunTableSchema.canonical_tables(tables)
 
     @staticmethod
@@ -146,7 +131,7 @@ class RunArtifactPublisher:
         return {
             "artifact_type": artifact_type,
             "relative_path": path.name,
-            "content_hash": RunArtifactPublisher._hash(path),
+            "content_hash": StrategyStudyArtifactPublisher._hash(path),
             "byte_count": path.stat().st_size,
             "row_count": len(frame) if frame is not None else None,
             "schema": (
@@ -171,4 +156,4 @@ class RunArtifactPublisher:
         return digest.hexdigest()
 
 
-__all__ = ["RunArtifactPublisher"]
+__all__ = ["StrategyStudyArtifactPublisher"]

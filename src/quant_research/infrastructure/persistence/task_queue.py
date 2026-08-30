@@ -716,7 +716,7 @@ class TaskQueue:
         available_at: datetime | None = None,
         request_id: str | None = None,
     ) -> str:
-        """仅为非 Experiment Run 任务复用同一任务标识重新排队。
+        """仅为可重试任务复用同一任务标识重新排队。
 
         入参：
             task_id：终态任务标识；actor、request_id：审计信息；available_at：
@@ -724,17 +724,17 @@ class TaskQueue:
         返回值：
             返回重新排队的原任务标识。
         异常：
-            TaskQueueConflict：任务不是可重试终态，或其主体是 Experiment Run 时抛出。
+            TaskQueueConflict：任务不是可重试终态，或其主体是策略研究时抛出。
         """
         now = self._utc(self._clock())
         available = self._utc(available_at) if available_at is not None else now
 
         def operation(connection: Connection) -> str:
             task = self._task(connection, task_id)
-            if task["subject_kind"] == "EXPERIMENT_RUN":
+            if task["subject_kind"] == "STRATEGY_STUDY":
                 self._conflict(
-                    "TASK_RETRY_REQUIRES_NEW_RUN",
-                    "experiment retries must create a new Run",
+                    "TASK_RETRY_REQUIRES_STUDY_COPY",
+                    "strategy study retries require a copied study",
                 )
             if task["status"] not in _RETRYABLE:
                 self._conflict(
@@ -1057,9 +1057,6 @@ class TaskQueue:
         task = TaskQueue._task(connection, task_id)
         connection.execute(
             insert(AuditEventORM).values(
-                run_id=task["subject_id"]
-                if task["subject_kind"] == "EXPERIMENT_RUN"
-                else None,
                 subject_kind=task["subject_kind"],
                 subject_id=task["subject_id"],
                 task_id=task_id,

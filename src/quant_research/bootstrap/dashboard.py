@@ -8,17 +8,17 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from quant_research.application.experiments import ExperimentService
 from quant_research.application.factor_studies import FactorStudyService
 from quant_research.application.operations import OperationalCommandService
 from quant_research.application.settings import DashboardSettingsService
+from quant_research.application.strategy_studies import StrategyStudyService
 from quant_research.backtest.rulebook import AShareRuleBook
 from quant_research.config import Settings
 from quant_research.dashboard.app import create_dashboard_app as create_http_app
-from quant_research.dashboard.experiments import ExperimentDashboardService
 from quant_research.dashboard.factor_studies import FactorStudyDashboardService
 from quant_research.dashboard.market_review import MarketReviewService
 from quant_research.dashboard.notebook import NotebookProbe
+from quant_research.dashboard.strategy_studies import StrategyStudyDashboardService
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.data.pipeline.publish import DataUpdatePlanner
 from quant_research.data.repository import CanonicalResearchRepository
@@ -28,13 +28,13 @@ from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
 )
-from quant_research.infrastructure.persistence.experiment_runs import (
-    ExperimentRunRegistry,
-)
 from quant_research.infrastructure.persistence.factor_studies import (
     FactorStudyRegistry,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
+from quant_research.infrastructure.persistence.strategy_studies import (
+    StrategyStudyRegistry,
+)
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from quant_research.infrastructure.runtime_settings import DataRootEnvSettingsStore
 from quant_research.infrastructure.tushare import (
@@ -161,8 +161,8 @@ class DashboardBootstrap:
                 commission_bps=rulebook.commission_bps,
                 commission_minimum_fen=rulebook.commission_minimum_fen,
             )
-            experiments = ExperimentService(
-                ExperimentRunRegistry(engine), repository.catalog(), strategies
+            strategy_studies = StrategyStudyService(
+                StrategyStudyRegistry(engine), repository.catalog(), strategies
             )
             factor_studies = FactorStudyService(
                 FactorStudyRegistry(engine),
@@ -176,15 +176,14 @@ class DashboardBootstrap:
                     repository=MetadataRepository(engine),
                     routes=TUSHARE_ROUTES,
                 ),
-                experiments,
-                factor_studies,
+                factor_studies=factor_studies,
             )
             return create_http_app(
                 service=service,
                 commands=commands,
                 settings_service=DashboardSettingsService(runtime_settings),
-                experiment_service=ExperimentDashboardService(
-                    experiments, strategies, settings.artifact_root
+                strategy_study_service=StrategyStudyDashboardService(
+                    strategy_studies, strategies, settings.artifact_root
                 ),
                 factor_study_service=FactorStudyDashboardService(
                     factor_studies, settings.artifact_root

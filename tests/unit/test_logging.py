@@ -43,7 +43,7 @@ def test_structured_logger_writes_stable_core_fields_and_redacts_context() -> No
         stream,
         context=log_context_type(
             request_id="request-7",
-            experiment_id="experiment-7",
+            strategy_study_id="study-7",
             task_id="task-7",
             attempt_id="attempt-7",
             worker_id="worker-7",
@@ -72,7 +72,7 @@ def test_structured_logger_writes_stable_core_fields_and_redacts_context() -> No
         "level",
         "event",
         "request_id",
-        "experiment_id",
+        "strategy_study_id",
         "task_id",
         "attempt_id",
         "worker_id",
@@ -84,7 +84,7 @@ def test_structured_logger_writes_stable_core_fields_and_redacts_context() -> No
         "level": "INFO",
         "event": "experiment.stage",
         "request_id": "request-7",
-        "experiment_id": "experiment-7",
+        "strategy_study_id": "study-7",
         "task_id": "task-7",
         "attempt_id": "attempt-7",
         "worker_id": "worker-7",
@@ -170,7 +170,7 @@ def test_task_log_manager_binds_diagnostics_to_controlled_artifact_paths(
     )
     context = logging_module.LogContext(
         request_id="request-7",
-        experiment_id="00000000-0000-0000-0000-000000000701",
+        strategy_study_id="00000000-0000-0000-0000-000000000701",
         task_id="00000000-0000-0000-0000-000000000702",
         attempt_id="00000000-0000-0000-0000-000000000703",
         worker_id="worker-7",
@@ -189,9 +189,9 @@ def test_task_log_manager_binds_diagnostics_to_controlled_artifact_paths(
         session.logger.emit("info", "stage.started")
         outside = tmp_path / "caller-selected"
         outside.mkdir()
-        with pytest.raises(ValueError, match="controlled experiment staging"):
+        with pytest.raises(ValueError, match="controlled task staging"):
             manager.materialize(context, outside)
-        staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
+        staging = artifact_root / ".task-staging" / ".staging-study-7"
         staging.mkdir(parents=True)
         materialized = manager.materialize(context, staging)
 
@@ -204,7 +204,7 @@ def test_task_log_manager_binds_diagnostics_to_controlled_artifact_paths(
         "level": "INFO",
         "event": "stage.started",
         "request_id": "request-7",
-        "experiment_id": "00000000-0000-0000-0000-000000000701",
+        "strategy_study_id": "00000000-0000-0000-0000-000000000701",
         "task_id": "00000000-0000-0000-0000-000000000702",
         "attempt_id": "00000000-0000-0000-0000-000000000703",
         "worker_id": "worker-7",
@@ -220,8 +220,8 @@ def test_task_log_manager_binds_diagnostics_to_controlled_artifact_paths(
     assert not (tmp_path / "escape").exists()
 
 
-def test_task_log_manager_accepts_experiment_task_ulid(tmp_path: Path) -> None:
-    """实验任务的 ULID 必须安全映射到受控诊断路径。"""
+def test_task_log_manager_accepts_strategy_study_task_ulid(tmp_path: Path) -> None:
+    """策略研究任务的 ULID 必须安全映射到受控诊断路径。"""
     logging_module = import_module("quant_research.logging")
     diagnostic_root = tmp_path / "state" / "task-logs"
     manager = logging_module.TaskLogManager(
@@ -229,7 +229,7 @@ def test_task_log_manager_accepts_experiment_task_ulid(tmp_path: Path) -> None:
         artifact_root=tmp_path / "artifacts",
     )
     context = logging_module.LogContext(
-        experiment_id="01M0M25S92XABB0B3347ST5KWV",
+        strategy_study_id="01M0M25S92XABB0B3347ST5KWV",
         task_id="01M0M25S924HFM59DP2CB9WK70",
         attempt_id="00000000-0000-0000-0000-000000000703",
         worker_id="worker-7",
@@ -311,7 +311,7 @@ def test_task_log_materialization_requires_an_active_session(
     )
     with manager.open(context) as session:
         session.logger.emit("info", "task.claimed")
-    staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
+    staging = artifact_root / ".task-staging" / ".staging-study-7"
     staging.mkdir(parents=True)
 
     with pytest.raises(ValueError, match="active session"):
@@ -458,7 +458,7 @@ def test_task_log_flush_materialize_and_close_are_durability_boundaries(
         attempt_id="00000000-0000-0000-0000-000000000743",
         worker_id="worker-7",
     )
-    staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
+    staging = artifact_root / ".task-staging" / ".staging-study-7"
     staging.mkdir(parents=True)
 
     with manager.open(context) as session:
@@ -522,12 +522,12 @@ def test_unavailable_task_log_materializes_a_safe_placeholder(tmp_path: Path) ->
     )
     context = logging_module.LogContext(
         request_id="00000000-0000-0000-0000-000000000763",
-        experiment_id="00000000-0000-0000-0000-000000000761",
+        strategy_study_id="00000000-0000-0000-0000-000000000761",
         task_id="00000000-0000-0000-0000-000000000762",
         attempt_id="00000000-0000-0000-0000-000000000763",
         worker_id="worker-7",
     )
-    staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
+    staging = artifact_root / ".task-staging" / ".staging-study-7"
     staging.mkdir(parents=True)
 
     path = manager.materialize_unavailable(
@@ -542,7 +542,7 @@ def test_unavailable_task_log_materializes_a_safe_placeholder(tmp_path: Path) ->
         "level": "WARNING",
         "event": "task.log_unavailable",
         "request_id": "00000000-0000-0000-0000-000000000763",
-        "experiment_id": "00000000-0000-0000-0000-000000000761",
+        "strategy_study_id": "00000000-0000-0000-0000-000000000761",
         "task_id": "00000000-0000-0000-0000-000000000762",
         "attempt_id": "00000000-0000-0000-0000-000000000763",
         "worker_id": "worker-7",
@@ -563,12 +563,12 @@ def test_materialize_falls_back_when_all_task_log_writes_fail(
         artifact_root=artifact_root,
     )
     context = logging_module.LogContext(
-        experiment_id="00000000-0000-0000-0000-000000000781",
+        strategy_study_id="00000000-0000-0000-0000-000000000781",
         task_id="00000000-0000-0000-0000-000000000782",
         attempt_id="00000000-0000-0000-0000-000000000783",
         worker_id="worker-7",
     )
-    staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
+    staging = artifact_root / ".task-staging" / ".staging-study-7"
     staging.mkdir(parents=True)
 
     with manager.open(context) as session:
@@ -600,7 +600,7 @@ def test_materialize_does_not_hide_task_log_correlation_conflicts(
         attempt_id="00000000-0000-0000-0000-000000000793",
         worker_id="worker-7",
     )
-    staging = artifact_root / ".experiment-staging" / ".staging-experiment-7"
+    staging = artifact_root / ".task-staging" / ".staging-study-7"
     staging.mkdir(parents=True)
 
     with manager.open(context) as session:

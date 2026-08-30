@@ -33,14 +33,12 @@ from quant_research.infrastructure.persistence.orm import (
     DataCatalogStateORM,
     DataInitializationStateORM,
     DatasetOperationalStateORM,
-    ExperimentORM,
     QualityIssueORM,
     QualityRuleResultORM,
     QualityRunDatasetORM,
     QualityRunORM,
     RawObjectORM,
     RawRequestORM,
-    TaskORM,
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1251,45 +1249,6 @@ class MetadataRepository:
             )
             return tuple(self._quality_record(session, item) for item in identifiers)
 
-    def _removed_register_experiment(self, spec: object) -> object:
-        """注册一个初始状态为 ``CREATED`` 的研究实验。
-
-        入参：
-            spec：不可变规格。
-        返回值：
-            返回实验（``ExperimentRecord``）。
-        异常：
-            ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
-        """
-        del spec
-        raise RuntimeError("legacy experiment registry was removed")
-
-    def _removed_count_experiments_by_fingerprint(self, fingerprint: str) -> int:
-        """统计具有指定研究指纹的实验数量。
-
-        入参：
-            fingerprint：由策略、数据、源码、依赖锁和交易规则共同形成的研究指纹。
-        返回值：
-            返回与该研究指纹完全相同的已登记实验数量。
-        异常：
-            无。
-        """
-        del fingerprint
-        raise RuntimeError("legacy experiment fingerprint query was removed")
-
-    def _removed_create_task(self, spec: object) -> object:
-        """为已存在的实验创建一个初始状态为 ``QUEUED`` 的任务。
-
-        入参：
-            spec：不可变规格。
-        返回值：
-            返回创建任务后的任务（``TaskRecord``）。
-        异常：
-            输入、状态或依赖结果违反契约时抛出 ``KeyError``。
-        """
-        del spec
-        raise RuntimeError("legacy task creation was removed")
-
     @staticmethod
     def _raw_partition_record(
         request: RawRequestORM, obj: RawObjectORM
@@ -1500,17 +1459,6 @@ class MetadataRepository:
             rule_results=rule_results,
             results_complete=row.results_complete,
         )
-
-    @staticmethod
-    def _removed_experiment_record(row: ExperimentORM) -> object:
-        del row
-        raise RuntimeError("legacy experiment records were removed")
-
-    @staticmethod
-    def _removed_task_record(row: TaskORM) -> object:
-        del row
-        raise RuntimeError("legacy repository task records were removed")
-
 
 def canonical_dataset_hash(spec: CanonicalDatasetSpec) -> str:
     """计算 Canonical 数据集的稳定内容身份；该函数作为稳定公开 API保留在模块级。

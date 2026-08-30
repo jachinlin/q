@@ -6,18 +6,21 @@ Revises: data_initialization
 
 from __future__ import annotations
 
-from typing import cast
-
 from alembic import op
-from sqlalchemy import Column, String, Table, inspect
-
-from quant_research.infrastructure.persistence.orm import (
-    ExperimentORM,
-    ExperimentTagORM,
-    RunArtifactORM,
-    RunMetricORM,
-    RunORM,
-    RunTagORM,
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    inspect,
 )
 
 revision = "experiment_runs"
@@ -25,13 +28,109 @@ down_revision = "data_initialization"
 branch_labels = None
 depends_on = None
 
+_metadata = MetaData()
+_experiment = Table(
+    "experiment",
+    _metadata,
+    Column("id", String(36), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("description", Text, nullable=False),
+    Column("definition_json", Text, nullable=False),
+    Column("definition_hash", String(64), nullable=False),
+    Column("baseline_run_id", String(36)),
+    Column("created_at", String(32), nullable=False),
+    Index("ix_experiment_created", "created_at", "id"),
+)
+_experiment_tag = Table(
+    "experiment_tag",
+    _metadata,
+    Column(
+        "experiment_id",
+        String(36),
+        ForeignKey("experiment.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("tag", String(64), primary_key=True),
+)
+_run = Table(
+    "run",
+    _metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "experiment_id",
+        String(36),
+        ForeignKey("experiment.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("task_id", String(36), unique=True),
+    Column("config_json", Text, nullable=False),
+    Column("config_hash", String(64), nullable=False),
+    Column("catalog_hash", String(64), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("stage", String(32), nullable=False),
+    Column("research_mark", String(16), nullable=False),
+    Column("uses_test_region", Boolean, nullable=False),
+    Column("artifact_dir", String),
+    Column("manifest_hash", String(64)),
+    Column("error_json", Text),
+    Column("created_at", String(32), nullable=False),
+    Column("started_at", String(32)),
+    Column("completed_at", String(32)),
+    CheckConstraint(
+        "status IN ('CREATED', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+        name="ck_run_status",
+    ),
+    CheckConstraint(
+        "research_mark IN ('UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED')",
+        name="ck_run_research_mark",
+    ),
+    Index("ix_run_experiment_created", "experiment_id", "created_at", "id"),
+)
+_run_tag = Table(
+    "run_tag",
+    _metadata,
+    Column(
+        "run_id",
+        String(36),
+        ForeignKey("run.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("tag", String(64), primary_key=True),
+)
+_run_metric = Table(
+    "run_metric",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String(36), ForeignKey("run.id", ondelete="CASCADE")),
+    Column("name", String(128), nullable=False),
+    Column("value", Float, nullable=False),
+    Column("unit", String(32)),
+    Column("p_value", Float),
+    Column("adjusted_p_value", Float),
+    Column("created_at", String(32), nullable=False),
+    UniqueConstraint("run_id", "name", name="uq_run_metric_name"),
+)
+_run_artifact = Table(
+    "run_artifact",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", String(36), ForeignKey("run.id", ondelete="CASCADE")),
+    Column("artifact_type", String(64), nullable=False),
+    Column("relative_path", String, nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    Column("byte_count", Integer, nullable=False),
+    Column("row_count", Integer),
+    Column("schema_json", Text),
+    Column("created_at", String(32), nullable=False),
+    UniqueConstraint("run_id", "artifact_type", name="uq_run_artifact_type"),
+)
 _NEW_TABLES = (
-    ExperimentORM.__table__,
-    ExperimentTagORM.__table__,
-    RunORM.__table__,
-    RunTagORM.__table__,
-    RunMetricORM.__table__,
-    RunArtifactORM.__table__,
+    _experiment,
+    _experiment_tag,
+    _run,
+    _run_tag,
+    _run_metric,
+    _run_artifact,
 )
 _REMOVED_TABLES = (
     "research_tag",
@@ -75,7 +174,7 @@ def upgrade() -> None:
         if inspect(bind).has_table(table_name):
             op.drop_table(table_name)
     for table in _NEW_TABLES:
-        cast(Table, table).create(bind=bind, checkfirst=True)
+        table.create(bind=bind, checkfirst=True)
     if inspect(bind).has_table("audit_event"):
         columns = {item["name"] for item in inspect(bind).get_columns("audit_event")}
         with op.batch_alter_table("audit_event") as batch:
@@ -101,7 +200,7 @@ def downgrade() -> None:
     """
     bind = op.get_bind()
     for table in reversed(_NEW_TABLES):
-        cast(Table, table).drop(bind=bind, checkfirst=True)
+        table.drop(bind=bind, checkfirst=True)
     if inspect(bind).has_table("task"):
         columns = {item["name"] for item in inspect(bind).get_columns("task")}
         if "experiment_id" not in columns:

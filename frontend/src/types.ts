@@ -90,42 +90,32 @@ export type DataUpdateWindow = {
   trigger_date?: string
 }
 
-export type RunStatus = 'CREATED' | 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
-export type ResearchMark = 'UNREVIEWED' | 'BASELINE' | 'CANDIDATE' | 'DISCARDED'
+export type StrategyStudyStatus = 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
 
-export type ExperimentDefinitionDto = {
+export type StrategyStudyDefinition = {
   name: string
   description: string
   tags: string[]
-  sample_windows: Record<'train' | 'validation' | 'test', { start: string; end: string }>
-  governance: { test_budget: number; correction: 'BONFERRONI' | 'BH_FDR' }
-  initial_run: Record<string, unknown>
+  start_date: string
+  end_date: string
+  strategy: { strategy_id: string; parameters: Record<string, unknown> }
+  benchmark: string
+  initial_cash_fen: number
+  execution: {
+    reference_price: string
+    slippage_bps: number
+    max_volume_participation: number
+    limit_order_policy: string
+  }
 }
 
-export type ExperimentSummary = {
+export type StrategyStudy = {
   id: string
-  definition: ExperimentDefinitionDto
-  baseline_run_id: string | null
-  created_at: string
-}
-
-export type ExperimentOverview = ExperimentSummary & {
-  latest_run: ExperimentRun | null
-  run_count: number
-  test_uses: number
-  has_active_runs: boolean
-}
-
-export type ExperimentRun = {
-  id: string
-  experiment_id: string
-  config: Record<string, unknown>
+  definition: StrategyStudyDefinition
   config_hash: string
   catalog_hash: string
-  status: RunStatus
+  status: StrategyStudyStatus
   stage: string
-  research_mark: ResearchMark
-  uses_test_region: boolean
   task_id: string | null
   artifact_dir: string | null
   manifest_hash: string | null
@@ -133,13 +123,10 @@ export type ExperimentRun = {
   created_at: string
   started_at: string | null
   completed_at: string | null
-  tags: string[]
   metrics: Array<{
     name: string
     value: number
     unit: string | null
-    p_value: number | null
-    adjusted_p_value: number | null
   }>
   artifacts: Array<{
     artifact_type: string
@@ -151,35 +138,7 @@ export type ExperimentRun = {
   }>
 }
 
-export type ExperimentAggregate = {
-  experiment: ExperimentSummary
-  runs: ExperimentRun[]
-  tags: string[]
-}
-
-export type ExperimentComparison = {
-  experiment_id: string
-  baseline_run_id: string | null
-  runs: Array<{ id: string; status: RunStatus; research_mark: ResearchMark }>
-  metrics: Array<{
-    name: string
-    unit: string | null
-    values: Array<{
-      run_id: string
-      value: number | null
-      p_value: number | null
-      adjusted_p_value: number | null
-      delta_from_baseline: number | null
-    }>
-  }>
-  configs: Array<{
-    path: string
-    differs: boolean
-    values: Array<{ run_id: string; value: unknown }>
-  }>
-}
-
-export type RunQualityDisclosure = {
+export type StrategyStudyQualityDisclosure = {
   calculation_mode: string
   risk_free_rate_annual: number
   undefined_metrics: Record<string, string>
@@ -251,21 +210,21 @@ export type FactorSeriesArtifactRow = {
   long_short_return?: number | null
 }
 
-export type RunRawArtifactRow = {
+export type ArtifactRow = {
   [column: string]: string | number | boolean | null
 }
 
-export type RunArtifactRow =
+export type StrategyArtifactRow =
   | StrategyPerformanceArtifactRow
   | PeriodReturnArtifactRow
   | ExecutionSummaryArtifactRow
   | FactorSummaryArtifactRow
   | FactorSeriesArtifactRow
-  | RunRawArtifactRow
+  | ArtifactRow
 
-export type ExperimentValidation = {
+export type StrategyStudyValidation = {
   config_hash: string
-  normalized: ExperimentDefinitionDto
+  normalized: StrategyStudyDefinition
 }
 
 export type StrategyCatalog = {
@@ -675,17 +634,4 @@ export type QualityRuleResult = {
   skip_reason: string | null
   evidence: 'RUN_SNAPSHOT' | 'LEGACY_ISSUE' | 'MISSING'
   issues: QualityIssue[]
-}
-
-export type Backtest = {
-  experiment_id: string
-  manifest_hash: string
-  metrics: Record<string, number | string | null | unknown[]>
-  nav: Array<{ trade_date: string; portfolio_nav: number; benchmark_nav: number }>
-  drawdown: Array<Record<string, unknown>>
-  monthly_returns: Array<Record<string, unknown>>
-  exposures: Array<Record<string, unknown>>
-  attribution: Array<Record<string, unknown>>
-  execution_summary: Array<Record<string, unknown>>
-  quality: Record<string, unknown>
 }

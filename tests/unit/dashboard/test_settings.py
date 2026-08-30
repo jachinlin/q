@@ -336,7 +336,7 @@ def test_settings_http_api_sets_and_clears_without_echoing_token(
         service=cast(Any, object()),
         commands=cast(Any, object()),
         settings_service=service,
-        experiment_service=cast(Any, object()),
+        strategy_study_service=cast(Any, object()),
         notebook_probe=cast(Any, object()),
         static_dir=tmp_path / "static",
         allowed_hosts=("testserver",),
@@ -386,7 +386,7 @@ def test_settings_http_api_atomically_changes_token_and_rate_limit(
         service=cast(Any, object()),
         commands=cast(Any, object()),
         settings_service=service,
-        experiment_service=cast(Any, object()),
+        strategy_study_service=cast(Any, object()),
         notebook_probe=cast(Any, object()),
         static_dir=tmp_path / "static",
         allowed_hosts=("testserver",),
@@ -500,7 +500,7 @@ def test_settings_http_api_rejects_invalid_typed_changes_without_value_echo(
         settings_service=DashboardSettingsService(
             DataRootEnvSettingsStore(tmp_path, environment={})
         ),
-        experiment_service=cast(Any, object()),
+        strategy_study_service=cast(Any, object()),
         notebook_probe=cast(Any, object()),
         static_dir=tmp_path / "static",
         allowed_hosts=("testserver",),

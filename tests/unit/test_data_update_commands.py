@@ -184,7 +184,7 @@ def _task(payload: dict[str, JsonValue]) -> TaskRecord:
 
 
 def _service(queue: _Queue, planner: _Planner) -> OperationalCommandService:
-    return OperationalCommandService(cast(Any, queue), planner, cast(Any, object()))
+    return OperationalCommandService(cast(Any, queue), planner)
 
 
 def test_preview_and_enqueue_persist_the_same_complete_plan() -> None:

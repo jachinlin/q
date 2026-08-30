@@ -1,11 +1,11 @@
-"""验证 Experiment Worker 的 Canonical 行情适配语义。"""
+"""验证策略研究 Worker 的 Canonical 行情适配语义。"""
 
 from datetime import date
 from typing import Any, cast
 
 import polars as pl
 
-from quant_research.bootstrap.worker import CanonicalRunData
+from quant_research.bootstrap.worker import CanonicalStrategyStudyData
 from quant_research.domain.identifiers import InstrumentId
 
 
@@ -59,7 +59,7 @@ class _SuspendedRepository:
 
 def test_market_slice_preserves_null_volume_for_suspended_placeholder() -> None:
     """适配器不得把全空停牌行的成交量改写为零。"""
-    source = object.__new__(CanonicalRunData)
+    source = object.__new__(CanonicalStrategyStudyData)
     source._repository = cast(Any, _SuspendedRepository())
     source._metadata = {
         "300114.SZ": {

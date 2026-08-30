@@ -29,10 +29,10 @@ from quant_research.strategies.base import (
 
 @dataclass(frozen=True, slots=True)
 class BacktestRequest:
-    """定义一次 Run 级回测的身份、区间、资金、基准和撮合配置。
+    """定义一次策略研究回测的身份、区间、资金、基准和撮合配置。
 
     入参：
-        experiment_id、run_id：实验与运行标识；catalog_hash、rulebook_hash：
+        strategy_study_id：策略研究标识；catalog_hash、rulebook_hash：
         数据目录与交易规则的 SHA-256；其余字段定义区间、基准、资金和撮合参数。
     返回值：
         创建经过身份、日期和资金校验的回测请求。
@@ -40,8 +40,7 @@ class BacktestRequest:
         ValueError：标识为空、哈希非法、日期倒置或初始资金非正时抛出。
     """
 
-    experiment_id: str
-    run_id: str
+    strategy_study_id: str
     catalog_hash: str
     start_date: date
     end_date: date
@@ -51,8 +50,8 @@ class BacktestRequest:
     execution_config: ExecutionConfig
 
     def __post_init__(self) -> None:
-        if not self.experiment_id or not self.run_id:
-            raise ValueError("experiment_id and run_id must be nonempty")
+        if not self.strategy_study_id:
+            raise ValueError("strategy_study_id must be nonempty")
         for value, name in (
             (self.catalog_hash, "catalog_hash"),
             (self.rulebook_hash, "rulebook_hash"),
@@ -72,7 +71,7 @@ class BacktestResult:
     """记录尚未发布的规范回测表、冻结输入和最终账户状态。
 
     入参：
-        各字段分别提供实验与运行标识、回测表、配置、输入身份、已处理交易日数和
+        各字段分别提供策略研究标识、回测表、配置、输入身份、已处理交易日数和
         最终账户快照。
     返回值：
         创建不可变的回测结果值对象。
@@ -80,8 +79,7 @@ class BacktestResult:
         不执行额外校验；字段类型错误由调用边界的类型校验负责。
     """
 
-    experiment_id: str
-    run_id: str
+    strategy_study_id: str
     tables: Mapping[str, pl.DataFrame]
     config: Mapping[str, JsonValue]
     identities: Mapping[str, JsonValue]
@@ -248,7 +246,7 @@ class BacktestCancelled(RuntimeError):
     入参：
         message：包含已完成交易日数量的取消说明。
     返回值：
-        创建供 ExperimentRunner 转换为 CANCELLED 状态的异常。
+        创建供策略研究处理器转换为 CANCELLED 状态的异常。
     异常：
         构造过程不主动抛出其他异常。
     """
@@ -376,13 +374,11 @@ class BacktestEngine:
             raise RuntimeError("backtest produced no account snapshot")
         signals = self._signals(strategy)
         return BacktestResult(
-            request.experiment_id,
-            request.run_id,
+            request.strategy_study_id,
             RunTableSchema.canonical_backtest_tables({**tables, "signals": signals}),
             self._config(request, strategy),
             {
-                "experiment_id": request.experiment_id,
-                "run_id": request.run_id,
+                "strategy_study_id": request.strategy_study_id,
                 "catalog_hash": request.catalog_hash,
                 "rulebook_hash": request.rulebook_hash,
                 "strategy_id": strategy.spec.strategy_id,

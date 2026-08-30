@@ -1,8 +1,8 @@
 # Quant Research
 
 Quant Research 是一个单用户、本地运行的跨平台 A 股量化研究平台。它把数据采集、
-PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashboard 放在同一个可审计的
-研究闭环中，核心目的是降低新策略从开发、回测到比较验证的成本，支持快速迭代
+PIT 研究数据、因子分析、策略研究、回测、任务执行和 Dashboard 放在同一个可审计的
+研究闭环中，核心目的是降低新策略从开发到回测验证的成本，支持快速迭代
 新策略。
 
 项目当前未发布，不承诺旧 Python 导入、旧数据库或旧研究产物兼容。Python 包统一为
@@ -14,9 +14,9 @@ PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashbo
 - Canonical 分区、质量校验和全局研究门禁；
 - PIT 股票池、17 个股票 Alpha、1 个流动性辅助因子和独立因子研究；
 - ETF 轮动与股票多因子策略；
-- 固定七阶段实验、回测、绩效分析和不可变产物登记；
+- 单次提交、单次执行的四阶段策略研究和不可变产物登记；
 - SQLite 持久化任务队列和本地 Worker；
-- FastAPI + Vue 数据中心、实验中心、因子研究和任务运行界面；
+- FastAPI + Vue 数据中心、策略研究、因子研究和任务运行界面；
 - 结构化 CLI、JSON Lines 日志和敏感信息脱敏。
 
 ## 运行要求
@@ -148,19 +148,19 @@ uv run qlab data validate daily_bar
 
 `validate <dataset>` 只生成诊断结果；只有 `validate-all` 能开放研究读取。
 
-## 策略实验、因子研究与任务
+## 策略研究、因子研究与任务
 
-提交实验只创建不可变实验和后台任务，不在 CLI 进程中同步执行：
+提交策略研究只创建一份冻结定义和一个后台任务，不在 CLI 进程中同步执行：
 
 ```console
-uv run qlab experiments submit configs/experiments/examples/etf_rotation.yaml
+uv run qlab strategy-studies submit configs/strategy_studies/examples/etf_rotation.yaml
 uv run qlab worker once
 ```
 
-查看实验：
+查看策略研究：
 
 ```console
-uv run qlab experiments show <experiment-id>
+uv run qlab strategy-studies show <strategy-study-id>
 ```
 
 因子研究使用独立的扁平配置和命令组：
@@ -182,13 +182,13 @@ uv run qlab tasks retry <task-id>
 ```
 
 失败或取消的因子研究重试会复用同一任务和冻结配置并创建新 attempt；成功研究不可重跑。
-策略实验的重跑继续创建新的 Run 和产物，任何成功产物都不可覆盖。
+策略研究不提供任务重试；失败、取消或参数调整后，从原定义复制并提交一项独立研究。
 
-实验示例：
+策略研究示例：
 
-- `configs/experiments/examples/etf_rotation.yaml`
-- `configs/experiments/examples/multifactor.yaml`
-- `configs/experiments/examples/dual_ma_trend.yaml`
+- `configs/strategy_studies/examples/etf_rotation.yaml`
+- `configs/strategy_studies/examples/multifactor.yaml`
+- `configs/strategy_studies/examples/dual_ma_trend.yaml`
 
 因子研究示例：`configs/factor_studies/examples/factor_study.yaml`。
 
@@ -198,11 +198,12 @@ uv run qlab tasks retry <task-id>
 
 ```json
 {
-  "experiment_id": "<uuid>",
-  "experiment_status": "QUEUED",
-  "status": "SUCCEEDED",
+  "id": "<ulid>",
+  "status": "QUEUED",
+  "stage": "VALIDATE",
   "task_id": "<uuid>",
-  "task_status": "QUEUED"
+  "metrics": [],
+  "artifacts": []
 }
 ```
 
@@ -248,7 +249,7 @@ timezone: Asia/Shanghai
 max_partition_size: 100
 ```
 
-交易规则唯一来源为 `configs/rules/a_share.yaml`，其内容哈希进入实验身份。
+交易规则唯一来源为 `configs/rules/a_share.yaml`，其内容哈希进入策略研究身份。
 
 ## 架构
 
@@ -266,7 +267,7 @@ src/quant_research/
 ├── strategies/        # 策略
 ├── backtest/          # 回测
 ├── analytics/         # 分析与归因
-├── experiments/       # 实验
+├── strategy_studies/  # 单次策略研究
 ├── tasks/             # 任务模型
 ├── infrastructure/    # SQLite、Alembic、Tushare
 ├── cli/               # Typer 适配器
@@ -275,7 +276,7 @@ src/quant_research/
 ```
 
 研究代码只能通过 `CanonicalResearchRepository` 读取数据，不能直接扫描 Raw 或
-Canonical 路径。实验提交时捕获当前 Catalog、源码、锁文件和交易规则身份；任一阶段
+Canonical 路径。策略研究提交时捕获当前 Catalog 和冻结配置身份；任一阶段
 发现漂移都会失败，而不是静默切换输入。
 
 ## 开发与验证

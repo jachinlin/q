@@ -9,13 +9,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Never, Protocol, cast
+from typing import Never, Protocol, cast
 
 import typer
 from typer import _click
 
-from quant_research.application.experiments import ExperimentService
 from quant_research.application.factor_studies import FactorStudyService
+from quant_research.application.strategy_studies import StrategyStudyService
 from quant_research.application.worker import WorkerRunResult
 from quant_research.data.pipeline.dataset import DatasetCurateResult, LocalizeResult
 from quant_research.data.pipeline.publish import DataPipeline, PipelineResult
@@ -73,7 +73,7 @@ class TaskCommands(Protocol):
         ...
 
 
-class ExperimentCommands(Protocol):
+class StrategyStudyCommands(Protocol):
     """定义策略命令端口。入参：实现实例。返回值：命令端口。异常：实现不满足协议时类型检查失败。"""
 
     def validate(self, config: str) -> object:
@@ -81,23 +81,15 @@ class ExperimentCommands(Protocol):
         ...
 
     def submit(self, config: str) -> object:
-        """提交策略实验。入参：受信配置路径。返回值：创建结果。异常：门禁或事务失败时抛出。"""
+        """提交策略研究。入参：受信配置路径。返回值：创建结果。异常：门禁或事务失败时抛出。"""
         ...
 
-    def show(self, experiment_id: str) -> object:
-        """读取策略实验。入参：实验 ID。返回值：实验聚合。异常：实验不存在时抛出。"""
-        ...
-
-    def run(self, experiment_id: str, config: str) -> object:
-        """创建策略运行。入参：实验 ID 和配置路径。返回值：运行结果。异常：配置或实验非法时抛出。"""
-        ...
-
-    def rerun(self, run_id: str) -> object:
-        """重跑策略。入参：运行 ID。返回值：新运行结果。异常：运行不可重跑时抛出。"""
+    def show(self, study_id: str) -> object:
+        """读取策略研究。入参：研究 ID。返回值：研究快照。异常：研究不存在时抛出。"""
         ...
 
     def list(self) -> object:
-        """列出策略实验。入参：无。返回值：有序聚合。异常：仓储不可用时抛出。"""
+        """列出策略研究。入参：无。返回值：有序快照。异常：仓储不可用时抛出。"""
         ...
 
 
@@ -396,99 +388,45 @@ class LocalTaskCommands:
         }
 
 
-class LocalExperimentCommands:
-    """从受信配置目录调用统一实验应用服务。
+class LocalStrategyStudyCommands:
+    """执行本地策略研究命令。入参：研究服务和配置根。返回值：命令实例。异常：依赖非法时传播。"""
 
-    入参：
-        service：实验应用服务；config_root：允许读取 YAML 的配置根目录。
-    返回值：
-        创建不接受任意文件路径的本地实验命令适配器。
-    异常：
-        构造不读取文件；命令执行时的路径和领域错误由各方法说明。
-    """
-
-    def __init__(self, service: ExperimentService, config_root: Path) -> None:
+    def __init__(self, service: StrategyStudyService, config_root: Path) -> None:
         self._service = service
         self._config_root = config_root.resolve()
 
     def validate(self, config: str) -> Mapping[str, object]:
-        """校验实验定义并返回规范化配置。
+        """校验研究配置。入参：受信配置路径。返回值：定义与哈希。异常：路径或配置非法时传播。"""
 
-        入参：
-            config：受信配置根内的 YAML 文件名。
-        返回值：
-            返回规范化定义和确定性配置哈希。
-        异常：
-            ValueError：路径越界、文件不存在或严格 Schema 校验失败时抛出。
-        """
-        resolved = self._service.validate_experiment(self._read(config))
+        resolved = self._service.validate(self._read(config))
         return {
             "definition": resolved.definition.model_dump(mode="json"),
             "config_hash": resolved.config_hash,
         }
 
     def submit(self, config: str) -> Mapping[str, object]:
-        """创建实验及首个已入队 Run。
+        """提交研究配置。入参：受信配置路径。返回值：已入队快照。异常：门禁或事务失败时传播。"""
 
-        入参：
-            config：受信实验 YAML 文件名。
-        返回值：
-            返回新实验、首个 Run 和标签。
-        异常：
-            ValueError：配置非法时抛出；持久化失败时事务回滚并传播异常。
-        """
-        return self._aggregate(self._service.submit(self._read(config), actor="cli"))
-
-    def show(self, experiment_id: str) -> Mapping[str, object]:
-        """读取实验定义及其全部 Run。
-
-        入参：
-            experiment_id：实验标识。
-        返回值：
-            返回实验、全部 Run 和标签的 JSON 映射。
-        异常：
-            KeyError：实验不存在时抛出。
-        """
-        return self._aggregate(self._service.show(experiment_id))
-
-    def run(self, experiment_id: str, config: str) -> Mapping[str, object]:
-        """在指定实验下创建一个显式 Run。
-
-        入参：
-            experiment_id：实验标识；config：受信 Run YAML 文件名。
-        返回值：
-            返回加入新 Run 后的实验聚合。
-        异常：
-            KeyError：实验不存在时抛出；ValueError：Run 配置违反协议时抛出。
-        """
-        return self._aggregate(
-            self._service.add_run(experiment_id, self._read(config), actor="cli")
+        return cast(
+            Mapping[str, object],
+            self._service.submit(self._read(config), actor="cli").model_dump(
+                mode="json"
+            ),
         )
 
-    def rerun(self, run_id: str) -> Mapping[str, object]:
-        """从指定 Run 的冻结配置创建新 Run。
+    def show(self, study_id: str) -> Mapping[str, object]:
+        """读取研究。入参：研究 ID。返回值：完整快照。异常：不存在时抛出键错误。"""
 
-        入参：
-            run_id：源 Run 标识。
-        返回值：
-            返回包含新 Run 的实验聚合。
-        异常：
-            KeyError：源 Run 不存在时抛出。
-        """
-        return self._aggregate(self._service.rerun(run_id, actor="cli"))
+        return cast(
+            Mapping[str, object],
+            self._service.show(study_id).model_dump(mode="json"),
+        )
 
     def list(self) -> Mapping[str, object]:
-        """列出最近创建的实验。
+        """列出研究。入参：无。返回值：有序快照。异常：持久化读取失败时传播。"""
 
-        入参：
-            无。
-        返回值：
-            返回最近实验的 JSON 列表。
-        异常：
-            实验存储读取失败时传播持久化异常。
-        """
         return {
-            "experiments": [
+            "strategy_studies": [
                 item.model_dump(mode="json") for item in self._service.list()
             ]
         }
@@ -496,19 +434,8 @@ class LocalExperimentCommands:
     def _read(self, value: str) -> str:
         candidate = Path(value).resolve()
         if not candidate.is_relative_to(self._config_root) or not candidate.is_file():
-            raise ValueError("experiment config must be a file inside configs")
+            raise ValueError("strategy study config must be a file inside configs")
         return candidate.read_text(encoding="utf-8")
-
-    @staticmethod
-    def _aggregate(value: Any) -> Mapping[str, object]:
-        experiment = value.experiment
-        runs = value.runs
-        tags = value.tags
-        return {
-            "experiment": experiment.model_dump(mode="json"),
-            "runs": [item.model_dump(mode="json") for item in runs],
-            "tags": list(tags),
-        }
 
 
 class LocalFactorStudyCommands:
@@ -695,7 +622,7 @@ class ApplicationServices:
 
     pipeline: DataPipeline
     task_commands: TaskCommands | None = None
-    experiment_commands: ExperimentCommands | None = None
+    strategy_study_commands: StrategyStudyCommands | None = None
     factor_study_commands: FactorStudyCommands | None = None
     strategy_commands: StrategyCommands | None = None
     worker_commands: WorkerCommands | None = None
@@ -736,13 +663,13 @@ def create_app(
     application = typer.Typer(no_args_is_help=True)
     data = typer.Typer(no_args_is_help=True)
     tasks = typer.Typer(no_args_is_help=True)
-    experiments = typer.Typer(no_args_is_help=True)
+    strategy_studies = typer.Typer(no_args_is_help=True)
     factor_studies = typer.Typer(no_args_is_help=True)
     strategies = typer.Typer(no_args_is_help=True)
     worker = typer.Typer(no_args_is_help=True)
     application.add_typer(data, name="data")
     application.add_typer(tasks, name="tasks")
-    application.add_typer(experiments, name="experiments")
+    application.add_typer(strategy_studies, name="strategy-studies")
     application.add_typer(factor_studies, name="factor-studies")
     application.add_typer(strategies, name="strategies")
     application.add_typer(worker, name="worker")
@@ -761,17 +688,17 @@ def create_app(
         )
 
     from quant_research.cli.data import _DataCommands
-    from quant_research.cli.experiments import _ExperimentCommands
     from quant_research.cli.factor_studies import _FactorStudyCommands
     from quant_research.cli.runtime import _RuntimeCommands
     from quant_research.cli.strategies import _StrategyCommands
+    from quant_research.cli.strategy_studies import _StrategyStudyCommands
     from quant_research.cli.tasks import _TaskCommands
     from quant_research.cli.worker import _WorkerCommands
 
     _RuntimeCommands.register(application)
     _DataCommands.register(data, services_factory)
     _TaskCommands.register(tasks, services_factory)
-    _ExperimentCommands.register(experiments, services_factory)
+    _StrategyStudyCommands.register(strategy_studies, services_factory)
     _FactorStudyCommands.register(factor_studies, services_factory)
     _StrategyCommands.register(strategies, services_factory)
     _WorkerCommands.register(worker, services_factory)
@@ -789,10 +716,12 @@ class _CliSupport:
         return commands
 
     @staticmethod
-    def _experiment_commands(services: ApplicationServices) -> ExperimentCommands:
-        commands = services.experiment_commands
+    def _strategy_study_commands(
+        services: ApplicationServices,
+    ) -> StrategyStudyCommands:
+        commands = services.strategy_study_commands
         if commands is None:
-            _CliSupport._raise_service_unavailable("experiments")
+            _CliSupport._raise_service_unavailable("strategy-studies")
         return commands
 
     @staticmethod

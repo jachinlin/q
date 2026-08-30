@@ -1,4 +1,4 @@
-"""实现实验内候选显著性的确定性多重检验校正。"""
+"""实现因子研究候选显著性的多重检验校正。"""
 
 from __future__ import annotations
 
@@ -8,21 +8,12 @@ from quant_research.domain.enums import MultipleTestingMethod
 
 
 class MultipleTestingCorrector:
-    """计算均值零假设 p-value，并应用 Bonferroni 或 BH-FDR。
-
-    入参：方法均来自实验冻结治理配置。
-    返回值：与输入顺序一致的原始或校正后 p-value。
-    异常：样本统计或 p-value 非有限、越界时抛出值错误。
-    """
+    """校正因子显著性。入参：无构造参数。返回值：统计工具实例。异常：构造不主动抛出异常。"""
 
     @staticmethod
     def normal_mean_p_value(mean: float, sample_std: float, count: int) -> float:
-        """按双侧正态近似计算样本均值为零的 p-value。
+        """计算双侧 p-value。入参：均值、标准差和样本数。返回值：零到一的数值。异常：非有限值或样本不足时抛出值错误。"""
 
-        入参：样本均值、样本标准差和有效样本数。
-        返回值：闭区间 ``[0, 1]`` 内的双侧 p-value。
-        异常：统计量非有限、标准差非正或样本不足二时抛出值错误。
-        """
         if not all(isfinite(value) for value in (mean, sample_std)):
             raise ValueError("mean and sample_std must be finite")
         if sample_std <= 0 or type(count) is not int or count < 2:
@@ -34,12 +25,8 @@ class MultipleTestingCorrector:
     def adjust(
         method: MultipleTestingMethod, p_values: tuple[float, ...]
     ) -> tuple[float, ...]:
-        """按冻结方法校正一组候选 p-value。
+        """校正一组 p-value。入参：方法与数值元组。返回值：保持顺序的校正值。异常：方法或数值非法时抛出。"""
 
-        入参：校正方法和原始 p-value 元组。
-        返回值：保持输入顺序的校正结果元组。
-        异常：方法类型错误或任一 p-value 不在 ``[0, 1]`` 时抛出错误。
-        """
         if not isinstance(method, MultipleTestingMethod):
             raise TypeError("method must be a MultipleTestingMethod")
         if any(not isfinite(value) or not 0 <= value <= 1 for value in p_values):

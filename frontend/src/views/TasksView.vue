@@ -16,7 +16,7 @@ import { factorStudyTaskProgress, isFactorStudyTask } from '../factor-study-task
 import { formatDuration, formatTime } from '../format'
 import type { DataUpdatePlan, DataUpdateWindow, Task, TaskAttempt, TaskDetail, TaskDiagnostic, TaskLog, TaskPage } from '../types'
 
-type RetryResult = { task_id: string; experiment_id?: string; run_id?: string }
+type RetryResult = { task_id: string }
 
 const client = useQueryClient()
 const route = useRoute()
@@ -26,7 +26,7 @@ const taskTypeLabels: Record<string, string> = {
   DATA_BOOTSTRAP: '数据初始化',
   DATA_UPDATE: '数据更新',
   DATA_VALIDATION: '数据校验',
-  EXPERIMENT_RUN: '实验运行',
+  STRATEGY_STUDY: '策略研究',
   FACTOR_STUDY: '因子研究',
 }
 const requestedStatus = typeof route.query.status === 'string' && taskStatuses.some((item) => item === route.query.status)
@@ -74,8 +74,7 @@ const retry = useMutation({
   mutationFn: ({ id, orphaned }: { id: string; orphaned: boolean }) =>
     api.post<RetryResult>(`/api/v1/tasks/${id}/retry`, { confirm_orphaned: orphaned }),
   onSuccess: async (result) => {
-    const run = result.run_id ? `，新 Run ${result.run_id.slice(0, 8)}` : ''
-    ElMessage.success(`已创建安全重试：任务 ${result.task_id.slice(0, 8)}${run}`)
+    ElMessage.success(`已创建安全重试：任务 ${result.task_id.slice(0, 8)}`)
     await Promise.all([
       client.invalidateQueries({ queryKey: ['tasks'] }),
       client.invalidateQueries({ queryKey: ['task'] }),
@@ -233,6 +232,12 @@ function taskTypeLabel(taskType: string) {
 function factorStudyPath(task: Task) {
   return task.subject_kind === 'FACTOR_STUDY' && task.subject_id
     ? `/factor-studies/${task.subject_id}`
+    : null
+}
+
+function strategyStudyPath(task: Task) {
+  return task.subject_kind === 'STRATEGY_STUDY' && task.subject_id
+    ? `/strategy-studies/${task.subject_id}`
     : null
 }
 
@@ -425,7 +430,14 @@ onUnmounted(() => {
             <template #default="scope">
               <div class="association-cell">
                 <RouterLink
-                  v-if="factorStudyPath(scope.row)"
+                  v-if="strategyStudyPath(scope.row)"
+                  class="association-link"
+                  :to="strategyStudyPath(scope.row) ?? '/strategy-studies'"
+                >
+                  策略研究 · {{ scope.row.subject_id?.slice(0, 8) }}
+                </RouterLink>
+                <RouterLink
+                  v-else-if="factorStudyPath(scope.row)"
                   class="association-link"
                   :to="factorStudyPath(scope.row) ?? '/factor-studies'"
                 >
@@ -456,7 +468,7 @@ onUnmounted(() => {
           <el-table-column label="操作" width="118" align="center">
             <template #default="scope">
               <el-button v-if="['QUEUED','RUNNING'].includes(scope.row.status)" text type="danger" @click="cancelTask(scope.row)">取消</el-button>
-              <el-button v-if="['SUCCEEDED','FAILED','CANCELLED','ORPHANED'].includes(scope.row.status)" text type="primary" @click="retryTask(scope.row)">{{ scope.row.status === 'SUCCEEDED' ? '再次运行' : '重试' }}</el-button>
+              <el-button v-if="scope.row.subject_kind !== 'STRATEGY_STUDY' && ['SUCCEEDED','FAILED','CANCELLED','ORPHANED'].includes(scope.row.status)" text type="primary" @click="retryTask(scope.row)">{{ scope.row.status === 'SUCCEEDED' ? '再次运行' : '重试' }}</el-button>
               <el-button v-if="['SUCCEEDED','FAILED','CANCELLED','ORPHANED'].includes(scope.row.status)" text type="danger" @click="deleteTask(scope.row)">删除</el-button>
             </template>
           </el-table-column>
@@ -475,7 +487,12 @@ onUnmounted(() => {
           <div>
             <span class="eyebrow">{{ taskTypeLabel(detail.data.value.task_type) }}</span>
             <h2>{{ detail.data.value.id }}</h2>
-            <p v-if="factorStudyPath(detail.data.value)">
+            <p v-if="strategyStudyPath(detail.data.value)">
+              <RouterLink class="association-link" :to="strategyStudyPath(detail.data.value) ?? '/strategy-studies'">
+                策略研究 · {{ detail.data.value.subject_id }}
+              </RouterLink>
+            </p>
+            <p v-else-if="factorStudyPath(detail.data.value)">
               <RouterLink class="association-link" :to="factorStudyPath(detail.data.value) ?? '/factor-studies'">
                 因子研究 · {{ detail.data.value.subject_id }}
               </RouterLink>
@@ -525,7 +542,14 @@ onUnmounted(() => {
               <el-descriptions-item label="完成时间">{{ formatTime(detail.data.value.completed_at) }}</el-descriptions-item>
               <el-descriptions-item label="关联对象" :span="2">
                 <RouterLink
-                  v-if="factorStudyPath(detail.data.value)"
+                  v-if="strategyStudyPath(detail.data.value)"
+                  class="association-link hash"
+                  :to="strategyStudyPath(detail.data.value) ?? '/strategy-studies'"
+                >
+                  策略研究/{{ detail.data.value.subject_id }}
+                </RouterLink>
+                <RouterLink
+                  v-else-if="factorStudyPath(detail.data.value)"
                   class="association-link hash"
                   :to="factorStudyPath(detail.data.value) ?? '/factor-studies'"
                 >

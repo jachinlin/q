@@ -10,7 +10,7 @@ const nav = [
   ['/', '总览', '01'],
   ['/market', '市场全景', '02'],
   ['/data', '数据中心', '03'],
-  ['/experiments', '实验中心', '04'],
+  ['/strategy-studies', '策略研究', '04'],
   ['/factor-studies', '因子研究', '05'],
   ['/tasks', '运行中心', '06'],
   ['/notebook', 'Notebook', '07'],

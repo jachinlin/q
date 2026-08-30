@@ -30,7 +30,7 @@ def _definition() -> FactorStudyDefinition:
 
 
 def test_empty_database_contains_independent_factor_study_tables(tmp_path: Path) -> None:
-    """空库升级后应同时具有纯策略实验表和五张独立研究表。"""
+    """空库升级后应同时具有策略研究表和五张独立因子研究表。"""
     database = tmp_path / "state.sqlite3"
     upgrade_database(database)
     engine = create_sqlite_engine(database)
@@ -42,14 +42,15 @@ def test_empty_database_contains_independent_factor_study_tables(tmp_path: Path)
         "factor_study_artifact",
         "factor_study_decision",
     }.issubset(tables)
-    assert "kind" not in {item["name"] for item in inspect(engine).get_columns("experiment")}
+    assert "strategy_study" in tables
+    assert "experiment" not in tables
     engine.dispose()
 
 
 def test_existing_strategy_database_upgrade_drops_legacy_factor_experiments(
     tmp_path: Path,
 ) -> None:
-    """现有策略记录应去除 kind，旧因子实验和任务引用应直接丢弃。"""
+    """升级旧统一实验库后应直接删除全部旧实验、Run 和旧任务。"""
     database = tmp_path / "legacy.sqlite3"
     engine = create_sqlite_engine(database)
     strategy_definition = '{"initial_run":{"kind":"STRATEGY_BACKTEST"},"kind":"STRATEGY_BACKTEST","name":"strategy"}'
@@ -75,14 +76,12 @@ def test_existing_strategy_database_upgrade_drops_legacy_factor_experiments(
 
     upgrade_database(database)
     upgraded = create_sqlite_engine(database)
+    tables = set(inspect(upgraded).get_table_names())
+    assert "strategy_study" in tables
+    assert "factor_study" in tables
+    assert not {"experiment", "run"}.intersection(tables)
     with upgraded.connect() as connection:
-        assert connection.execute(text("SELECT id FROM experiment")).scalars().all() == ["strategy"]
         assert connection.execute(text("SELECT id FROM task")).scalars().all() == []
-        definition_json = connection.execute(text("SELECT definition_json FROM experiment")).scalar_one()
-        config_json = connection.execute(text("SELECT config_json FROM run")).scalar_one()
-    assert '"kind"' not in definition_json
-    assert '"kind"' not in config_json
-    assert "kind" not in {item["name"] for item in inspect(upgraded).get_columns("experiment")}
     upgraded.dispose()
 
 

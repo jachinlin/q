@@ -38,7 +38,7 @@ class TaskSpec(_TaskModel):
     """定义可持久化并参与身份计算的任务不可变规格。
 
     入参：
-        experiment_id：目标实验标识，类型为 ``str | None``。
+        subject_kind、subject_id：可选的业务主体类型和标识。
         task_type：任务类型。
         payload：任务载荷。
         priority：任务在同一可运行集合中的调度优先级。
@@ -111,7 +111,7 @@ class TaskRecord(_TaskModel):
 
     入参：
         id：用于持久化关联和日志追踪的标识。
-        experiment_id：目标实验标识，类型为 ``str | None``。
+        subject_kind、subject_id：可选的业务主体类型和标识。
         task_type：任务类型。
         payload：任务载荷。
         status：当前记录所处的受控生命周期状态。
@@ -194,7 +194,6 @@ class AuditEventSpec(_TaskModel):
         event_type：事件类型。
         details：详情。
         created_at：记录创建时的 UTC 时间戳。
-        experiment_id：目标实验标识，类型为 ``str | None``。
         task_id：目标任务标识，类型为 ``str | None``。
         actor：操作主体。
     返回值：
@@ -206,7 +205,6 @@ class AuditEventSpec(_TaskModel):
     event_type: str
     details: dict[str, JsonValue]
     created_at: datetime
-    run_id: str | None = None
     subject_kind: str | None = None
     subject_id: str | None = None
     task_id: str | None = None
@@ -394,7 +392,7 @@ class ClaimedTask(_TaskModel):
         id：用于持久化关联和日志追踪的标识。
         attempt_id：一次任务执行尝试的 UUID 标识。
         attempt_no：执行尝试从一开始计数的尝试序号。
-        experiment_id：目标实验标识，类型为 ``str | None``。
+        subject_kind、subject_id：可选的业务主体类型和标识。
         task_type：任务类型。
         payload：任务载荷。
         priority：任务在同一可运行集合中的调度优先级。

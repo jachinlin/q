@@ -10,16 +10,16 @@ import { formatDuration, formatPercent, shortHash, statusType } from './format'
 import router from './router'
 
 describe('dashboard shell contract', () => {
-  it('keeps strategy experiments and independent factor studies as separate routes', () => {
+  it('keeps strategy studies and independent factor studies as separate routes', () => {
     expect(router.getRoutes().map((route) => route.path).sort()).toEqual([
       '/',
       '/data',
       '/market',
       '/notebook',
       '/settings',
-      '/experiments',
-      '/experiments/:experimentId',
-      '/experiments/new',
+      '/strategy-studies',
+      '/strategy-studies/:strategyStudyId',
+      '/strategy-studies/new',
       '/factor-studies',
       '/factor-studies/:factorStudyId',
       '/factor-studies/new',
@@ -42,7 +42,7 @@ describe('dashboard shell contract', () => {
     const shellView = { template: '<div />' }
     const shellRouter = createRouter({
       history: createMemoryHistory(),
-      routes: ['/', '/market', '/data', '/experiments', '/factor-studies', '/tasks', '/notebook', '/settings'].map(
+      routes: ['/', '/market', '/data', '/strategy-studies', '/factor-studies', '/tasks', '/notebook', '/settings'].map(
         (path) => ({ path, component: shellView }),
       ),
     })

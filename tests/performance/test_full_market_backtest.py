@@ -1,4 +1,4 @@
-"""当前 Run Schema 的可选 20 年分析与发布性能证据。"""
+"""策略研究产物 Schema 的可选 20 年分析与发布性能证据。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import pytest
 
 from quant_research.analytics.attribution import calculate_attribution
 from quant_research.analytics.performance import calculate_performance
-from quant_research.backtest.run_artifacts import RunArtifactPublisher
+from quant_research.backtest.study_artifacts import StrategyStudyArtifactPublisher
 from quant_research.data.contracts import JsonValue
 from tests.performance._process_memory import process_peak_rss_bytes
 
@@ -83,7 +83,7 @@ def test_current_schema_analysis_and_atomic_publication_stay_within_budget(
     tracemalloc.start()
     started = time.perf_counter()
     raw_tables, sessions = _raw_tables()
-    normalized = RunArtifactPublisher.canonical_tables(raw_tables)
+    normalized = StrategyStudyArtifactPublisher.canonical_tables(raw_tables)
 
     analytics_started = time.perf_counter()
     performance = calculate_performance(
@@ -125,11 +125,11 @@ def test_current_schema_analysis_and_atomic_publication_stay_within_budget(
     analytics_seconds = time.perf_counter() - analytics_started
 
     publish_started = time.perf_counter()
-    final, _, _ = RunArtifactPublisher(
-        tmp_path, "synthetic-full-market", "run-current-schema"
+    final, _, _ = StrategyStudyArtifactPublisher(
+        tmp_path, "synthetic-full-market"
     ).publish(
-        RunArtifactPublisher.canonical_tables(normalized),
-        config={"kind": "STRATEGY_BACKTEST"},
+        StrategyStudyArtifactPublisher.canonical_tables(normalized),
+        config={"strategy_id": "synthetic-full-market"},
         metrics=cast(dict[str, JsonValue], dict(performance.metrics)),
         quality_disclosure={
             "undefined_metrics": dict(performance.undefined_metrics),

@@ -271,10 +271,10 @@ def test_overview_uses_global_task_counts_without_legacy_research_payloads(
     )
     for index in range(7):
         queue.enqueue(
-            "EXPERIMENT_RUN",
+            "STRATEGY_STUDY",
             {},
             0,
-            subject_kind="EXPERIMENT_RUN",
+            subject_kind="STRATEGY_STUDY",
             subject_id=f"run-{index}",
         )
 
@@ -292,7 +292,7 @@ def test_overview_uses_global_task_counts_without_legacy_research_payloads(
 
     assert response.tasks.status_counts.QUEUED == 7
     assert len(response.tasks.active) == 5
-    assert all(item.subject_kind == "EXPERIMENT_RUN" for item in response.tasks.active)
+    assert all(item.subject_kind == "STRATEGY_STUDY" for item in response.tasks.active)
 
 
 def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
@@ -386,10 +386,10 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
     )
     research_run_id = "research-run-0001"
     research_task_id = queue.enqueue(
-        "EXPERIMENT_RUN",
+        "STRATEGY_STUDY",
         {"run_id": research_run_id, "config_hash": "a" * 64},
         0,
-        subject_kind="EXPERIMENT_RUN",
+        subject_kind="STRATEGY_STUDY",
         subject_id=research_run_id,
     )
     service = DashboardViewService(
@@ -419,7 +419,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
 
         all_tasks = service.task_list(status=None, page=1, page_size=10)
         tasks_by_id = {item["id"]: item for item in all_tasks["items"]}
-        assert tasks_by_id[research_task_id]["subject_kind"] == "EXPERIMENT_RUN"
+        assert tasks_by_id[research_task_id]["subject_kind"] == "STRATEGY_STUDY"
         assert tasks_by_id[research_task_id]["subject_id"] == research_run_id
         assert tasks_by_id[queued_id]["subject_kind"] is None
         assert all("payload" not in task for task in tasks_by_id.values())
@@ -441,7 +441,7 @@ def test_task_views_expose_global_counts_runtime_and_structured_diagnostic(
         ]
         assert service.task_detail(queued_id)["payload"] == {}
         research_detail = service.task_detail(research_task_id)
-        assert research_detail["subject_kind"] == "EXPERIMENT_RUN"
+        assert research_detail["subject_kind"] == "STRATEGY_STUDY"
         assert research_detail["subject_id"] == research_run_id
         attempt = detail["attempts"][0]
         assert attempt["has_log"] is True

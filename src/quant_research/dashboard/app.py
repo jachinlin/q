@@ -17,16 +17,16 @@ from starlette.responses import Response
 
 from quant_research.application.operations import OperationalCommandService
 from quant_research.application.settings import DashboardSettingsService
-from quant_research.dashboard.experiments import (
-    ExperimentDashboardService,
-    ExperimentRoutes,
-)
 from quant_research.dashboard.factor_studies import (
     FactorStudyDashboardService,
     FactorStudyRoutes,
 )
 from quant_research.dashboard.notebook import NotebookProbe
 from quant_research.dashboard.routes.api import _DashboardRoutes
+from quant_research.dashboard.strategy_studies import (
+    StrategyStudyDashboardService,
+    StrategyStudyRoutes,
+)
 from quant_research.dashboard.views import DashboardViewService
 from quant_research.domain.errors import QuantError
 
@@ -36,7 +36,7 @@ def create_dashboard_app(
     service: DashboardViewService,
     commands: OperationalCommandService,
     settings_service: DashboardSettingsService,
-    experiment_service: ExperimentDashboardService,
+    strategy_study_service: StrategyStudyDashboardService,
     factor_study_service: FactorStudyDashboardService | None = None,
     notebook_probe: NotebookProbe,
     static_dir: Path,
@@ -196,7 +196,7 @@ def create_dashboard_app(
         )
 
     _DashboardRoutes.mount(app, service, commands, notebook_probe, settings_service)
-    ExperimentRoutes.mount(app, experiment_service)
+    StrategyStudyRoutes.register(app, strategy_study_service)
     if factor_study_service is not None:
         FactorStudyRoutes.mount(app, factor_study_service)
 

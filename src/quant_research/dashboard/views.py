@@ -216,7 +216,7 @@ class DashboardViewService:
                     select(func.count())
                     .select_from(TaskORM)
                     .where(
-                        TaskORM.task_type == "EXPERIMENT_RUN",
+                        TaskORM.task_type == "STRATEGY_STUDY",
                         TaskORM.status.in_(["QUEUED", "RUNNING", "CANCEL_REQUESTED"]),
                     )
                 )

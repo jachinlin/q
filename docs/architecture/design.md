@@ -5,6 +5,6 @@
 平台以快速迭代新策略为核心目标，降低新策略从开发、回测到比较验证的成本。
 
 数据层的权威设计见 [data-layer-design.md](data-layer-design.md)，包与组合根边界见
-[package-layout.md](package-layout.md)。实验固定捕获 Canonical `catalog_hash`、规则、
+[package-layout.md](package-layout.md)。策略研究固定捕获 Canonical `catalog_hash`、规则、
 配置和代码身份，运行中发现漂移立即失败；组合、订单和持仓只使用可交易的
 `InstrumentId`，指数 benchmark 使用独立 `IndexId`。

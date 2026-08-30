@@ -5,5 +5,11 @@ from quant_research.factor_studies.models import (
     FactorStudyDefinition,
     FactorStudyRecord,
 )
+from quant_research.factor_studies.statistics import MultipleTestingCorrector
 
-__all__ = ["FactorStudyConfigParser", "FactorStudyDefinition", "FactorStudyRecord"]
+__all__ = [
+    "FactorStudyConfigParser",
+    "FactorStudyDefinition",
+    "FactorStudyRecord",
+    "MultipleTestingCorrector",
+]

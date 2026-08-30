@@ -1,4 +1,4 @@
-"""装配以 Canonical Repository 为唯一数据入口的 Experiment Run Worker。"""
+"""装配以 Canonical Repository 为唯一数据入口的研究 Worker。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from quant_research.backtest.engine import (
 )
 from quant_research.backtest.models import ExecutionConfig, ExecutionPrice, MarketSlice
 from quant_research.backtest.rulebook import AShareRuleBook, SecurityStatus
-from quant_research.backtest.run_artifacts import RunArtifactPublisher
+from quant_research.backtest.study_artifacts import StrategyStudyArtifactPublisher
 from quant_research.config import Settings
 from quant_research.data.contracts import (
     JsonValue,
@@ -46,13 +46,6 @@ from quant_research.data.contracts import (
 from quant_research.data.repository import CanonicalResearchRepository
 from quant_research.domain.enums import Board, MultipleTestingMethod
 from quant_research.domain.identifiers import IndexId, InstrumentId
-from quant_research.experiments.models import (
-    RunRecord,
-    RunStage,
-    RunStatus,
-)
-from quant_research.experiments.runner import ExperimentRunHandler
-from quant_research.experiments.statistics import MultipleTestingCorrector
 from quant_research.factor_studies.analysis import (
     DIRECTION_ADJUSTED,
     EXECUTABLE_FORWARD_RETURN,
@@ -71,6 +64,7 @@ from quant_research.factor_studies.models import (
 )
 from quant_research.factor_studies.progress import FactorStudyProgressReporter
 from quant_research.factor_studies.runner import FactorStudyHandler
+from quant_research.factor_studies.statistics import MultipleTestingCorrector
 from quant_research.factor_studies.streaming import (
     FactorStudyTemporaryStore,
     SpilledFrame,
@@ -94,16 +88,22 @@ from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
 )
-from quant_research.infrastructure.persistence.experiment_runs import (
-    ExperimentRunRegistry,
-)
 from quant_research.infrastructure.persistence.factor_studies import (
     FactorStudyRegistry,
 )
+from quant_research.infrastructure.persistence.strategy_studies import (
+    StrategyStudyRegistry,
+)
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from quant_research.logging import TaskLogManager
-from quant_research.strategies.base import DecisionData
+from quant_research.strategies.base import DecisionData, Strategy
 from quant_research.strategies.registry import StrategyRegistry
+from quant_research.strategy_studies.models import (
+    StrategyStudyRecord,
+    StrategyStudyStage,
+    StrategyStudyStatus,
+)
+from quant_research.strategy_studies.runner import StrategyStudyHandler
 from quant_research.tasks.handlers import CancellationToken, ProgressSink, TaskHandler
 from quant_research.tasks.models import TaskProgress, TaskStatus
 from quant_research.universe.builder import UniverseBatchEvaluator
@@ -169,8 +169,8 @@ _FACTOR_ARTIFACT_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "correlation": ("signal_variant", "factor_x", "factor_y"),
 }
-_ACTIVE_RUN_STATUSES = frozenset(
-    {RunStatus.CREATED, RunStatus.QUEUED, RunStatus.RUNNING}
+_ACTIVE_STRATEGY_STUDY_STATUSES = frozenset(
+    {StrategyStudyStatus.QUEUED, StrategyStudyStatus.RUNNING}
 )
 _ACTIVE_FACTOR_STUDY_STATUSES = frozenset(
     {FactorStudyStatus.QUEUED, FactorStudyStatus.RUNNING}
@@ -228,7 +228,7 @@ class _StockPriceService:
         )
 
 
-class CanonicalRunData:
+class CanonicalStrategyStudyData:
     """将只读 Canonical Repository 适配为回测行情和 PIT 决策工厂。
 
     入参：
@@ -517,7 +517,7 @@ class CanonicalRunData:
 class _BoundDecisionData:
     """绑定一个 signal_date 并封闭所有显式日期参数。"""
 
-    def __init__(self, source: CanonicalRunData, signal_date: date) -> None:
+    def __init__(self, source: CanonicalStrategyStudyData, signal_date: date) -> None:
         self._source, self._repository, self._signal_date = (
             source,
             source._repository,
@@ -638,7 +638,7 @@ class _BacktestProgress:
         """把交易日进度映射为任务进度。"""
         self._sink.update(
             TaskProgress(
-                stage="STRATEGY_RUN",
+                stage="BACKTEST",
                 completed=completed,
                 total=total,
                 message=trade_date.isoformat(),
@@ -646,14 +646,14 @@ class _BacktestProgress:
         )
 
 
-class StrategyRunExecutor:
-    """为策略 Run 创建隔离的分阶段执行会话。
+class StrategyStudyExecutor:
+    """为策略研究创建隔离的分阶段执行会话。
 
     入参：
-        repository、registry、strategies、rulebook、artifact_root：数据入口、Run
+        repository、registry、strategies、rulebook、artifact_root：数据入口、研究
         登记簿、策略目录、唯一 A 股规则和不可变产物根。
     返回值：
-        创建策略 Run 执行器。
+        创建策略研究执行器。
     异常：
         构造不执行回测；运行期错误由会话方法说明。
     """
@@ -661,7 +661,7 @@ class StrategyRunExecutor:
     def __init__(
         self,
         repository: CanonicalResearchRepository,
-        registry: ExperimentRunRegistry,
+        registry: StrategyStudyRegistry,
         strategies: StrategyRegistry,
         rulebook: AShareRuleBook,
         artifact_root: Path,
@@ -673,14 +673,14 @@ class StrategyRunExecutor:
         )
         self._rulebook, self._artifact_root = rulebook, artifact_root
 
-    def create(self, run: RunRecord) -> _StrategyRunSession:
-        """创建绑定一个冻结策略 Run 的阶段会话。
+    def create(self, study: StrategyStudyRecord) -> _StrategyStudySession:
+        """创建绑定一个冻结策略研究的阶段会话。
 
-        入参：run：冻结策略 Run。返回值：任务专属会话。
+        入参：study：冻结策略研究。返回值：任务专属会话。
         异常：冻结配置不满足策略契约时抛出 ``TypeError``。
         """
-        return _StrategyRunSession(
-            run,
+        return _StrategyStudySession(
+            study,
             self._repository,
             self._registry,
             self._strategies,
@@ -689,24 +689,26 @@ class StrategyRunExecutor:
         )
 
 
-class _StrategyRunSession:
-    """保存策略 Run 的回测、分析和发布中间状态。"""
+class _StrategyStudySession:
+    """保存策略研究的校验、回测、分析和发布中间状态。"""
 
     def __init__(
         self,
-        run: RunRecord,
+        study: StrategyStudyRecord,
         repository: CanonicalResearchRepository,
-        registry: ExperimentRunRegistry,
+        registry: StrategyStudyRegistry,
         strategies: StrategyRegistry,
         rulebook: AShareRuleBook,
         artifact_root: Path,
     ) -> None:
-        self._run = run
+        self._study = study
         self._repository = repository
         self._registry = registry
         self._strategies = strategies
         self._rulebook = rulebook
         self._artifact_root = artifact_root
+        self._strategy: Strategy | None = None
+        self._source: CanonicalStrategyStudyData | None = None
         self._backtest: BacktestResult | None = None
         self._tables: dict[str, pl.DataFrame] | None = None
         self._performance: PerformanceResult | None = None
@@ -715,30 +717,31 @@ class _StrategyRunSession:
 
     def execute(
         self,
-        stage: RunStage,
+        stage: StrategyStudyStage,
         progress: ProgressSink,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
-        """按固定阶段计算并在 PERSIST 一次性发布。
+        """按四阶段计算并在 PUBLISH 一次性发布。
 
         入参：stage、progress、cancellation：当前阶段、进度端口和取消端口。
-        返回值：仅 PERSIST 返回可信发布身份，其余阶段返回空映射。
+        返回值：仅 PUBLISH 返回可信发布身份，其余阶段返回空映射。
         异常：阶段乱序、取消、回测、分析、发布或登记失败时抛出。
         """
-        if stage in {RunStage.VALIDATE, RunStage.PREPARE_INPUTS}:
+        if stage is StrategyStudyStage.VALIDATE:
+            self._validate()
             return {}
-        if stage is RunStage.STRATEGY_RUN:
-            self._run_backtest(progress, cancellation)
+        if stage is StrategyStudyStage.BACKTEST:
+            self._backtest_strategy(progress, cancellation)
             return {}
-        if stage is RunStage.ANALYTICS:
+        if stage is StrategyStudyStage.ANALYTICS:
             self._analyze()
             return {}
-        if stage is RunStage.PERSIST:
-            return self._persist(cancellation)
+        if stage is StrategyStudyStage.PUBLISH:
+            return self._publish(cancellation)
         raise ValueError(f"unsupported strategy stage: {stage.value}")
 
     def abort(self) -> None:
-        """撤销未成功提交的策略 Run 输出。
+        """撤销未成功提交的策略研究输出。
 
         入参：无。返回值：数据库登记和最终目录清理后无返回。
         异常：登记清理失败时传播，目录仍会尽力删除。
@@ -746,43 +749,54 @@ class _StrategyRunSession:
         if self._published_dir is None:
             return
         try:
-            self._registry.discard_outputs(self._run.id)
+            self._registry.discard_outputs(self._study.id)
         finally:
             if self._published_dir.is_relative_to(self._artifact_root.resolve()):
                 shutil.rmtree(self._published_dir, ignore_errors=True)
             self._published_dir = None
 
-    def _run_backtest(
+    def _validate(self) -> None:
+        definition = self._study.definition
+        frozen_hash = hashlib.sha256(
+            canonical_json_bytes(definition.model_dump(mode="json"))
+        ).hexdigest()
+        if frozen_hash != self._study.config_hash:
+            raise ValueError("strategy study frozen config hash mismatch")
+        self._strategy = self._strategies.build(
+            definition.strategy.strategy_id,
+            cast(Mapping[str, JsonValue], definition.strategy.parameters),
+        )
+        self._source = CanonicalStrategyStudyData(
+            self._repository, self._study.catalog_hash
+        )
+
+    def _backtest_strategy(
         self, progress: ProgressSink, cancellation: CancellationToken
     ) -> None:
-        config = self._run.config
-        strategy = self._strategies.build(
-            config.strategy.strategy_id,
-            cast(Mapping[str, JsonValue], config.strategy.parameters),
-        )
-        source = CanonicalRunData(self._repository, self._run.catalog_hash)
+        definition = self._study.definition
+        if self._strategy is None or self._source is None:
+            raise RuntimeError("strategy study must be validated before backtest")
         self._backtest = BacktestEngine(
-            source,
-            source,
+            self._source,
+            self._source,
             self._rulebook,
             CanonicalCatalogGuard(self._repository),
         ).run(
             BacktestRequest(
-                self._run.experiment_id,
-                self._run.id,
-                self._run.catalog_hash,
-                config.start_date,
-                config.end_date,
-                config.benchmark,
-                config.initial_cash_fen,
+                self._study.id,
+                self._study.catalog_hash,
+                definition.start_date,
+                definition.end_date,
+                definition.benchmark,
+                definition.initial_cash_fen,
                 self._rulebook.content_hash,
                 ExecutionConfig(
-                    ExecutionPrice(config.execution.reference_price),
-                    config.execution.slippage_bps,
-                    config.execution.max_volume_participation,
+                    ExecutionPrice(definition.execution.reference_price),
+                    definition.execution.slippage_bps,
+                    definition.execution.max_volume_participation,
                 ),
             ),
-            strategy,
+            self._strategy,
             _BacktestProgress(progress),
             cancellation,
         )
@@ -790,7 +804,9 @@ class _StrategyRunSession:
     def _analyze(self) -> None:
         if self._backtest is None:
             raise RuntimeError("strategy analytics requires completed backtest")
-        tables = RunArtifactPublisher.canonical_tables(self._backtest.tables)
+        tables = StrategyStudyArtifactPublisher.canonical_tables(
+            self._backtest.tables
+        )
         performance = calculate_performance(
             tables["nav"], tables["holdings"], tables["fills"], tables["costs"]
         )
@@ -824,20 +840,20 @@ class _StrategyRunSession:
                 "attribution": attribution.attribution,
             }
         )
-        self._tables = RunArtifactPublisher.canonical_tables(tables)
+        self._tables = StrategyStudyArtifactPublisher.canonical_tables(tables)
         self._performance = performance
         self._attribution = attribution
 
-    def _persist(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
+    def _publish(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
         if (
             self._backtest is None
             or self._tables is None
             or self._performance is None
             or self._attribution is None
         ):
-            raise RuntimeError("strategy persistence requires completed analytics")
+            raise RuntimeError("strategy publication requires completed analytics")
         if cancellation.is_cancelled():
-            raise RuntimeError("strategy persistence cancelled before publication")
+            raise RuntimeError("strategy publication cancelled before publication")
         metrics = dict(self._performance.metrics)
         quality = cast(
             Mapping[str, JsonValue],
@@ -853,8 +869,8 @@ class _StrategyRunSession:
                 "warnings": list(self._attribution.disclosures),
             },
         )
-        directory, manifest_hash, artifacts = RunArtifactPublisher(
-            self._artifact_root, self._run.experiment_id, self._run.id
+        directory, manifest_hash, artifacts = StrategyStudyArtifactPublisher(
+            self._artifact_root, self._study.id
         ).publish(
             self._tables,
             config=self._backtest.config,
@@ -866,10 +882,10 @@ class _StrategyRunSession:
         if cancellation.is_cancelled():
             self.abort()
             raise RuntimeError("strategy persistence cancelled after publication")
-        registered_metrics = _StrategyRunSession._registered_metrics(metrics)
+        registered_metrics = _StrategyStudySession._registered_metrics(metrics)
         try:
             self._registry.register_outputs(
-                self._run.id, registered_metrics, artifacts
+                self._study.id, registered_metrics, artifacts
             )
         except BaseException:
             if directory.is_relative_to(self._artifact_root.resolve()):
@@ -885,7 +901,7 @@ class _StrategyRunSession:
     @staticmethod
     def _registered_metrics(
         metrics: Mapping[str, int | float | str | None],
-    ) -> dict[str, tuple[float, str | None, float | None, float | None]]:
+    ) -> dict[str, tuple[float, str | None]]:
         units = {
             "observations": "count",
             "max_drawdown_duration_sessions": "sessions",
@@ -908,9 +924,7 @@ class _StrategyRunSession:
                 )
             )
         }
-        result: dict[
-            str, tuple[float, str | None, float | None, float | None]
-        ] = {}
+        result: dict[str, tuple[float, str | None]] = {}
         for name, value in metrics.items():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
@@ -920,8 +934,6 @@ class _StrategyRunSession:
             result[name] = (
                 numeric,
                 units.get(name, "ratio" if name in ratio_names else None),
-                None,
-                None,
             )
         return result
 
@@ -1858,7 +1870,7 @@ class _FactorStudySession:
     def _streaming_analysis_tables(
         self,
         *,
-        source: CanonicalRunData,
+        source: CanonicalStrategyStudyData,
         eligible: pl.DataFrame,
         universe_ids: tuple[InstrumentId, ...],
         universe_hash: str,
@@ -2067,7 +2079,9 @@ class _FactorStudySession:
         cancellation: CancellationToken,
     ) -> None:
         config = self._study.definition
-        source = CanonicalRunData(self._repository, self._study.catalog_hash)
+        source = CanonicalStrategyStudyData(
+            self._repository, self._study.catalog_hash
+        )
         progress.substage_started(
             "BUILD_UNIVERSE",
             "正在准备逐日 PIT 股票池",
@@ -2440,12 +2454,12 @@ class _FactorPublisher:
 
 
 class _WorkerRecovery:
-    """回收失联任务，并将其仍活动的实验 Run 同步终结为失败。"""
+    """回收失联任务，并将其仍活动的研究同步终结为失败。"""
 
     def __init__(
         self,
         queue: TaskQueue,
-        registry: ExperimentRunRegistry,
+        registry: StrategyStudyRegistry,
         factor_studies: FactorStudyRegistry,
         stale_after: timedelta = _ORPHAN_STALE_AFTER,
     ) -> None:
@@ -2455,13 +2469,13 @@ class _WorkerRecovery:
         self._stale_after = stale_after
 
     def __call__(self, now: datetime) -> int:
-        """回收超时任务并收敛全部 ORPHANED 实验 Run。"""
+        """回收超时任务并收敛全部 ORPHANED 研究。"""
         recovered = self._queue.mark_orphans(now, self._stale_after)
         offset = 0
         while True:
             tasks = self._queue.list(
                 status=TaskStatus.ORPHANED,
-                subject_kind="EXPERIMENT_RUN",
+                subject_kind="STRATEGY_STUDY",
                 limit=_ORPHAN_PAGE_SIZE,
                 offset=offset,
             )
@@ -2469,27 +2483,27 @@ class _WorkerRecovery:
                 if task.subject_id is None:
                     continue
                 try:
-                    run = self._registry.get_run(task.subject_id)
+                    strategy_study = self._registry.get(task.subject_id)
                 except KeyError:
                     continue
-                if run.status not in _ACTIVE_RUN_STATUSES:
+                if strategy_study.status not in _ACTIVE_STRATEGY_STUDY_STATUSES:
                     continue
                 error: dict[str, JsonValue] = {
                     "code": "TASK_ORPHANED",
-                    "message": "Run task heartbeat exceeded the stale threshold",
+                    "message": "Strategy study heartbeat exceeded the stale threshold",
                     "task_id": task.id,
                 }
                 try:
                     self._registry.transition(
-                        run.id,
-                        run.status,
-                        RunStatus.FAILED,
-                        stage=run.stage,
+                        strategy_study.id,
+                        strategy_study.status,
+                        StrategyStudyStatus.FAILED,
+                        stage=strategy_study.stage,
                         error=error,
                     )
                 except ValueError:
-                    current = self._registry.get_run(run.id)
-                    if current.status in _ACTIVE_RUN_STATUSES:
+                    current = self._registry.get(strategy_study.id)
+                    if current.status in _ACTIVE_STRATEGY_STUDY_STATUSES:
                         raise
             if len(tasks) < _ORPHAN_PAGE_SIZE:
                 break
@@ -2506,16 +2520,16 @@ class _WorkerRecovery:
                 if task.subject_id is None:
                     continue
                 try:
-                    study = self._factor_studies.get(task.subject_id)
+                    factor_study = self._factor_studies.get(task.subject_id)
                 except KeyError:
                     continue
-                if study.status not in _ACTIVE_FACTOR_STUDY_STATUSES:
+                if factor_study.status not in _ACTIVE_FACTOR_STUDY_STATUSES:
                     continue
                 self._factor_studies.transition(
-                    study.id,
-                    study.status,
+                    factor_study.id,
+                    factor_study.status,
                     FactorStudyStatus.FAILED,
-                    stage=study.stage,
+                    stage=factor_study.stage,
                     error={
                         "code": "TASK_ORPHANED",
                         "message": "Factor study heartbeat exceeded the stale threshold",
@@ -2528,7 +2542,7 @@ class _WorkerRecovery:
         return recovered
 
 
-def build_experiment_worker(
+def build_strategy_study_worker(
     *,
     engine: Engine,
     worker_id: str,
@@ -2537,26 +2551,26 @@ def build_experiment_worker(
     rulebook: AShareRuleBook,
     extra_handlers: tuple[TaskHandler, ...] = (),
 ) -> Worker:
-    """作为组合根模块级入口装配统一 Run handler、队列和任务日志。
+    """作为组合根模块级入口装配策略研究、因子研究和附加任务。
 
     入参：
         engine、worker_id、repository、artifact_root、rulebook：运行依赖；
         extra_handlers：数据任务等额外处理器。
     返回值：
-        返回可处理 EXPERIMENT_RUN 及附加任务类型的 Worker。
+        返回可处理 STRATEGY_STUDY 及附加任务类型的 Worker。
     异常：
         处理器类型重复、规则或日志根非法时在装配阶段抛出。
     """
     log_root = artifact_root.parent / "state" / "task-logs"
     queue, registry, factor_studies = (
         TaskQueue(engine, task_log_root=log_root),
-        ExperimentRunRegistry(engine),
+        StrategyStudyRegistry(engine),
         FactorStudyRegistry(engine),
     )
-    handler = ExperimentRunHandler(
+    handler = StrategyStudyHandler(
         registry,
         CanonicalCatalogGuard(repository),
-        StrategyRunExecutor(
+        StrategyStudyExecutor(
             repository,
             registry,
             StrategyRegistry.builtins(
@@ -2586,13 +2600,13 @@ def build_experiment_worker(
     )
 
 
-def build_default_experiment_worker(
+def build_default_strategy_study_worker(
     *,
     worker_id: str,
     engine: Engine | None = None,
     extra_handlers: tuple[TaskHandler, ...] = (),
 ) -> Worker:
-    """作为组合根模块级入口从本地设置装配默认统一实验 Worker。
+    """作为组合根模块级入口从本地设置装配默认研究 Worker。
 
     入参：
         worker_id：Worker 身份；engine：可选已有数据库引擎；extra_handlers：
@@ -2609,7 +2623,7 @@ def build_default_experiment_worker(
         service_engine, trusted_curated_root=settings.curated_root
     )
     rulebook = AShareRuleBook.load(source_root / "configs" / "rules" / "a_share.yaml")
-    return build_experiment_worker(
+    return build_strategy_study_worker(
         engine=service_engine,
         worker_id=worker_id,
         repository=repository,
@@ -2621,7 +2635,7 @@ def build_default_experiment_worker(
 
 __all__ = [
     "CanonicalCatalogGuard",
-    "CanonicalRunData",
-    "build_default_experiment_worker",
-    "build_experiment_worker",
+    "CanonicalStrategyStudyData",
+    "build_default_strategy_study_worker",
+    "build_strategy_study_worker",
 ]

@@ -1213,7 +1213,7 @@ def test_handler_registry_names_standard_types_and_rejects_duplicate_registratio
         "DATA_BOOTSTRAP",
         "DATA_UPDATE",
         "DATA_VALIDATION",
-        "EXPERIMENT_RUN",
+        "STRATEGY_STUDY",
         "FACTOR_STUDY",
     }
     assert getattr(module, "STANDARD_TASK_TYPES", None) == frozenset(standard)
@@ -1225,7 +1225,7 @@ def test_handler_registry_names_standard_types_and_rejects_duplicate_registratio
 
     assert [registry.get(name) for name in sorted(standard)] == handlers
     with pytest.raises(ValueError, match="already registered"):
-        registry.register(_TypedSuccessHandler("EXPERIMENT_RUN"))
+        registry.register(_TypedSuccessHandler("STRATEGY_STUDY"))
 
 
 @pytest.mark.parametrize("task_type", ["BACKTEST", "UNKNOWN_TASK"])

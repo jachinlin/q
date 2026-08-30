@@ -12,12 +12,12 @@ vi.mock('./api', () => ({ api: { get: apiGet } }))
 
 const activeTask = {
   id: 'task-active-0001',
-  subject_kind: 'EXPERIMENT_RUN',
-  subject_id: 'run-active',
-  task_type: 'EXPERIMENT_RUN',
+  subject_kind: 'STRATEGY_STUDY',
+  subject_id: 'study-active',
+  task_type: 'STRATEGY_STUDY',
   status: 'RUNNING',
   priority: 0,
-  progress: { stage: 'BACKTEST', completed: 3, total: 7, message: '正在执行回测', context: {} },
+  progress: { stage: 'BACKTEST', completed: 1, total: 4, message: '正在执行回测', context: {} },
   created_at: '2026-08-15T01:00:00Z',
   started_at: '2026-08-15T01:00:02Z',
   updated_at: '2026-08-15T01:03:00Z',
@@ -77,7 +77,7 @@ async function mountOverview(payload: Overview) {
       { path: '/', component: OverviewView },
       { path: '/data', component: { template: '<div />' } },
       { path: '/tasks', component: { template: '<div />' } },
-      { path: '/experiments', component: { template: '<div />' } },
+      { path: '/strategy-studies', component: { template: '<div />' } },
       { path: '/notebook', component: { template: '<div />' } },
     ],
   })
@@ -122,7 +122,7 @@ describe('research workbench overview', () => {
     expect(wrapper.find('a[href="/tasks?status=FAILED"]').exists()).toBe(true)
     expect(wrapper.find('a[href="/tasks?status=ORPHANED"]').exists()).toBe(true)
     expect(wrapper.find(`a[href="/tasks?task=${activeTask.id}"]`).exists()).toBe(true)
-    expect(wrapper.text()).toContain('43%')
+    expect(wrapper.text()).toContain('25%')
 
     wrapper.unmount()
     queryClient.clear()

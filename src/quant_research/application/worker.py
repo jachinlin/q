@@ -44,7 +44,7 @@ _SAFE_CONTEXT_FIELDS = frozenset(
         "dataset",
         "error_code",
         "expected",
-        "experiment_id",
+        "strategy_study_id",
         "host",
         "operation",
         "partition",
@@ -86,7 +86,7 @@ class WorkerRunResult:
 
     入参：
         task_id：目标任务标识，类型为 ``str``。
-        experiment_id：目标实验标识，类型为 ``str | None``。
+        subject_kind、subject_id：任务绑定的业务主体类型和标识。
         task_status：最近一次 Worker 处理后任务的持久化状态。
     返回值：
         返回完成字段规范化和不变量校验的对象。
@@ -511,8 +511,8 @@ class Worker:
         assert self._task_logs is not None
         context = LogContext(
             request_id=task.attempt_id,
-            experiment_id=(
-                task.subject_id if task.subject_kind == "EXPERIMENT_RUN" else None
+            strategy_study_id=(
+                task.subject_id if task.subject_kind == "STRATEGY_STUDY" else None
             ),
             task_id=task.id,
             attempt_id=task.attempt_id,

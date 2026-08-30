@@ -84,6 +84,6 @@ describe('factor study task progress', () => {
     }))
     expect(malformed).toMatchObject({ completed: 0, total: 0, waiting: true, itemPosition: null, substage: null })
     expect(isFactorStudyTask(task())).toBe(true)
-    expect(isFactorStudyTask(task({ task_type: 'EXPERIMENT_RUN' }))).toBe(false)
+    expect(isFactorStudyTask(task({ task_type: 'STRATEGY_STUDY' }))).toBe(false)
   })
 })

@@ -15,15 +15,15 @@ from quant_research.application.data import (
     DataUpdateHandler,
     DataValidationHandler,
 )
-from quant_research.application.experiments import ExperimentService
 from quant_research.application.factor_studies import FactorStudyService
+from quant_research.application.strategy_studies import StrategyStudyService
 from quant_research.backtest.rulebook import AShareRuleBook
-from quant_research.bootstrap.worker import build_default_experiment_worker
+from quant_research.bootstrap.worker import build_default_strategy_study_worker
 from quant_research.cli.app import (
     ApplicationServices,
-    LocalExperimentCommands,
     LocalFactorStudyCommands,
     LocalStrategyCommands,
+    LocalStrategyStudyCommands,
     LocalTaskCommands,
     LocalWorkerCommands,
     create_app,
@@ -40,13 +40,13 @@ from quant_research.infrastructure.persistence.database import (
     create_sqlite_engine,
     upgrade_database,
 )
-from quant_research.infrastructure.persistence.experiment_runs import (
-    ExperimentRunRegistry,
-)
 from quant_research.infrastructure.persistence.factor_studies import (
     FactorStudyRegistry,
 )
 from quant_research.infrastructure.persistence.repositories import MetadataRepository
+from quant_research.infrastructure.persistence.strategy_studies import (
+    StrategyStudyRegistry,
+)
 from quant_research.infrastructure.persistence.task_queue import TaskQueue
 from quant_research.infrastructure.runtime_settings import DataRootEnvSettingsStore
 from quant_research.infrastructure.tushare import (
@@ -142,15 +142,15 @@ class CliBootstrap:
                 commission_bps=rulebook.commission_bps,
                 commission_minimum_fen=rulebook.commission_minimum_fen,
             )
-            experiments = ExperimentService(
-                ExperimentRunRegistry(engine), repository, strategies
+            strategy_studies = StrategyStudyService(
+                StrategyStudyRegistry(engine), repository, strategies
             )
             factor_studies = FactorStudyService(
                 FactorStudyRegistry(engine),
                 repository,
                 FactorReferenceCatalog(STOCK_FACTOR_REFERENCES),
             )
-            worker = build_default_experiment_worker(
+            worker = build_default_strategy_study_worker(
                 worker_id=f"cli-worker-{os.getpid()}",
                 engine=engine,
                 extra_handlers=(
@@ -166,8 +166,8 @@ class CliBootstrap:
                     worker,
                     queue=queue,
                 ),
-                experiment_commands=LocalExperimentCommands(
-                    experiments, source_root / "configs"
+                strategy_study_commands=LocalStrategyStudyCommands(
+                    strategy_studies, source_root / "configs"
                 ),
                 factor_study_commands=LocalFactorStudyCommands(
                     factor_studies, source_root / "configs"

@@ -320,84 +320,31 @@ class DataInitializationStateORM(Base):
     quality_run_id: Mapped[str | None] = mapped_column(String(36))
 
 
-class ExperimentORM(Base):
-    """持久化不可变策略实验定义和精确 baseline Run 指针。
+class StrategyStudyORM(Base):
+    """映射策略研究主表。入参：ORM 字段。返回值：持久化实体。异常：违反约束时数据库拒绝。"""
 
-    入参：
-        字段保存实验标识、名称、冻结定义、标签关系和基线指针。
-    返回值：
-        SQLAlchemy 查询或构造时返回实验 ORM 记录。
-    异常：
-        数据库约束拒绝重复主键或缺失必填字段。
-    """
-
-    __tablename__ = "experiment"
-    __table_args__ = (Index("ix_experiment_created", "created_at", "id"),)
+    __tablename__ = "strategy_study"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
+            name="ck_strategy_study_status",
+        ),
+        CheckConstraint(
+            "stage IN ('VALIDATE', 'BACKTEST', 'ANALYTICS', 'PUBLISH')",
+            name="ck_strategy_study_stage",
+        ),
+        Index("ix_strategy_study_created", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     definition_json: Mapped[str] = mapped_column(Text, nullable=False)
-    definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    baseline_run_id: Mapped[str | None] = mapped_column(String(36))
-    created_at: Mapped[str] = mapped_column(String(32), nullable=False)
-
-
-class ExperimentTagORM(Base):
-    """将实验标签``orm``记录映射到 SQLite 持久化表。
-
-    入参：
-        参数和字段含义由公开签名及类型声明给出。
-    返回值：
-        返回该操作构造、计算或查询得到的领域结果。
-    异常：
-        输入违反领域不变量时抛出类型或值错误；依赖失败保持原异常语义。
-    """
-
-    __tablename__ = "experiment_tag"
-
-    experiment_id: Mapped[str] = mapped_column(
-        ForeignKey("experiment.id", ondelete="CASCADE"), primary_key=True
-    )
-    tag: Mapped[str] = mapped_column(String(64), primary_key=True)
-
-
-class RunORM(Base):
-    """持久化冻结 Run 配置、数据身份、状态和发布结果。
-
-    入参：
-        字段保存 Run 身份、所属实验、任务、配置、目录哈希和生命周期状态。
-    返回值：
-        SQLAlchemy 查询或构造时返回 Run ORM 记录。
-    异常：
-        数据库约束拒绝非法状态、非法研究标记或不存在的实验外键。
-    """
-
-    __tablename__ = "run"
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('CREATED', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
-            name="ck_run_status",
-        ),
-        CheckConstraint(
-            "research_mark IN ('UNREVIEWED', 'BASELINE', 'CANDIDATE', 'DISCARDED')",
-            name="ck_run_research_mark",
-        ),
-        Index("ix_run_experiment_created", "experiment_id", "created_at", "id"),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    experiment_id: Mapped[str] = mapped_column(
-        ForeignKey("experiment.id", ondelete="CASCADE"), nullable=False
-    )
-    task_id: Mapped[str | None] = mapped_column(String(36), unique=True)
-    config_json: Mapped[str] = mapped_column(Text, nullable=False)
     config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     catalog_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     stage: Mapped[str] = mapped_column(String(32), nullable=False)
-    research_mark: Mapped[str] = mapped_column(String(16), nullable=False)
-    uses_test_region: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
     artifact_dir: Mapped[str | None] = mapped_column(String)
     manifest_hash: Mapped[str | None] = mapped_column(String(64))
     error_json: Mapped[str | None] = mapped_column(Text)
@@ -406,70 +353,52 @@ class RunORM(Base):
     completed_at: Mapped[str | None] = mapped_column(String(32))
 
 
-class RunTagORM(Base):
-    """持久化 Run 用户标签。
+class StrategyStudyTagORM(Base):
+    """映射策略研究标签。入参：研究 ID 和标签。返回值：持久化实体。异常：重复或孤立记录由数据库拒绝。"""
 
-    入参：
-        run_id：Run 标识；tag：用户标签文本。
-    返回值：
-        SQLAlchemy 查询或构造时返回 Run 标签关联记录。
-    异常：
-        数据库约束拒绝重复标签或不存在的 Run 外键。
-    """
+    __tablename__ = "strategy_study_tag"
 
-    __tablename__ = "run_tag"
-
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("run.id", ondelete="CASCADE"), primary_key=True
+    strategy_study_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_study.id", ondelete="CASCADE"), primary_key=True
     )
     tag: Mapped[str] = mapped_column(String(64), primary_key=True)
 
 
-class RunMetricORM(Base):
-    """持久化 Run 的命名标量指标及显著性字段。
+class StrategyStudyMetricORM(Base):
+    """映射策略研究指标。入参：研究 ID、名称和值。返回值：持久化实体。异常：重复或孤立记录由数据库拒绝。"""
 
-    入参：
-        字段保存指标名称、数值、单位、原始 p-value 和校正后 p-value。
-    返回值：
-        SQLAlchemy 查询或构造时返回 Run 指标记录。
-    异常：
-        数据库约束拒绝同一 Run 下的重复指标名或不存在的 Run 外键。
-    """
-
-    __tablename__ = "run_metric"
-    __table_args__ = (UniqueConstraint("run_id", "name", name="uq_run_metric_name"),)
+    __tablename__ = "strategy_study_metric"
+    __table_args__ = (
+        UniqueConstraint(
+            "strategy_study_id", "name", name="uq_strategy_study_metric_name"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("run.id", ondelete="CASCADE"), nullable=False
+    strategy_study_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_study.id", ondelete="CASCADE"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     value: Mapped[float] = mapped_column(Float, nullable=False)
     unit: Mapped[str | None] = mapped_column(String(32))
-    p_value: Mapped[float | None] = mapped_column(Float)
-    adjusted_p_value: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
-class RunArtifactORM(Base):
-    """持久化可信 Manifest 中登记的 Run 产物。
+class StrategyStudyArtifactORM(Base):
+    """映射策略研究产物。入参：研究 ID 和完整性字段。返回值：持久化实体。异常：重复或孤立记录由数据库拒绝。"""
 
-    入参：
-        字段保存产物类型、相对路径、内容哈希、大小、行数和 Schema。
-    返回值：
-        SQLAlchemy 查询或构造时返回 Run 产物记录。
-    异常：
-        数据库约束拒绝同一 Run 下的重复产物类型或不存在的 Run 外键。
-    """
-
-    __tablename__ = "run_artifact"
+    __tablename__ = "strategy_study_artifact"
     __table_args__ = (
-        UniqueConstraint("run_id", "artifact_type", name="uq_run_artifact_type"),
+        UniqueConstraint(
+            "strategy_study_id",
+            "artifact_type",
+            name="uq_strategy_study_artifact_type",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    run_id: Mapped[str] = mapped_column(
-        ForeignKey("run.id", ondelete="CASCADE"), nullable=False
+    strategy_study_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_study.id", ondelete="CASCADE"), nullable=False
     )
     artifact_type: Mapped[str] = mapped_column(String(64), nullable=False)
     relative_path: Mapped[str] = mapped_column(String, nullable=False)
@@ -684,10 +613,10 @@ class TaskAttemptORM(Base):
 
 
 class AuditEventORM(Base):
-    """持久化关联 Run、任务或其他通用主体的审计事件。
+    """持久化关联任务或其他通用主体的审计事件。
 
     入参：
-        字段保存 Run、通用主体、任务、事件类型、操作者和结构化详情。
+        字段保存通用主体、任务、事件类型、操作者和结构化详情。
     返回值：
         SQLAlchemy 查询或构造时返回审计事件记录。
     异常：
@@ -698,7 +627,6 @@ class AuditEventORM(Base):
     __table_args__ = (Index("ix_audit_event_task_created", "task_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    run_id: Mapped[str | None] = mapped_column(String(36))
     subject_kind: Mapped[str | None] = mapped_column(String(32))
     subject_id: Mapped[str | None] = mapped_column(String(64))
     task_id: Mapped[str | None] = mapped_column(

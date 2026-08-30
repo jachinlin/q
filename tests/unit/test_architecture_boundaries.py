@@ -18,6 +18,7 @@ _PURE_CAPABILITIES = frozenset(
         "factors",
         "portfolio",
         "strategies",
+        "strategy_studies",
         "tasks",
         "universe",
     }
@@ -90,6 +91,27 @@ def test_legacy_package_is_absent() -> None:
         if "quant_core" in path.read_text(encoding="utf-8")
     ]
     assert legacy == []
+
+
+def test_legacy_strategy_experiment_surface_is_absent() -> None:
+    """锁定单一 StrategyStudy 包、任务和接口，不允许旧策略实验语义回流。"""
+    assert (_PACKAGE_ROOT / "strategy_studies" / "models.py").is_file()
+    legacy_package = _PACKAGE_ROOT / "experiments"
+    assert not legacy_package.exists() or not tuple(legacy_package.glob("*.py"))
+    current_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(_PACKAGE_ROOT.rglob("*.py"))
+        if "migrations" not in path.parts
+    )
+    for removed in (
+        "EXPERIMENT_RUN",
+        "/api/v1/experiments",
+        "ExperimentRunRegistry",
+        "baseline_run_id",
+        "sample_windows",
+        "test_budget",
+    ):
+        assert removed not in current_sources
 
 
 def test_data_layer_package_layout() -> None:

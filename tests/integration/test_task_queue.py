@@ -378,15 +378,15 @@ def test_subject_identity_is_persisted_without_a_legacy_parent(engine: Engine) -
     queue = _queue(engine)
 
     task_id = queue.enqueue(
-        "EXPERIMENT_RUN",
+        "STRATEGY_STUDY",
         {},
         0,
-        subject_kind="EXPERIMENT_RUN",
+        subject_kind="STRATEGY_STUDY",
         subject_id="run-1",
     )
 
     row = _task_row(engine, task_id)
-    assert row["subject_kind"] == "EXPERIMENT_RUN"
+    assert row["subject_kind"] == "STRATEGY_STUDY"
     assert row["subject_id"] == "run-1"
 
 

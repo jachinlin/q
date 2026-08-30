@@ -15,7 +15,7 @@ import ErrorState from '../components/ErrorState.vue'
 import FactorStudyTaskProgress from '../components/FactorStudyTaskProgress.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import { formatTime } from '../format'
-import type { FactorDecisionMark, FactorStudy, FactorStudyMatrixRow, RunRawArtifactRow, TaskDetail } from '../types'
+import type { ArtifactRow, FactorDecisionMark, FactorStudy, FactorStudyMatrixRow, TaskDetail } from '../types'
 
 type SummaryMetricValue = string | number | null
 type SummaryMetricDefinition = { name: string; label: string }
@@ -207,13 +207,13 @@ function filters(type: string) {
 }
 const curveQueries = CURVE_DEFINITIONS.map((definition) => useQuery({
   queryKey: computed(() => ['factor-study-artifact', studyId.value, definition.type, filters(definition.type).toString()]),
-  queryFn: () => api.get<{ items: RunRawArtifactRow[]; total: number }>(`/api/v1/factor-studies/${studyId.value}/artifacts/${definition.type}?${filters(definition.type)}`),
+  queryFn: () => api.get<{ items: ArtifactRow[]; total: number }>(`/api/v1/factor-studies/${studyId.value}/artifacts/${definition.type}?${filters(definition.type)}`),
   enabled: computed(() => detail.data.value?.status === 'SUCCEEDED'
     && tab.value === 'research'
     && Boolean(selectedVariant.value && selectedLabel.value && selectedFactor.value && selectedHorizon.value)),
 }))
 
-function buildChartOption(type: CurveArtifactType, rows: RunRawArtifactRow[]) {
+function buildChartOption(type: CurveArtifactType, rows: ArtifactRow[]) {
   if (!rows.length) return null
   if (type === 'correlation') {
     const names = [...new Set(rows.flatMap((row) => [String(row.factor_x), String(row.factor_y)]))].sort()
@@ -240,7 +240,7 @@ function buildChartOption(type: CurveArtifactType, rows: RunRawArtifactRow[]) {
   const numeric = Object.keys(rows[0]).find((name) => typeof rows[0][name] === 'number') ?? ''
   return lineOption(rows.map((row) => String(row[dateField])), [{ name: numeric, field: numeric }], rows)
 }
-function lineOption(categories: string[], series: Array<{ name: string; field: string }>, rows: RunRawArtifactRow[]) {
+function lineOption(categories: string[], series: Array<{ name: string; field: string }>, rows: ArtifactRow[]) {
   return { tooltip, legend: { data: series.map((item) => item.name), top: 2, left: 'center' }, grid: { left: 55, right: 24, top: 50, bottom: 56, containLabel: true }, xAxis: { type: 'category', data: categories, ...axis }, yAxis: { type: 'value', ...axis }, dataZoom: [{ type: 'inside' }], series: series.map((item) => ({ name: item.name, type: 'line', symbol: 'none', data: rows.map((row) => row[item.field]) })) }
 }
 
