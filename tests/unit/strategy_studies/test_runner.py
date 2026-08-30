@@ -14,6 +14,7 @@ from quant_research.strategy_studies.models import (
     StrategyStudyStage,
     StrategyStudyStatus,
 )
+from quant_research.strategy_studies.progress import StrategyStudyProgressReporter
 from quant_research.strategy_studies.runner import StrategyStudyHandler
 from quant_research.tasks.models import ClaimedTask, TaskProgress, TaskStatus
 from tests.unit.strategy_studies.test_models import strategy_study_yaml
@@ -85,8 +86,11 @@ class _Catalog:
 
 
 class _Progress:
+    def __init__(self) -> None:
+        self.values: list[TaskProgress] = []
+
     def update(self, progress: TaskProgress) -> None:
-        del progress
+        self.values.append(progress)
 
 
 class _Cancellation:
@@ -103,10 +107,19 @@ class _Session:
         self.fail_at = fail_at
         self.aborted = 0
 
-    def execute(self, stage: StrategyStudyStage, progress: _Progress, cancellation: _Cancellation) -> dict[str, Any]:
-        del progress, cancellation
+    def execute(
+        self,
+        stage: StrategyStudyStage,
+        progress: StrategyStudyProgressReporter,
+        cancellation: _Cancellation,
+    ) -> dict[str, Any]:
+        del cancellation
         self.stages.append(stage)
         if stage is self.fail_at:
+            progress.substage_started(
+                f"{stage.value}_WORK",
+                "正在执行失败子步骤",
+            )
             raise RuntimeError("stage failed")
         return {"artifact_dir": "strategy-studies/study-1", "manifest_hash": "b" * 64} if stage is StrategyStudyStage.PUBLISH else {}
 
@@ -125,11 +138,55 @@ class _Executor:
 
 def test_executes_exact_four_stage_order() -> None:
     registry, catalog, session = _Registry(), _Catalog(), _Session()
-    outcome = StrategyStudyHandler(registry, catalog, _Executor(session)).run(_task(), _Progress(), _Cancellation())
+    progress = _Progress()
+    outcome = StrategyStudyHandler(registry, catalog, _Executor(session)).run(
+        _task(), progress, _Cancellation()
+    )
     assert outcome.status is TaskStatus.SUCCEEDED
     assert session.stages == list(STRATEGY_STUDY_STAGES)
     assert registry.transitions == [StrategyStudyStatus.RUNNING, StrategyStudyStatus.SUCCEEDED]
     assert catalog.calls == len(STRATEGY_STUDY_STAGES) * 2
+    assert [(item.stage, item.completed, item.total) for item in progress.values] == [
+        ("VALIDATE", 0, 4),
+        ("VALIDATE", 1, 4),
+        ("BACKTEST", 1, 4),
+        ("BACKTEST", 2, 4),
+        ("ANALYTICS", 2, 4),
+        ("ANALYTICS", 3, 4),
+        ("PUBLISH", 3, 4),
+        ("PUBLISH", 4, 4),
+    ]
+    assert progress.values[-1].context == {
+        "stage_state": "COMPLETED",
+        "manifest_hash": "b" * 64,
+    }
+
+
+def test_backtest_progress_uses_deterministic_five_percent_sampling() -> None:
+    progress = _Progress()
+    reporter = StrategyStudyProgressReporter(progress)
+    reporter.stage_started(StrategyStudyStage.BACKTEST)
+    reporter.substage_started("RUN_BACKTEST", "开始回测")
+
+    published = [
+        completed
+        for completed in range(1, 1_001)
+        if reporter.substage_progress(
+            "RUN_BACKTEST",
+            "回测中",
+            item_completed=completed,
+            item_total=1_000,
+        )
+    ]
+
+    assert published == [1, *range(50, 1_001, 50)]
+    sampled = [
+        item
+        for item in progress.values
+        if item.context.get("substage_state") == "PROGRESS"
+    ]
+    assert len(sampled) == 21
+    assert all((item.completed, item.total) == (1, 4) for item in sampled)
 
 
 @pytest.mark.parametrize("failure", [StrategyStudyStage.BACKTEST, StrategyStudyStage.ANALYTICS])
@@ -140,6 +197,11 @@ def test_failure_aborts_and_never_publishes(failure: StrategyStudyStage) -> None
     assert StrategyStudyStage.PUBLISH not in session.stages
     assert session.aborted == 1
     assert registry.transitions[-1] is StrategyStudyStatus.FAILED
+    assert registry.study.error == {
+        "code": "STRATEGY_STUDY_STAGE_FAILED",
+        "error_type": "RuntimeError",
+        "substage": f"{failure.value}_WORK",
+    }
 
 
 def test_catalog_drift_fails_before_next_stage_and_cleans_session() -> None:

@@ -11,11 +11,11 @@ from quant_research.strategy_studies.models import (
     StrategyStudyStage,
     StrategyStudyStatus,
 )
+from quant_research.strategy_studies.progress import StrategyStudyProgressReporter
 from quant_research.tasks.handlers import CancellationToken, ProgressSink
 from quant_research.tasks.models import (
     ClaimedTask,
     TaskOutcome,
-    TaskProgress,
     TaskStatus,
 )
 
@@ -64,7 +64,7 @@ class StrategyStudyExecutionSession(Protocol):
     def execute(
         self,
         stage: StrategyStudyStage,
-        progress: ProgressSink,
+        progress: StrategyStudyProgressReporter,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
         """执行阶段。入参：阶段、进度和取消端口。返回值：阶段结果。异常：执行失败时传播。"""
@@ -117,9 +117,10 @@ class StrategyStudyHandler:
         )
         result: dict[str, JsonValue] = {}
         session: StrategyStudyExecutionSession | None = None
+        reporter = StrategyStudyProgressReporter(progress)
         try:
             session = self._executor.create(study)
-            for index, stage in enumerate(STRATEGY_STUDY_STAGES):
+            for stage in STRATEGY_STUDY_STAGES:
                 self._catalog.assert_unchanged(study.catalog_hash)
                 if cancellation.is_cancelled():
                     session.abort()
@@ -131,15 +132,8 @@ class StrategyStudyHandler:
                     )
                     return TaskOutcome(status=TaskStatus.CANCELLED)
                 self._registry.update_stage(study.id, stage)
-                progress.update(
-                    TaskProgress(
-                        stage=stage.value,
-                        completed=index,
-                        total=len(STRATEGY_STUDY_STAGES),
-                        message=f"{stage.value.lower()} started",
-                    )
-                )
-                stage_result = session.execute(stage, progress, cancellation)
+                reporter.stage_started(stage)
+                stage_result = session.execute(stage, reporter, cancellation)
                 if stage_result:
                     result = stage_result
                 self._catalog.assert_unchanged(study.catalog_hash)
@@ -152,6 +146,12 @@ class StrategyStudyHandler:
                         stage=stage,
                     )
                     return TaskOutcome(status=TaskStatus.CANCELLED)
+                evidence: dict[str, JsonValue] = {}
+                if stage is StrategyStudyStage.PUBLISH:
+                    manifest_hash = stage_result.get("manifest_hash")
+                    if isinstance(manifest_hash, str):
+                        evidence["manifest_hash"] = manifest_hash
+                reporter.stage_completed(stage, evidence)
             if not isinstance(result.get("artifact_dir"), str) or not isinstance(
                 result.get("manifest_hash"), str
             ):
@@ -188,6 +188,7 @@ class StrategyStudyHandler:
                 error={
                     "code": "STRATEGY_STUDY_STAGE_FAILED",
                     "error_type": type(error).__name__,
+                    "substage": reporter.current_substage,
                 },
             )
             raise

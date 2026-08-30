@@ -94,6 +94,33 @@ class _InstrumentCatalogRepository:
             },
         ).lazy()
 
+    def fund_bars(self, *_args: object) -> pl.LazyFrame:
+        """返回目标基金在故障日期的有效行情。"""
+        return pl.DataFrame(
+            {
+                "instrument_id": ["510300.SH"],
+                "trade_date": [date(2018, 1, 5)],
+                "open": [4.179],
+                "high": [4.197],
+                "low": [4.165],
+                "close": [4.187],
+                "preclose": [4.171],
+                "volume": [127_131_673],
+            }
+        ).lazy()
+
+    def stock_suspensions(self, *_args: object) -> pl.LazyFrame:
+        """返回空停牌事件。"""
+        return pl.DataFrame(
+            schema={"instrument_id": pl.String, "trade_date": pl.Date}
+        ).lazy()
+
+    def stock_risk_warnings(self, *_args: object) -> pl.LazyFrame:
+        """返回空风险警示事件。"""
+        return pl.DataFrame(
+            schema={"instrument_id": pl.String, "trade_date": pl.Date}
+        ).lazy()
+
 
 class _DualMAStrategy:
     """暴露双均线策略所需的稳定市场范围。"""
@@ -187,6 +214,10 @@ def test_strategy_scope_excludes_unrelated_security_types_and_funds() -> None:
 
     assert source._stock_ids == ()
     assert tuple(item.canonical() for item in source._fund_ids) == ("510300.SH",)
+
+    market = source.market_slice(date(2018, 1, 5)).market
+
+    assert market.bars.item(0, "instrument_type") == "ETF"
 
 
 def test_market_slice_ignores_bars_before_registered_listing_date() -> None:

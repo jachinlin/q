@@ -63,6 +63,22 @@ VALIDATE → BACKTEST → ANALYTICS → PUBLISH
 每阶段前后检查 `catalog_hash`，阶段边界检查协作取消。失败和取消调用执行会话的清理逻辑，
 删除未登记输出；只有最终 Manifest 完整性验证成功后才能转为 `SUCCEEDED`。
 
+### 进度与任务日志
+
+`progress.completed/progress.total` 始终表示四个公开阶段，成功终态为 `PUBLISH 4/4`。
+内部进度只写入 `progress.context`，口径与因子研究一致：
+
+- `substage`：`BUILD_STRATEGY`、`RUN_BACKTEST`、`CALCULATE_ANALYTICS`、
+  `PUBLISH_ARTIFACTS` 或 `REGISTER_OUTPUTS`；
+- `substage_state`：`STARTED`、`PROGRESS` 或 `COMPLETED`；
+- `item_completed`、`item_total`、`trade_date`：只用于回测交易日进度；
+- 已脱敏的交易日数、表行数、指标数、产物数、字节数和身份哈希；
+- `last_completed_substage` 与 `last_completed_evidence`。
+
+逐日回测只报告首项、末项和跨越 5% 桶的里程碑，长区间最多约 21 条中间进度，
+不得为每个交易日写一条任务日志。Task API 返回 `progress.context`；JSON Lines 将其放在
+`context.details`；失败状态与失败日志同时保留当前 `substage` 和最后安全进度。
+
 ## 持久化与任务
 
 SQLite 主脊为：

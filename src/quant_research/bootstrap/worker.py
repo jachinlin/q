@@ -103,9 +103,10 @@ from quant_research.strategy_studies.models import (
     StrategyStudyStage,
     StrategyStudyStatus,
 )
+from quant_research.strategy_studies.progress import StrategyStudyProgressReporter
 from quant_research.strategy_studies.runner import StrategyStudyHandler
-from quant_research.tasks.handlers import CancellationToken, ProgressSink, TaskHandler
-from quant_research.tasks.models import TaskProgress, TaskStatus
+from quant_research.tasks.handlers import CancellationToken, TaskHandler
+from quant_research.tasks.models import TaskStatus
 from quant_research.universe.builder import UniverseBatchEvaluator
 from quant_research.universe.rules import UniverseRules
 
@@ -253,7 +254,7 @@ class CanonicalStrategyStudyData:
             pl.lit("STOCK").alias("instrument_type")
         )
         funds = repository.funds().collect().with_columns(
-            pl.lit("FUND").alias("instrument_type"),
+            pl.lit("ETF").alias("instrument_type"),
             pl.lit("MAIN").alias("board"),
         )
         if strategy is not None:
@@ -289,7 +290,7 @@ class CanonicalStrategyStudyData:
         self._fund_ids = tuple(
             InstrumentId.parse(identifier)
             for identifier, row in sorted(self._metadata.items())
-            if row.get("instrument_type") == "FUND"
+            if row.get("instrument_type") == "ETF"
         )
         registry = FactorRegistry()
         if self._stock_ids:
@@ -690,18 +691,17 @@ class _BoundDecisionData:
 
 
 class _BacktestProgress:
-    def __init__(self, sink: ProgressSink) -> None:
-        self._sink = sink
+    def __init__(self, reporter: StrategyStudyProgressReporter) -> None:
+        self._reporter = reporter
 
     def update(self, completed: int, total: int, trade_date: date) -> None:
-        """把交易日进度映射为任务进度。"""
-        self._sink.update(
-            TaskProgress(
-                stage="BACKTEST",
-                completed=completed,
-                total=total,
-                message=trade_date.isoformat(),
-            )
+        """把交易日进度映射为按固定百分比采样的回测子步骤。"""
+        self._reporter.substage_progress(
+            "RUN_BACKTEST",
+            f"正在执行策略回测（{completed}/{total}）",
+            item_completed=completed,
+            item_total=total,
+            evidence={"trade_date": trade_date.isoformat()},
         )
 
 
@@ -777,7 +777,7 @@ class _StrategyStudySession:
     def execute(
         self,
         stage: StrategyStudyStage,
-        progress: ProgressSink,
+        progress: StrategyStudyProgressReporter,
         cancellation: CancellationToken,
     ) -> dict[str, JsonValue]:
         """按四阶段计算并在 PUBLISH 一次性发布。
@@ -787,16 +787,16 @@ class _StrategyStudySession:
         异常：阶段乱序、取消、回测、分析、发布或登记失败时抛出。
         """
         if stage is StrategyStudyStage.VALIDATE:
-            self._validate()
+            self._validate(progress)
             return {}
         if stage is StrategyStudyStage.BACKTEST:
             self._backtest_strategy(progress, cancellation)
             return {}
         if stage is StrategyStudyStage.ANALYTICS:
-            self._analyze()
+            self._analyze(progress)
             return {}
         if stage is StrategyStudyStage.PUBLISH:
-            return self._publish(cancellation)
+            return self._publish(progress, cancellation)
         raise ValueError(f"unsupported strategy stage: {stage.value}")
 
     def abort(self) -> None:
@@ -814,8 +814,17 @@ class _StrategyStudySession:
                 shutil.rmtree(self._published_dir, ignore_errors=True)
             self._published_dir = None
 
-    def _validate(self) -> None:
+    def _validate(self, progress: StrategyStudyProgressReporter) -> None:
         definition = self._study.definition
+        progress.substage_started(
+            "BUILD_STRATEGY",
+            "正在构造并复核冻结策略配置",
+            {
+                "strategy_id": definition.strategy.strategy_id,
+                "config_hash": self._study.config_hash,
+                "catalog_hash": self._study.catalog_hash,
+            },
+        )
         frozen_hash = hashlib.sha256(
             canonical_json_bytes(definition.model_dump(mode="json"))
         ).hexdigest()
@@ -830,13 +839,37 @@ class _StrategyStudySession:
             self._study.catalog_hash,
             strategy=self._strategy,
         )
+        progress.substage_completed(
+            "BUILD_STRATEGY",
+            "冻结策略配置构造并复核完成",
+            {
+                "strategy_id": definition.strategy.strategy_id,
+                "market_instrument_count": (
+                    len(self._source._stock_ids) + len(self._source._fund_ids)
+                ),
+                "stock_instrument_count": len(self._source._stock_ids),
+                "fund_instrument_count": len(self._source._fund_ids),
+            },
+        )
 
     def _backtest_strategy(
-        self, progress: ProgressSink, cancellation: CancellationToken
+        self,
+        progress: StrategyStudyProgressReporter,
+        cancellation: CancellationToken,
     ) -> None:
         definition = self._study.definition
         if self._strategy is None or self._source is None:
             raise RuntimeError("strategy study must be validated before backtest")
+        progress.substage_started(
+            "RUN_BACKTEST",
+            "正在执行策略回测",
+            {
+                "start_date": definition.start_date.isoformat(),
+                "end_date": definition.end_date.isoformat(),
+                "benchmark": definition.benchmark.canonical(),
+                "initial_cash_fen": definition.initial_cash_fen,
+            },
+        )
         self._backtest = BacktestEngine(
             self._source,
             self._source,
@@ -861,10 +894,26 @@ class _StrategyStudySession:
             _BacktestProgress(progress),
             cancellation,
         )
+        progress.substage_completed(
+            "RUN_BACKTEST",
+            "策略回测完成",
+            {
+                "sessions_completed": self._backtest.sessions_completed,
+                "table_row_counts": {
+                    name: len(frame)
+                    for name, frame in sorted(self._backtest.tables.items())
+                },
+            },
+        )
 
-    def _analyze(self) -> None:
+    def _analyze(self, progress: StrategyStudyProgressReporter) -> None:
         if self._backtest is None:
             raise RuntimeError("strategy analytics requires completed backtest")
+        progress.substage_started(
+            "CALCULATE_ANALYTICS",
+            "正在计算策略绩效与归因",
+            {"sessions_completed": self._backtest.sessions_completed},
+        )
         tables = StrategyStudyArtifactPublisher.canonical_tables(
             self._backtest.tables
         )
@@ -904,8 +953,23 @@ class _StrategyStudySession:
         self._tables = StrategyStudyArtifactPublisher.canonical_tables(tables)
         self._performance = performance
         self._attribution = attribution
+        progress.substage_completed(
+            "CALCULATE_ANALYTICS",
+            "策略绩效与归因计算完成",
+            {
+                "metric_count": len(performance.metrics),
+                "table_row_counts": {
+                    name: len(frame) for name, frame in sorted(self._tables.items())
+                },
+                "disclosure_count": len(attribution.disclosures),
+            },
+        )
 
-    def _publish(self, cancellation: CancellationToken) -> dict[str, JsonValue]:
+    def _publish(
+        self,
+        progress: StrategyStudyProgressReporter,
+        cancellation: CancellationToken,
+    ) -> dict[str, JsonValue]:
         if (
             self._backtest is None
             or self._tables is None
@@ -916,6 +980,7 @@ class _StrategyStudySession:
         if cancellation.is_cancelled():
             raise RuntimeError("strategy publication cancelled before publication")
         metrics = dict(self._performance.metrics)
+        registered_metrics = _StrategyStudySession._registered_metrics(metrics)
         quality = cast(
             Mapping[str, JsonValue],
             {
@@ -930,6 +995,14 @@ class _StrategyStudySession:
                 "warnings": list(self._attribution.disclosures),
             },
         )
+        progress.substage_started(
+            "PUBLISH_ARTIFACTS",
+            "正在写入并复核策略研究产物",
+            {
+                "table_count": len(self._tables),
+                "metric_count": len(registered_metrics),
+            },
+        )
         directory, manifest_hash, artifacts = StrategyStudyArtifactPublisher(
             self._artifact_root, self._study.id
         ).publish(
@@ -940,10 +1013,35 @@ class _StrategyStudySession:
             identities=self._backtest.identities,
         )
         self._published_dir = directory
+        progress.substage_completed(
+            "PUBLISH_ARTIFACTS",
+            "策略研究产物写入并复核完成",
+            {
+                "artifact_count": len(artifacts),
+                "artifact_row_count": sum(
+                    cast(int, item["row_count"])
+                    for item in artifacts
+                    if isinstance(item.get("row_count"), int)
+                ),
+                "artifact_byte_count": sum(
+                    cast(int, item["byte_count"])
+                    for item in artifacts
+                    if isinstance(item.get("byte_count"), int)
+                ),
+                "manifest_hash": manifest_hash,
+            },
+        )
         if cancellation.is_cancelled():
             self.abort()
             raise RuntimeError("strategy persistence cancelled after publication")
-        registered_metrics = _StrategyStudySession._registered_metrics(metrics)
+        progress.substage_started(
+            "REGISTER_OUTPUTS",
+            "正在登记策略研究指标与产物",
+            {
+                "metric_count": len(registered_metrics),
+                "artifact_count": len(artifacts),
+            },
+        )
         try:
             self._registry.register_outputs(
                 self._study.id, registered_metrics, artifacts
@@ -953,6 +1051,14 @@ class _StrategyStudySession:
                 shutil.rmtree(directory, ignore_errors=True)
             self._published_dir = None
             raise
+        progress.substage_completed(
+            "REGISTER_OUTPUTS",
+            "策略研究指标与产物登记完成",
+            {
+                "metric_count": len(registered_metrics),
+                "artifact_count": len(artifacts),
+            },
+        )
         return {
             "artifact_dir": str(directory),
             "manifest_hash": manifest_hash,
