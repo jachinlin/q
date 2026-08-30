@@ -117,8 +117,9 @@ GET    /api/v1/strategy-studies/{study_id}/artifacts/{artifact_type}
 ```
 
 Dashboard 提供策略研究列表、创建页和单项详情。详情展示配置、状态、指标、图表与产物；
+创建页默认使用覆盖三个内置策略全部参数的结构化表单，并保留可双向同步的高级 YAML 模式。
 活动研究可取消，终态研究可删除。“复制研究”跳转到
-`/strategy-studies/new?from=<study_id>`，用原冻结定义预填 YAML；任何修改都必须重新校验。
+`/strategy-studies/new?from=<study_id>`，用原冻结定义同时预填表单和 YAML；任何修改都必须重新校验。
 任务中心将 `STRATEGY_STUDY` 链接到研究详情，不提供原任务重试。
 
 示例：

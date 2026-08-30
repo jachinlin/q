@@ -92,13 +92,44 @@ export type DataUpdateWindow = {
 
 export type StrategyStudyStatus = 'QUEUED' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
 
+export type DualMAStrategyParameters = {
+  instrument_id: string
+  short_window: number
+  long_window: number
+  long_weight: number
+  flat_weight: number
+  target_tolerance: number
+}
+
+export type StrategyComponentRef = {
+  model_id: string
+  params?: Record<string, unknown>
+}
+
+export type CrossSectionalPipelineParameters = {
+  pipeline: {
+    frequency: 'MONTHLY' | 'WEEKLY'
+    target_tolerance: number
+    alpha: StrategyComponentRef
+    risk: StrategyComponentRef
+    cost: StrategyComponentRef
+    construction: StrategyComponentRef
+    constraints: StrategyComponentRef
+  }
+}
+
+export type StrategyStudyStrategy =
+  | { strategy_id: 'dual_ma_trend'; parameters: DualMAStrategyParameters }
+  | { strategy_id: 'etf_rotation'; parameters: CrossSectionalPipelineParameters }
+  | { strategy_id: 'stock_multifactor'; parameters: CrossSectionalPipelineParameters }
+
 export type StrategyStudyDefinition = {
   name: string
   description: string
   tags: string[]
   start_date: string
   end_date: string
-  strategy: { strategy_id: string; parameters: Record<string, unknown> }
+  strategy: StrategyStudyStrategy
   benchmark: string
   initial_cash_fen: number
   execution: {
