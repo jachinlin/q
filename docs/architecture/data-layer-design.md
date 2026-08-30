@@ -400,8 +400,8 @@ Canonical 文件成功写出不代表数据一定正确。VALIDATE 会先按 SQL
 两个命令的作用不同：
 
 ```text
-quant data validate stock_daily_bar  # 诊断单个数据集
-quant data validate-all              # 校验完整目录并决定是否开放研究读取
+qlab data validate stock_daily_bar  # 诊断单个数据集
+qlab data validate-all              # 校验完整目录并决定是否开放研究读取
 ```
 
 单数据集 `validate` 只用于诊断，不能打开研究门禁。只有完整 `validate-all` 通过，Repository 才允许研究代码读取当前目录。
@@ -694,22 +694,22 @@ SQLite 和更新任务进度，因此网络响应逆序完成不会改变产物�
 首次构建最近五年数据：
 
 ```console
-uv run quant data bootstrap --years 5
+uv run qlab data bootstrap --years 5
 ```
 
 日常自动增量更新：
 
 ```console
-uv run quant data update
+uv run qlab data update
 ```
 
 开发或排障时，可以分阶段运行：
 
 ```console
-uv run quant data localize stock_daily_bar --from 2026-08-01 --to 2026-08-25
-uv run quant data curate stock_daily_bar --from 2026-08-01 --to 2026-08-25
-uv run quant data validate stock_daily_bar
-uv run quant data validate-all
+uv run qlab data localize stock_daily_bar --from 2026-08-01 --to 2026-08-25
+uv run qlab data curate stock_daily_bar --from 2026-08-01 --to 2026-08-25
+uv run qlab data validate stock_daily_bar
+uv run qlab data validate-all
 ```
 
 `bootstrap` 和 `update` 会编排完整流程。分阶段命令主要用于理解、测试和定位错误。

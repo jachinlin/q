@@ -956,7 +956,7 @@ class DataUpdatePlanner:
                     message="data initialization has not completed",
                     context={"frozen_years": initialization.years},
                     remediation=(
-                        f"retry quant data bootstrap --years {initialization.years}"
+                        f"retry qlab data bootstrap --years {initialization.years}"
                     ),
                     retryable=False,
                 )
@@ -995,7 +995,7 @@ class DataUpdatePlanner:
                         context={"missing_datasets": list(missing_baseline)},
                         remediation=(
                             "choose a new QUANT_DATA_ROOT, configure its settings, "
-                            "and run quant data bootstrap"
+                            "and run qlab data bootstrap"
                         ),
                         retryable=False,
                     )
@@ -1006,7 +1006,7 @@ class DataUpdatePlanner:
                     severity=Severity.SEVERE,
                     message="data update requires a complete canonical baseline",
                     context={"missing_datasets": list(missing_baseline)},
-                    remediation="run quant data bootstrap --years <years>",
+                    remediation="run qlab data bootstrap --years <years>",
                     retryable=False,
                 )
             )
@@ -3363,7 +3363,7 @@ class DataPipeline:
                         context={"missing_datasets": missing},
                         remediation=(
                             "choose a new QUANT_DATA_ROOT, configure its settings, "
-                            "and run quant data bootstrap"
+                            "and run qlab data bootstrap"
                         ),
                         retryable=False,
                     )
@@ -3377,7 +3377,7 @@ class DataPipeline:
                         "is complete"
                     ),
                     context={},
-                    remediation="run quant data update for subsequent refreshes",
+                    remediation="run qlab data update for subsequent refreshes",
                     retryable=False,
                 )
             )
@@ -3391,7 +3391,7 @@ class DataPipeline:
                         "is complete"
                     ),
                     context={},
-                    remediation="run quant data update for subsequent refreshes",
+                    remediation="run qlab data update for subsequent refreshes",
                     retryable=False,
                 )
             )
@@ -3406,7 +3406,7 @@ class DataPipeline:
                         "requested_years": years,
                     },
                     remediation=(
-                        f"retry with quant data bootstrap --years {initialization.years}"
+                        f"retry with qlab data bootstrap --years {initialization.years}"
                     ),
                     retryable=False,
                 )

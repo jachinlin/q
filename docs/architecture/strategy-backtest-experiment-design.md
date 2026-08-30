@@ -1,6 +1,6 @@
 # 策略、回测与实验设计
 
-文档状态：当前有效设计　·　日期：2026-08-22
+文档状态：当前有效设计　·　日期：2026-08-30
 
 本文是策略定义与组装、订单级回测、实验编排与追踪的权威详细设计。平台定位、整体依赖方向、
 因子层、分析层、Worker 和分阶段实施见[总体设计](design.md)；数据读取和 PIT 门禁见
@@ -971,13 +971,13 @@ long_weight/target_tolerance`，不伪装成 Alpha 因子组合。
 CLI：
 
 ```text
-quant experiments validate <yaml>
-quant experiments submit <yaml>
-quant experiments run <experiment_id> <run-yaml>
-quant experiments rerun <run_id>
-quant experiments list
-quant experiments show <experiment_id>
-quant strategies list
+qlab experiments validate <yaml>
+qlab experiments submit <yaml>
+qlab experiments run <experiment_id> <run-yaml>
+qlab experiments rerun <run_id>
+qlab experiments list
+qlab experiments show <experiment_id>
+qlab strategies list
 ```
 
 HTTP：
@@ -1010,7 +1010,7 @@ GET  /api/v1/runs/{run_id}/artifacts/{artifact_type}?page=1&page_size=100
 - `/tasks`：通用运行中心；策略任务使用 `subject_kind=EXPERIMENT_RUN`，因子研究任务使用
   `subject_kind=FACTOR_STUDY`。
 
-旧 `/research`、`/factors`、`/api/v1/research/*`、`quant research` 和 `quant components` 不存在。
+旧 `/research`、`/factors`、`/api/v1/research/*`、`qlab research` 和 `qlab components` 不存在。
 
 ### 5.9 迁移与硬切
 

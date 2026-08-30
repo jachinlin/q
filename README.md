@@ -6,7 +6,7 @@ PIT 研究数据、因子分析、策略实验、回测、任务执行和 Dashbo
 新策略。
 
 项目当前未发布，不承诺旧 Python 导入、旧数据库或旧研究产物兼容。Python 包统一为
-`quant_research`，命令行入口为 `quant`。
+`quant_research`，命令行入口为 `qlab`。
 
 ## 能力概览
 
@@ -62,7 +62,7 @@ LOCALIZE 默认同时抓取 4 个逻辑请求，可在 Dashboard 设置为 1–3
 
 ```console
 uv sync --group notebook
-uv run quant --help
+uv run qlab --help
 ```
 
 ### 2. 构建 Dashboard 前端
@@ -76,7 +76,7 @@ npm run build
 ### 3. 初始化数据
 
 ```console
-uv run quant data bootstrap --years 5
+uv run qlab data bootstrap --years 5
 ```
 
 首次初始化会通过 Tushare 全市场端点构建指定年数的基线。
@@ -87,13 +87,13 @@ uv run quant data bootstrap --years 5
 如果已经存在本地数据，可以使用增量命令：
 
 ```console
-uv run quant data update
+uv run qlab data update
 ```
 
 ### 4. 一次启动 Dashboard、Worker 与 Notebook
 
 ```console
-uv run quant start
+uv run qlab start
 ```
 
 默认同时启动：
@@ -105,7 +105,7 @@ uv run quant start
 三个服务都固定监听或运行在本机；按 `Ctrl+C`，或任一服务退出时，监督器会统一关闭
 其余进程。Dashboard 健康检查通过后会自动在默认浏览器打开。可使用
 `--dashboard-port` 和 `--notebook-dir` 修改默认值；Notebook 端口固定为 `8009`。
-需要单独运行服务时，仍可使用 `quant dashboard` 和 `quant worker run`。
+需要单独运行服务时，仍可使用 `qlab dashboard` 和 `qlab worker run`。
 
 ## 数据流水线
 
@@ -123,27 +123,27 @@ Dashboard 数据中心会显示当前阶段、数据集和正在处理的 Tushar
 
 ```console
 # 查看完整数据命令
-uv run quant data --help
+uv run qlab data --help
 
 # 获取所有目录数据的 Raw 响应
-uv run quant data localize-all
+uv run qlab data localize-all
 
 # 只重建输入发生变化的 Canonical 分区
-uv run quant data curate-all
+uv run qlab data curate-all
 
 # 强制重建全部 Canonical 分区
-uv run quant data curate-all --full
+uv run qlab data curate-all --full
 
 # 执行全局质量校验并开放研究门禁
-uv run quant data validate-all
+uv run qlab data validate-all
 ```
 
 单数据集诊断：
 
 ```console
-uv run quant data localize daily_bar --from 2026-01-01 --to 2026-01-31
-uv run quant data curate daily_bar --from 2026-01-01 --to 2026-01-31
-uv run quant data validate daily_bar
+uv run qlab data localize daily_bar --from 2026-01-01 --to 2026-01-31
+uv run qlab data curate daily_bar --from 2026-01-01 --to 2026-01-31
+uv run qlab data validate daily_bar
 ```
 
 `validate <dataset>` 只生成诊断结果；只有 `validate-all` 能开放研究读取。
@@ -153,32 +153,32 @@ uv run quant data validate daily_bar
 提交实验只创建不可变实验和后台任务，不在 CLI 进程中同步执行：
 
 ```console
-uv run quant experiments submit configs/experiments/examples/etf_rotation.yaml
-uv run quant worker once
+uv run qlab experiments submit configs/experiments/examples/etf_rotation.yaml
+uv run qlab worker once
 ```
 
 查看实验：
 
 ```console
-uv run quant experiments show <experiment-id>
+uv run qlab experiments show <experiment-id>
 ```
 
 因子研究使用独立的扁平配置和命令组：
 
 ```console
-uv run quant factor-studies validate configs/factor_studies/examples/factor_study.yaml
-uv run quant factor-studies submit configs/factor_studies/examples/factor_study.yaml
-uv run quant factor-studies show <factor-study-id>
-uv run quant factor-studies list
+uv run qlab factor-studies validate configs/factor_studies/examples/factor_study.yaml
+uv run qlab factor-studies submit configs/factor_studies/examples/factor_study.yaml
+uv run qlab factor-studies show <factor-study-id>
+uv run qlab factor-studies list
 ```
 
 管理任务：
 
 ```console
-uv run quant tasks list
-uv run quant tasks list --status FAILED --limit 50
-uv run quant tasks cancel <task-id>
-uv run quant tasks retry <task-id>
+uv run qlab tasks list
+uv run qlab tasks list --status FAILED --limit 50
+uv run qlab tasks cancel <task-id>
+uv run qlab tasks retry <task-id>
 ```
 
 失败或取消的因子研究重试会复用同一任务和冻结配置并创建新 attempt；成功研究不可重跑。
@@ -217,7 +217,7 @@ uv run quant tasks retry <task-id>
 
 ```sh
 export QUANT_DASHBOARD_DEV_ORIGIN="http://127.0.0.1:5173"
-uv run quant dashboard --port 8000
+uv run qlab dashboard --port 8000
 ```
 
 Windows PowerShell 中对应使用

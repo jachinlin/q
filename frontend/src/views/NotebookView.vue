@@ -36,7 +36,7 @@ const ready = computed(() => query.data.value?.status === 'READY')
       </template>
       <template v-else>
         <strong>Notebook 尚未启动</strong>
-        <p>请使用 <code>uv run quant start</code> 同时启动 Dashboard、Worker 和 JupyterLab。</p>
+        <p>请使用 <code>uv run qlab start</code> 同时启动 Dashboard、Worker 和 JupyterLab。</p>
       </template>
       <el-button
         v-if="!query.isLoading.value"

@@ -47,7 +47,7 @@ notebook = [
 ]
 
 [project.scripts]
-quant = "quant_research.bootstrap.cli:main"
+qlab = "quant_research.bootstrap.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/quant_research"]

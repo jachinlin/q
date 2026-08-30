@@ -17,7 +17,7 @@ class _StrategyCommands:
         group: typer.Typer,
         services_factory: Callable[[], ApplicationServices],
     ) -> None:
-        """登记 ``quant strategies list`` 命令。"""
+        """登记 ``qlab strategies list`` 命令。"""
 
         @group.command("list")
         def list_strategies() -> None:

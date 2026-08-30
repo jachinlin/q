@@ -115,11 +115,11 @@ cost_bps_scenarios: [5, 10, 20]
 ### 2.2 校验与提交
 
 ```console
-uv run quant factor-studies validate configs/factor_studies/examples/factor_study.yaml
-uv run quant factor-studies submit configs/factor_studies/examples/factor_study.yaml
-uv run quant worker once
-uv run quant factor-studies show <factor-study-id>
-uv run quant factor-studies list
+uv run qlab factor-studies validate configs/factor_studies/examples/factor_study.yaml
+uv run qlab factor-studies submit configs/factor_studies/examples/factor_study.yaml
+uv run qlab worker once
+uv run qlab factor-studies show <factor-study-id>
+uv run qlab factor-studies list
 ```
 
 `validate` 解析配置并确认因子 ID 存在，不创建研究。`submit` 还要求整个 Canonical 数据目录已经通过
@@ -424,10 +424,10 @@ Manifest 使用 `factor_study_id`，记录相对路径、SHA-256 和字节数；
 ### 9.1 CLI
 
 ```text
-quant factor-studies validate <yaml>
-quant factor-studies submit <yaml>
-quant factor-studies show <factor-study-id>
-quant factor-studies list
+qlab factor-studies validate <yaml>
+qlab factor-studies submit <yaml>
+qlab factor-studies show <factor-study-id>
+qlab factor-studies list
 ```
 
 取消与失败重试走通用任务命令。成功 stdout 只输出 JSON，受控错误写 stderr。

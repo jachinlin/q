@@ -1,13 +1,16 @@
 """CLI surface tests for the current-data-only design."""
 
+import tomllib
 from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Never, cast
 
+import pytest
 from typer.testing import CliRunner
 
 from quant_research.cli import create_app
-from quant_research.cli.app import ApplicationServices
+from quant_research.cli.app import ApplicationServices, run
 from quant_research.data.pipeline.dataset import (
     DataUpdatePlan,
     DataUpdateWindow,
@@ -19,6 +22,32 @@ from quant_research.domain.enums import DatasetKind
 
 def _unexpected_services() -> Never:
     raise AssertionError("help must not construct application services")
+
+
+def test_package_exposes_only_qlab_command() -> None:
+    configuration = tomllib.loads(
+        (Path(__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert configuration["project"]["scripts"] == {
+        "qlab": "quant_research.bootstrap.cli:main"
+    }
+
+
+def test_cli_runner_uses_qlab_as_program_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Command:
+        invocation: tuple[str, bool] | None = None
+
+        def main(self, *, prog_name: str, standalone_mode: bool) -> None:
+            self.invocation = (prog_name, standalone_mode)
+
+    command = _Command()
+    monkeypatch.setattr("typer.main.get_command", lambda _application: command)
+
+    assert run(create_app(_unexpected_services)) == 0
+    assert command.invocation == ("qlab", False)
 
 
 def test_data_cli_exposes_validate_gate_without_snapshot_commands() -> None:

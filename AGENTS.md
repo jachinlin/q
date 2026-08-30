@@ -4,7 +4,7 @@
 
 本项目是单用户、本地运行的跨平台 A 股量化研究平台，支持 Windows、
 macOS 和 Linux。Python 包名为
-`quant_research`，安装后的命令为 `quant`。项目尚未发布，不兼容旧接口、旧包、
+`quant_research`，安装后的命令为 `qlab`。项目尚未发布，不兼容旧接口、旧包、
 旧数据库或旧产物；设计变化应直接落实到最终结构，不创建兼容转发层。
 
 项目的核心目的是降低新策略从开发、回测到比较验证的迭代成本，支持快速迭代
@@ -49,7 +49,7 @@ docs/architecture/     # 当前有效架构文档
 
 ```console
 uv sync
-uv run quant --help
+uv run qlab --help
 ```
 
 后端验证：
@@ -77,17 +77,17 @@ npm run build
 常用运行命令：
 
 ```console
-uv run quant data --help
-uv run quant data bootstrap
-uv run quant data update
-uv run quant data localize-all
-uv run quant data curate-all
-uv run quant data validate-all
-uv run quant experiments submit configs/experiments/examples/etf_rotation.yaml
-uv run quant worker once
-uv run quant worker run
-uv run quant dashboard --port 8000
-uv run quant start
+uv run qlab data --help
+uv run qlab data bootstrap
+uv run qlab data update
+uv run qlab data localize-all
+uv run qlab data curate-all
+uv run qlab data validate-all
+uv run qlab experiments submit configs/experiments/examples/etf_rotation.yaml
+uv run qlab worker once
+uv run qlab worker run
+uv run qlab dashboard --port 8000
+uv run qlab start
 ```
 
 环境变量：

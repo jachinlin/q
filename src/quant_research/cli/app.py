@@ -1128,7 +1128,7 @@ def run(application: typer.Typer) -> int:
     """
     command = typer.main.get_command(application)
     try:
-        result = command.main(prog_name="quant", standalone_mode=False)
+        result = command.main(prog_name="qlab", standalone_mode=False)
     except _click.ClickException as error:
         _CliSupport._write_error(
             QuantError(

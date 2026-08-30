@@ -1068,7 +1068,7 @@ class MetadataRepository:
                     severity=Severity.FATAL,
                     message="current canonical data has not passed validate-all",
                     context={"catalog_hash": state.catalog_hash},
-                    remediation="run quant data validate-all before reading research data",
+                    remediation="run qlab data validate-all before reading research data",
                     retryable=False,
                 )
             )

@@ -45,7 +45,7 @@ describe('embedded notebook workspace', () => {
     const { wrapper, queryClient } = await mountNotebook()
 
     expect(wrapper.text()).toContain('Notebook 尚未启动')
-    expect(wrapper.text()).toContain('uv run quant start')
+    expect(wrapper.text()).toContain('uv run qlab start')
     expect(wrapper.find('iframe').exists()).toBe(false)
 
     await wrapper.get('button').trigger('click')

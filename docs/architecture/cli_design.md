@@ -1,19 +1,19 @@
 # CLI 外部契约
 
-文档状态：当前有效设计　·　日期：2026-08-22
+文档状态：当前有效设计　·　日期：2026-08-30
 
-安装命令为 `quant`。stdout 只输出成功 JSON；受控错误和结构化日志写 stderr。实验配置只接受
+安装命令为 `qlab`。stdout 只输出成功 JSON；受控错误和结构化日志写 stderr。实验配置只接受
 明确路径下的严格 YAML，不接受旧 research、components 或 factor-studies 命令。
 
 ## 数据命令
 
 ```console
-quant data bootstrap --years <正整数>
-quant data update
-quant data localize [--dataset <name>] [--start YYYY-MM-DD --end YYYY-MM-DD]
-quant data localize-all --start YYYY-MM-DD --end YYYY-MM-DD
-quant data curate-all
-quant data validate-all
+qlab data bootstrap --years <正整数>
+qlab data update
+qlab data localize [--dataset <name>] [--start YYYY-MM-DD --end YYYY-MM-DD]
+qlab data localize-all --start YYYY-MM-DD --end YYYY-MM-DD
+qlab data curate-all
+qlab data validate-all
 ```
 
 - `bootstrap` 仅在没有 Canonical 数据时使用，必须指定年数。
@@ -23,13 +23,13 @@ quant data validate-all
 ## 实验与策略命令
 
 ```console
-quant experiments validate <experiment-yaml>
-quant experiments submit <experiment-yaml>
-quant experiments run <experiment_id> <run-yaml>
-quant experiments rerun <run_id>
-quant experiments list
-quant experiments show <experiment_id>
-quant strategies list
+qlab experiments validate <experiment-yaml>
+qlab experiments submit <experiment-yaml>
+qlab experiments run <experiment_id> <run-yaml>
+qlab experiments rerun <run_id>
+qlab experiments list
+qlab experiments show <experiment_id>
+qlab strategies list
 ```
 
 - `submit` 原子创建 Experiment、首个 Run 和 `EXPERIMENT_RUN` 任务。
@@ -40,10 +40,10 @@ quant strategies list
 ## Worker 与 Dashboard
 
 ```console
-quant worker once
-quant worker run
-quant dashboard --port 8000
-quant start
+qlab worker once
+qlab worker run
+qlab dashboard --port 8000
+qlab start
 ```
 
 `worker once` 至多领取一个可见任务；`worker run` 持续轮询。策略回测与因子研究都使用唯一

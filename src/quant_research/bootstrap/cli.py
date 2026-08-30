@@ -1,4 +1,4 @@
-"""装配并启动本地 ``quant`` 命令行应用。"""
+"""装配并启动本地 ``qlab`` 命令行应用。"""
 
 from __future__ import annotations
 
@@ -223,7 +223,7 @@ app = create_app(CliBootstrap.build_services)
 
 
 def main() -> int:
-    """运行安装后的 ``quant`` CLI；该函数是项目脚本框架入口。
+    """运行安装后的 ``qlab`` CLI；该函数是项目脚本框架入口。
 
     入参：
         无。
