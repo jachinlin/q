@@ -12,7 +12,8 @@ from types import MappingProxyType
 
 import polars as pl
 
-from quant_research.backtest.rulebook import FeeBreakdown
+from quant_research.backtest.rulebook import FeeBreakdown, SecurityStatus
+from quant_research.domain.enums import Board
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.strategies.base import OrderIntent, OrderSide
 
@@ -356,12 +357,20 @@ class _ModelsSupport:
             if identifier in seen:
                 raise ValueError("market bars instrument_id must be unique")
             seen.add(identifier)
-            if not isinstance(status, str) or status not in {"NORMAL", "ST"}:
-                raise ValueError("market bars security_status is invalid")
+            if not isinstance(status, str):
+                raise TypeError("market bars security_status is invalid")
+            try:
+                SecurityStatus(status)
+            except ValueError as error:
+                raise ValueError("market bars security_status is invalid") from error
             if not isinstance(instrument_type, str) or not instrument_type:
                 raise ValueError("market bars instrument_type is invalid")
-            if not isinstance(board, str) or board not in {"MAIN", "CHINEXT", "STAR"}:
-                raise ValueError("market bars board is invalid")
+            if not isinstance(board, str):
+                raise TypeError("market bars board is invalid")
+            try:
+                Board(board)
+            except ValueError as error:
+                raise ValueError("market bars board is invalid") from error
             market_values = tuple(
                 row[column]
                 for column in ("open", "high", "low", "close", "preclose", "volume")

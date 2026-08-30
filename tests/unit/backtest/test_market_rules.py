@@ -91,6 +91,7 @@ def _market(
     price: float | None,
     instrument_type: str = "ETF",
     board: str = "MAIN",
+    security_status: str = "NORMAL",
 ) -> MarketSlice:
     values = {
         "instrument_id": [instrument.canonical()],
@@ -101,7 +102,7 @@ def _market(
         "preclose": [price],
         "volume": [None if price is None else 10_000],
         "is_suspended": [suspended],
-        "security_status": ["NORMAL"],
+        "security_status": [security_status],
         "instrument_type": [instrument_type],
         "board": [board],
     }
@@ -119,6 +120,21 @@ def _market(
         "board": pl.String,
     }
     return MarketSlice(_DAY_ONE, pl.DataFrame(values, schema=schema))
+
+
+def test_market_slice_accepts_every_rulebook_status_and_supported_board() -> None:
+    """行情切片必须接受交易规则已定义的无涨跌停状态和北交所板块。"""
+    market = _market(
+        InstrumentId.parse("920001.BJ"),
+        suspended=False,
+        price=10.0,
+        instrument_type="STOCK",
+        board="BSE",
+        security_status="NO_LIMIT",
+    )
+
+    assert market.bars.item(0, "security_status") == SecurityStatus.NO_LIMIT.value
+    assert market.bars.item(0, "board") == Board.BSE.value
 
 
 def _buy_fill(settlement_sessions: int) -> FillResult:
