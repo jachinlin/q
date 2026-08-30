@@ -86,6 +86,9 @@ _DRAWDOWN_SCHEMA = pl.Schema(
         "trade_date": pl.Date,
         "nav": pl.Float64,
         "benchmark_nav": pl.Float64,
+        "gross_nav": pl.Float64,
+        "gross_cumulative_return": pl.Float64,
+        "cumulative_cost_drag": pl.Float64,
         "portfolio_daily_return": pl.Float64,
         "benchmark_daily_return": pl.Float64,
         "running_peak_nav": pl.Float64,
@@ -93,6 +96,33 @@ _DRAWDOWN_SCHEMA = pl.Schema(
         "active_nav": pl.Float64,
         "active_running_peak_nav": pl.Float64,
         "active_drawdown": pl.Float64,
+    }
+)
+_ROLLING_PERFORMANCE_SCHEMA = pl.Schema(
+    {
+        "trade_date": pl.Date,
+        "window_sessions": pl.Int64,
+        "annualized_return": pl.Float64,
+        "benchmark_annualized_return": pl.Float64,
+        "annualized_excess_return": pl.Float64,
+        "annualized_volatility": pl.Float64,
+        "sharpe_ratio": pl.Float64,
+        "max_drawdown": pl.Float64,
+        "tracking_error": pl.Float64,
+        "information_ratio": pl.Float64,
+        "beta": pl.Float64,
+    }
+)
+_DRAWDOWN_EPISODE_SCHEMA = pl.Schema(
+    {
+        "episode_index": pl.Int64,
+        "peak_date": pl.Date,
+        "trough_date": pl.Date,
+        "recovery_date": pl.Date,
+        "max_drawdown": pl.Float64,
+        "underwater_sessions": pl.Int64,
+        "recovery_sessions": pl.Int64,
+        "is_recovered": pl.Boolean,
     }
 )
 _EXECUTION_SUMMARY_SCHEMA = pl.Schema(
@@ -118,6 +148,8 @@ class PerformanceResult:
         metrics：参与本次处理的指标集合；调用方不得依赖未声明的顺序。
         nav：按交易日排序的账户净值序列，用于计算收益、回撤和归因。
         drawdown：回撤。
+        rolling_performance：固定 252 个收益观察值的滚动绩效。
+        drawdown_episodes：按时间排序的完整回撤事件。
         monthly_returns：月度收益序列。
         annual_returns：年度收益序列。
         execution_summary：按买卖方向和执行原因汇总的成交质量表。
@@ -131,6 +163,8 @@ class PerformanceResult:
     metrics: Mapping[str, int | float | str | None]
     nav: pl.DataFrame
     drawdown: pl.DataFrame
+    rolling_performance: pl.DataFrame
+    drawdown_episodes: pl.DataFrame
     monthly_returns: pl.DataFrame
     annual_returns: pl.DataFrame
     execution_summary: pl.DataFrame
@@ -176,6 +210,12 @@ def calculate_performance(
     active_nav = normalized_nav / normalized_benchmark
     active_running_peak = np.maximum.accumulate(active_nav)
     active_drawdowns = active_nav / active_running_peak - 1.0
+    monthly = _PerformanceSupport._period_returns(
+        dates, nav_values, benchmark_values, include_month=True
+    )
+    annual = _PerformanceSupport._period_returns(
+        dates, nav_values, benchmark_values, include_month=False
+    )
 
     undefined: dict[str, str] = {}
     cumulative_return = float(normalized_nav[-1] - 1.0)
@@ -193,6 +233,13 @@ def calculate_performance(
         sessions_per_year,
         undefined,
         "benchmark_annualized_return",
+    )
+    annualized_geometric_excess_return = _PerformanceSupport._annualized_return(
+        np.float64(active_nav[-1]),
+        len(nav_values),
+        sessions_per_year,
+        undefined,
+        "annualized_geometric_excess_return",
     )
     annualized_volatility = _PerformanceSupport._annualized_volatility(
         sample, sessions_per_year
@@ -278,6 +325,15 @@ def calculate_performance(
     )
     max_drawdown_duration = _PerformanceSupport._max_drawdown_duration(drawdowns)
     time_under_water_rate = float(np.count_nonzero(drawdowns < 0.0) / len(drawdowns))
+    historical_var_95_loss, historical_expected_shortfall_95_loss = (
+        _PerformanceSupport._historical_tail_losses(sample, undefined)
+    )
+    positive_month_rate = float(
+        np.count_nonzero(
+            np.asarray(monthly["portfolio_return"].to_list(), dtype=np.float64) > 0.0
+        )
+        / monthly.height
+    )
 
     metrics: dict[str, int | float | str | None] = {
         "start_date": dates[0].isoformat(),
@@ -289,6 +345,7 @@ def calculate_performance(
         "geometric_excess_return": float(
             normalized_nav[-1] / normalized_benchmark[-1] - 1.0
         ),
+        "annualized_geometric_excess_return": annualized_geometric_excess_return,
         "annualized_volatility": annualized_volatility,
         "sharpe_ratio": sharpe_ratio,
         "sortino_ratio": sortino_ratio,
@@ -320,6 +377,11 @@ def calculate_performance(
         "benchmark_cumulative_return": benchmark_cumulative,
         "relative_cumulative_return": cumulative_return - benchmark_cumulative,
         "information_ratio": information_ratio,
+        "positive_month_rate": positive_month_rate,
+        "historical_daily_var_95_loss": historical_var_95_loss,
+        "historical_daily_expected_shortfall_95_loss": (
+            historical_expected_shortfall_95_loss
+        ),
     }
     _PerformanceSupport._require_finite_metrics(metrics)
 
@@ -328,6 +390,9 @@ def calculate_performance(
             "trade_date": dates,
             "nav": normalized_nav,
             "benchmark_nav": normalized_benchmark,
+            "gross_nav": gross_growth,
+            "gross_cumulative_return": gross_growth - 1.0,
+            "cumulative_cost_drag": gross_growth - normalized_nav,
             "portfolio_daily_return": portfolio_daily,
             "benchmark_daily_return": benchmark_daily,
             "running_peak_nav": running_peak,
@@ -338,22 +403,27 @@ def calculate_performance(
         },
         schema=_DRAWDOWN_SCHEMA,
     )
+    rolling_performance = _PerformanceSupport._rolling_performance(
+        dates,
+        normalized_nav,
+        normalized_benchmark,
+        portfolio_daily,
+        benchmark_daily,
+        sessions_per_year,
+    )
+    drawdown_episodes = _PerformanceSupport._drawdown_episodes(dates, drawdowns)
     nav_output = nav.with_columns(
         pl.Series("nav", normalized_nav, dtype=pl.Float64),
         pl.Series("benchmark_nav", normalized_benchmark, dtype=pl.Float64),
         pl.Series("portfolio_daily_return", portfolio_daily, dtype=pl.Float64),
         pl.Series("benchmark_daily_return", benchmark_daily, dtype=pl.Float64),
     )
-    monthly = _PerformanceSupport._period_returns(
-        dates, nav_values, benchmark_values, include_month=True
-    )
-    annual = _PerformanceSupport._period_returns(
-        dates, nav_values, benchmark_values, include_month=False
-    )
     return PerformanceResult(
         metrics,
         nav_output,
         drawdown,
+        rolling_performance,
+        drawdown_episodes,
         monthly,
         annual,
         execution_summary,
@@ -545,6 +615,179 @@ class _PerformanceSupport:
         if len(values) > 1:
             result[1:] = values[1:] / values[:-1] - 1.0
         return result
+
+    @staticmethod
+    def _historical_tail_losses(
+        sample: NDArray[np.float64], undefined: dict[str, str]
+    ) -> tuple[float | None, float | None]:
+        """计算历史法 95% 单日 VaR 与 Expected Shortfall 损失。"""
+
+        if not len(sample):
+            undefined["historical_daily_var_95_loss"] = "NO_RETURN_OBSERVATIONS"
+            undefined["historical_daily_expected_shortfall_95_loss"] = (
+                "NO_RETURN_OBSERVATIONS"
+            )
+            return None, None
+        cutoff = float(np.quantile(sample, 0.05, method="linear"))
+        tail = sample[sample <= cutoff]
+        return max(0.0, -cutoff), max(0.0, -float(np.mean(tail)))
+
+    @staticmethod
+    def _rolling_performance(
+        dates: tuple[date, ...],
+        normalized_nav: NDArray[np.float64],
+        normalized_benchmark: NDArray[np.float64],
+        portfolio_daily: NDArray[np.float64],
+        benchmark_daily: NDArray[np.float64],
+        sessions_per_year: int,
+        *,
+        window_sessions: int = 252,
+    ) -> pl.DataFrame:
+        """生成固定收益观察窗口的滚动绩效表。"""
+
+        rows: list[dict[str, object]] = []
+        for end in range(window_sessions, len(dates)):
+            start = end - window_sessions
+            portfolio_sample = portfolio_daily[start + 1 : end + 1]
+            benchmark_sample = benchmark_daily[start + 1 : end + 1]
+            active_sample = portfolio_sample - benchmark_sample
+            portfolio_ratio = float(normalized_nav[end] / normalized_nav[start])
+            benchmark_ratio = float(
+                normalized_benchmark[end] / normalized_benchmark[start]
+            )
+            annualized_return = _PerformanceSupport._annualized_growth_ratio(
+                portfolio_ratio, window_sessions, sessions_per_year
+            )
+            benchmark_annualized_return = (
+                _PerformanceSupport._annualized_growth_ratio(
+                    benchmark_ratio, window_sessions, sessions_per_year
+                )
+            )
+            volatility = float(np.std(portfolio_sample, ddof=1))
+            active_volatility = float(np.std(active_sample, ddof=1))
+            benchmark_variance = float(np.var(benchmark_sample, ddof=1))
+            window_nav = normalized_nav[start : end + 1]
+            window_drawdown = window_nav / np.maximum.accumulate(window_nav) - 1.0
+            rows.append(
+                {
+                    "trade_date": dates[end],
+                    "window_sessions": window_sessions,
+                    "annualized_return": annualized_return,
+                    "benchmark_annualized_return": benchmark_annualized_return,
+                    "annualized_excess_return": (
+                        _PerformanceSupport._annualized_growth_ratio(
+                            portfolio_ratio / benchmark_ratio,
+                            window_sessions,
+                            sessions_per_year,
+                        )
+                    ),
+                    "annualized_volatility": volatility
+                    * sqrt(sessions_per_year),
+                    "sharpe_ratio": (
+                        float(np.mean(portfolio_sample))
+                        / volatility
+                        * sqrt(sessions_per_year)
+                        if volatility > 0.0
+                        else None
+                    ),
+                    "max_drawdown": float(np.min(window_drawdown)),
+                    "tracking_error": active_volatility
+                    * sqrt(sessions_per_year),
+                    "information_ratio": (
+                        float(np.mean(active_sample))
+                        / active_volatility
+                        * sqrt(sessions_per_year)
+                        if active_volatility > 0.0
+                        else None
+                    ),
+                    "beta": (
+                        float(
+                            np.cov(
+                                portfolio_sample, benchmark_sample, ddof=1
+                            )[0, 1]
+                        )
+                        / benchmark_variance
+                        if benchmark_variance > 0.0
+                        else None
+                    ),
+                }
+            )
+        return pl.DataFrame(rows, schema=_ROLLING_PERFORMANCE_SCHEMA)
+
+    @staticmethod
+    def _annualized_growth_ratio(
+        terminal_ratio: float, observations: int, sessions_per_year: int
+    ) -> float:
+        """按正增长比例和观察数计算确定性的年化收益。"""
+
+        return exp(log(terminal_ratio) * sessions_per_year / observations) - 1.0
+
+    @staticmethod
+    def _drawdown_episodes(
+        dates: tuple[date, ...], drawdowns: NDArray[np.float64]
+    ) -> pl.DataFrame:
+        """从完整回撤序列提取按时间排序的独立潜水事件。"""
+
+        rows: list[dict[str, object]] = []
+        start: int | None = None
+        trough: int | None = None
+        for index, value in enumerate(drawdowns):
+            if value < 0.0 and start is None:
+                start = index
+                trough = index
+            elif value < 0.0 and trough is not None:
+                if value < drawdowns[trough]:
+                    trough = index
+            elif value >= 0.0 and start is not None and trough is not None:
+                rows.append(
+                    _PerformanceSupport._drawdown_episode_row(
+                        len(rows) + 1,
+                        dates,
+                        drawdowns,
+                        start,
+                        trough,
+                        index,
+                    )
+                )
+                start = None
+                trough = None
+        if start is not None and trough is not None:
+            rows.append(
+                _PerformanceSupport._drawdown_episode_row(
+                    len(rows) + 1,
+                    dates,
+                    drawdowns,
+                    start,
+                    trough,
+                    None,
+                )
+            )
+        return pl.DataFrame(rows, schema=_DRAWDOWN_EPISODE_SCHEMA)
+
+    @staticmethod
+    def _drawdown_episode_row(
+        episode_index: int,
+        dates: tuple[date, ...],
+        drawdowns: NDArray[np.float64],
+        start: int,
+        trough: int,
+        recovery: int | None,
+    ) -> dict[str, object]:
+        peak = max(0, start - 1)
+        return {
+            "episode_index": episode_index,
+            "peak_date": dates[peak],
+            "trough_date": dates[trough],
+            "recovery_date": dates[recovery] if recovery is not None else None,
+            "max_drawdown": float(drawdowns[trough]),
+            "underwater_sessions": (
+                recovery - start if recovery is not None else len(dates) - start
+            ),
+            "recovery_sessions": (
+                recovery - trough if recovery is not None else None
+            ),
+            "is_recovered": recovery is not None,
+        }
 
     @staticmethod
     def _reference_value_fen(price: float, quantity: int) -> int:

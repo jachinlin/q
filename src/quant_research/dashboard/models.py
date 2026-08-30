@@ -24,6 +24,123 @@ class DashboardModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class StrategyPerformancePoint(DashboardModel):
+    """描述完整研究区间的一日绩效。入参：日期、收益、净值、成本与回撤。返回值：冻结序列点。异常：字段非法时校验失败。"""
+
+    trade_date: date
+    return_: float = Field(alias="return")
+    benchmark_return: float
+    cumulative_return: float
+    benchmark_cumulative_return: float
+    active_return: float
+    nav: float
+    benchmark_nav: float
+    gross_nav: float
+    gross_cumulative_return: float
+    cumulative_cost_drag: float
+    drawdown: float
+    active_drawdown: float
+
+
+class StrategyRollingPerformancePoint(DashboardModel):
+    """描述固定窗口滚动绩效。入参：日期、窗口和风险收益指标。返回值：冻结序列点。异常：字段非法时校验失败。"""
+
+    trade_date: date
+    window_sessions: int
+    annualized_return: float
+    benchmark_annualized_return: float
+    annualized_excess_return: float
+    annualized_volatility: float
+    sharpe_ratio: float | None
+    max_drawdown: float
+    tracking_error: float
+    information_ratio: float | None
+    beta: float | None
+
+
+class StrategyPeriodReturnPoint(DashboardModel):
+    """描述月度或年度收益。入参：期间身份、边界及三类收益。返回值：冻结期间点。异常：字段非法时校验失败。"""
+
+    year: int
+    month: int | None = None
+    period_start: date
+    period_end: date
+    portfolio_return: float
+    benchmark_return: float
+    relative_return: float
+
+
+class StrategyDrawdownEpisode(DashboardModel):
+    """描述一次独立回撤事件。入参：峰谷恢复日期、幅度和持续时间。返回值：冻结事件。异常：字段非法时校验失败。"""
+
+    episode_index: int
+    peak_date: date
+    trough_date: date
+    recovery_date: date | None
+    max_drawdown: float
+    underwater_sessions: int
+    recovery_sessions: int | None
+    is_recovered: bool
+
+
+class StrategyExposurePoint(DashboardModel):
+    """描述证券或现金的一日组合暴露。入参：日期、维度、键和值。返回值：冻结暴露点。异常：字段非法时校验失败。"""
+
+    trade_date: date
+    dimension: Literal["SECURITY", "CASH"]
+    key: str
+    weight: float
+
+
+class StrategyAttributionSummary(DashboardModel):
+    """描述证券级累计归因。入参：证券、损益和贡献收益。返回值：冻结汇总。异常：字段非法时校验失败。"""
+
+    key: str
+    pnl_fen: int
+    contribution_return: float
+
+
+class StrategyExecutionSummary(DashboardModel):
+    """描述按方向和原因汇总的执行质量。入参：订单数量、成交数量和金额。返回值：冻结汇总。异常：字段非法时校验失败。"""
+
+    side: str
+    reason_code: str
+    order_count: int
+    requested_quantity: int
+    filled_quantity: int
+    unfilled_quantity: int
+    priced_requested_notional_fen: int
+    priced_filled_notional_fen: int
+    unpriced_order_count: int
+
+
+class StrategyStudyQualityDisclosure(DashboardModel):
+    """描述策略研究计算口径和不可用项。入参：算法身份、未定义项和警告。返回值：冻结披露。异常：字段非法时校验失败。"""
+
+    calculation_mode: str
+    rolling_window_sessions: int
+    tail_risk_method: str
+    risk_free_rate_annual: float
+    undefined_metrics: dict[str, str]
+    unavailable_dimensions: dict[str, str]
+    attribution_method: str
+    warnings: tuple[str, ...]
+
+
+class StrategyStudyReportResponse(DashboardModel):
+    """返回策略研究的完整图表报告。入参：可信产物派生的类型化序列。返回值：冻结报告。异常：任一产物字段非法时校验失败。"""
+
+    performance: tuple[StrategyPerformancePoint, ...]
+    rolling_performance: tuple[StrategyRollingPerformancePoint, ...]
+    monthly_returns: tuple[StrategyPeriodReturnPoint, ...]
+    annual_returns: tuple[StrategyPeriodReturnPoint, ...]
+    drawdown_episodes: tuple[StrategyDrawdownEpisode, ...]
+    exposure: tuple[StrategyExposurePoint, ...]
+    attribution: tuple[StrategyAttributionSummary, ...]
+    execution: tuple[StrategyExecutionSummary, ...]
+    quality: StrategyStudyQualityDisclosure
+
+
 class NotebookStatusResponse(DashboardModel):
     """返回 Dashboard 内嵌 Notebook 的本机就绪状态。
 

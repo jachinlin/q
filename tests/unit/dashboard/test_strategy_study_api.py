@@ -5,6 +5,10 @@ from typing import Any, cast
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from quant_research.dashboard.models import (
+    StrategyStudyQualityDisclosure,
+    StrategyStudyReportResponse,
+)
 from quant_research.dashboard.strategy_studies import StrategyStudyRoutes
 
 
@@ -23,6 +27,29 @@ class _Service:
 
     def show(self, study_id: str) -> dict[str, object]:
         return {"id": study_id}
+
+    def report(self, study_id: str) -> StrategyStudyReportResponse:
+        del study_id
+        return StrategyStudyReportResponse(
+            performance=(),
+            rolling_performance=(),
+            monthly_returns=(),
+            annual_returns=(),
+            drawdown_episodes=(),
+            exposure=(),
+            attribution=(),
+            execution=(),
+            quality=StrategyStudyQualityDisclosure(
+                calculation_mode="CASH_EXACT",
+                rolling_window_sessions=252,
+                tail_risk_method="HISTORICAL_95",
+                risk_free_rate_annual=0.0,
+                undefined_metrics={},
+                unavailable_dimensions={},
+                attribution_method="CASH_EXACT_SECURITY",
+                warnings=(),
+            ),
+        )
 
     def delete(self, study_id: str, actor: str) -> dict[str, object]:
         return {"strategy_study_id": study_id, "actor": actor, "status": "DELETED"}
@@ -53,6 +80,9 @@ def test_final_routes_validate_submit_query_delete_and_artifacts() -> None:
     assert submitted.json()["id"] == "study-1"
     assert client.get("/api/v1/strategy-studies").status_code == 200
     assert client.get("/api/v1/strategy-studies/study-1").json() == {"id": "study-1"}
+    report = client.get("/api/v1/strategy-studies/study-1/report")
+    assert report.status_code == 200
+    assert report.json()["performance"] == []
     assert client.get("/api/v1/strategy-studies/study-1/artifacts/nav").status_code == 200
     assert client.delete("/api/v1/strategy-studies/study-1").status_code == 200
 
