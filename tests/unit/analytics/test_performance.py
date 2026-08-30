@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 import pytest
@@ -155,6 +155,7 @@ def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> Non
         "failed_fill_rate": 0.5,
         "benchmark_annualized_return": 0.02,
         "geometric_excess_return": 1.1 / 1.02 - 1.0,
+        "annualized_geometric_excess_return": 1.1 / 1.02 - 1.0,
         "tracking_error": 0.12798819311255116,
         "beta": 2.2307707810594835,
         "jensen_alpha": 0.0611843364873989,
@@ -173,6 +174,9 @@ def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> Non
         "benchmark_cumulative_return": 0.02,
         "relative_cumulative_return": 0.08,
         "information_ratio": 0.6932683130554919,
+        "positive_month_rate": 0.5,
+        "historical_daily_var_95_loss": 0.08,
+        "historical_daily_expected_shortfall_95_loss": 0.1,
     }
     for name, expected in expected_metrics.items():
         assert result.metrics[name] == pytest.approx(expected)
@@ -197,6 +201,28 @@ def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> Non
     }
     for name, expected in expected_drawdown.items():
         assert result.drawdown[name].to_list() == pytest.approx(expected)
+    assert result.drawdown["gross_nav"].to_list() == pytest.approx(
+        [1.0, 1.101, 0.9909, 1.101]
+    )
+    assert result.drawdown["gross_cumulative_return"].to_list() == pytest.approx(
+        [0.0, 0.101, -0.0091, 0.101]
+    )
+    assert result.drawdown["cumulative_cost_drag"].to_list() == pytest.approx(
+        [0.0, 0.001, 0.0009, 0.001]
+    )
+    assert result.rolling_performance.is_empty()
+    assert result.drawdown_episodes.to_dicts() == [
+        {
+            "episode_index": 1,
+            "peak_date": date(2024, 1, 31),
+            "trough_date": date(2024, 2, 1),
+            "recovery_date": date(2024, 2, 2),
+            "max_drawdown": pytest.approx(-0.1),
+            "underwater_sessions": 1,
+            "recovery_sessions": 1,
+            "is_recovered": True,
+        }
+    ]
     assert result.drawdown["trade_date"].to_list() == _nav()["trade_date"].to_list()
     assert result.monthly_returns.to_dicts() == [
         {
@@ -253,6 +279,34 @@ def test_calculate_performance_matches_hand_checked_metrics_and_periods() -> Non
         },
     ]
     assert result.undefined_metrics == {}
+
+
+def test_rolling_performance_uses_exactly_252_return_observations() -> None:
+    """滚动表必须在第 252 个收益观察值结束时才产生首行。"""
+
+    dates = [date(2024, 1, 1) + timedelta(days=index) for index in range(253)]
+    nav = _period_nav(dates, [10_000] * 253, [100.0] * 253)
+
+    result = calculate_performance(
+        nav, _empty_holdings(), _empty_fills(), _empty_costs()
+    )
+
+    assert result.rolling_performance.to_dicts() == [
+        {
+            "trade_date": dates[-1],
+            "window_sessions": 252,
+            "annualized_return": 0.0,
+            "benchmark_annualized_return": 0.0,
+            "annualized_excess_return": 0.0,
+            "annualized_volatility": 0.0,
+            "sharpe_ratio": None,
+            "max_drawdown": 0.0,
+            "tracking_error": 0.0,
+            "information_ratio": None,
+            "beta": None,
+        }
+    ]
+    assert result.drawdown_episodes.is_empty()
 
 
 def test_all_unpriced_orders_disclose_null_notional_rate_and_zero_coverage() -> None:
@@ -454,6 +508,18 @@ def test_unrecovered_drawdown_is_null_and_disclosed() -> None:
     assert result.undefined_metrics["max_drawdown_recovery_date"] == (
         "DRAWDOWN_NOT_RECOVERED"
     )
+    assert result.drawdown_episodes.to_dicts() == [
+        {
+            "episode_index": 1,
+            "peak_date": date(2024, 1, 31),
+            "trough_date": date(2024, 2, 1),
+            "recovery_date": None,
+            "max_drawdown": pytest.approx(-0.1),
+            "underwater_sessions": 1,
+            "recovery_sessions": None,
+            "is_recovered": False,
+        }
+    ]
 
 
 def test_single_nav_row_has_exactly_defined_and_undefined_metrics() -> None:

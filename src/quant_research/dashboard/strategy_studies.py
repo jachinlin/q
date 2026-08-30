@@ -16,6 +16,17 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 
 from quant_research.application.strategy_studies import StrategyStudyService
+from quant_research.dashboard.models import (
+    StrategyAttributionSummary,
+    StrategyDrawdownEpisode,
+    StrategyExecutionSummary,
+    StrategyExposurePoint,
+    StrategyPerformancePoint,
+    StrategyPeriodReturnPoint,
+    StrategyRollingPerformancePoint,
+    StrategyStudyQualityDisclosure,
+    StrategyStudyReportResponse,
+)
 from quant_research.data.contracts import JsonValue
 from quant_research.strategies.components import StrategyComponentCatalog
 from quant_research.strategies.registry import StrategyRegistry
@@ -33,6 +44,8 @@ _ARTIFACT_TYPES = frozenset(
         "costs",
         "nav",
         "performance",
+        "rolling_performance",
+        "drawdown_episodes",
         "monthly_returns",
         "annual_returns",
         "execution_summary",
@@ -150,6 +163,81 @@ class StrategyStudyDashboardService:
         self._purge_directory(staged)
         return {"strategy_study_id": study_id, "status": "DELETED"}
 
+    def report(self, study_id: str) -> StrategyStudyReportResponse:
+        """读取完整研究报告。入参：研究 ID。返回值：可信图表 DTO。异常：产物缺失或完整性非法时抛出值错误。"""
+
+        study = self._studies.show(study_id)
+        performance = self._require_frame(study, "performance")
+        rolling = self._require_frame(study, "rolling_performance")
+        monthly = self._require_frame(study, "monthly_returns")
+        annual = self._require_frame(study, "annual_returns")
+        episodes = self._require_frame(study, "drawdown_episodes")
+        exposure = self._require_frame(study, "exposure_summary").filter(
+            pl.col("dimension").is_in(["SECURITY", "CASH"])
+        )
+        attribution = (
+            self._require_frame(study, "attribution")
+            .filter(pl.col("dimension") == "SECURITY")
+            .group_by("key")
+            .agg(
+                pl.col("pnl_fen").sum(),
+                pl.col("contribution_return").sum(),
+            )
+            .with_columns(
+                pl.col("contribution_return").abs().alias("absolute_contribution")
+            )
+            .sort(
+                ["absolute_contribution", "key"], descending=[True, False]
+            )
+            .drop("absolute_contribution")
+        )
+        execution = self._require_frame(study, "execution_summary")
+        quality_value = self._read_artifact(study, "quality_disclosure")
+        if not isinstance(quality_value, dict):
+            raise TypeError("strategy study quality disclosure is not an object")
+        quality_payload = dict(quality_value)
+        warnings = quality_payload.get("warnings")
+        if not isinstance(warnings, list) or not all(
+            isinstance(item, str) for item in warnings
+        ):
+            raise ValueError("strategy study quality warnings are invalid")
+        quality_payload["warnings"] = tuple(warnings)
+        return StrategyStudyReportResponse(
+            performance=tuple(
+                StrategyPerformancePoint.model_validate(row)
+                for row in performance.to_dicts()
+            ),
+            rolling_performance=tuple(
+                StrategyRollingPerformancePoint.model_validate(row)
+                for row in rolling.to_dicts()
+            ),
+            monthly_returns=tuple(
+                StrategyPeriodReturnPoint.model_validate(row)
+                for row in monthly.to_dicts()
+            ),
+            annual_returns=tuple(
+                StrategyPeriodReturnPoint.model_validate(row)
+                for row in annual.to_dicts()
+            ),
+            drawdown_episodes=tuple(
+                StrategyDrawdownEpisode.model_validate(row)
+                for row in episodes.to_dicts()
+            ),
+            exposure=tuple(
+                StrategyExposurePoint.model_validate(row)
+                for row in exposure.to_dicts()
+            ),
+            attribution=tuple(
+                StrategyAttributionSummary.model_validate(row)
+                for row in attribution.to_dicts()
+            ),
+            execution=tuple(
+                StrategyExecutionSummary.model_validate(row)
+                for row in execution.to_dicts()
+            ),
+            quality=StrategyStudyQualityDisclosure.model_validate(quality_payload),
+        )
+
     def artifact(
         self,
         study_id: str,
@@ -176,53 +264,14 @@ class StrategyStudyDashboardService:
                 f"unsupported filter for {artifact_type}: {min(unsupported)}"
             )
         study = self._studies.show(study_id)
-        if study.artifact_dir is None:
-            raise ValueError("strategy study has no published artifacts")
-        directory = Path(study.artifact_dir).resolve()
-        if not directory.is_relative_to(self._artifact_root):
-            raise ValueError("strategy study artifact directory is outside trusted root")
-        manifest_path = directory / "manifest.json"
-        manifest_bytes = manifest_path.read_bytes()
-        if study.manifest_hash != hashlib.sha256(manifest_bytes).hexdigest():
-            raise ValueError("strategy study manifest hash mismatch")
-        manifest = json.loads(manifest_bytes)
-        if artifact_type == "manifest":
-            return cast(dict[str, JsonValue], manifest)
-        entry = next(
-            (
-                item
-                for item in manifest["artifacts"]
-                if item["artifact_type"] == artifact_type
-            ),
-            None,
-        )
-        if entry is None:
-            raise ValueError("strategy study did not publish requested artifact")
-        path = (directory / entry["relative_path"]).resolve()
-        if not path.is_relative_to(directory):
-            raise ValueError("artifact path escaped strategy study directory")
-        content = path.read_bytes()
-        if (
-            len(content) != entry["byte_count"]
-            or hashlib.sha256(content).hexdigest() != entry["content_hash"]
-        ):
-            raise ValueError("artifact integrity check failed")
-        if path.suffix == ".json":
-            return {"value": cast(JsonValue, json.loads(content))}
-        frame = pl.read_parquet(path)
-        if entry.get("row_count") != len(frame):
-            raise ValueError("artifact row count does not match Manifest")
-        actual_schema = {name: str(dtype) for name, dtype in frame.schema.items()}
-        if entry.get("schema") != actual_schema:
-            raise ValueError("artifact schema does not match Manifest")
-        primary_key = tuple(cast(list[str], entry.get("primary_key") or ()))
-        sort_key = tuple(cast(list[str], entry.get("sort_key") or ()))
-        if not primary_key or not sort_key:
-            raise ValueError("Parquet artifact lacks key metadata")
-        if frame.select(pl.struct(primary_key).is_duplicated().any()).item():
-            raise ValueError("artifact primary key is not unique")
-        if not frame.equals(frame.sort(sort_key)):
-            raise ValueError("artifact rows are not canonically sorted")
+        value = self._read_artifact(study, artifact_type)
+        if not isinstance(value, pl.DataFrame):
+            if artifact_type == "manifest":
+                if not isinstance(value, dict):
+                    raise ValueError("strategy study Manifest is not an object")
+                return cast(dict[str, JsonValue], value)
+            return {"value": value}
+        frame = value
         for name, value in requested_filters.items():
             if name not in frame.columns:
                 raise ValueError(f"artifact filter column is missing: {name}")
@@ -238,6 +287,79 @@ class StrategyStudyDashboardService:
             "page_size": page_size,
             "total": len(frame),
         }
+
+    def _require_frame(
+        self, study: StrategyStudyRecord, artifact_type: str
+    ) -> pl.DataFrame:
+        value = self._read_artifact(study, artifact_type)
+        if not isinstance(value, pl.DataFrame):
+            raise TypeError(f"strategy study {artifact_type} is not tabular")
+        return value
+
+    def _read_artifact(
+        self, study: StrategyStudyRecord, artifact_type: str
+    ) -> JsonValue | pl.DataFrame:
+        directory, manifest = self._verified_manifest(study)
+        if artifact_type == "manifest":
+            return cast(JsonValue, manifest)
+        entries = cast(list[dict[str, JsonValue]], manifest.get("artifacts"))
+        entry = next(
+            (
+                item
+                for item in entries
+                if item.get("artifact_type") == artifact_type
+            ),
+            None,
+        )
+        if entry is None:
+            raise ValueError("strategy study did not publish requested artifact")
+        relative_path = entry.get("relative_path")
+        if not isinstance(relative_path, str):
+            raise TypeError("artifact relative path is invalid")
+        path = (directory / relative_path).resolve()
+        if not path.is_relative_to(directory):
+            raise ValueError("artifact path escaped strategy study directory")
+        content = path.read_bytes()
+        if (
+            len(content) != entry.get("byte_count")
+            or hashlib.sha256(content).hexdigest() != entry.get("content_hash")
+        ):
+            raise ValueError("artifact integrity check failed")
+        if path.suffix == ".json":
+            return cast(JsonValue, json.loads(content))
+        frame = pl.read_parquet(path)
+        if entry.get("row_count") != len(frame):
+            raise ValueError("artifact row count does not match Manifest")
+        actual_schema = {name: str(dtype) for name, dtype in frame.schema.items()}
+        if entry.get("schema") != actual_schema:
+            raise ValueError("artifact schema does not match Manifest")
+        primary_key = tuple(cast(list[str], entry.get("primary_key") or ()))
+        sort_key = tuple(cast(list[str], entry.get("sort_key") or ()))
+        if not primary_key or not sort_key:
+            raise ValueError("Parquet artifact lacks key metadata")
+        if frame.select(pl.struct(primary_key).is_duplicated().any()).item():
+            raise ValueError("artifact primary key is not unique")
+        if not frame.equals(frame.sort(sort_key)):
+            raise ValueError("artifact rows are not canonically sorted")
+        return frame
+
+    def _verified_manifest(
+        self, study: StrategyStudyRecord
+    ) -> tuple[Path, dict[str, JsonValue]]:
+        if study.artifact_dir is None:
+            raise ValueError("strategy study has no published artifacts")
+        directory = Path(study.artifact_dir).resolve()
+        if not directory.is_relative_to(self._artifact_root):
+            raise ValueError("strategy study artifact directory is outside trusted root")
+        manifest_bytes = (directory / "manifest.json").read_bytes()
+        if study.manifest_hash != hashlib.sha256(manifest_bytes).hexdigest():
+            raise ValueError("strategy study manifest hash mismatch")
+        manifest = json.loads(manifest_bytes)
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("artifacts"), list
+        ):
+            raise TypeError("strategy study Manifest is invalid")
+        return directory, cast(dict[str, JsonValue], manifest)
 
     def _stage_directory(
         self, study: StrategyStudyRecord
@@ -300,6 +422,10 @@ class StrategyStudyRoutes:
         @app.get("/api/v1/strategy-studies/{study_id}")
         def show(study_id: str) -> dict[str, JsonValue]:
             return service.show(study_id)
+
+        @app.get("/api/v1/strategy-studies/{study_id}/report")
+        def report(study_id: str) -> StrategyStudyReportResponse:
+            return service.report(study_id)
 
         @app.delete("/api/v1/strategy-studies/{study_id}")
         def delete(study_id: str, request: Request) -> dict[str, JsonValue]:

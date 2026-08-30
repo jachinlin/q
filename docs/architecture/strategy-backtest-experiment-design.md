@@ -109,6 +109,21 @@ artifacts/strategy-studies/<strategy_study_id>/
 Manifest 记录 `strategy_study_id`、配置身份、数据身份、交易规则身份，以及每个产物的相对
 路径、SHA-256、字节数、Schema、行数、主键和排序键。发布目录不可覆盖。
 
+分析阶段必须发布以下直接面向研究判断的确定性产物：
+
+- `performance`：完整交易日区间的策略/基准净值、毛净值、日收益、累计收益、回撤和
+  累计成本拖累；
+- `rolling_performance`：固定 252 个交易日窗口的策略/基准/超额年化收益、波动率、
+  Sharpe、最大回撤、跟踪误差、信息比率和 Beta；
+- `drawdown_episodes`：每次回撤的峰值日、谷底日、恢复日、最大回撤、水下日数和恢复日数；
+- `monthly_returns`、`annual_returns`、`exposure_summary`、`attribution` 和
+  `execution_summary`：分别支持周期收益、证券/现金暴露、证券归因和成交质量分析；
+- `metrics` 与 `quality_disclosure`：包含年化几何超额、正收益月份占比、历史法 95%
+  单日 VaR/Expected Shortfall，并披露 252 日窗口和历史尾部风险口径。
+
+既有策略研究产物不迁移、不补写新文件；用户通过“复制研究”创建独立研究并重新执行，
+从而获得当前产物契约。
+
 ## 公开接口
 
 CLI：
@@ -129,10 +144,21 @@ POST   /api/v1/strategy-studies
 GET    /api/v1/strategy-studies
 GET    /api/v1/strategy-studies/{study_id}
 DELETE /api/v1/strategy-studies/{study_id}
+GET    /api/v1/strategy-studies/{study_id}/report
 GET    /api/v1/strategy-studies/{study_id}/artifacts/{artifact_type}
 ```
 
-Dashboard 提供策略研究列表、创建页和单项详情。详情展示配置、状态、指标、图表与产物；
+`report` 从可信最终目录重新校验 Manifest、哈希、Schema、主键和确定性排序后，一次返回完整、
+类型化的主图数据。它不使用产物分页，因此研究区间不会在第 1,000 行截断。通用产物接口只
+用于证据浏览，表格支持分页和声明过的 `dimension` 过滤，JSON 产物保持对象结构。
+
+Dashboard 提供策略研究列表、创建页和单项详情。详情采用“研究判断优先”布局：先展示六项
+核心指标和完整策略/毛值/基准净值，再展示回撤、252 日滚动指标、月度热力图、年度收益、
+证券/现金暴露、成本拖累、成交质量、证券归因和主要回撤事件。完整指标按收益、风险、基准
+相对表现、交易执行和组合暴露分组，使用中文名称并解释口径。冻结配置、执行身份、质量披露、
+Manifest 和原始产物集中在“配置与证据”页签，产物选择器由 Manifest 动态生成。详情内容最大
+宽度为 1500px，并在 1360px 和 1100px 桌面宽度下调整指标、图表和 Hero 布局。
+
 创建页默认使用覆盖三个内置策略全部参数的结构化表单，并保留可双向同步的高级 YAML 模式。
 活动研究可取消，终态研究可删除。“复制研究”跳转到
 `/strategy-studies/new?from=<study_id>`，用原冻结定义同时预填表单和 YAML；任何修改都必须重新校验。

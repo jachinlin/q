@@ -171,6 +171,8 @@ export type StrategyStudy = {
 
 export type StrategyStudyQualityDisclosure = {
   calculation_mode: string
+  rolling_window_sessions: number
+  tail_risk_method: string
   risk_free_rate_annual: number
   undefined_metrics: Record<string, string>
   unavailable_dimensions: Record<string, string>
@@ -188,8 +190,61 @@ export type StrategyPerformanceArtifactRow = {
   active_return: number
   nav: number
   benchmark_nav: number
+  gross_nav: number
+  gross_cumulative_return: number
+  cumulative_cost_drag: number
   drawdown: number
   active_drawdown: number
+}
+
+export type StrategyRollingPerformanceRow = {
+  trade_date: string
+  window_sessions: number
+  annualized_return: number
+  benchmark_annualized_return: number
+  annualized_excess_return: number
+  annualized_volatility: number
+  sharpe_ratio: number | null
+  max_drawdown: number
+  tracking_error: number
+  information_ratio: number | null
+  beta: number | null
+}
+
+export type StrategyDrawdownEpisodeRow = {
+  episode_index: number
+  peak_date: string
+  trough_date: string
+  recovery_date: string | null
+  max_drawdown: number
+  underwater_sessions: number
+  recovery_sessions: number | null
+  is_recovered: boolean
+}
+
+export type StrategyExposureRow = {
+  trade_date: string
+  dimension: 'SECURITY' | 'CASH'
+  key: string
+  weight: number
+}
+
+export type StrategyAttributionRow = {
+  key: string
+  pnl_fen: number
+  contribution_return: number
+}
+
+export type StrategyStudyReport = {
+  performance: StrategyPerformanceArtifactRow[]
+  rolling_performance: StrategyRollingPerformanceRow[]
+  monthly_returns: PeriodReturnArtifactRow[]
+  annual_returns: PeriodReturnArtifactRow[]
+  drawdown_episodes: StrategyDrawdownEpisodeRow[]
+  exposure: StrategyExposureRow[]
+  attribution: StrategyAttributionRow[]
+  execution: ExecutionSummaryArtifactRow[]
+  quality: StrategyStudyQualityDisclosure
 }
 
 export type PeriodReturnArtifactRow = {

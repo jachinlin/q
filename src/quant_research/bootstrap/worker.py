@@ -940,9 +940,14 @@ class _StrategyStudySession:
                     ).alias("active_return"),
                     pl.col("nav"),
                     pl.col("benchmark_nav"),
+                    pl.col("gross_nav"),
+                    pl.col("gross_cumulative_return"),
+                    pl.col("cumulative_cost_drag"),
                     pl.col("drawdown"),
                     pl.col("active_drawdown"),
                 ),
+                "rolling_performance": performance.rolling_performance,
+                "drawdown_episodes": performance.drawdown_episodes,
                 "monthly_returns": performance.monthly_returns,
                 "annual_returns": performance.annual_returns,
                 "execution_summary": performance.execution_summary,
@@ -985,6 +990,8 @@ class _StrategyStudySession:
             Mapping[str, JsonValue],
             {
                 "calculation_mode": "CASH_EXACT",
+                "rolling_window_sessions": 252,
+                "tail_risk_method": "HISTORICAL_95",
                 "risk_free_rate_annual": 0.0,
                 "undefined_metrics": dict(self._performance.undefined_metrics),
                 "unavailable_dimensions": {
@@ -1088,6 +1095,8 @@ class _StrategyStudySession:
                     "drag",
                     "alpha",
                     "error",
+                    "var_95_loss",
+                    "shortfall_95_loss",
                 )
             )
         }

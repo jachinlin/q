@@ -50,6 +50,8 @@ def test_publisher_writes_and_rechecks_the_complete_artifact_set(
         "costs",
         "nav",
         "performance",
+        "rolling_performance",
+        "drawdown_episodes",
         "monthly_returns",
         "annual_returns",
         "execution_summary",
