@@ -323,24 +323,40 @@ class _PriceAdjustmentSupport:
             .last()
             .over("instrument_id")
             .alias("_end_factor"),
-            pl.col("adjustment_factor")
-            .shift(1)
-            .over("instrument_id")
-            .fill_null(pl.col("adjustment_factor"))
-            .alias("_previous_factor"),
         )
+        factor = pl.col("adjustment_factor")
+        if _PriceAdjustmentSupport._has_any(
+            normalized_factors,
+            factor.is_null() | ~factor.is_finite() | (factor <= 0),
+        ):
+            raise ValueError("adjustment factor must be finite and positive")
         calculated = (
-            ordered.join(
+            ordered.join_asof(
                 normalized_factors.select(
                     "instrument_id",
                     "trade_date",
                     "adjustment_factor",
                     "_end_factor",
-                    "_previous_factor",
                 ),
-                on=["instrument_id", "trade_date"],
-                how="left",
-                validate="1:1",
+                on="trade_date",
+                by="instrument_id",
+                strategy="backward",
+                check_sortedness=False,
+            )
+            .join_asof(
+                normalized_factors.select(
+                    "instrument_id",
+                    "trade_date",
+                    pl.col("adjustment_factor").alias("_previous_factor"),
+                ),
+                on="trade_date",
+                by="instrument_id",
+                strategy="backward",
+                allow_exact_matches=False,
+                check_sortedness=False,
+            )
+            .with_columns(
+                pl.col("_previous_factor").fill_null(pl.col("adjustment_factor"))
             )
         )
         invalid = pl.col("adjustment_factor").is_null() | ~pl.col(
