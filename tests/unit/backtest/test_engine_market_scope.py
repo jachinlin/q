@@ -93,6 +93,15 @@ class _DecisionDataFactory:
         return _BoundDecisionData(signal_date)
 
 
+class _CorporateActionData:
+    """返回无权益事件的显式测试端口。"""
+
+    def corporate_actions(self, start: date, end: date) -> tuple[()]:
+        """返回空事件序列。"""
+        assert start <= end
+        return ()
+
+
 class _BuyOnceStrategy:
     """首日生成一笔买单，随后保持持仓。"""
 
@@ -208,6 +217,7 @@ def _run(market: _MarketData, *, guard: _Guard | None = None) -> BacktestResult:
     return BacktestEngine(
         market,
         _DecisionDataFactory(),  # type: ignore[arg-type]
+        _CorporateActionData(),  # type: ignore[arg-type]
         rulebook,
         guard or _Guard(),
     ).run(

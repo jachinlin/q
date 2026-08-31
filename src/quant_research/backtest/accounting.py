@@ -5,12 +5,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from math import isfinite
 from types import MappingProxyType
 
 from quant_research.backtest.calendar import TradingCalendar
+from quant_research.backtest.corporate_actions import (
+    CorporateActionType,
+    MappedCorporateAction,
+)
 from quant_research.backtest.models import ExecutionBatch, ExecutionReason, FillResult
 from quant_research.domain.identifiers import InstrumentId
 from quant_research.portfolio.rebalance import OrderSide
@@ -33,6 +37,10 @@ class LedgerEventType(StrEnum):
     OPENING_CASH = "OPENING_CASH"
     BUY = "BUY"
     SELL = "SELL"
+    DIVIDEND_ACCRUAL = "DIVIDEND_ACCRUAL"
+    DIVIDEND_PAYMENT = "DIVIDEND_PAYMENT"
+    STOCK_DISTRIBUTION = "STOCK_DISTRIBUTION"
+    FUND_SPLIT = "FUND_SPLIT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +74,7 @@ class LedgerEvent:
     gross_value_fen: int
     fees_fen: int
     source_id: str
+    receivable_delta_fen: int = 0
 
     def __post_init__(self) -> None:
         _AccountingSupport._identifier(self.event_id, "event_id")
@@ -80,6 +89,7 @@ class LedgerEvent:
             (self.cost_basis_delta_fen, "cost_basis_delta_fen"),
             (self.gross_value_fen, "gross_value_fen"),
             (self.fees_fen, "fees_fen"),
+            (self.receivable_delta_fen, "receivable_delta_fen"),
         ):
             _AccountingSupport._integer(value, name)
         _AccountingSupport._identifier(self.source_id, "source_id")
@@ -147,6 +157,7 @@ class AccountSnapshot:
 
     trade_date: date
     cash_fen: int
+    dividend_receivable_fen: int
     positions: tuple[PositionSnapshot, ...]
     total_market_value_fen: int
     nav_fen: int
@@ -154,6 +165,9 @@ class AccountSnapshot:
     def __post_init__(self) -> None:
         _AccountingSupport._date(self.trade_date, "trade_date")
         _AccountingSupport._nonnegative_int(self.cash_fen, "cash_fen")
+        _AccountingSupport._nonnegative_int(
+            self.dividend_receivable_fen, "dividend_receivable_fen"
+        )
         if not isinstance(self.positions, tuple):
             raise TypeError("positions must be a tuple")
         if any(
@@ -175,8 +189,12 @@ class AccountSnapshot:
             position.market_value_fen for position in self.positions
         ):
             raise ValueError("total_market_value_fen must equal positions")
-        if self.nav_fen != self.cash_fen + self.total_market_value_fen:
-            raise ValueError("nav_fen must equal cash plus market value")
+        if self.nav_fen != (
+            self.cash_fen
+            + self.dividend_receivable_fen
+            + self.total_market_value_fen
+        ):
+            raise ValueError("nav_fen must equal cash, receivable and market value")
 
     @property
     def long_market_value_fen(self) -> int:
@@ -218,6 +236,7 @@ class AccountSnapshot:
         """
         value = (
             self.cash_fen
+            + self.dividend_receivable_fen
             + self.long_market_value_fen
             - self.short_market_value_fen
             - self.accrued_fees_fen
@@ -276,6 +295,46 @@ class _Lot:
         )
 
 
+@dataclass(slots=True)
+class _DividendEntitlement:
+    action: MappedCorporateAction
+    entitlement_quantity: int
+    gross_cash_fen: int
+    distributed_quantity: int
+    discarded_fractional_quantity: Decimal
+    accrued: bool = False
+    paid: bool = False
+
+    def copy(self) -> _DividendEntitlement:
+        return _DividendEntitlement(
+            self.action,
+            self.entitlement_quantity,
+            self.gross_cash_fen,
+            self.distributed_quantity,
+            self.discarded_fractional_quantity,
+            self.accrued,
+            self.paid,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DividendRecord:
+    """记录账户实际锁定的一次分红送转权益及最终结算结果。
+
+    入参：来源事件、官方与映射日期、登记数量、税前现金、送转数量和零碎股。
+    返回值：用于 ``dividends.parquet`` 的不可变审计记录。异常：账户仅从已校验
+    权益状态构造该对象。
+    """
+
+    action: MappedCorporateAction
+    entitlement_quantity: int
+    gross_cash_fen: int
+    receivable_fen: int
+    paid_fen: int
+    distributed_quantity: int
+    discarded_fractional_quantity: Decimal
+
+
 class PortfolioAccount:
     """以账户流水为事实来源，原子应用成交并生成逐日估值快照。
 
@@ -295,6 +354,7 @@ class PortfolioAccount:
             raise TypeError("calendar must be a TradingCalendar")
         self._calendar = calendar
         self._cash_fen = initial_cash_fen
+        self._dividend_receivable_fen = 0
         self._lots: dict[InstrumentId, list[_Lot]] = {}
         opening = LedgerEvent(
             "account:opening-cash",
@@ -315,6 +375,7 @@ class PortfolioAccount:
         self._phase = "idle"
         self._last_snapshot: AccountSnapshot | None = None
         self._last_mark_prices: dict[InstrumentId, Decimal] = {}
+        self._dividend_entitlements: dict[str, _DividendEntitlement] = {}
 
     @property
     def ledger(self) -> tuple[LedgerEvent, ...]:
@@ -342,6 +403,28 @@ class PortfolioAccount:
         """
         return self._last_snapshot
 
+    @property
+    def dividend_records(self) -> tuple[DividendRecord, ...]:
+        """返回按事件 ID 稳定排序的账户分红送转审计记录。
+
+        入参：无。返回值：仅包含登记日收盘实际持有正数量的权益。异常：无。
+        """
+        return tuple(
+            DividendRecord(
+                item.action,
+                item.entitlement_quantity,
+                item.gross_cash_fen,
+                item.gross_cash_fen if item.accrued else 0,
+                item.gross_cash_fen if item.paid else 0,
+                item.distributed_quantity,
+                item.discarded_fractional_quantity,
+            )
+            for item in sorted(
+                self._dividend_entitlements.values(),
+                key=lambda value: value.action.event.event_id,
+            )
+        )
+
     def begin_session(self, trade_date: date) -> None:
         """处理回测中的``begin``交易会话。
 
@@ -367,6 +450,205 @@ class PortfolioAccount:
         self._last_session = trade_date
         self._phase = "open"
         self._last_snapshot = None
+
+    def apply_corporate_actions_before_open(
+        self, actions: Sequence[MappedCorporateAction]
+    ) -> None:
+        """在当日撮合前原子确认应收、增加送转股份并支付到期现金。
+
+        入参：一次性预载后按稳定顺序提供的映射权益事件。返回值：无。重复调用同一
+        事件阶段不会重复入账。异常：账户阶段或事件状态不一致时抛出 ``ValueError``。
+        """
+        if self._phase != "open" or self._last_session is None:
+            raise ValueError("corporate actions require an open session")
+        if any(not isinstance(item, MappedCorporateAction) for item in actions):
+            raise TypeError("actions must contain MappedCorporateAction")
+        ordered = tuple(
+            sorted(
+                actions,
+                key=lambda item: (
+                    item.event.instrument_id.canonical(), item.event.event_id
+                ),
+            )
+        )
+        cash = self._cash_fen
+        receivable = self._dividend_receivable_fen
+        lots = _AccountingSupport._copy_lots(self._lots)
+        entitlements = {
+            event_id: item.copy()
+            for event_id, item in self._dividend_entitlements.items()
+        }
+        additions: list[LedgerEvent] = []
+        event_ids = set(self._ledger_event_ids)
+        source_ids = set(self._ledger_source_ids)
+        for action in ordered:
+            event_id = action.event.event_id
+            entitlement = entitlements.get(event_id)
+            if (
+                entitlement is None
+                and action.event.action_type is CorporateActionType.FUND_SPLIT
+                and action.mapped_ex_date == self._last_session
+            ):
+                quantities, _, _ = _AccountingSupport._lot_totals(
+                    lots, self._last_session
+                )
+                quantity = quantities.get(action.event.instrument_id, 0)
+                if quantity > 0:
+                    exact_total = action.event.stock_dividend_per_share * quantity
+                    target_total = int(
+                        exact_total.to_integral_value(rounding=ROUND_FLOOR)
+                    )
+                    entitlement = _DividendEntitlement(
+                        action,
+                        quantity,
+                        0,
+                        target_total - quantity,
+                        exact_total - Decimal(target_total),
+                    )
+                    entitlements[event_id] = entitlement
+            if entitlement is None:
+                continue
+            if action.mapped_ex_date == self._last_session and not entitlement.accrued:
+                if entitlement.gross_cash_fen:
+                    ledger = LedgerEvent(
+                        f"corporate-action:{event_id}:accrual",
+                        LedgerEventType.DIVIDEND_ACCRUAL,
+                        self._last_session,
+                        action.event.instrument_id,
+                        0,
+                        0,
+                        0,
+                        entitlement.gross_cash_fen,
+                        0,
+                        f"corporate-action:{event_id}:accrual-source",
+                        entitlement.gross_cash_fen,
+                    )
+                    _AccountingSupport._reserve_ledger_identity(
+                        ledger, event_ids, source_ids
+                    )
+                    additions.append(ledger)
+                    receivable += entitlement.gross_cash_fen
+                if entitlement.distributed_quantity:
+                    sellable_date = (
+                        self._last_session
+                        if action.event.action_type is CorporateActionType.FUND_SPLIT
+                        else action.mapped_stock_listing_date or date.max
+                    )
+                    lots.setdefault(action.event.instrument_id, []).append(
+                        _Lot(
+                            self._last_session,
+                            sellable_date,
+                            entitlement.distributed_quantity,
+                            0,
+                        )
+                    )
+                    _AccountingSupport._redistribute_cost_basis(
+                        lots[action.event.instrument_id]
+                    )
+                    ledger = LedgerEvent(
+                        f"corporate-action:{event_id}:stock",
+                        (
+                            LedgerEventType.FUND_SPLIT
+                            if action.event.action_type
+                            is CorporateActionType.FUND_SPLIT
+                            else LedgerEventType.STOCK_DISTRIBUTION
+                        ),
+                        self._last_session,
+                        action.event.instrument_id,
+                        0,
+                        entitlement.distributed_quantity,
+                        0,
+                        0,
+                        0,
+                        f"corporate-action:{event_id}:stock-source",
+                    )
+                    _AccountingSupport._reserve_ledger_identity(
+                        ledger, event_ids, source_ids
+                    )
+                    additions.append(ledger)
+                entitlement.accrued = True
+            if (
+                action.mapped_pay_date == self._last_session
+                and entitlement.accrued
+                and not entitlement.paid
+                and entitlement.gross_cash_fen
+            ):
+                if entitlement.gross_cash_fen > receivable:
+                    raise ValueError("dividend payment exceeds receivable")
+                ledger = LedgerEvent(
+                    f"corporate-action:{event_id}:payment",
+                    LedgerEventType.DIVIDEND_PAYMENT,
+                    self._last_session,
+                    action.event.instrument_id,
+                    entitlement.gross_cash_fen,
+                    0,
+                    0,
+                    entitlement.gross_cash_fen,
+                    0,
+                    f"corporate-action:{event_id}:payment-source",
+                    -entitlement.gross_cash_fen,
+                )
+                _AccountingSupport._reserve_ledger_identity(
+                    ledger, event_ids, source_ids
+                )
+                additions.append(ledger)
+                cash += entitlement.gross_cash_fen
+                receivable -= entitlement.gross_cash_fen
+                entitlement.paid = True
+        self._cash_fen = cash
+        self._dividend_receivable_fen = receivable
+        self._lots = lots
+        self._dividend_entitlements = entitlements
+        self._ledger.extend(additions)
+        self._ledger_event_ids = event_ids
+        self._ledger_source_ids = source_ids
+
+    def lock_corporate_actions_after_close(
+        self, actions: Sequence[MappedCorporateAction]
+    ) -> None:
+        """按登记日当日成交后的收盘持仓幂等锁定权益。
+
+        入参：映射权益事件。返回值：无；零持仓事件不产生账户记录。异常：必须在
+        当日收盘估值后调用，重复事件身份但内容冲突时抛出 ``ValueError``。
+        """
+        if self._phase != "marked" or self._last_session is None:
+            raise ValueError("entitlements must be locked after close")
+        quantities, _, _ = _AccountingSupport._lot_totals(
+            self._lots, self._last_session
+        )
+        additions = dict(self._dividend_entitlements)
+        if any(not isinstance(item, MappedCorporateAction) for item in actions):
+            raise TypeError("actions must contain MappedCorporateAction")
+        for action in sorted(
+            actions,
+            key=lambda item: (item.event.instrument_id.canonical(), item.event.event_id),
+        ):
+            if (
+                action.event.action_type is CorporateActionType.FUND_SPLIT
+                or action.mapped_record_date != self._last_session
+            ):
+                continue
+            existing = additions.get(action.event.event_id)
+            if existing is not None:
+                if existing.action != action:
+                    raise ValueError("corporate action identity content changed")
+                continue
+            quantity = quantities.get(action.event.instrument_id, 0)
+            if quantity <= 0:
+                continue
+            cash = _AccountingSupport._rounded_fen(
+                action.event.cash_per_share_or_unit * quantity
+            )
+            exact_stock = action.event.stock_dividend_per_share * quantity
+            distributed = int(exact_stock.to_integral_value(rounding=ROUND_FLOOR))
+            additions[action.event.event_id] = _DividendEntitlement(
+                action,
+                quantity,
+                cash,
+                distributed,
+                exact_stock - Decimal(distributed),
+            )
+        self._dividend_entitlements = additions
 
     def apply(self, execution: ExecutionBatch) -> None:
         """原子应用回测。
@@ -509,9 +791,13 @@ class PortfolioAccount:
             raise ValueError("mark_to_market trade_date must match current session")
         prices = dict(self._last_mark_prices)
         prices.update(_AccountingSupport._prices(closes))
-        cash, quantities, costs = _AccountingSupport._reduce_ledger(self._ledger)
+        cash, receivable, quantities, costs = _AccountingSupport._reduce_ledger(
+            self._ledger
+        )
         if cash != self._cash_fen:
             raise RuntimeError("ledger cash does not match account cash")
+        if receivable != self._dividend_receivable_fen:
+            raise RuntimeError("ledger receivable does not match account receivable")
         lot_quantities, lot_costs, sellable = _AccountingSupport._lot_totals(
             self._lots, trade_date
         )
@@ -539,7 +825,12 @@ class PortfolioAccount:
             )
         market_value = sum(position.market_value_fen for position in positions)
         snapshot = AccountSnapshot(
-            trade_date, cash, tuple(positions), market_value, cash + market_value
+            trade_date,
+            cash,
+            receivable,
+            tuple(positions),
+            market_value,
+            cash + receivable + market_value,
         )
         self._last_snapshot = snapshot
         self._last_mark_prices = prices
@@ -563,6 +854,7 @@ class _AccountingSupport:
                         event.cost_basis_delta_fen,
                         event.gross_value_fen,
                         event.fees_fen,
+                        event.receivable_delta_fen,
                     )
                 )
             ):
@@ -578,6 +870,7 @@ class _AccountingSupport:
                 or event.gross_value_fen <= 0
                 or event.cost_basis_delta_fen != event.gross_value_fen + event.fees_fen
                 or event.cash_delta_fen != -event.cost_basis_delta_fen
+                or event.receivable_delta_fen != 0
             ):
                 raise ValueError("buy ledger event is invalid")
         elif event.event_type is LedgerEventType.SELL and (
@@ -585,8 +878,39 @@ class _AccountingSupport:
             or event.gross_value_fen <= 0
             or event.cost_basis_delta_fen > 0
             or event.cash_delta_fen != event.gross_value_fen - event.fees_fen
+            or event.receivable_delta_fen != 0
         ):
             raise ValueError("sell ledger event is invalid")
+        elif event.event_type is LedgerEventType.DIVIDEND_ACCRUAL and (
+            event.cash_delta_fen != 0
+            or event.quantity_delta != 0
+            or event.cost_basis_delta_fen != 0
+            or event.gross_value_fen <= 0
+            or event.fees_fen != 0
+            or event.receivable_delta_fen != event.gross_value_fen
+        ):
+            raise ValueError("dividend accrual ledger event is invalid")
+        elif event.event_type is LedgerEventType.DIVIDEND_PAYMENT and (
+            event.cash_delta_fen <= 0
+            or event.quantity_delta != 0
+            or event.cost_basis_delta_fen != 0
+            or event.gross_value_fen != event.cash_delta_fen
+            or event.fees_fen != 0
+            or event.receivable_delta_fen != -event.cash_delta_fen
+        ):
+            raise ValueError("dividend payment ledger event is invalid")
+        elif event.event_type in {
+            LedgerEventType.STOCK_DISTRIBUTION,
+            LedgerEventType.FUND_SPLIT,
+        } and (
+            event.cash_delta_fen != 0
+            or event.quantity_delta <= 0
+            or event.cost_basis_delta_fen != 0
+            or event.gross_value_fen != 0
+            or event.fees_fen != 0
+            or event.receivable_delta_fen != 0
+        ):
+            raise ValueError("stock distribution ledger event is invalid")
 
     @staticmethod
     def _copy_lots(
@@ -596,6 +920,30 @@ class _AccountingSupport:
             instrument: [lot.copy() for lot in values]
             for instrument, values in lots.items()
         }
+
+    @staticmethod
+    def _redistribute_cost_basis(lots: list[_Lot]) -> None:
+        """按股份数量比例确定性重分配整数分成本，并保持总成本不变。"""
+        ordered = sorted(
+            enumerate(lots),
+            key=lambda item: (
+                item[1].buy_date,
+                item[1].sellable_date,
+                item[0],
+            ),
+        )
+        total_quantity = sum(lot.quantity for _, lot in ordered)
+        total_cost = sum(lot.cost_basis_fen for _, lot in ordered)
+        if total_quantity <= 0:
+            raise ValueError("cost redistribution requires positive total quantity")
+        allocated = 0
+        for position, (_, lot) in enumerate(ordered):
+            if position + 1 == len(ordered):
+                cost = total_cost - allocated
+            else:
+                cost = total_cost * lot.quantity // total_quantity
+                allocated += cost
+            lot.cost_basis_fen = cost
 
     @staticmethod
     def _unlock_lots(lots: Mapping[InstrumentId, list[_Lot]], trade_date: date) -> None:
@@ -662,12 +1010,16 @@ class _AccountingSupport:
     @staticmethod
     def _reduce_ledger(
         ledger: Sequence[LedgerEvent],
-    ) -> tuple[int, dict[InstrumentId, int], dict[InstrumentId, int]]:
+    ) -> tuple[int, int, dict[InstrumentId, int], dict[InstrumentId, int]]:
         cash = 0
+        receivable = 0
         quantities: dict[InstrumentId, int] = {}
         costs: dict[InstrumentId, int] = {}
         for event in ledger:
             cash += event.cash_delta_fen
+            receivable += event.receivable_delta_fen
+            if cash < 0 or receivable < 0:
+                raise RuntimeError("ledger cash balance became negative")
             if event.instrument_id is not None:
                 instrument = event.instrument_id
                 quantities[instrument] = (
@@ -680,6 +1032,7 @@ class _AccountingSupport:
                     raise RuntimeError("ledger reduction became negative")
         return (
             cash,
+            receivable,
             {
                 instrument: quantity
                 for instrument, quantity in quantities.items()

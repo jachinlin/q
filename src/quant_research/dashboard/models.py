@@ -87,7 +87,7 @@ class StrategyExposurePoint(DashboardModel):
     """描述证券或现金的一日组合暴露。入参：日期、维度、键和值。返回值：冻结暴露点。异常：字段非法时校验失败。"""
 
     trade_date: date
-    dimension: Literal["SECURITY", "CASH"]
+    dimension: Literal["SECURITY", "CASH", "RECEIVABLE"]
     key: str
     weight: float
 
@@ -124,6 +124,10 @@ class StrategyStudyQualityDisclosure(DashboardModel):
     undefined_metrics: dict[str, str]
     unavailable_dimensions: dict[str, str]
     attribution_method: str
+    dividend_cash_tax_treatment: str
+    stock_distribution_rounding: str
+    corporate_action_timing: str
+    fund_split_source: str
     warnings: tuple[str, ...]
 
 

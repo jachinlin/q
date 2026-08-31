@@ -160,6 +160,9 @@ class _ResearchRepositoryHarness:
                 self._instrument_batch(),
                 self._daily_bar_batch(),
                 self._adjustment_factor_batch(),
+                self._fund_adjustment_factor_batch(),
+                self._stock_dividend_batch(),
+                self._fund_dividend_batch(),
                 self._index_bar_batch(),
                 self._trade_calendar_batch(),
                 self._industry_batch(),
@@ -306,6 +309,97 @@ class _ResearchRepositoryHarness:
             ],
         )
         return CanonicalBatch(dataset, frame, ("f" * 64,))
+
+    @staticmethod
+    def _fund_adjustment_factor_batch() -> CanonicalBatch:
+        dataset = DatasetKind.FUND_ADJUSTMENT_FACTOR
+        observations = (
+            (date(2022, 1, 13), 1.0),
+            (date(2022, 1, 14), 5.002),
+            (date(2022, 1, 17), 10.004),
+        )
+        frame = _canonical_frame(
+            dataset,
+            [
+                {
+                    "instrument_id": "513100.SH",
+                    "trade_date": trade_date,
+                    "adjustment_factor": factor,
+                    "source": "tushare",
+                    "available_at": datetime(
+                        trade_date.year,
+                        trade_date.month,
+                        trade_date.day,
+                        tzinfo=UTC,
+                    ),
+                    "availability_source": "test",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+                for trade_date, factor in observations
+            ],
+        )
+        return CanonicalBatch(dataset, frame, ("1" * 64,))
+
+    @staticmethod
+    def _stock_dividend_batch() -> CanonicalBatch:
+        dataset = DatasetKind.STOCK_DIVIDEND
+        rows: list[dict[str, object]] = []
+        for revision, available_at, cash in (
+            (0, datetime(2026, 8, 11, 0, tzinfo=UTC), 0.10),
+            (1, datetime(2026, 8, 11, 6, tzinfo=UTC), 0.12),
+            (2, datetime(2026, 8, 11, 8, tzinfo=UTC), 0.99),
+        ):
+            rows.append(
+                {
+                    "instrument_id": "600000.SH",
+                    "report_period": date(2025, 12, 31),
+                    "announcement_date": date(2026, 3, 1),
+                    "status": "实施",
+                    "stock_dividend_per_share": 0.0,
+                    "stock_bonus_rate_per_share": 0.0,
+                    "stock_conversion_rate_per_share": 0.0,
+                    "cash_dividend_after_tax_per_share": cash,
+                    "cash_dividend_before_tax_per_share": cash,
+                    "record_date": date(2026, 8, 11),
+                    "ex_date": date(2026, 8, 12),
+                    "pay_date": date(2026, 8, 13),
+                    "implementation_announcement_date": date(2026, 8, 10),
+                    "revision": revision,
+                    "source": "tushare",
+                    "available_at": available_at,
+                    "availability_source": "implementation_announcement_date_eod",
+                    "pit_usable": True,
+                    "ingested_at": _NOW,
+                }
+            )
+        return CanonicalBatch(dataset, _canonical_frame(dataset, rows), ("2" * 64,))
+
+    @staticmethod
+    def _fund_dividend_batch() -> CanonicalBatch:
+        dataset = DatasetKind.FUND_DIVIDEND
+        row = {
+            "instrument_id": "513100.SH",
+            "announcement_date": date(2022, 1, 10),
+            "implementation_announcement_date": date(2022, 1, 13),
+            "base_date": date(2022, 1, 14),
+            "status": "实施",
+            "record_date": date(2022, 1, 14),
+            "ex_date": date(2022, 1, 17),
+            "pay_date": date(2022, 1, 18),
+            "cash_dividend_per_unit": 0.01,
+            "revision": 0,
+            "source": "tushare",
+            "available_at": datetime(2022, 1, 13, tzinfo=UTC),
+            "availability_source": "implementation_announcement_date_eod",
+            "pit_usable": True,
+            "ingested_at": _NOW,
+        }
+        return CanonicalBatch(
+            dataset,
+            _canonical_frame(dataset, [row]),
+            ("3" * 64,),
+        )
 
     @staticmethod
     def _trade_calendar_batch() -> CanonicalBatch:
@@ -605,6 +699,22 @@ def test_every_public_read_api_enters_internal_verification(
             lambda: repository.fund_dividends(query_date, ()),
         ),
         (
+            DatasetKind.STOCK_DIVIDEND,
+            lambda: repository.stock_dividend_events(
+                query_date, query_date, ()
+            ),
+        ),
+        (
+            DatasetKind.FUND_DIVIDEND,
+            lambda: repository.fund_dividend_events(
+                query_date, query_date, ()
+            ),
+        ),
+        (
+            DatasetKind.FUND_ADJUSTMENT_FACTOR,
+            lambda: repository.fund_split_events(query_date, query_date, ()),
+        ),
+        (
             DatasetKind.INDUSTRY_CATALOG,
             repository.industry_catalog,
         ),
@@ -641,6 +751,9 @@ def test_from_sqlite_exposes_bound_read_only_catalog(tmp_path: Path) -> None:
             DatasetKind.STOCK_MASTER,
             DatasetKind.STOCK_DAILY_BAR,
             DatasetKind.STOCK_ADJUSTMENT_FACTOR,
+            DatasetKind.FUND_ADJUSTMENT_FACTOR,
+            DatasetKind.STOCK_DIVIDEND,
+            DatasetKind.FUND_DIVIDEND,
             DatasetKind.INDEX_DAILY_BAR,
             DatasetKind.TRADE_CALENDAR,
             DatasetKind.INDUSTRY_MEMBERSHIP,
@@ -744,6 +857,55 @@ def test_derived_price_queries_use_end_as_information_cutoff(tmp_path: Path) -> 
         assert returns["trade_date"].to_list() == [start, end]
         assert returns["forward_log_return"].to_list() == pytest.approx(
             [0.0, 0.09531017980432493]
+        )
+    finally:
+        harness.close()
+
+
+def test_dividend_events_use_record_close_pit_revision(tmp_path: Path) -> None:
+    """权益事件只选择登记日收盘前可见的最新实施 revision。"""
+    harness = _ResearchRepositoryHarness(tmp_path)
+    try:
+        events = harness.repository.stock_dividend_events(
+            date(2026, 8, 11),
+            date(2026, 8, 11),
+            (InstrumentId.parse("600000.SH"),),
+        ).collect()
+
+        assert events.select(
+            "instrument_id",
+            "record_date",
+            "revision",
+            "cash_dividend_before_tax_per_share",
+        ).rows() == [("600000.SH", date(2026, 8, 11), 1, 0.12)]
+    finally:
+        harness.close()
+
+
+def test_fund_split_events_use_factor_ratio_and_exclude_cash_date(
+    tmp_path: Path,
+) -> None:
+    """基金拆分由相邻复权因子推导，并排除已实施现金分红同日变化。"""
+    harness = _ResearchRepositoryHarness(tmp_path)
+    try:
+        events = harness.repository.fund_split_events(
+            date(2022, 1, 14),
+            date(2022, 1, 17),
+            (InstrumentId.parse("513100.SH"),),
+        ).collect()
+
+        assert events.select(
+            "instrument_id",
+            "ex_date",
+            "previous_adjustment_factor",
+            "adjustment_factor",
+            "raw_adjustment_factor_ratio",
+            "split_ratio",
+        ).rows() == [
+            ("513100.SH", date(2022, 1, 14), 1.0, 5.002, 5.002, 5.0)
+        ]
+        assert events["split_inference_relative_error"].to_list() == pytest.approx(
+            [0.0004]
         )
     finally:
         harness.close()

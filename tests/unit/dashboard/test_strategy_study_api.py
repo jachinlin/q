@@ -47,6 +47,10 @@ class _Service:
                 undefined_metrics={},
                 unavailable_dimensions={},
                 attribution_method="CASH_EXACT_SECURITY",
+                dividend_cash_tax_treatment="PRE_TAX",
+                stock_distribution_rounding="FLOOR",
+                corporate_action_timing="RECORD_CLOSE_EX_OPEN_PAY_PRE_MATCH",
+                fund_split_source="FUND_ADJUSTMENT_FACTOR_NEAR_INTEGER_0.1_PERCENT_UNEXPLAINED_BY_FUND_DIVIDEND",
                 warnings=(),
             ),
         )

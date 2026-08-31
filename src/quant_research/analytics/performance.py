@@ -16,6 +16,7 @@ _NAV_SCHEMA = pl.Schema(
     {
         "trade_date": pl.Date,
         "cash_fen": pl.Int64,
+        "dividend_receivable_fen": pl.Int64,
         "long_market_value_fen": pl.Int64,
         "short_market_value_fen": pl.Int64,
         "accrued_fees_fen": pl.Int64,
@@ -176,6 +177,7 @@ def calculate_performance(
     holdings: pl.DataFrame,
     fills: pl.DataFrame,
     costs: pl.DataFrame,
+    dividends: pl.DataFrame | None = None,
     *,
     sessions_per_year: int = 252,
 ) -> PerformanceResult:
@@ -186,6 +188,7 @@ def calculate_performance(
         holdings：逐交易日、逐证券的收盘持仓快照。
         fills：回测撮合产生的逐笔成交及拒绝记录。
         costs：按交易日汇总的佣金、印花税和其他交易成本。
+        dividends：分红送转与基金拆分审计明细；缺省表示无公司行动。
         sessions_per_year：将日频波动率和收益率年化时采用的年交易会话数。
     返回值：
         返回计算绩效后的绩效（``PerformanceResult``）。
@@ -194,6 +197,7 @@ def calculate_performance(
     Calculate metrics from validated canonical backtest tables.
     """
     _PerformanceSupport._validate_inputs(nav, holdings, fills, costs, sessions_per_year)
+    dividend_rows = dividends if dividends is not None else pl.DataFrame()
 
     dates = tuple(nav["trade_date"].to_list())
     nav_values = np.asarray(nav["equity_fen"].to_list(), dtype=np.float64)
@@ -315,6 +319,14 @@ def calculate_performance(
     average_cash_weight = float(
         np.mean(np.asarray(nav["cash_fen"].to_list(), dtype=np.float64) / nav_values)
     )
+    average_receivable_weight = float(
+        np.mean(
+            np.asarray(
+                nav["dividend_receivable_fen"].to_list(), dtype=np.float64
+            )
+            / nav_values
+        )
+    )
     nav_by_date = dict(zip(dates, nav_values, strict=True))
     max_position_weight = max(
         (
@@ -371,6 +383,39 @@ def calculate_performance(
         "notional_fill_rate": notional_fill_rate,
         "priced_order_coverage_rate": priced_order_coverage_rate,
         "average_cash_weight": average_cash_weight,
+        "average_receivable_weight": average_receivable_weight,
+        "gross_dividend_cash_fen": (
+            int(dividend_rows["gross_cash_fen"].sum())
+            if "gross_cash_fen" in dividend_rows.columns
+            else 0
+        ),
+        "stock_distribution_quantity": (
+            int(
+                dividend_rows.filter(
+                    pl.col("action_type") == "STOCK_DISTRIBUTION"
+                )["distributed_quantity"].sum()
+            )
+            if {"action_type", "distributed_quantity"}.issubset(
+                dividend_rows.columns
+            )
+            else 0
+        ),
+        "fund_split_quantity": (
+            int(
+                dividend_rows.filter(pl.col("action_type") == "FUND_SPLIT")[
+                    "distributed_quantity"
+                ].sum()
+            )
+            if {"action_type", "distributed_quantity"}.issubset(
+                dividend_rows.columns
+            )
+            else 0
+        ),
+        "discarded_fractional_stock_quantity": (
+            float(dividend_rows["discarded_fractional_quantity"].sum())
+            if "discarded_fractional_quantity" in dividend_rows.columns
+            else 0.0
+        ),
         "max_position_weight": max_position_weight,
         "max_drawdown_duration_sessions": max_drawdown_duration,
         "time_under_water_rate": time_under_water_rate,
@@ -487,6 +532,7 @@ class _PerformanceSupport:
         nav_rows = nav.select(
             "trade_date",
             "cash_fen",
+            "dividend_receivable_fen",
             "long_market_value_fen",
             "short_market_value_fen",
             "accrued_fees_fen",
@@ -499,6 +545,7 @@ class _PerformanceSupport:
         for row in nav_rows:
             trade_date = row["trade_date"]
             cash = row["cash_fen"]
+            receivable = row["dividend_receivable_fen"]
             market_value = row["long_market_value_fen"]
             short_market_value = row["short_market_value_fen"]
             accrued_fees = row["accrued_fees_fen"]
@@ -511,6 +558,7 @@ class _PerformanceSupport:
                 value < 0
                 for value in (
                     cash,
+                    receivable,
                     market_value,
                     short_market_value,
                     accrued_fees,
@@ -518,7 +566,13 @@ class _PerformanceSupport:
                 )
             ):
                 raise ValueError("nav monetary values must be nonnegative")
-            if nav_fen != cash + market_value - short_market_value - accrued_fees:
+            if nav_fen != (
+                cash
+                + receivable
+                + market_value
+                - short_market_value
+                - accrued_fees
+            ):
                 raise ValueError("nav equity identity is invalid")
             if nav_fen <= 0:
                 raise ValueError("nav_fen must be positive")

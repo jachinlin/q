@@ -12,6 +12,7 @@ from quant_research.analytics.attribution import calculate_attribution
 NAV_SCHEMA = {
     "trade_date": pl.Date,
     "cash_fen": pl.Int64,
+    "dividend_receivable_fen": pl.Int64,
     "long_market_value_fen": pl.Int64,
     "short_market_value_fen": pl.Int64,
     "accrued_fees_fen": pl.Int64,
@@ -60,6 +61,7 @@ def _nav() -> pl.DataFrame:
                 date(2024, 1, 5),
             ],
             "cash_fen": [10_000, 4_000, 4_000, 4_000],
+            "dividend_receivable_fen": [0, 0, 0, 0],
             "long_market_value_fen": [0, 6_000, 6_600, 6_600],
             "short_market_value_fen": [0, 0, 0, 0],
             "accrued_fees_fen": [0, 0, 0, 0],
@@ -162,3 +164,71 @@ def test_attribution_is_cash_exact_without_industry_dimension() -> None:
             )["pnl_fen"].sum()
             assert total == expected
         previous_nav = nav_fen
+
+
+def test_cash_dividend_is_attributed_on_ex_date_without_payment_gain() -> None:
+    """现金分红在除权日归因证券，支付日只转换应收而不重复产生收益。"""
+    days = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4)]
+    nav = pl.DataFrame(
+        {
+            "trade_date": days,
+            "cash_fen": [0, 0, 500],
+            "dividend_receivable_fen": [0, 500, 0],
+            "long_market_value_fen": [10_000, 10_000, 10_000],
+            "short_market_value_fen": [0, 0, 0],
+            "accrued_fees_fen": [0, 0, 0],
+            "margin_used_fen": [0, 0, 0],
+            "equity_fen": [10_000, 10_500, 10_500],
+            "benchmark_close": [100.0, 100.0, 100.0],
+        },
+        schema=NAV_SCHEMA,
+    )
+    holdings = pl.DataFrame(
+        {
+            "trade_date": days,
+            "instrument_id": ["600001.SH"] * 3,
+            "total_quantity": [100] * 3,
+            "sellable_quantity": [100] * 3,
+            "cost_basis_fen": [8_000] * 3,
+            "market_value_fen": [10_000] * 3,
+        },
+        schema=HOLDINGS_SCHEMA,
+    )
+    dividends = pl.DataFrame(
+        {
+            "mapped_ex_date": [date(2024, 1, 3)],
+            "instrument_id": ["600001.SH"],
+            "action_type": ["CASH_DIVIDEND"],
+            "gross_cash_fen": [500],
+        }
+    )
+
+    result = calculate_attribution(
+        nav,
+        holdings,
+        pl.DataFrame(schema=FILLS_SCHEMA),
+        pl.DataFrame(schema=COSTS_SCHEMA),
+        dividends,
+    )
+
+    security = result.attribution.filter(
+        (pl.col("dimension") == "SECURITY")
+        & (pl.col("key") == "600001.SH")
+        & (pl.col("trade_date") == date(2024, 1, 3))
+    )
+    assert security.select("trade_date", "pnl_fen").rows() == [
+        (date(2024, 1, 3), 500)
+    ]
+    payment_day = result.attribution.filter(
+        (pl.col("trade_date") == date(2024, 1, 4))
+        & (pl.col("dimension") == "SECURITY")
+    )
+    assert payment_day["pnl_fen"].sum() == 0
+    receivable = result.exposure_summary.filter(
+        pl.col("dimension") == "RECEIVABLE"
+    )
+    assert receivable.select("trade_date", "weight").rows() == [
+        (date(2024, 1, 2), 0.0),
+        (date(2024, 1, 3), 500 / 10_500),
+        (date(2024, 1, 4), 0.0),
+    ]

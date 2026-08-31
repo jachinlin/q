@@ -10,6 +10,9 @@ import pytest
 from quant_research.backtest import (
     AccountView,
     AShareRuleBook,
+    CorporateAction,
+    CorporateActionInstrumentType,
+    CorporateActionType,
     ExecutionBatch,
     ExecutionConfig,
     ExecutionModel,
@@ -18,6 +21,7 @@ from quant_research.backtest import (
     FeeBreakdown,
     FillResult,
     InstrumentTradingProfile,
+    MappedCorporateAction,
     MarketSlice,
     PortfolioAccount,
     PriceLimitParameters,
@@ -315,3 +319,89 @@ def test_account_fails_closed_when_holding_has_no_current_or_historical_mark() -
 
     with pytest.raises(ValueError, match="missing close"):
         account.mark_to_market(_DAY_ONE, {})
+
+
+def test_account_accrues_pays_and_distributes_stock_at_explicit_phases() -> None:
+    """登记日、除权日、支付日和上市日必须形成互不重复的账户状态。"""
+    day_three = date(2026, 8, 3)
+    day_four = date(2026, 8, 4)
+    calendar = TradingCalendar(
+        _DAY_ONE, day_four, (_DAY_ONE, _DAY_TWO, day_three, day_four)
+    )
+    account = PortfolioAccount(1_000_000, calendar)
+    cash = MappedCorporateAction(
+        CorporateAction(
+            "cash-event", _ETF_T1, CorporateActionInstrumentType.FUND,
+            CorporateActionType.CASH_DIVIDEND, 2, date(2026, 7, 27),
+            date(2026, 7, 28), _DAY_ONE, _DAY_TWO, day_three, None,
+            Decimal("0.12345"), Decimal(0),
+        ),
+        _DAY_ONE, _DAY_TWO, day_three, None,
+    )
+    stock = MappedCorporateAction(
+        CorporateAction(
+            "stock-event", _ETF_T1, CorporateActionInstrumentType.STOCK,
+            CorporateActionType.STOCK_DISTRIBUTION, 3, date(2026, 7, 27),
+            date(2026, 7, 28), _DAY_ONE, _DAY_TWO, None, day_three,
+            Decimal(0), Decimal("0.15"),
+        ),
+        _DAY_ONE, _DAY_TWO, None, day_three,
+    )
+    actions = (cash, stock)
+    account.begin_session(_DAY_ONE)
+    account.apply(ExecutionBatch(_DAY_ONE, (_buy_fill(0),), 964_230))
+    account.mark_to_market(_DAY_ONE, {_ETF_T1: 3.527})
+    account.lock_corporate_actions_after_close(actions)
+
+    account.begin_session(_DAY_TWO)
+    account.apply_corporate_actions_before_open(actions)
+    account.apply_corporate_actions_before_open(actions)
+    open_view = account.execution_view()
+    ex_snapshot = account.mark_to_market(_DAY_TWO, {_ETF_T1: 3.067})
+
+    assert open_view.cash_fen == 964_230
+    assert open_view.total_quantities[_ETF_T1] == 115
+    assert open_view.sellable_quantities[_ETF_T1] == 100
+    assert ex_snapshot.dividend_receivable_fen == 1_235
+    assert ex_snapshot.positions[0].cost_basis_fen == 35_770
+
+    account.begin_session(day_three)
+    account.apply_corporate_actions_before_open(actions)
+    paid = account.mark_to_market(day_three, {_ETF_T1: 3.067})
+
+    assert paid.cash_fen == 965_465
+    assert paid.dividend_receivable_fen == 0
+    assert paid.positions[0].sellable_quantity == 115
+    event_types = [event.event_type.value for event in account.ledger]
+    assert event_types.count("DIVIDEND_ACCRUAL") == 1
+    assert event_types.count("DIVIDEND_PAYMENT") == 1
+    assert event_types.count("STOCK_DISTRIBUTION") == 1
+
+
+def test_account_applies_fund_split_before_open_without_changing_cost() -> None:
+    """基金拆分使用复权因子倍率增加份额，并使新增份额当日可卖。"""
+    calendar = TradingCalendar(_DAY_ONE, _DAY_TWO, (_DAY_ONE, _DAY_TWO))
+    account = PortfolioAccount(1_000_000, calendar)
+    account.begin_session(_DAY_ONE)
+    account.apply(ExecutionBatch(_DAY_ONE, (_buy_fill(0),), 964_230))
+    account.mark_to_market(_DAY_ONE, {_ETF_T1: 3.527})
+    split = MappedCorporateAction(
+        CorporateAction(
+            "split-event", _ETF_T1, CorporateActionInstrumentType.FUND,
+            CorporateActionType.FUND_SPLIT, 0, None, None, None, _DAY_TWO,
+            None, None, Decimal(0), Decimal(5), Decimal(1), Decimal("5.002"),
+        ),
+        None, _DAY_TWO, None, None,
+    )
+
+    account.begin_session(_DAY_TWO)
+    account.apply_corporate_actions_before_open((split,))
+    view = account.execution_view()
+    snapshot = account.mark_to_market(_DAY_TWO, {_ETF_T1: 0.7054})
+
+    assert view.total_quantities[_ETF_T1] == 500
+    assert view.sellable_quantities[_ETF_T1] == 500
+    assert snapshot.positions[0].cost_basis_fen == 35_770
+    assert snapshot.positions[0].market_value_fen == 35_270
+    assert account.dividend_records[0].distributed_quantity == 400
+    assert account.ledger[-1].event_type.value == "FUND_SPLIT"

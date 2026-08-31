@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import date, time
 
 import polars as pl
 
@@ -405,7 +405,7 @@ def financial_availability_issues(inputs: CanonicalPartitions) -> list[QualityIs
 
 
 def dividend_event_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
-    """检查分红数值、日期与证券边界；该函数作为稳定公开 API 或框架入口保留在模块级。
+    """检查实施分红送转的数值、PIT 可见性、日期与证券边界；该函数作为稳定公开 API 或框架入口保留在模块级。
 
     入参：Canonical 分区。返回值：质量问题。异常：帧错误按原类型传播。
     """
@@ -429,29 +429,103 @@ def dividend_event_issues(inputs: CanonicalPartitions) -> list[QualityIssue]:
         frame = _Support.compatible(inputs.get(dataset, ()))
         if frame is None:
             continue
-        negative = pl.any_horizontal(
+        invalid_number = pl.any_horizontal(
             *(
-                pl.col(field).is_not_null() & (pl.col(field) < 0)
+                pl.col(field).is_not_null()
+                & (~pl.col(field).is_finite() | (pl.col(field) < 0))
                 for field in nonnegative[dataset]
             )
         )
-        pay_date = pl.col("pay_date")
-        date_conflict = pay_date.is_not_null() & pl.any_horizontal(
-            *(
-                pl.col(earlier).is_not_null() & (pay_date < pl.col(earlier))
-                for earlier in (
-                    "announcement_date",
-                    "implementation_announcement_date",
-                    "record_date",
-                    "ex_date",
+        implemented = pl.col("status") == "实施"
+        cash_field = (
+            "cash_dividend_before_tax_per_share"
+            if dataset is DatasetKind.STOCK_DIVIDEND
+            else "cash_dividend_per_unit"
+        )
+        positive_cash = pl.col(cash_field).fill_null(0.0) > 0.0
+        positive_stock = (
+            pl.col("stock_dividend_per_share").fill_null(0.0) > 0.0
+            if dataset is DatasetKind.STOCK_DIVIDEND
+            else pl.lit(False)
+        )
+        record_close = (
+            pl.col("record_date")
+            .dt.combine(time(15, 0))
+            .dt.replace_time_zone("Asia/Shanghai")
+            .dt.convert_time_zone("UTC")
+        )
+        missing_implemented_dates = implemented & (positive_cash | positive_stock) & (
+            pl.col("implementation_announcement_date").is_null()
+            | pl.col("record_date").is_null()
+            | pl.col("ex_date").is_null()
+            | (positive_cash & pl.col("pay_date").is_null())
+            | (
+                positive_stock
+                & pl.col("stock_listing_date").is_null()
+                if dataset is DatasetKind.STOCK_DIVIDEND
+                else pl.lit(False)
+            )
+        )
+        implementation_not_pit = implemented & pl.col("record_date").is_not_null() & (
+            pl.col("available_at").is_null()
+            | (pl.col("available_at") > record_close)
+            | (
+                pl.col("implementation_announcement_date").is_not_null()
+                & (
+                    pl.col("implementation_announcement_date")
+                    > pl.col("record_date")
                 )
             )
         )
+        record_after_ex = (
+            pl.col("record_date").is_not_null()
+            & pl.col("ex_date").is_not_null()
+            & (pl.col("record_date") >= pl.col("ex_date"))
+        )
+        date_conflict = (
+            (
+                pl.col("implementation_announcement_date").is_not_null()
+                & pl.col("announcement_date").is_not_null()
+                & (
+                    pl.col("implementation_announcement_date")
+                    < pl.col("announcement_date")
+                )
+            )
+            | record_after_ex
+            | (
+                pl.col("pay_date").is_not_null()
+                & pl.col("ex_date").is_not_null()
+                & (pl.col("pay_date") < pl.col("ex_date"))
+            )
+        )
+        if dataset is DatasetKind.STOCK_DIVIDEND:
+            date_conflict = date_conflict | (
+                pl.col("stock_listing_date").is_not_null()
+                & pl.col("ex_date").is_not_null()
+                & (pl.col("stock_listing_date") < pl.col("ex_date"))
+            )
+            component_total = (
+                pl.col("stock_bonus_rate_per_share").fill_null(0.0)
+                + pl.col("stock_conversion_rate_per_share").fill_null(0.0)
+            )
+            inconsistent_stock_total = (
+                pl.col("stock_dividend_per_share").fill_null(0.0)
+                - component_total
+            ).abs() > 1e-12
+        else:
+            inconsistent_stock_total = pl.lit(False)
         invalid_suffix = ~pl.col("instrument_id").str.contains(
             r"^\d{6}\.(?:SH|SZ|BJ)$"
         )
         invalid = int(
-            frame.filter(negative | date_conflict | invalid_suffix)
+            frame.filter(
+                invalid_number
+                | missing_implemented_dates
+                | implementation_not_pit
+                | date_conflict
+                | inconsistent_stock_total
+                | invalid_suffix
+            )
             .select(pl.len())
             .collect()
             .item()

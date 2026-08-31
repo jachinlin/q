@@ -44,10 +44,13 @@ const study = {
     { name: 'tracking_error', value: 0.06, unit: 'ratio' },
     { name: 'failed_fill_rate', value: 0.02, unit: 'ratio' },
     { name: 'average_cash_weight', value: 0.15, unit: 'ratio' },
+    { name: 'average_receivable_weight', value: 0.01, unit: 'ratio' },
+    { name: 'gross_dividend_cash_fen', value: 123500, unit: 'fen' },
   ],
   artifacts: [
     { artifact_type: 'performance', relative_path: 'performance.parquet', content_hash: '1'.repeat(64), byte_count: 100, row_count: 1001, schema: {} },
     { artifact_type: 'quality_disclosure', relative_path: 'quality_disclosure.json', content_hash: '2'.repeat(64), byte_count: 80, row_count: null, schema: null },
+    { artifact_type: 'dividends', relative_path: 'dividends.parquet', content_hash: '3'.repeat(64), byte_count: 120, row_count: 2, schema: {} },
   ],
 }
 
@@ -71,6 +74,7 @@ const report = {
   exposure: [
     { trade_date: '2024-12-31', dimension: 'SECURITY', key: '510300.SH', weight: 0.85 },
     { trade_date: '2024-12-31', dimension: 'CASH', key: 'CASH', weight: 0.15 },
+    { trade_date: '2024-12-31', dimension: 'RECEIVABLE', key: 'DIVIDEND_RECEIVABLE', weight: 0.01 },
   ],
   attribution: [{ key: '510300.SH', pnl_fen: 420000, contribution_return: 0.042 }],
   execution: [{ side: 'BUY', reason_code: 'FILLED', order_count: 3, requested_quantity: 300, filled_quantity: 290, unfilled_quantity: 10, priced_requested_notional_fen: 300000, priced_filled_notional_fen: 290000, unpriced_order_count: 0 }],
@@ -82,6 +86,10 @@ const report = {
     undefined_metrics: {},
     unavailable_dimensions: {},
     attribution_method: 'DAILY_PNL',
+    dividend_cash_tax_treatment: 'PRE_TAX',
+    stock_distribution_rounding: 'FLOOR',
+    corporate_action_timing: 'RECORD_CLOSE_EX_OPEN_PAY_PRE_MATCH',
+      fund_split_source: 'FUND_ADJUSTMENT_FACTOR_NEAR_INTEGER_0.1_PERCENT_UNEXPLAINED_BY_FUND_DIVIDEND',
     warnings: ['成交价格为日频近似'],
   },
 }
@@ -124,7 +132,8 @@ describe('strategy study detail', () => {
     expect(wrapper.text()).toContain('正收益月份占比')
     expect(wrapper.text()).toContain('主要回撤事件')
     expect(wrapper.text()).toContain('252 日滚动风险幅度')
-    expect(wrapper.text()).toContain('证券与现金暴露')
+    expect(wrapper.text()).toContain('证券、现金与分红应收暴露')
+    expect(wrapper.text()).toContain('平均分红应收权重')
     expect(wrapper.text()).toContain('成交质量')
     expect(wrapper.text()).toContain('复制研究')
     expect(wrapper.text()).not.toContain('Run 比较')
@@ -159,6 +168,7 @@ describe('strategy study detail', () => {
     await vi.waitFor(() => expect(wrapper.text()).toContain('Manifest 产物登记'))
     expect(wrapper.text()).toContain('每日绩效')
     expect(wrapper.text()).toContain('质量披露')
+    expect(wrapper.text()).toContain('分红送转与基金拆分明细')
     expect(wrapper.text()).toContain('1001 行')
 
     const selects = wrapper.findAllComponents({ name: 'ElSelect' })

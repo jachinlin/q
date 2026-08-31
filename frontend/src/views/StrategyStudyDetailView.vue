@@ -61,6 +61,11 @@ const metricDefinitions: Record<string, MetricDefinition> = {
   notional_fill_rate: { label: '金额成交率', description: '已成交名义金额占可定价请求金额的比例。', group: '交易执行' },
   priced_order_coverage_rate: { label: '可定价订单覆盖率', description: '具备参考价格的订单比例。', group: '交易执行' },
   average_cash_weight: { label: '平均现金权重', description: '研究期每日现金权重的平均值。', group: '组合暴露' },
+  average_receivable_weight: { label: '平均分红应收权重', description: '已在除权日确认、尚未支付的税前现金分红占净资产的平均比例。', group: '组合暴露' },
+  gross_dividend_cash_fen: { label: '税前现金分红', description: '逐事件四舍五入到分后确认的税前现金分红总额。', group: '收益' },
+  stock_distribution_quantity: { label: '送转新增股数', description: '按登记数量乘总送转比例并向下取整后的新增股票数量。', group: '组合暴露' },
+  fund_split_quantity: { label: '基金拆分新增份额', description: '由基金复权因子变化确定、在生效会话开盘前增加的基金份额。', group: '组合暴露' },
+  discarded_fractional_stock_quantity: { label: '舍弃零碎份额', description: '送转或拆分按 FLOOR 规则舍弃的小数股份/份额总量。', group: '组合暴露' },
   max_position_weight: { label: '最大单一持仓权重', description: '研究期任一证券出现过的最大权重。', group: '组合暴露' },
   observations: { label: '有效观测数', description: '用于绩效分析的交易日观测数量。', group: '组合暴露' },
 }
@@ -79,6 +84,7 @@ const artifactLabels: Record<string, string> = {
   fills: '成交',
   holdings: '持仓',
   costs: '成本',
+  dividends: '分红送转与基金拆分明细',
   quality_disclosure: '质量披露',
   metrics: '指标',
   manifest: 'Manifest',
@@ -167,7 +173,7 @@ const artifactTypes = computed(() => {
 })
 const dimensionOptions = computed(() => {
   if (artifactType.value === 'attribution') return ['SECURITY', 'INDUSTRY', 'FACTOR', 'CASH', 'COST']
-  if (artifactType.value === 'exposure_summary') return ['SECURITY', 'CASH', 'INDUSTRY', 'FACTOR']
+  if (artifactType.value === 'exposure_summary') return ['SECURITY', 'CASH', 'RECEIVABLE', 'INDUSTRY', 'FACTOR']
   return []
 })
 const artifactRows = computed(() => artifact.data.value?.items ?? [])
@@ -302,13 +308,13 @@ const exposureOption = computed(() => {
   const values = new Map(rows.map((row) => [`${row.trade_date}|${row.key}`, row.weight]))
   return {
     tooltip,
-    legend: { ...topLegend, type: 'scroll', data: keys.map((key) => key === 'CASH' ? '现金' : key) },
+    legend: { ...topLegend, type: 'scroll', data: keys.map((key) => key === 'CASH' ? '现金' : key === 'DIVIDEND_RECEIVABLE' ? '分红应收' : key) },
     grid: { left: 48, right: 18, top: 58, bottom: 48, containLabel: true },
     dataZoom: [{ type: 'inside' }],
     xAxis: { ...axis, type: 'category', data: dates, boundaryGap: false },
     yAxis: { ...axis, type: 'value', max: 1, axisLabel: { color: '#66778D', formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
     series: keys.map((key) => ({
-      name: key === 'CASH' ? '现金' : key,
+      name: key === 'CASH' ? '现金' : key === 'DIVIDEND_RECEIVABLE' ? '分红应收' : key,
       type: 'line',
       stack: 'exposure',
       showSymbol: false,
@@ -450,7 +456,7 @@ async function deleteStudy() {
               </div>
 
               <div class="chart-grid">
-                <ChartCard title="证券与现金暴露" subtitle="每日权重堆叠，现金作为独立暴露展示" :empty="report.data.value.exposure.length === 0"><VChart class="study-chart" :option="exposureOption" autoresize data-chart="exposure" /></ChartCard>
+                <ChartCard title="证券、现金与分红应收暴露" subtitle="每日权重堆叠；除权已确认但未支付的分红作为独立应收暴露" :empty="report.data.value.exposure.length === 0"><VChart class="study-chart" :option="exposureOption" autoresize data-chart="exposure" /></ChartCard>
                 <ChartCard title="累计成本拖累" subtitle="毛净值与扣费后净值的累计差额" :empty="report.data.value.performance.length === 0"><VChart class="study-chart" :option="costOption" autoresize data-chart="cost" /></ChartCard>
                 <section class="panel execution-panel">
                   <header class="panel-heading"><div><h2>成交质量</h2><p>按买卖方向和原因代码汇总请求、成交及未成交数量</p></div></header>

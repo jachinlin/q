@@ -447,7 +447,7 @@ def test_dividend_quality_rejects_each_value_date_and_market_violation(
 
 def test_fund_dividend_quality_allows_negative_distributable_income() -> None:
     dataset = DatasetKind.FUND_DIVIDEND
-    observed_at = datetime(2026, 8, 13, tzinfo=UTC)
+    observed_at = datetime(2026, 8, 9, 6, tzinfo=UTC)
     row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
         "instrument_id": ["510300.SH"],
         "announcement_date": [date(2026, 8, 8)],
@@ -475,7 +475,7 @@ def test_fund_dividend_quality_allows_negative_distributable_income() -> None:
     assert dividend_event_issues({dataset: (frame,)}) == []
 
 
-def test_stock_dividend_quality_allows_b_share_record_after_ex_date() -> None:
+def test_stock_dividend_quality_rejects_record_after_ex_date() -> None:
     dataset = DatasetKind.STOCK_DIVIDEND
     observed_at = datetime(2026, 8, 13, tzinfo=UTC)
     row = dict.fromkeys(CANONICAL_SCHEMAS[dataset].columns.names()) | {
@@ -501,7 +501,8 @@ def test_stock_dividend_quality_allows_b_share_record_after_ex_date() -> None:
         strict=False,
     )
 
-    assert dividend_event_issues({dataset: (frame,)}) == []
+    (issue,) = dividend_event_issues({dataset: (frame,)})
+    assert issue.rule_id == "dividend_event"
 
 
 def test_cancelled_dividend_allows_missing_later_event_dates() -> None:

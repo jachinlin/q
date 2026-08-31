@@ -11,6 +11,11 @@ import polars as pl
 
 from quant_research.backtest.accounting import AccountSnapshot, PortfolioAccount
 from quant_research.backtest.calendar import TradingCalendar
+from quant_research.backtest.corporate_actions import (
+    CorporateAction,
+    CorporateActionCalendarMapper,
+    CorporateActionType,
+)
 from quant_research.backtest.execution import ExecutionModel
 from quant_research.backtest.models import AccountView as ExecutionAccountView
 from quant_research.backtest.models import ExecutionConfig, FillResult, MarketSlice
@@ -158,6 +163,23 @@ class BacktestMarketData(Protocol):
         ...
 
 
+class BacktestCorporateActionData(Protocol):
+    """定义回测区间权益事件的一次性预载端口。
+
+    入参：实现方接收研究自然日闭区间。返回值：按登记日 PIT 裁决的股票与基金
+    实施事件。异常：数据缺失、PIT 违规或读取失败时由实现方抛出明确异常。
+    """
+
+    def corporate_actions(
+        self, start: date, end: date
+    ) -> tuple[CorporateAction, ...]:
+        """一次读取研究区间全部分红送转事件。
+
+        入参：研究开始与结束日。返回值：事件 ID 唯一且稳定排序的不可变序列。
+        异常：范围、PIT 或 Canonical 读取不满足契约时抛出明确异常。
+        """
+        ...
+
 class DecisionDataFactory(Protocol):
     """为单个信号日创建只允许 PIT 截断读取的决策数据。
 
@@ -282,6 +304,7 @@ class BacktestEngine:
         self,
         market_data: BacktestMarketData,
         decision_data: DecisionDataFactory,
+        corporate_action_data: BacktestCorporateActionData,
         rulebook: MarketRuleBook,
         catalog_guard: CatalogGuard,
         *,
@@ -289,6 +312,7 @@ class BacktestEngine:
     ) -> None:
         self._market_data = market_data
         self._decision_data = decision_data
+        self._corporate_action_data = corporate_action_data
         self._rulebook = rulebook
         self._catalog_guard = catalog_guard
         self._execution = execution_model or ExecutionModel()
@@ -324,10 +348,17 @@ class BacktestEngine:
         benchmark_closes = self._market_data.benchmark_closes(
             request.benchmark, sessions
         )
+        corporate_actions = CorporateActionCalendarMapper.map(
+            self._corporate_action_data.corporate_actions(
+                request.start_date, request.end_date
+            ),
+            calendar,
+        )
         account = PortfolioAccount(request.initial_cash_fen, calendar)
         pending: tuple[OrderIntent, ...] = ()
         tables: dict[str, list[dict[str, object]]] = {
-            name: [] for name in ("orders", "fills", "holdings", "costs", "nav")
+            name: []
+            for name in ("orders", "fills", "holdings", "costs", "nav", "dividends")
         }
         snapshots: list[AccountSnapshot] = []
         final: AccountSnapshot | None = None
@@ -335,6 +366,7 @@ class BacktestEngine:
             if cancellation.is_cancelled():
                 raise BacktestCancelled(f"backtest cancelled after {index} sessions")
             account.begin_session(trade_date)
+            account.apply_corporate_actions_before_open(corporate_actions)
             execution_view = account.execution_view()
             market_instruments = tuple(
                 sorted(
@@ -363,6 +395,7 @@ class BacktestEngine:
             )
             account.apply(execution)
             final = account.mark_to_market(trade_date, closes)
+            account.lock_corporate_actions_after_close(corporate_actions)
             snapshots.append(final)
             self._append_execution(
                 tables, execution, request.execution_config.slippage_bps
@@ -402,6 +435,7 @@ class BacktestEngine:
             progress.update(index + 1, len(sessions), trade_date)
         if final is None:
             raise RuntimeError("backtest produced no account snapshot")
+        self._append_dividends(tables, account)
         self._catalog_guard.assert_unchanged(request.catalog_hash)
         signals = self._signals(strategy)
         return BacktestResult(
@@ -521,6 +555,7 @@ class BacktestEngine:
             {
                 "trade_date": snapshot.trade_date,
                 "cash_fen": snapshot.cash_fen,
+                "dividend_receivable_fen": snapshot.dividend_receivable_fen,
                 "long_market_value_fen": snapshot.total_market_value_fen,
                 "short_market_value_fen": 0,
                 "accrued_fees_fen": 0,
@@ -529,6 +564,92 @@ class BacktestEngine:
                 "benchmark_close": benchmark_close,
             }
         )
+
+    @staticmethod
+    def _append_dividends(
+        tables: dict[str, list[dict[str, object]]], account: PortfolioAccount
+    ) -> None:
+        """把账户权益审计记录转换为固定 Run 表。
+
+        入参：回测表与已完成账户。返回值：无。异常：账户记录字段非法时由
+        ``RunTableSchema`` 在规范化阶段报告。
+        """
+        for record in account.dividend_records:
+            action = record.action
+            event = action.event
+            tables["dividends"].append(
+                {
+                    "event_id": event.event_id,
+                    "instrument_id": event.instrument_id.canonical(),
+                    "instrument_type": event.instrument_type.value,
+                    "action_type": event.action_type.value,
+                    "source_revision": event.source_revision,
+                    "announcement_date": event.announcement_date,
+                    "implementation_announcement_date": (
+                        event.implementation_announcement_date
+                    ),
+                    "record_date": event.record_date,
+                    "mapped_record_date": action.mapped_record_date,
+                    "ex_date": event.ex_date,
+                    "mapped_ex_date": action.mapped_ex_date,
+                    "pay_date": event.pay_date,
+                    "mapped_pay_date": action.mapped_pay_date,
+                    "stock_listing_date": event.stock_listing_date,
+                    "mapped_stock_listing_date": action.mapped_stock_listing_date,
+                    "entitlement_quantity": record.entitlement_quantity,
+                    "cash_per_share_or_unit": float(event.cash_per_share_or_unit),
+                    "gross_cash_fen": record.gross_cash_fen,
+                    "receivable_fen": record.receivable_fen,
+                    "paid_fen": record.paid_fen,
+                    "stock_dividend_per_share": float(
+                        event.stock_dividend_per_share
+                    ),
+                    "previous_adjustment_factor": (
+                        float(event.previous_adjustment_factor)
+                        if event.previous_adjustment_factor is not None
+                        else None
+                    ),
+                    "adjustment_factor": (
+                        float(event.adjustment_factor)
+                        if event.adjustment_factor is not None
+                        else None
+                    ),
+                    "raw_adjustment_factor_ratio": (
+                        float(
+                            event.adjustment_factor
+                            / event.previous_adjustment_factor
+                        )
+                        if event.adjustment_factor is not None
+                        and event.previous_adjustment_factor is not None
+                        else None
+                    ),
+                    "split_inference_relative_error": (
+                        float(
+                            abs(
+                                event.adjustment_factor
+                                / event.previous_adjustment_factor
+                                / event.stock_dividend_per_share
+                                - 1
+                            )
+                        )
+                        if event.action_type is CorporateActionType.FUND_SPLIT
+                        and event.adjustment_factor is not None
+                        and event.previous_adjustment_factor is not None
+                        else None
+                    ),
+                    "split_inference_method": (
+                        "ADJUSTMENT_FACTOR_NEAR_INTEGER_0.1_PERCENT"
+                        if event.action_type is CorporateActionType.FUND_SPLIT
+                        else None
+                    ),
+                    "distributed_quantity": record.distributed_quantity,
+                    "discarded_fractional_quantity": float(
+                        record.discarded_fractional_quantity
+                    ),
+                    "cash_tax_treatment": "PRE_TAX",
+                    "stock_rounding_treatment": "FLOOR",
+                }
+            )
 
     @staticmethod
     def _signals(strategy: Strategy) -> pl.DataFrame | list[dict[str, object]]:
@@ -580,6 +701,7 @@ class BacktestEngine:
 
 __all__ = [
     "BacktestCancelled",
+    "BacktestCorporateActionData",
     "BacktestEngine",
     "BacktestRequest",
     "BacktestResult",

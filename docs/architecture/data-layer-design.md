@@ -394,7 +394,7 @@ Canonical 文件成功写出不代表数据一定正确。VALIDATE 会先按 SQL
 - 股票和基金行情代码是否存在于相应 Master；历史 Master 缺口保留为非阻断警告；
 - 标记为 `pit_usable=true` 的财务公告日期和可用时间是否合理；
 - 三张报表是否为 `report_type=1`、报告期是否为合法季末；
-- 分红支付数值是否非负、支付日是否早于关键事件，以及场内证券代码是否规范；会计口径的可分配收益允许为负，B 股登记日与除权日不强制套用 A 股顺序；
+- 分红送转数值是否有限且非负；正金额或正比例的已实施事件是否具备登记、除权及相应支付/上市日期；实施信息是否在登记日收盘前可见；登记日必须早于除权日，支付/上市日不得早于除权日；股票送转总比例是否等于送股与转增分项之和；会计口径的可分配收益允许为负；
 - 行业进入、退出状态是否自洽。
 
 两个命令的作用不同：
@@ -595,12 +595,26 @@ stock_balance_sheets(as_of, ...)
 stock_cash_flow_statements(as_of, ...)
 stock_dividends(as_of, ...)
 fund_dividends(as_of, ...)
+stock_dividend_events(start, end, ...)
+fund_dividend_events(start, end, ...)
+fund_split_events(start, end, ...)
 stock_suspensions(...)
 stock_risk_warnings(...)
 industry_catalog()
 industry_memberships_on_dates(...)
 trade_calendar(...)
 ```
+
+`stock_dividend_events` 与 `fund_dividend_events` 以登记日为区间键，只保留登记日收盘前
+已经可见的最新“实施” revision。股票现金使用税前每股字段，基金现金使用每份现金；
+送转使用 `stock_dividend_per_share` 总比例，分项只做质量交叉校验。
+
+`fund_split_events` 不比较行情价格。它从权威 `fund_adjustment_factor` 的相邻因子增长
+识别份额事件，并排除同一生效日已由最新实施 `fund_dividend` 解释的现金除息变化。
+供应商因子可能把拆分与微小净值调整合并（例如真实 1:5 事件表现为 `1.0 → 5.002`），
+因此当前最小契约只接受相对误差不超过 0.1% 的唯一近整数倍率，输出原始因子倍率、
+规范拆分倍率和相对误差供产物审计。超过边界的非整数折算失败关闭，要求新增权威基金
+公司行动比例数据，不能按价格跳变猜测；因子下降也不静默解释为合并或反向拆分。
 
 接口返回真正以 Parquet 扫描为源的 Polars `LazyFrame`。可以把它理解为“尚未执行的查询
 计划”：Repository 只组合列投影、日期与证券过滤、PIT 修订排序和行业状态选择，调用

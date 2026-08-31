@@ -198,6 +198,45 @@ class ResearchDataRepository(Protocol):
         """读取场内基金分红。入参：观察日和基金。返回值：最新可见修订。异常：门禁失败时抛出。"""
         ...
 
+    def stock_dividend_events(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取最新实施股票权益事件。
+
+        入参：登记日闭区间与可选股票。返回值：登记日收盘前可见的最新 revision。
+        异常：范围、门禁或读取错误保持实现方语义。
+        """
+        ...
+
+    def fund_dividend_events(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取最新实施基金权益事件。
+
+        入参：登记日闭区间与可选基金。返回值：登记日收盘前可见的最新 revision。
+        异常：范围、门禁或读取错误保持实现方语义。
+        """
+        ...
+
+    def fund_split_events(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取基金份额拆分事件。
+
+        入参：生效日闭区间与可选基金。返回值：由权威复权因子变化且未被现金
+        分红解释的拆分事件。异常：范围、门禁或读取错误保持实现方语义。
+        """
+        ...
+
     def industry_catalog(self) -> pl.LazyFrame:
         """读取行业目录。入参：无。返回值：目录帧。异常：门禁失败时抛出。"""
         ...
@@ -719,6 +758,185 @@ class CanonicalResearchRepository:
             as_of,
             instruments,
             ("instrument_id", "announcement_date", "base_date"),
+        )
+
+    def stock_dividend_events(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取研究区间股票权益事件并按登记日 PIT 选择最新实施 revision。
+
+        入参：登记日闭区间与可选证券范围。返回值：按登记日、证券和业务键稳定
+        排序的实施事件。异常：区间非法、目录门禁或可信文件读取失败时传播。
+        """
+        return self._dividend_events(
+            DatasetKind.STOCK_DIVIDEND,
+            start,
+            end,
+            instruments,
+            ("instrument_id", "report_period", "announcement_date"),
+        )
+
+    def fund_dividend_events(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """读取研究区间基金权益事件并按登记日 PIT 选择最新实施 revision。
+
+        入参：登记日闭区间与可选证券范围。返回值：按登记日、证券和业务键稳定
+        排序的实施事件。异常：区间非法、目录门禁或可信文件读取失败时传播。
+        """
+        return self._dividend_events(
+            DatasetKind.FUND_DIVIDEND,
+            start,
+            end,
+            instruments,
+            ("instrument_id", "announcement_date", "base_date"),
+        )
+
+    def fund_split_events(
+        self,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None = None,
+    ) -> pl.LazyFrame:
+        """从基金复权因子确定性推导研究区间份额拆分。
+
+        入参：拆分生效日闭区间与可选基金范围。返回值：当前因子相对上一因子的
+        增长比例；与已实施基金现金分红同一除息日的因子变化会被排除。该方法不读取
+        或比较价格。异常：范围非法、因子非法或目录读取失败时传播。
+        """
+        if start > end:
+            raise ValueError("start must not follow end")
+        factors = (
+            self._scan(DatasetKind.FUND_ADJUSTMENT_FACTOR)
+            .filter(
+                self._instrument_scope(instruments)
+                & pl.col("pit_usable")
+                & pl.col("available_at").is_not_null()
+                & (pl.col("trade_date") <= end)
+                & (pl.col("available_at") <= self._shanghai_day_end_utc(end))
+            )
+            .sort("instrument_id", "trade_date")
+            .with_columns(
+                pl.col("adjustment_factor")
+                .shift(1)
+                .over("instrument_id")
+                .alias("previous_adjustment_factor")
+            )
+            .filter(pl.col("trade_date").is_between(start, end, closed="both"))
+            .with_columns(
+                (
+                    pl.col("adjustment_factor")
+                    / pl.col("previous_adjustment_factor")
+                ).alias("raw_adjustment_factor_ratio")
+            )
+            .filter(
+                pl.col("previous_adjustment_factor").is_not_null()
+                & pl.col("previous_adjustment_factor").is_finite()
+                & (pl.col("previous_adjustment_factor") > 0)
+                & pl.col("adjustment_factor").is_finite()
+                & (pl.col("adjustment_factor") > 0)
+                & (pl.col("raw_adjustment_factor_ratio") > 1.5)
+            )
+            .with_columns(
+                pl.col("raw_adjustment_factor_ratio")
+                .round(0)
+                .alias("split_ratio")
+            )
+            .with_columns(
+                (
+                    pl.col("raw_adjustment_factor_ratio")
+                    / pl.col("split_ratio")
+                    - 1.0
+                )
+                .abs()
+                .alias("split_inference_relative_error")
+            )
+        )
+        cash_business_key = ("instrument_id", "announcement_date", "base_date")
+        cash_record_close = (
+            pl.col("record_date")
+            .dt.combine(time(15, 0))
+            .dt.replace_time_zone("Asia/Shanghai")
+            .dt.convert_time_zone("UTC")
+        )
+        cash_ex_dates = (
+            self._scan(DatasetKind.FUND_DIVIDEND)
+            .filter(
+                self._instrument_scope(instruments)
+                & pl.col("pit_usable")
+                & (pl.col("status") == "实施")
+                & pl.col("record_date").is_not_null()
+                & pl.col("available_at").is_not_null()
+                & (pl.col("available_at") <= cash_record_close)
+                & pl.col("ex_date").is_between(start, end, closed="both")
+            )
+            .sort([*cash_business_key, "available_at", "revision"])
+            .unique(
+                subset=list(cash_business_key),
+                keep="last",
+                maintain_order=True,
+            )
+            .filter(pl.col("cash_dividend_per_unit").fill_null(0.0) > 0.0)
+            .select("instrument_id", pl.col("ex_date").alias("trade_date"))
+            .unique()
+        )
+        return (
+            factors.join(
+                cash_ex_dates,
+                on=["instrument_id", "trade_date"],
+                how="anti",
+            )
+            .select(
+                "instrument_id",
+                pl.col("trade_date").alias("ex_date"),
+                "previous_adjustment_factor",
+                "adjustment_factor",
+                "raw_adjustment_factor_ratio",
+                "split_ratio",
+                "split_inference_relative_error",
+                "available_at",
+            )
+            .sort("ex_date", "instrument_id")
+        )
+
+    def _dividend_events(
+        self,
+        dataset: DatasetKind,
+        start: date,
+        end: date,
+        instruments: Sequence[InstrumentId] | None,
+        business_key: tuple[str, ...],
+    ) -> pl.LazyFrame:
+        if start > end:
+            raise ValueError("start must not follow end")
+        definition = CANONICAL_SCHEMAS[dataset]
+        record_close = (
+            pl.col("record_date")
+            .dt.combine(time(15, 0))
+            .dt.replace_time_zone("Asia/Shanghai")
+            .dt.convert_time_zone("UTC")
+        )
+        return (
+            self._scan(dataset)
+            .select(list(definition.columns))
+            .filter(
+                self._instrument_scope(instruments)
+                & pl.col("pit_usable")
+                & (pl.col("status") == "实施")
+                & pl.col("record_date").is_between(start, end, closed="both")
+                & pl.col("available_at").is_not_null()
+                & (pl.col("available_at") <= record_close)
+            )
+            .sort([*business_key, "available_at", "revision"])
+            .unique(subset=list(business_key), keep="last", maintain_order=True)
+            .cast(definition.columns)
+            .sort(["record_date", "instrument_id", *business_key[1:], "revision"])
         )
 
     def _latest_visible_revisions(

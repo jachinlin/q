@@ -57,12 +57,45 @@ RUN_PARQUET_SCHEMAS: dict[str, dict[str, object]] = {
     "nav": {
         "trade_date": pl.Date,
         "cash_fen": pl.Int64,
+        "dividend_receivable_fen": pl.Int64,
         "long_market_value_fen": pl.Int64,
         "short_market_value_fen": pl.Int64,
         "accrued_fees_fen": pl.Int64,
         "margin_used_fen": pl.Int64,
         "equity_fen": pl.Int64,
         "benchmark_close": pl.Float64,
+    },
+    "dividends": {
+        "event_id": pl.String,
+        "instrument_id": pl.String,
+        "instrument_type": pl.String,
+        "action_type": pl.String,
+        "source_revision": pl.Int64,
+        "announcement_date": pl.Date,
+        "implementation_announcement_date": pl.Date,
+        "record_date": pl.Date,
+        "mapped_record_date": pl.Date,
+        "ex_date": pl.Date,
+        "mapped_ex_date": pl.Date,
+        "pay_date": pl.Date,
+        "mapped_pay_date": pl.Date,
+        "stock_listing_date": pl.Date,
+        "mapped_stock_listing_date": pl.Date,
+        "entitlement_quantity": pl.Int64,
+        "cash_per_share_or_unit": pl.Float64,
+        "gross_cash_fen": pl.Int64,
+        "receivable_fen": pl.Int64,
+        "paid_fen": pl.Int64,
+        "stock_dividend_per_share": pl.Float64,
+        "previous_adjustment_factor": pl.Float64,
+        "adjustment_factor": pl.Float64,
+        "raw_adjustment_factor_ratio": pl.Float64,
+        "split_inference_relative_error": pl.Float64,
+        "split_inference_method": pl.String,
+        "distributed_quantity": pl.Int64,
+        "discarded_fractional_quantity": pl.Float64,
+        "cash_tax_treatment": pl.String,
+        "stock_rounding_treatment": pl.String,
     },
     "performance": {
         "trade_date": pl.Date,
@@ -151,6 +184,7 @@ RUN_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "holdings": ("trade_date", "instrument_id"),
     "costs": ("trade_date", "result_index"),
     "nav": ("trade_date",),
+    "dividends": ("event_id",),
     "performance": ("trade_date",),
     "rolling_performance": ("trade_date",),
     "drawdown_episodes": ("episode_index",),
@@ -160,7 +194,15 @@ RUN_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "exposure_summary": ("trade_date", "dimension", "key"),
     "attribution": ("trade_date", "dimension", "key"),
 }
-_BACKTEST_TABLES = ("signals", "orders", "fills", "holdings", "costs", "nav")
+_BACKTEST_TABLES = (
+    "signals",
+    "orders",
+    "fills",
+    "holdings",
+    "costs",
+    "nav",
+    "dividends",
+)
 
 
 class RunTableSchema:
@@ -185,9 +227,9 @@ class RunTableSchema:
     def canonical_backtest_tables(
         tables: Mapping[str, Sequence[Mapping[str, object]] | pl.DataFrame],
     ) -> dict[str, pl.DataFrame]:
-        """规范化回测引擎负责的六张原始表。
+        """规范化回测引擎负责的七张原始表。
 
-        入参：回测内存行。返回值：六张固定 Schema DataFrame。
+        入参：回测内存行。返回值：七张固定 Schema DataFrame。
         异常：缺列、类型或唯一键不符合契约时抛出 ``ValueError``。
         """
         return RunTableSchema._canonical(tables, _BACKTEST_TABLES)
