@@ -17,6 +17,8 @@ describe('dashboard shell contract', () => {
       '/market',
       '/notebook',
       '/settings',
+      '/strategies',
+      '/strategies/:strategyId',
       '/strategy-studies',
       '/strategy-studies/:strategyStudyId',
       '/strategy-studies/new',
@@ -42,7 +44,7 @@ describe('dashboard shell contract', () => {
     const shellView = { template: '<div />' }
     const shellRouter = createRouter({
       history: createMemoryHistory(),
-      routes: ['/', '/market', '/data', '/strategy-studies', '/factor-studies', '/tasks', '/notebook', '/settings'].map(
+      routes: ['/', '/market', '/data', '/strategies', '/strategy-studies', '/factor-studies', '/tasks', '/notebook', '/settings'].map(
         (path) => ({ path, component: shellView }),
       ),
     })
@@ -56,6 +58,7 @@ describe('dashboard shell contract', () => {
     expect(notebook.attributes('target')).toBeUndefined()
     expect(notebook.text()).not.toContain('↗')
     expect(wrapper.get('a[href="/settings"]').text()).toContain('设置')
+    expect(wrapper.get('a[href="/strategies"]').text()).toContain('策略库')
   })
 
   it('never turns missing values into zero', () => {

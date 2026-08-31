@@ -1,6 +1,6 @@
 # 包结构与依赖方向
 
-文档状态：当前有效设计　·　日期：2026-08-22
+文档状态：当前有效设计　·　日期：2026-08-31
 
 本文定义 `quant_research` 的包职责和禁止依赖。数据契约以
 [数据层设计](data-layer-design.md)为准；策略研究与回测契约以
@@ -16,7 +16,7 @@ src/quant_research/
 ├── signals/            # 三类判别式信号值对象
 ├── risk/ costs/        # 截面策略 Risk/Cost 能力
 ├── portfolio/          # 组合构建、约束、权重到订单规划
-├── strategies/         # Strategy 契约、五模块装配、三个内置策略
+├── strategies/         # Strategy 契约、五模块装配、按 ID 隔离的内置策略包
 ├── backtest/           # T/T+1 引擎、撮合、账户、规则和不可变产物
 ├── analytics/          # 绩效、成交质量与归因
 ├── strategy_studies/   # 单次策略研究模型、配置和四阶段状态机
@@ -44,6 +44,10 @@ bootstrap → cli / dashboard → application → capabilities
 - `strategy_studies` 只拥有单次策略研究生命周期；不存在子 Run 或比较语义。
 - `factor_studies` 拥有独立因子研究生命周期和统计校正，不依赖策略研究。
 - `strategies` 生成整数股数 `OrderIntent`；回测引擎不消费目标权重，也不生成信号。
+- 每个可注册策略位于与 `strategy_id` 同名的子包，包含 `strategy.py`、`__init__.py`
+  和 Dashboard 使用的 `README.md`。共享契约、组件和截面装配仍位于包根。
+- 策略包可选 `references/` 只保存源码仓库资料，不进入 wheel、sdist 或 HTTP 文件接口；
+  README 随 Python 包发布，注册表在组合阶段读取并校验其标题与摘要。
 - `bootstrap` 负责把 Repository、Registry、规则簿、Worker 和接口适配器组装起来。
 
 架构门禁由 `tests/unit/test_architecture_boundaries.py` 执行；新增包或移动职责时必须同步更新该测试。

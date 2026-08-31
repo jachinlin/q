@@ -141,3 +141,17 @@ def test_data_layer_package_layout() -> None:
     )
     assert (_PACKAGE_ROOT / "infrastructure" / "tushare").is_dir()
     assert not (_PACKAGE_ROOT / "infrastructure" / "baostock").exists()
+
+
+def test_builtin_strategies_use_independent_documented_packages() -> None:
+    """锁定每个内置策略的独立代码与结构性说明目录。"""
+    strategy_root = _PACKAGE_ROOT / "strategies"
+    for strategy_id in ("dual_ma_trend", "etf_rotation", "stock_multifactor"):
+        package = strategy_root / strategy_id
+        assert (package / "__init__.py").is_file()
+        assert (package / "strategy.py").is_file()
+        assert (package / "README.md").is_file()
+    assert not any(
+        (strategy_root / name).exists()
+        for name in ("dual_ma.py", "etf_rotation.py", "multifactor.py")
+    )

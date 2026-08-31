@@ -10,11 +10,12 @@ const nav = [
   ['/', '总览', '01'],
   ['/market', '市场全景', '02'],
   ['/data', '数据中心', '03'],
-  ['/strategy-studies', '策略研究', '04'],
-  ['/factor-studies', '因子研究', '05'],
-  ['/tasks', '运行中心', '06'],
-  ['/notebook', 'Notebook', '07'],
-  ['/settings', '设置', '08'],
+  ['/strategies', '策略库', '04'],
+  ['/strategy-studies', '策略研究', '05'],
+  ['/factor-studies', '因子研究', '06'],
+  ['/tasks', '运行中心', '07'],
+  ['/notebook', 'Notebook', '08'],
+  ['/settings', '设置', '09'],
 ]
 </script>
 

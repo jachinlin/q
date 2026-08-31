@@ -21,6 +21,7 @@ const definition = {
 async function mountComposer(path = '/strategy-studies/new') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: '/strategies/:strategyId', component: { template: '<div />' } },
     { path: '/strategy-studies', component: { template: '<div />' } },
     { path: '/strategy-studies/new', component: StrategyStudyComposerView },
     { path: '/strategy-studies/:strategyStudyId', component: { template: '<div />' } },
@@ -43,7 +44,11 @@ describe('strategy study composer', () => {
     apiGet.mockReset()
     apiPost.mockReset()
     apiGet.mockImplementation((path: string) => {
-      if (path === '/api/v1/strategies') return Promise.resolve({ strategies: ['dual_ma_trend', 'etf_rotation', 'stock_multifactor'], components: {}, component_schemas: {}, capability_rules: [] })
+      if (path === '/api/v1/strategies') return Promise.resolve({ strategies: [
+        { strategy_id: 'dual_ma_trend', display_name: '双均线趋势', summary: '双均线摘要' },
+        { strategy_id: 'etf_rotation', display_name: 'ETF 轮动', summary: 'ETF 摘要' },
+        { strategy_id: 'stock_multifactor', display_name: '股票多因子', summary: '多因子摘要' },
+      ], components: {}, component_schemas: {}, capability_rules: [] })
       if (path === '/api/v1/factor-studies/catalog') return Promise.resolve({ factors: [{ factor_id: 'book_to_price_mrq' }], universes: [], corrections: [], industry_policies: [], label_kinds: [] })
       return Promise.resolve({ definition })
     })
@@ -88,9 +93,12 @@ describe('strategy study composer', () => {
 
   it('resets strategy parameters and enforces a risk model for mean variance', async () => {
     const { wrapper } = await mountComposer()
+    expect(wrapper.get('[data-strategy-profile]').text()).toContain('双均线摘要')
     selectByField(wrapper, 'strategy-id').vm.$emit('update:modelValue', 'etf_rotation')
     await flushPromises()
     expect(wrapper.find('[data-strategy-form="etf_rotation"]').exists()).toBe(true)
+    expect(wrapper.get('[data-strategy-profile]').text()).toContain('ETF 摘要')
+    expect(wrapper.get('[data-strategy-profile] a').attributes('href')).toBe('/strategies/etf_rotation')
     selectByField(wrapper, 'construction-model').vm.$emit('change', 'mean_variance')
     await flushPromises()
     await wrapper.get('input[value="yaml"]').setValue()

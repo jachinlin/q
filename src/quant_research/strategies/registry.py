@@ -1,11 +1,91 @@
-"""提供无接口层依赖的确定性策略插件注册表。"""
+"""提供无接口层依赖的确定性策略插件注册表与说明资源契约。"""
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from importlib import resources
 
 from quant_research.data.contracts import JsonValue
 from quant_research.strategies.base import Strategy
 
 StrategyFactory = Callable[[Mapping[str, JsonValue]], Strategy]
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyProfile:
+    """描述策略在目录与 Dashboard 中展示的结构性说明。
+
+    入参：策略 ID、展示名称、摘要和完整 Markdown。
+    返回值：冻结且可确定性序列化的策略说明。
+    异常：字段为空、Markdown 标题或摘要不满足约定时抛出值错误。
+    """
+
+    strategy_id: str
+    display_name: str
+    summary: str
+    documentation_markdown: str
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.strategy_id, "strategy_id"),
+            (self.display_name, "display_name"),
+            (self.summary, "summary"),
+            (self.documentation_markdown, "documentation_markdown"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be nonempty")
+
+    @classmethod
+    def from_package(cls, *, strategy_id: str, package: str) -> "StrategyProfile":
+        """从可信策略包的 README 创建说明。
+
+        入参：非空策略 ID 和可导入的策略包名。
+        返回值：由一级标题、首段摘要和全文构造的冻结说明。
+        异常：包或 README 不存在、编码错误、标题或摘要缺失时传播明确错误。
+        """
+        markdown = (
+            resources.files(package)
+            .joinpath("README.md")
+            .read_text(encoding="utf-8")
+            .replace("\r\n", "\n")
+        )
+        return cls.from_markdown(strategy_id=strategy_id, markdown=markdown)
+
+    @classmethod
+    def from_markdown(
+        cls, *, strategy_id: str, markdown: str
+    ) -> "StrategyProfile":
+        """从统一模板 Markdown 创建策略说明。
+
+        入参：策略 ID 与 UTF-8 解码后的 Markdown。返回值：解析出的冻结说明。异常：标题或首段摘要缺失时抛出值错误。
+        """
+        lines = markdown.splitlines()
+        first = next(
+            (index for index, line in enumerate(lines) if line.strip()), None
+        )
+        if first is None or not lines[first].startswith("# "):
+            raise ValueError(f"strategy README must start with H1: {strategy_id}")
+        display_name = lines[first][2:].strip()
+        summary_lines: list[str] = []
+        for line in lines[first + 1 :]:
+            stripped = line.strip()
+            if not stripped:
+                if summary_lines:
+                    break
+                continue
+            if stripped.startswith("#"):
+                break
+            summary_lines.append(stripped)
+        summary = " ".join(summary_lines)
+        if not display_name or not summary:
+            raise ValueError(
+                f"strategy README must provide title and summary: {strategy_id}"
+            )
+        return cls(
+            strategy_id=strategy_id,
+            display_name=display_name,
+            summary=summary,
+            documentation_markdown=markdown,
+        )
 
 
 class StrategyRegistry:
@@ -16,19 +96,22 @@ class StrategyRegistry:
 
     def __init__(self) -> None:
         self._factories: dict[str, StrategyFactory] = {}
+        self._profiles: dict[str, StrategyProfile] = {}
 
-    def register(self, factory: StrategyFactory, *, strategy_id: str) -> None:
+    def register(self, factory: StrategyFactory, *, profile: StrategyProfile) -> None:
         """登记一个策略工厂；重复标识立即失败。
 
-        入参：可调用工厂和非空策略 ID。返回值：无。异常：输入非法或 ID 重复时抛出类型或值错误。
+        入参：可调用工厂和同一策略的结构性说明。返回值：无。异常：输入非法或 ID 重复时抛出类型或值错误。
         """
         if not callable(factory):
             raise TypeError("factory must be callable")
-        if not isinstance(strategy_id, str) or not strategy_id.strip():
-            raise ValueError("strategy_id must be nonempty")
+        if not isinstance(profile, StrategyProfile):
+            raise TypeError("profile must be a StrategyProfile")
+        strategy_id = profile.strategy_id
         if strategy_id in self._factories:
             raise ValueError(f"strategy already registered: {strategy_id}")
         self._factories[strategy_id] = factory
+        self._profiles[strategy_id] = profile
 
     def build(self, strategy_id: str, params: Mapping[str, JsonValue]) -> Strategy:
         """按标识和严格参数构造新策略实例。
@@ -58,6 +141,23 @@ class StrategyRegistry:
         """
         return tuple(sorted(self._factories))
 
+    def profiles(self) -> tuple[StrategyProfile, ...]:
+        """返回按策略 ID 稳定排序的全部结构性说明。
+
+        入参：无。返回值：冻结说明元组。异常：无。
+        """
+        return tuple(self._profiles[item] for item in sorted(self._profiles))
+
+    def profile(self, strategy_id: str) -> StrategyProfile:
+        """读取一个已注册策略的结构性说明。
+
+        入参：策略 ID。返回值：对应冻结说明。异常：策略未知时抛出值错误。
+        """
+        try:
+            return self._profiles[strategy_id]
+        except KeyError as error:
+            raise ValueError(f"unknown strategy: {strategy_id}") from error
+
     @classmethod
     def builtins(
         cls, *, commission_bps: float, commission_minimum_fen: int
@@ -69,12 +169,15 @@ class StrategyRegistry:
         异常：费率非法、内置 ID 重复或策略构造失败时抛出值错误。
         """
         from quant_research.portfolio.rebalance import RebalancePlanner
-        from quant_research.strategies.dual_ma import DualMAConfig, DualMATrendStrategy
+        from quant_research.strategies.dual_ma_trend import (
+            DualMAConfig,
+            DualMATrendStrategy,
+        )
         from quant_research.strategies.etf_rotation import (
             EtfRotationConfig,
             EtfRotationStrategy,
         )
-        from quant_research.strategies.multifactor import (
+        from quant_research.strategies.stock_multifactor import (
             MultifactorConfig,
             MultifactorStrategy,
         )
@@ -87,7 +190,10 @@ class StrategyRegistry:
                 commission_bps=commission_bps,
                 commission_minimum_fen=commission_minimum_fen,
             ),
-            strategy_id="stock_multifactor",
+            profile=StrategyProfile.from_package(
+                strategy_id="stock_multifactor",
+                package="quant_research.strategies.stock_multifactor",
+            ),
         )
         registry.register(
             lambda value: EtfRotationStrategy(
@@ -96,12 +202,21 @@ class StrategyRegistry:
                 commission_bps=commission_bps,
                 commission_minimum_fen=commission_minimum_fen,
             ),
-            strategy_id="etf_rotation",
+            profile=StrategyProfile.from_package(
+                strategy_id="etf_rotation",
+                package="quant_research.strategies.etf_rotation",
+            ),
         )
         registry.register(
             lambda value: DualMATrendStrategy(
                 DualMAConfig.from_mapping(value), RebalancePlanner()
             ),
-            strategy_id="dual_ma_trend",
+            profile=StrategyProfile.from_package(
+                strategy_id="dual_ma_trend",
+                package="quant_research.strategies.dual_ma_trend",
+            ),
         )
         return registry
+
+
+__all__ = ["StrategyFactory", "StrategyProfile", "StrategyRegistry"]

@@ -13,9 +13,15 @@ from quant_research.strategies.components import (
     StrategyPipelineConfig,
 )
 from quant_research.strategies.cross_sectional import CrossSectionalPortfolioAssembler
-from quant_research.strategies.dual_ma import DualMAConfig, DualMATrendStrategy
-from quant_research.strategies.multifactor import MultifactorConfig, MultifactorStrategy
-from quant_research.strategies.registry import StrategyRegistry
+from quant_research.strategies.dual_ma_trend import (
+    DualMAConfig,
+    DualMATrendStrategy,
+)
+from quant_research.strategies.registry import StrategyProfile, StrategyRegistry
+from quant_research.strategies.stock_multifactor import (
+    MultifactorConfig,
+    MultifactorStrategy,
+)
 
 
 class _Data:
@@ -130,12 +136,21 @@ def test_reference_prices_fall_back_to_account_mark_during_suspension() -> None:
 
 
 def test_registry_and_five_module_catalog_are_stable() -> None:
-    assert StrategyRegistry.builtins(
+    registry = StrategyRegistry.builtins(
         commission_bps=3.0, commission_minimum_fen=500
-    ).strategy_ids() == (
+    )
+    assert registry.strategy_ids() == (
         "dual_ma_trend",
         "etf_rotation",
         "stock_multifactor",
+    )
+    assert [item.display_name for item in registry.profiles()] == [
+        "双均线趋势",
+        "ETF 轮动",
+        "股票多因子",
+    ]
+    assert registry.profile("dual_ma_trend").documentation_markdown.startswith(
+        "# 双均线趋势\n"
     )
     assert StrategyComponentCatalog().list() == {
         "alpha": ("multi_factor_composite", "single_factor"),
@@ -144,6 +159,19 @@ def test_registry_and_five_module_catalog_are_stable() -> None:
         "cost": ("fixed_bps", "linear_impact", "sqrt_impact"),
         "risk": ("none", "sample_cov", "shrinkage"),
     }
+
+
+def test_strategy_profile_requires_markdown_title_and_summary() -> None:
+    """结构性说明必须同时包含一级标题和摘要。"""
+    with pytest.raises(ValueError, match="must start with H1"):
+        StrategyProfile.from_markdown(
+            strategy_id="invalid", markdown="没有一级标题\n\n摘要"
+        )
+    with pytest.raises(ValueError, match="title and summary"):
+        StrategyProfile.from_markdown(strategy_id="invalid", markdown="# 标题\n")
+
+    with pytest.raises(ValueError, match="unknown strategy"):
+        StrategyRegistry().profile("missing")
 
 
 def test_pipeline_rejects_mean_variance_without_non_degenerate_risk() -> None:

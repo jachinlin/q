@@ -153,6 +153,7 @@ HTTP：
 
 ```text
 GET    /api/v1/strategies
+GET    /api/v1/strategies/{strategy_id}
 POST   /api/v1/strategy-studies/validate
 POST   /api/v1/strategy-studies
 GET    /api/v1/strategy-studies
@@ -162,11 +163,16 @@ GET    /api/v1/strategy-studies/{study_id}/report
 GET    /api/v1/strategy-studies/{study_id}/artifacts/{artifact_type}
 ```
 
+策略目录返回按 `strategy_id` 稳定排序的展示名称与摘要；单项接口返回策略包
+`README.md` 的完整 Markdown。README 是 Dashboard 结构性说明，不参与冻结配置、数据身份或
+回测结果身份。未知策略返回 404，接口不接受路径，也不暴露策略包中的 `references/`。
+
 `report` 从可信最终目录重新校验 Manifest、哈希、Schema、主键和确定性排序后，一次返回完整、
 类型化的主图数据。它不使用产物分页，因此研究区间不会在第 1,000 行截断。通用产物接口只
 用于证据浏览，表格支持分页和声明过的 `dimension` 过滤，JSON 产物保持对象结构。
 
-Dashboard 提供策略研究列表、创建页和单项详情。详情采用“研究判断优先”布局：先展示六项
+Dashboard 提供策略库、策略研究列表、创建页和单项详情。策略库列出三个内置策略并安全渲染
+各策略 README；创建页在策略选择后展示摘要和完整说明入口。详情采用“研究判断优先”布局：先展示六项
 核心指标和完整策略/毛值/基准净值，再展示回撤、252 日滚动指标、月度热力图、年度收益、
 证券/现金暴露、成本拖累、成交质量、证券归因和主要回撤事件。完整指标按收益、风险、基准
 相对表现、交易执行和组合暴露分组，使用中文名称并解释口径。冻结配置、执行身份、质量披露、

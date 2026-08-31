@@ -14,7 +14,26 @@ from quant_research.dashboard.strategy_studies import StrategyStudyRoutes
 
 class _Service:
     def strategies(self) -> dict[str, object]:
-        return {"strategies": ["dual_ma_trend"], "components": {}}
+        return {
+            "strategies": [
+                {
+                    "strategy_id": "dual_ma_trend",
+                    "display_name": "双均线趋势",
+                    "summary": "趋势策略",
+                }
+            ],
+            "components": {},
+        }
+
+    def strategy(self, strategy_id: str) -> dict[str, object]:
+        if strategy_id != "dual_ma_trend":
+            raise ValueError("unknown strategy")
+        return {
+            "strategy_id": strategy_id,
+            "display_name": "双均线趋势",
+            "summary": "趋势策略",
+            "documentation_markdown": "# 双均线趋势\n",
+        }
 
     def validate(self, yaml_text: str) -> dict[str, object]:
         return {"config_hash": "a" * 64, "normalized": {"name": yaml_text}}
@@ -73,7 +92,13 @@ def _client() -> TestClient:
 def test_final_routes_validate_submit_query_delete_and_artifacts() -> None:
     """新 API 应覆盖计划中的全部单项操作。"""
     client = _client()
-    assert client.get("/api/v1/strategies").status_code == 200
+    catalog = client.get("/api/v1/strategies")
+    assert catalog.status_code == 200
+    assert catalog.json()["strategies"][0]["display_name"] == "双均线趋势"
+    detail = client.get("/api/v1/strategies/dual_ma_trend")
+    assert detail.status_code == 200
+    assert detail.json()["documentation_markdown"].startswith("# 双均线趋势")
+    assert client.get("/api/v1/strategies/missing").status_code == 404
     assert client.post("/api/v1/strategy-studies/validate", json={"yaml": "study"}).status_code == 200
     submitted = client.post("/api/v1/strategy-studies", json={"yaml": "study"})
     assert submitted.status_code == 202

@@ -264,7 +264,7 @@ src/quant_research/
 ├── factor_studies/    # 独立因子研究
 ├── universe/          # 股票池
 ├── portfolio/         # 组合构建
-├── strategies/        # 策略
+├── strategies/        # 共享契约及带 README 的独立策略包
 ├── backtest/          # 回测
 ├── analytics/         # 分析与归因
 ├── strategy_studies/  # 单次策略研究

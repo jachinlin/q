@@ -313,8 +313,18 @@ export type StrategyStudyValidation = {
   normalized: StrategyStudyDefinition
 }
 
+export type StrategyProfileSummary = {
+  strategy_id: string
+  display_name: string
+  summary: string
+}
+
+export type StrategyProfile = StrategyProfileSummary & {
+  documentation_markdown: string
+}
+
 export type StrategyCatalog = {
-  strategies: string[]
+  strategies: StrategyProfileSummary[]
   components: Record<string, string[]>
   component_schemas: Record<string, Array<{ model_id: string; params_schema: Record<string, unknown> }>>
   capability_rules: Array<Record<string, unknown>>

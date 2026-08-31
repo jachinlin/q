@@ -49,6 +49,12 @@ notebook = [
 [project.scripts]
 qlab = "quant_research.bootstrap.cli:main"
 
+[tool.hatch.build]
+exclude = [
+    "/src/quant_research/strategies/*/references",
+    "/src/quant_research/strategies/*/references/**",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/quant_research"]
 

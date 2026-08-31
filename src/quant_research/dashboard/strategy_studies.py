@@ -11,7 +11,7 @@ from typing import cast
 from uuid import uuid4
 
 import polars as pl
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -92,12 +92,32 @@ class StrategyStudyDashboardService:
 
         details = self._components.describe()
         return {
-            "strategies": list(self._strategies.strategy_ids()),
+            "strategies": [
+                {
+                    "strategy_id": item.strategy_id,
+                    "display_name": item.display_name,
+                    "summary": item.summary,
+                }
+                for item in self._strategies.profiles()
+            ],
             "components": {
                 key: list(values) for key, values in self._components.list().items()
             },
             "component_schemas": details["components"],
             "capability_rules": details["capability_rules"],
+        }
+
+    def strategy(self, strategy_id: str) -> dict[str, JsonValue]:
+        """读取单一策略的完整说明。
+
+        入参：已登记策略 ID。返回值：展示名称、摘要和 Markdown。异常：策略未知时抛出值错误。
+        """
+        item = self._strategies.profile(strategy_id)
+        return {
+            "strategy_id": item.strategy_id,
+            "display_name": item.display_name,
+            "summary": item.summary,
+            "documentation_markdown": item.documentation_markdown,
         }
 
     @staticmethod
@@ -402,6 +422,13 @@ class StrategyStudyRoutes:
         @app.get("/api/v1/strategies")
         def strategies() -> dict[str, JsonValue]:
             return service.strategies()
+
+        @app.get("/api/v1/strategies/{strategy_id}")
+        def strategy(strategy_id: str) -> dict[str, JsonValue]:
+            try:
+                return service.strategy(strategy_id)
+            except ValueError as error:
+                raise HTTPException(status_code=404) from error
 
         @app.post("/api/v1/strategy-studies/validate")
         def validate(body: YamlBody) -> dict[str, JsonValue]:

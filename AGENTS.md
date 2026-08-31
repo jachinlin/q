@@ -27,7 +27,7 @@ src/quant_research/
 ├── factor_studies/    # 独立因子研究模型和分析契约
 ├── universe/          # PIT 股票池
 ├── portfolio/         # 组合构建
-├── strategies/        # 策略定义
+├── strategies/        # 共享策略契约及按 strategy_id 隔离的内置策略包
 ├── backtest/          # 回测与执行
 ├── analytics/         # 绩效和归因
 ├── strategy_studies/  # 策略研究配置、身份和四阶段状态机
@@ -164,6 +164,11 @@ ingested_at
 - 因子产物在运行内绑定 `catalog_hash`、股票池哈希、配置和代码哈希。
 - 因子研究、策略信号和策略回测是不同产物，不得用其中一个替代另一个。
 - 策略使用唯一 `strategy_id`。
+- 每个可注册策略必须位于与 `strategy_id` 同名的独立子包，包含
+  `strategy.py`、`__init__.py` 和按统一章节编写的 `README.md`；可选论文与研究资料放入
+  `references/`，仅保留在源码仓库，不进入安装包或 Dashboard 文件接口。
+- 策略 README 的一级标题、首段摘要和全文由注册表作为结构性说明读取；说明变化不改变
+  研究配置、数据身份或回测结果身份。
 - 交易规则只使用 `configs/rules/a_share.yaml`，其内容哈希进入策略研究身份。
 - 策略研究 YAML 日期必须是明确的 `YYYY-MM-DD`，不接受 selector 或格式版本字段。
 - 每个 `StrategyStudy` 只提交、执行和产出一次，不存在子 Run、baseline、研究标记或比较。
