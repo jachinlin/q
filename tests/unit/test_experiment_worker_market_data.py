@@ -309,8 +309,27 @@ def _scoped_source(
     }
     source._stock_ids = (InstrumentId.parse("600000.SH"),)
     source._fund_ids = (InstrumentId.parse("510300.SH"),)
+    source._instruments = pl.DataFrame(tuple(source._metadata.values())).sort(
+        "instrument_id"
+    )
     source._no_limit_through = None
     return source
+
+
+def test_stock_universe_builds_reason_codes_with_vectorized_event_joins() -> None:
+    """股票池应通过事件连接生成稳定风险原因与可用标记。"""
+    source = _scoped_source(_ScopedCalendarRepository())
+
+    universe = source.universe(date(2024, 1, 15))
+
+    assert universe.rows(named=True) == [
+        {
+            "instrument_id": "600000.SH",
+            "as_of": date(2024, 1, 15),
+            "eligible": False,
+            "reason_codes": ["RISK_WARNING"],
+        }
+    ]
 
 
 def test_market_slice_preserves_null_volume_for_suspended_placeholder() -> None:

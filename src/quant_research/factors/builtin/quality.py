@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time
 from threading import Lock
-from typing import Protocol, cast
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -295,45 +295,37 @@ class _PitFinancialSupport:
         schema = pl.Schema(schema_fields)
         if frame.is_empty():
             return pl.DataFrame(schema=schema)
-        rows = frame.sort(
-            "instrument_id", "available_at", "revision", "report_period"
-        ).to_dicts()
-        transitions: list[dict[str, object]] = []
-        index = 0
-        while index < len(rows):
-            instrument = cast(str, rows[index]["instrument_id"])
-            active_by_period: dict[date, dict[str, object]] = {}
-            active_identity: tuple[date, int, datetime] | None = None
-            while index < len(rows) and rows[index]["instrument_id"] == instrument:
-                event_at = cast(datetime, rows[index]["available_at"])
-                while (
-                    index < len(rows)
-                    and rows[index]["instrument_id"] == instrument
-                    and rows[index]["available_at"] == event_at
-                ):
-                    event = rows[index]
-                    active_by_period[cast(date, event["report_period"])] = event
-                    index += 1
-                latest_period = max(active_by_period)
-                active = active_by_period[latest_period]
-                identity = (
-                    latest_period,
-                    cast(int, active["revision"]),
-                    cast(datetime, active["available_at"]),
-                )
-                if identity != active_identity:
-                    transition: dict[str, object] = {
-                        "instrument_id": instrument,
-                        "_event_at": event_at,
-                        "_active_available_at": cast(
-                            datetime, active["available_at"]
-                        ),
-                    }
-                    transition.update({field: active[field] for field in fields})
-                    transitions.append(transition)
-                    active_identity = identity
-        return pl.DataFrame(transitions, schema=schema).sort(
-            "instrument_id", "_event_at"
+        keys = ["instrument_id", "available_at", "report_period"]
+        return (
+            frame.sort(
+                "instrument_id", "available_at", "report_period", "revision"
+            )
+            .group_by(keys, maintain_order=True)
+            .agg(
+                pl.col("revision").last(),
+                *(pl.col(field).last() for field in fields),
+            )
+            .with_columns(
+                pl.col("report_period")
+                .max()
+                .over("instrument_id", "available_at")
+                .alias("_event_latest_period")
+            )
+            .with_columns(
+                pl.col("_event_latest_period")
+                .cum_max()
+                .over("instrument_id")
+                .alias("_active_report_period")
+            )
+            .filter(pl.col("report_period") == pl.col("_active_report_period"))
+            .select(
+                "instrument_id",
+                pl.col("available_at").alias("_event_at"),
+                *fields,
+                pl.col("available_at").alias("_active_available_at"),
+            )
+            .cast(schema)
+            .sort("instrument_id", "_event_at")
         )
 
     @staticmethod
@@ -393,10 +385,3 @@ class _PitFinancialSupport:
             .any()
         ).item():
             raise ValueError("duplicate financial revision key")
-        for value in frame["available_at"].to_list():
-            if not isinstance(value, datetime) or value.tzinfo is None:
-                raise TypeError("financial available_at must be timezone-aware")
-        for field in fields:
-            for value in frame[field].to_list():
-                if value is not None and not isinstance(value, float):
-                    raise TypeError(f"financial data {field} must contain Float64 values")

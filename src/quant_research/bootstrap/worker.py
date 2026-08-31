@@ -563,32 +563,44 @@ class CanonicalStrategyStudyData:
         异常：
             证券状态无法按 PIT 读取时传播 Canonical 数据异常。
         """
-        suspended = set(
-            self._repository.stock_suspensions(
-                signal_date, signal_date, self._stock_ids
-            ).collect()["instrument_id"].to_list()
+        suspended = self._repository.stock_suspensions(
+            signal_date, signal_date, self._stock_ids
+        ).select("instrument_id").unique().with_columns(
+            pl.lit(True).alias("_is_suspended")
         )
-        warned = set(
-            self._repository.stock_risk_warnings(
-                signal_date, signal_date, self._stock_ids
-            ).collect()["instrument_id"].to_list()
+        warned = self._repository.stock_risk_warnings(
+            signal_date, signal_date, self._stock_ids
+        ).select("instrument_id").unique().with_columns(
+            pl.lit(True).alias("_is_warned")
         )
-        rows: list[dict[str, object]] = []
-        for instrument in self._stock_ids:
-            reasons: list[str] = []
-            if instrument.canonical() in warned:
-                reasons.append("RISK_WARNING")
-            if instrument.canonical() in suspended:
-                reasons.append("SUSPENDED")
-            rows.append(
-                {
-                    "instrument_id": instrument.canonical(),
-                    "as_of": signal_date,
-                    "eligible": not reasons,
-                    "reason_codes": reasons,
-                }
+        return (
+            self._instruments.lazy()
+            .filter(pl.col("instrument_type") == "STOCK")
+            .select("instrument_id")
+            .join(warned, on="instrument_id", how="left")
+            .join(suspended, on="instrument_id", how="left")
+            .with_columns(
+                pl.col("_is_warned").fill_null(False),
+                pl.col("_is_suspended").fill_null(False),
             )
-        return pl.DataFrame(rows).sort("instrument_id")
+            .select(
+                "instrument_id",
+                pl.lit(signal_date, dtype=pl.Date).alias("as_of"),
+                (~(pl.col("_is_warned") | pl.col("_is_suspended"))).alias(
+                    "eligible"
+                ),
+                pl.when(pl.col("_is_warned") & pl.col("_is_suspended"))
+                .then(pl.lit(["RISK_WARNING", "SUSPENDED"]))
+                .when(pl.col("_is_warned"))
+                .then(pl.lit(["RISK_WARNING"]))
+                .when(pl.col("_is_suspended"))
+                .then(pl.lit(["SUSPENDED"]))
+                .otherwise(pl.lit([], dtype=pl.List(pl.String)))
+                .alias("reason_codes"),
+            )
+            .sort("instrument_id")
+            .collect()
+        )
 
     def factor_values(
         self,
