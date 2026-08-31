@@ -144,8 +144,17 @@ class BacktestMarketData(Protocol):
         """
         ...
 
-    def benchmark_close(self, benchmark: IndexId, trade_date: date) -> float:
-        """读取基准。入参：指数和交易日。返回值：收盘价。异常：缺失时抛出。"""
+    def benchmark_closes(
+        self,
+        benchmark: IndexId,
+        sessions: Sequence[date],
+    ) -> Mapping[date, float]:
+        """一次读取完整回测区间的基准收盘价。
+
+        入参：benchmark：基准指数；sessions：稳定排序且无重复的回测交易日。
+        返回值：覆盖全部交易日的不可变日期到收盘价映射。
+        异常：日期范围、覆盖、唯一性或价格非法时抛出 ``ValueError``。
+        """
         ...
 
 
@@ -174,7 +183,7 @@ class DecisionDataFactory(Protocol):
 
 
 class CatalogGuard(Protocol):
-    """在阶段和交易日边界校验提交时捕获的数据目录身份。
+    """在回测边界校验提交时捕获的数据目录身份。
 
     入参：
         实现方接收 Run 提交时冻结的 catalog_hash。
@@ -312,6 +321,9 @@ class BacktestEngine:
         sessions = calendar.sessions(request.start_date, request.end_date)
         if not sessions:
             raise ValueError("backtest has no trading sessions")
+        benchmark_closes = self._market_data.benchmark_closes(
+            request.benchmark, sessions
+        )
         account = PortfolioAccount(request.initial_cash_fen, calendar)
         pending: tuple[OrderIntent, ...] = ()
         tables: dict[str, list[dict[str, object]]] = {
@@ -320,7 +332,6 @@ class BacktestEngine:
         snapshots: list[AccountSnapshot] = []
         final: AccountSnapshot | None = None
         for index, trade_date in enumerate(sessions):
-            self._catalog_guard.assert_unchanged(request.catalog_hash)
             if cancellation.is_cancelled():
                 raise BacktestCancelled(f"backtest cancelled after {index} sessions")
             account.begin_session(trade_date)
@@ -337,9 +348,10 @@ class BacktestEngine:
                 raise ValueError("market slice is bound to a different date")
             market = bound.market
             closes = self._closes(market)
-            benchmark_close = self._market_data.benchmark_close(
-                request.benchmark, trade_date
-            )
+            try:
+                benchmark_close = benchmark_closes[trade_date]
+            except KeyError as error:
+                raise ValueError("benchmark close is missing for a session") from error
             execution = self._execution.execute(
                 pending,
                 market,
@@ -388,9 +400,9 @@ class BacktestEngine:
                 pending = tuple(strategy.on_event(context))
                 self._append_orders(tables, context, pending)
             progress.update(index + 1, len(sessions), trade_date)
-            self._catalog_guard.assert_unchanged(request.catalog_hash)
         if final is None:
             raise RuntimeError("backtest produced no account snapshot")
+        self._catalog_guard.assert_unchanged(request.catalog_hash)
         signals = self._signals(strategy)
         return BacktestResult(
             request.strategy_study_id,

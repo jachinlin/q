@@ -4,10 +4,11 @@ from datetime import date
 from typing import Any, cast
 
 import polars as pl
+import pytest
 
 from quant_research.bootstrap.worker import CanonicalStrategyStudyData
 from quant_research.domain.enums import DatasetKind
-from quant_research.domain.identifiers import InstrumentId
+from quant_research.domain.identifiers import IndexId, InstrumentId
 from quant_research.strategies.base import StrategySpec
 
 
@@ -286,6 +287,34 @@ class _ScopedCalendarRepository:
         ).lazy()
 
 
+class _BenchmarkRepository:
+    """记录基准区间查询并返回指定测试行。"""
+
+    def __init__(self, rows: list[tuple[str, date, float | None]]) -> None:
+        self._frame = pl.DataFrame(
+            rows,
+            schema={
+                "index_id": pl.String,
+                "trade_date": pl.Date,
+                "close": pl.Float64,
+            },
+            orient="row",
+        )
+        self.calls: list[tuple[tuple[str, ...], date, date]] = []
+
+    def index_bars(
+        self,
+        indexes: tuple[IndexId, ...],
+        start: date,
+        end: date,
+    ) -> pl.LazyFrame:
+        """返回测试基准行并记录唯一整段查询。"""
+        self.calls.append(
+            (tuple(item.canonical() for item in indexes), start, end)
+        )
+        return self._frame.lazy()
+
+
 def _scoped_source(
     repository: _ScopedCalendarRepository,
 ) -> CanonicalStrategyStudyData:
@@ -330,6 +359,100 @@ def test_stock_universe_builds_reason_codes_with_vectorized_event_joins() -> Non
             "reason_codes": ["RISK_WARNING"],
         }
     ]
+
+
+def test_benchmark_closes_loads_the_complete_session_range_once() -> None:
+    """基准曲线应按完整区间读取一次并返回只读日期映射。"""
+    sessions = (date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4))
+    repository = _BenchmarkRepository(
+        [
+            ("000300.SH", sessions[0], 100.0),
+            ("000300.SH", sessions[1], 101.0),
+            ("000300.SH", sessions[2], 102.0),
+            ("000300.SH", date(2024, 1, 5), 103.0),
+            ("000905.SH", sessions[0], 200.0),
+        ]
+    )
+    source = object.__new__(CanonicalStrategyStudyData)
+    source._repository = cast(Any, repository)
+
+    closes = source.benchmark_closes(IndexId.parse("000300.SH"), sessions)
+
+    assert dict(closes) == {
+        sessions[0]: 100.0,
+        sessions[1]: 101.0,
+        sessions[2]: 102.0,
+    }
+    assert repository.calls == [(("000300.SH",), sessions[0], sessions[-1])]
+    with pytest.raises(TypeError):
+        closes[sessions[0]] = 99.0  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (
+            [("000300.SH", date(2024, 1, 2), 100.0)],
+            "do not cover every session",
+        ),
+        (
+            [
+                ("000300.SH", date(2024, 1, 2), 100.0),
+                ("000300.SH", date(2024, 1, 2), 101.0),
+                ("000300.SH", date(2024, 1, 3), 102.0),
+            ],
+            "duplicate trade dates",
+        ),
+        (
+            [
+                ("000300.SH", date(2024, 1, 2), 100.0),
+                ("000300.SH", date(2024, 1, 3), float("nan")),
+            ],
+            "finite and positive",
+        ),
+        (
+            [
+                ("000300.SH", date(2024, 1, 2), 100.0),
+                ("000300.SH", date(2024, 1, 3), 0.0),
+            ],
+            "finite and positive",
+        ),
+    ],
+)
+def test_benchmark_closes_rejects_invalid_rows(
+    rows: list[tuple[str, date, float | None]], message: str
+) -> None:
+    """基准缺失、重复及非法价格必须明确失败。"""
+    source = object.__new__(CanonicalStrategyStudyData)
+    source._repository = cast(Any, _BenchmarkRepository(rows))
+
+    with pytest.raises(ValueError, match=message):
+        source.benchmark_closes(
+            IndexId.parse("000300.SH"),
+            (date(2024, 1, 2), date(2024, 1, 3)),
+        )
+
+
+@pytest.mark.parametrize(
+    "sessions",
+    [
+        (),
+        (date(2024, 1, 3), date(2024, 1, 2)),
+        (date(2024, 1, 2), date(2024, 1, 2)),
+    ],
+)
+def test_benchmark_closes_rejects_invalid_session_ranges(
+    sessions: tuple[date, ...],
+) -> None:
+    """空、倒序或重复交易日范围不得触发 Repository 查询。"""
+    repository = _BenchmarkRepository([])
+    source = object.__new__(CanonicalStrategyStudyData)
+    source._repository = cast(Any, repository)
+
+    with pytest.raises(ValueError, match="nonempty, sorted and unique"):
+        source.benchmark_closes(IndexId.parse("000300.SH"), sessions)
+
+    assert repository.calls == []
 
 
 def test_market_slice_preserves_null_volume_for_suspended_placeholder() -> None:

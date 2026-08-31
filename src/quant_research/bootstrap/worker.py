@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from math import isfinite
 from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 from zoneinfo import ZoneInfo
 
@@ -513,17 +514,49 @@ class CanonicalStrategyStudyData:
         )
         return BoundMarketSlice(MarketSlice(trade_date, frame))
 
-    def benchmark_close(self, benchmark: IndexId, trade_date: date) -> float:
-        """读取基准。入参：指数和交易日。返回值：收盘价。异常：缺失或非法时抛出。"""
-        frame = self._repository.index_bars(
-            (benchmark,), trade_date, trade_date
-        ).collect()
-        if frame.height != 1 or frame["close"][0] is None:
-            raise ValueError("benchmark close is missing from index bars")
-        close = float(frame["close"][0])
-        if not isfinite(close) or close <= 0:
-            raise ValueError("benchmark close must be finite and positive")
-        return close
+    def benchmark_closes(
+        self,
+        benchmark: IndexId,
+        sessions: Sequence[date],
+    ) -> Mapping[date, float]:
+        """一次读取并验证完整回测区间的基准收盘价。
+
+        入参：benchmark：基准指数；sessions：稳定排序且无重复的回测交易日。
+        返回值：覆盖全部交易日的只读日期到收盘价映射。
+        异常：交易日顺序、日期覆盖、唯一性或价格非法时抛出 ``ValueError``。
+        """
+        requested = tuple(sessions)
+        if not requested or requested != tuple(sorted(set(requested))):
+            raise ValueError("benchmark sessions must be nonempty, sorted and unique")
+        identifiers = [benchmark.canonical()]
+        frame = (
+            self._repository.index_bars(
+                (benchmark,), requested[0], requested[-1]
+            )
+            .filter(
+                pl.col("index_id").is_in(identifiers)
+                & pl.col("trade_date").is_in(list(requested))
+            )
+            .select("trade_date", "close")
+            .collect()
+        )
+        if frame.select(pl.col("trade_date").is_duplicated().any()).item():
+            raise ValueError("benchmark closes contain duplicate trade dates")
+        actual_dates = set(frame["trade_date"].to_list())
+        if actual_dates != set(requested):
+            raise ValueError("benchmark closes do not cover every session")
+        if frame.filter(
+            pl.col("close").is_null()
+            | ~pl.col("close").is_finite()
+            | (pl.col("close") <= 0.0)
+        ).height:
+            raise ValueError("benchmark closes must be finite and positive")
+        return MappingProxyType(
+            {
+                trade_date: float(close)
+                for trade_date, close in frame.sort("trade_date").iter_rows()
+            }
+        )
 
     def bind(self, signal_date: date) -> DecisionData:
         """创建无法接受其他 as-of 日期的决策数据视图。

@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from quant_research.backtest.calendar import TradingCalendar
 from quant_research.backtest.engine import (
@@ -30,6 +31,7 @@ class _MarketData:
 
     def __init__(self, *, missing_execution_bar: bool = False) -> None:
         self.scopes: list[tuple[str, ...]] = []
+        self.benchmark_requests: list[tuple[date, ...]] = []
         self._missing_execution_bar = missing_execution_bar
 
     def calendar(
@@ -66,11 +68,14 @@ class _MarketData:
             frame = _market_frame(trade_date, suspended=False)
         return BoundMarketSlice(MarketSlice(trade_date, frame))
 
-    def benchmark_close(self, benchmark: IndexId, trade_date: date) -> float:
-        """返回固定基准收盘价。"""
+    def benchmark_closes(
+        self, benchmark: IndexId, sessions: Sequence[date]
+    ) -> dict[date, float]:
+        """一次返回完整回测区间的固定基准收盘价。"""
         assert benchmark == IndexId.parse("000300.SH")
-        del trade_date
-        return 100.0
+        requested = tuple(sessions)
+        self.benchmark_requests.append(requested)
+        return {trade_date: 100.0 for trade_date in requested}
 
 
 class _BoundDecisionData:
@@ -110,9 +115,16 @@ class _BuyOnceStrategy:
 class _Guard:
     """断言研究目录身份保持不变。"""
 
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        self.calls = 0
+        self._fail_on_call = fail_on_call
+
     def assert_unchanged(self, catalog_hash: str) -> None:
         """校验固定测试哈希。"""
         assert catalog_hash == _CATALOG_HASH
+        self.calls += 1
+        if self.calls == self._fail_on_call:
+            raise RuntimeError("catalog drift")
 
 
 class _Progress:
@@ -135,10 +147,15 @@ class _Cancellation:
 def test_engine_scopes_market_to_pending_orders_then_positions() -> None:
     """空仓首日不读行情，新买入和停牌持仓都只读取目标证券。"""
     market = _MarketData()
+    guard = _Guard()
 
-    result = _run(market)
+    result = _run(market, guard=guard)
 
     assert market.scopes == [(), ("600000.SH",), ("600000.SH",)]
+    assert market.benchmark_requests == [
+        (date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4))
+    ]
+    assert guard.calls == 2
     assert result.tables["fills"].select(
         "trade_date", "instrument_id", "reason_code"
     ).to_dicts() == [
@@ -174,7 +191,17 @@ def test_missing_scoped_market_row_remains_no_market_data_rejection() -> None:
     assert result.tables["holdings"].is_empty()
 
 
-def _run(market: _MarketData) -> BacktestResult:
+def test_engine_rejects_catalog_drift_at_the_final_run_boundary() -> None:
+    """结束边界发现目录漂移时不得返回回测结果。"""
+    guard = _Guard(fail_on_call=2)
+
+    with pytest.raises(RuntimeError, match="catalog drift"):
+        _run(_MarketData(), guard=guard)
+
+    assert guard.calls == 2
+
+
+def _run(market: _MarketData, *, guard: _Guard | None = None) -> BacktestResult:
     rulebook = AShareRuleBook.load(
         Path(__file__).resolve().parents[3] / "configs" / "rules" / "a_share.yaml"
     )
@@ -182,7 +209,7 @@ def _run(market: _MarketData) -> BacktestResult:
         market,
         _DecisionDataFactory(),  # type: ignore[arg-type]
         rulebook,
-        _Guard(),
+        guard or _Guard(),
     ).run(
         BacktestRequest(
             "scope-test-study",
