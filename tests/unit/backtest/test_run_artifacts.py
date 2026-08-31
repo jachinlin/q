@@ -20,6 +20,7 @@ def test_publisher_writes_and_rechecks_the_complete_artifact_set(
                 {
                     "trade_date": [date(2024, 1, 2)],
                     "cash_fen": [1_000_000],
+                    "dividend_receivable_fen": [0],
                     "long_market_value_fen": [0],
                     "short_market_value_fen": [0],
                     "accrued_fees_fen": [0],
@@ -49,6 +50,7 @@ def test_publisher_writes_and_rechecks_the_complete_artifact_set(
         "holdings",
         "costs",
         "nav",
+        "dividends",
         "performance",
         "rolling_performance",
         "drawdown_episodes",

@@ -67,6 +67,7 @@ def calculate_attribution(
     holdings: pl.DataFrame,
     fills: pl.DataFrame,
     costs: pl.DataFrame,
+    dividends: pl.DataFrame | None = None,
 ) -> AttributionResult:
     """计算归因；该函数作为稳定公开 API 或框架入口保留在模块级。
 
@@ -75,17 +76,26 @@ def calculate_attribution(
         holdings：逐交易日、逐证券的收盘持仓快照。
         fills：回测撮合产生的逐笔成交及拒绝记录。
         costs：按交易日汇总的佣金、印花税和其他交易成本。
+        dividends：分红送转与基金拆分审计明细；缺省表示无公司行动。
     返回值：
         返回计算归因后的归因（``AttributionResult``）。
     异常：
         ``ValueError``：输入、状态转换或完整性证据违反上述业务契约时抛出。
     Calculate bounded cash-exact attribution without invented classifications.
     """
-    performance = calculate_performance(nav, holdings, fills, costs)
+    dividend_rows = dividends if dividends is not None else pl.DataFrame()
+    performance = calculate_performance(
+        nav, holdings, fills, costs, dividend_rows
+    )
     _AttributionSupport._validate_holdings(nav, holdings)
 
     nav_by_date = {
-        row["trade_date"]: (row["equity_fen"], row["long_market_value_fen"])
+        row["trade_date"]: (
+            row["equity_fen"],
+            row["long_market_value_fen"],
+            row["cash_fen"],
+            row["dividend_receivable_fen"],
+        )
         for row in nav.iter_rows(named=True)
     }
     holdings_by_date: dict[date, dict[str, int]] = {
@@ -108,6 +118,23 @@ def calculate_attribution(
             buy_sell[1] += row["gross_value_fen"]
         else:
             raise ValueError("fill side must be BUY or SELL")
+    dividend_accruals: dict[date, dict[str, int]] = {}
+    if {
+        "mapped_ex_date",
+        "instrument_id",
+        "action_type",
+        "gross_cash_fen",
+    }.issubset(dividend_rows.columns):
+        for row in dividend_rows.filter(
+            pl.col("action_type") == "CASH_DIVIDEND"
+        ).iter_rows(named=True):
+            accruals = dividend_accruals.setdefault(
+                row["mapped_ex_date"], {}
+            )
+            instrument = row["instrument_id"]
+            accruals[instrument] = (
+                accruals.get(instrument, 0) + row["gross_cash_fen"]
+            )
 
     exposure_rows: list[dict[str, object]] = []
     attribution_rows: list[dict[str, object]] = []
@@ -120,11 +147,14 @@ def calculate_attribution(
             strict=True,
         )
     )
-    for trade_date, (current_nav, _) in nav_by_date.items():
+    for trade_date, (current_nav, _, cash_fen, receivable_fen) in nav_by_date.items():
         current_values = holdings_by_date[trade_date]
         denominator = previous_nav if previous_nav is not None else current_nav
         instruments = (
-            set(previous_values) | set(current_values) | set(flows.get(trade_date, {}))
+            set(previous_values)
+            | set(current_values)
+            | set(flows.get(trade_date, {}))
+            | set(dividend_accruals.get(trade_date, {}))
         )
         security_pnl: dict[str, int] = {}
         for instrument in instruments:
@@ -134,6 +164,7 @@ def calculate_attribution(
                 - previous_values.get(instrument, 0)
                 + sell
                 - buy
+                + dividend_accruals.get(trade_date, {}).get(instrument, 0)
             )
             if contribution != 0:
                 security_pnl[instrument] = contribution
@@ -172,6 +203,8 @@ def calculate_attribution(
             trade_date,
             current_values,
             current_nav,
+            cash_fen,
+            receivable_fen,
         )
         previous_values = current_values
         previous_nav = current_nav
@@ -281,6 +314,8 @@ class _AttributionSupport:
         trade_date: date,
         current_values: dict[str, int],
         nav_fen: int,
+        cash_fen: int,
+        receivable_fen: int,
     ) -> None:
         ranked = sorted(
             current_values.items(), key=lambda item: (-abs(item[1]), item[0])
@@ -310,7 +345,13 @@ class _AttributionSupport:
                     "trade_date": trade_date,
                     "dimension": "CASH",
                     "key": "CASH",
-                    "weight": 1.0 - total_weight,
+                    "weight": cash_fen / nav_fen,
+                },
+                {
+                    "trade_date": trade_date,
+                    "dimension": "RECEIVABLE",
+                    "key": "DIVIDEND_RECEIVABLE",
+                    "weight": receivable_fen / nav_fen,
                 },
                 {
                     "trade_date": trade_date,

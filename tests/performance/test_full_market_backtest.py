@@ -51,6 +51,7 @@ def _raw_tables() -> tuple[dict[str, pl.DataFrame], int]:
             {
                 "trade_date": trade_date,
                 "cash_fen": cash,
+                "dividend_receivable_fen": 0,
                 "long_market_value_fen": market_value,
                 "short_market_value_fen": 0,
                 "accrued_fees_fen": 0,
@@ -112,6 +113,9 @@ def test_current_schema_analysis_and_atomic_publication_stay_within_budget(
                 ).alias("active_return"),
                 pl.col("nav"),
                 pl.col("benchmark_nav"),
+                pl.col("gross_nav"),
+                pl.col("gross_cumulative_return"),
+                pl.col("cumulative_cost_drag"),
                 pl.col("drawdown"),
                 pl.col("active_drawdown"),
             ),

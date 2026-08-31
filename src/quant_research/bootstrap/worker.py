@@ -10,6 +10,7 @@ import tempfile
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
@@ -29,6 +30,11 @@ from quant_research.analytics.performance import (
 )
 from quant_research.application.worker import Worker
 from quant_research.backtest.calendar import TradingCalendar
+from quant_research.backtest.corporate_actions import (
+    CorporateAction,
+    CorporateActionInstrumentType,
+    CorporateActionType,
+)
 from quant_research.backtest.engine import (
     BacktestEngine,
     BacktestRequest,
@@ -570,6 +576,180 @@ class CanonicalStrategyStudyData:
         """
         return _BoundDecisionData(self, signal_date)
 
+    def corporate_actions(
+        self, start: date, end: date
+    ) -> tuple[CorporateAction, ...]:
+        """一次预载研究区间内的股票/基金分红送转与基金份额拆分。
+
+        入参：研究自然日闭区间。返回值：按生效日期、证券、类型和事件 ID 稳定
+        排序的类型化事件；股票现金严格使用税前字段。异常：Repository 数据或事件
+        契约不完整时抛出明确异常。
+        """
+        rows: list[CorporateAction] = []
+        if self._stock_ids:
+            for row in self._repository.stock_dividend_events(
+                start, end, self._stock_ids
+            ).collect().to_dicts():
+                cash = Decimal(str(row["cash_dividend_before_tax_per_share"] or 0))
+                stock = Decimal(str(row["stock_dividend_per_share"] or 0))
+                if cash > 0:
+                    rows.append(
+                        self._dividend_action(
+                            row,
+                            CorporateActionInstrumentType.STOCK,
+                            CorporateActionType.CASH_DIVIDEND,
+                            cash=cash,
+                            stock=Decimal(0),
+                        )
+                    )
+                if stock > 0:
+                    rows.append(
+                        self._dividend_action(
+                            row,
+                            CorporateActionInstrumentType.STOCK,
+                            CorporateActionType.STOCK_DISTRIBUTION,
+                            cash=Decimal(0),
+                            stock=stock,
+                        )
+                    )
+        if self._fund_ids:
+            for row in self._repository.fund_dividend_events(
+                start, end, self._fund_ids
+            ).collect().to_dicts():
+                cash = Decimal(str(row["cash_dividend_per_unit"] or 0))
+                if cash > 0:
+                    rows.append(
+                        self._dividend_action(
+                            row,
+                            CorporateActionInstrumentType.FUND,
+                            CorporateActionType.CASH_DIVIDEND,
+                            cash=cash,
+                            stock=Decimal(0),
+                        )
+                    )
+            for row in self._repository.fund_split_events(
+                start, end, self._fund_ids
+            ).collect().to_dicts():
+                previous = Decimal(str(row["previous_adjustment_factor"]))
+                current = Decimal(str(row["adjustment_factor"]))
+                ratio = Decimal(str(row["split_ratio"]))
+                inference_error = Decimal(
+                    str(row["split_inference_relative_error"])
+                )
+                if inference_error > Decimal("0.001"):
+                    raise ValueError(
+                        "fund adjustment factor jump is not an unambiguous "
+                        "near-integer split; a canonical fund corporate action "
+                        "ratio is required"
+                    )
+                event_id = self._corporate_action_id(
+                    {
+                        "dataset": DatasetKind.FUND_ADJUSTMENT_FACTOR.value,
+                        "instrument_id": cast(str, row["instrument_id"]),
+                        "action_type": CorporateActionType.FUND_SPLIT.value,
+                        "ex_date": cast(date, row["ex_date"]).isoformat(),
+                        "previous_adjustment_factor": str(previous),
+                        "adjustment_factor": str(current),
+                    }
+                )
+                rows.append(
+                    CorporateAction(
+                        event_id=event_id,
+                        instrument_id=InstrumentId.parse(
+                            cast(str, row["instrument_id"])
+                        ),
+                        instrument_type=CorporateActionInstrumentType.FUND,
+                        action_type=CorporateActionType.FUND_SPLIT,
+                        source_revision=0,
+                        announcement_date=None,
+                        implementation_announcement_date=None,
+                        record_date=None,
+                        ex_date=cast(date, row["ex_date"]),
+                        pay_date=None,
+                        stock_listing_date=None,
+                        cash_per_share_or_unit=Decimal(0),
+                        stock_dividend_per_share=ratio,
+                        previous_adjustment_factor=previous,
+                        adjustment_factor=current,
+                    )
+                )
+        return tuple(
+            sorted(
+                rows,
+                key=lambda item: (
+                    item.ex_date,
+                    item.instrument_id.canonical(),
+                    item.action_type.value,
+                    item.event_id,
+                ),
+            )
+        )
+
+    @classmethod
+    def _dividend_action(
+        cls,
+        row: Mapping[str, object],
+        instrument_type: CorporateActionInstrumentType,
+        action_type: CorporateActionType,
+        *,
+        cash: Decimal,
+        stock: Decimal,
+    ) -> CorporateAction:
+        """把一行已裁决 Canonical 分红拆为唯一经济类型事件。"""
+        dataset = (
+            DatasetKind.STOCK_DIVIDEND
+            if instrument_type is CorporateActionInstrumentType.STOCK
+            else DatasetKind.FUND_DIVIDEND
+        )
+        business = {
+            "dataset": dataset.value,
+            "instrument_id": cast(str, row["instrument_id"]),
+            "action_type": action_type.value,
+            "announcement_date": cast(date, row["announcement_date"]).isoformat(),
+            "report_period": (
+                cast(date, row["report_period"]).isoformat()
+                if row.get("report_period") is not None
+                else None
+            ),
+            "base_date": (
+                cast(date, row["base_date"]).isoformat()
+                if row.get("base_date") is not None
+                else None
+            ),
+            "record_date": cast(date, row["record_date"]).isoformat(),
+            "revision": cast(int, row["revision"]),
+        }
+        return CorporateAction(
+            event_id=cls._corporate_action_id(business),
+            instrument_id=InstrumentId.parse(cast(str, row["instrument_id"])),
+            instrument_type=instrument_type,
+            action_type=action_type,
+            source_revision=cast(int, row["revision"]),
+            announcement_date=cast(date, row["announcement_date"]),
+            implementation_announcement_date=cast(
+                date, row["implementation_announcement_date"]
+            ),
+            record_date=cast(date, row["record_date"]),
+            ex_date=cast(date, row["ex_date"]),
+            pay_date=(
+                cast(date, row["pay_date"])
+                if row.get("pay_date") is not None
+                else None
+            ),
+            stock_listing_date=(
+                cast(date, row["stock_listing_date"])
+                if row.get("stock_listing_date") is not None
+                else None
+            ),
+            cash_per_share_or_unit=cash,
+            stock_dividend_per_share=stock,
+        )
+
+    @staticmethod
+    def _corporate_action_id(identity: Mapping[str, JsonValue]) -> str:
+        """返回事件业务身份的确定性 SHA-256。"""
+        return hashlib.sha256(canonical_json_bytes(dict(identity))).hexdigest()
+
     def _sessions(self, start: date, end: date) -> tuple[date, ...]:
         frame = self._repository.trade_calendar(start, end).collect()
         return tuple(
@@ -982,6 +1162,7 @@ class _StrategyStudySession:
         self._backtest = BacktestEngine(
             self._source,
             self._source,
+            self._source,
             self._rulebook,
             CanonicalCatalogGuard(self._repository),
         ).run(
@@ -1027,10 +1208,18 @@ class _StrategyStudySession:
             self._backtest.tables
         )
         performance = calculate_performance(
-            tables["nav"], tables["holdings"], tables["fills"], tables["costs"]
+            tables["nav"],
+            tables["holdings"],
+            tables["fills"],
+            tables["costs"],
+            tables["dividends"],
         )
         attribution = calculate_attribution(
-            tables["nav"], tables["holdings"], tables["fills"], tables["costs"]
+            tables["nav"],
+            tables["holdings"],
+            tables["fills"],
+            tables["costs"],
+            tables["dividends"],
         )
         drawdown = performance.drawdown
         tables.update(
@@ -1108,6 +1297,10 @@ class _StrategyStudySession:
                     "style": "UNAVAILABLE",
                 },
                 "attribution_method": "CASH_EXACT_SECURITY",
+                "dividend_cash_tax_treatment": "PRE_TAX",
+                "stock_distribution_rounding": "FLOOR",
+                "corporate_action_timing": "RECORD_CLOSE_EX_OPEN_PAY_PRE_MATCH",
+                "fund_split_source": "FUND_ADJUSTMENT_FACTOR_NEAR_INTEGER_0.1_PERCENT_UNEXPLAINED_BY_FUND_DIVIDEND",
                 "warnings": list(self._attribution.disclosures),
             },
         )
@@ -1188,6 +1381,10 @@ class _StrategyStudySession:
         units = {
             "observations": "count",
             "max_drawdown_duration_sessions": "sessions",
+            "gross_dividend_cash_fen": "fen",
+            "stock_distribution_quantity": "shares",
+            "fund_split_quantity": "units",
+            "discarded_fractional_stock_quantity": "shares",
         }
         ratio_names = {
             name

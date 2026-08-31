@@ -177,6 +177,10 @@ export type StrategyStudyQualityDisclosure = {
   undefined_metrics: Record<string, string>
   unavailable_dimensions: Record<string, string>
   attribution_method: string
+  dividend_cash_tax_treatment: string
+  stock_distribution_rounding: string
+  corporate_action_timing: string
+  fund_split_source: string
   warnings: string[]
 }
 
@@ -224,7 +228,7 @@ export type StrategyDrawdownEpisodeRow = {
 
 export type StrategyExposureRow = {
   trade_date: string
-  dimension: 'SECURITY' | 'CASH'
+  dimension: 'SECURITY' | 'CASH' | 'RECEIVABLE'
   key: string
   weight: number
 }

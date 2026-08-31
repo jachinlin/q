@@ -43,6 +43,7 @@ _ARTIFACT_TYPES = frozenset(
         "holdings",
         "costs",
         "nav",
+        "dividends",
         "performance",
         "rolling_performance",
         "drawdown_episodes",
@@ -193,7 +194,7 @@ class StrategyStudyDashboardService:
         annual = self._require_frame(study, "annual_returns")
         episodes = self._require_frame(study, "drawdown_episodes")
         exposure = self._require_frame(study, "exposure_summary").filter(
-            pl.col("dimension").is_in(["SECURITY", "CASH"])
+            pl.col("dimension").is_in(["SECURITY", "CASH", "RECEIVABLE"])
         )
         attribution = (
             self._require_frame(study, "attribution")

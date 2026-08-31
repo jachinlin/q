@@ -13,6 +13,7 @@ from quant_research.analytics.performance import calculate_performance
 NAV_SCHEMA = {
     "trade_date": pl.Date,
     "cash_fen": pl.Int64,
+    "dividend_receivable_fen": pl.Int64,
     "long_market_value_fen": pl.Int64,
     "short_market_value_fen": pl.Int64,
     "accrued_fees_fen": pl.Int64,
@@ -61,6 +62,7 @@ def _nav() -> pl.DataFrame:
                 date(2024, 2, 2),
             ],
             "cash_fen": [10_000, 11_000, 9_900, 11_000],
+            "dividend_receivable_fen": [0, 0, 0, 0],
             "long_market_value_fen": [0, 0, 0, 0],
             "short_market_value_fen": [0, 0, 0, 0],
             "accrued_fees_fen": [0, 0, 0, 0],
@@ -124,6 +126,7 @@ def _period_nav(
         {
             "trade_date": dates,
             "cash_fen": nav_values,
+            "dividend_receivable_fen": [0] * len(dates),
             "long_market_value_fen": [0] * len(dates),
             "short_market_value_fen": [0] * len(dates),
             "accrued_fees_fen": [0] * len(dates),
@@ -440,6 +443,7 @@ def test_zero_volatility_discloses_undefined_ratios_without_nonfinite_values() -
         {
             "trade_date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
             "cash_fen": [10_000, 10_000, 10_000],
+            "dividend_receivable_fen": [0, 0, 0],
             "long_market_value_fen": [0, 0, 0],
             "short_market_value_fen": [0, 0, 0],
             "accrued_fees_fen": [0, 0, 0],
@@ -479,6 +483,7 @@ def test_all_negative_returns_have_a_finite_sortino_ratio() -> None:
         {
             "trade_date": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
             "cash_fen": [10_000, 9_000, 8_100],
+            "dividend_receivable_fen": [0, 0, 0],
             "long_market_value_fen": [0, 0, 0],
             "short_market_value_fen": [0, 0, 0],
             "accrued_fees_fen": [0, 0, 0],
