@@ -190,6 +190,38 @@ def test_roe_uses_latest_report_and_revision_without_falling_back() -> None:
     assert factor.spec.parameters["invalid_latest_record_fallback"] is False
 
 
+def test_financial_transitions_ignore_old_period_revisions_and_collapse_one_event() -> None:
+    signals = [date(2026, 4, 29), date(2026, 4, 30), date(2026, 5, 1)]
+    provider = _Provider(
+        [
+            _row(period=date(2025, 9, 30), available=signals[0], roe=0.10),
+            _row(period=date(2025, 12, 31), available=signals[0], roe=0.12),
+            _row(
+                period=date(2025, 9, 30),
+                available=signals[1],
+                revision=1,
+                roe=0.90,
+            ),
+            _row(
+                period=date(2025, 12, 31),
+                available=signals[2],
+                revision=1,
+                roe=0.14,
+            ),
+        ],
+        signals,
+    )
+    factor = RoeFactor(provider, (InstrumentId.parse("000001.SZ"),))
+
+    result = factor.compute(_context(signals[0], signals[-1])).collect()
+
+    assert result.select("trade_date", "value").rows() == [
+        (signals[0], 0.12),
+        (signals[1], 0.12),
+        (signals[2], 0.14),
+    ]
+
+
 def test_financial_staleness_boundary_is_inclusive() -> None:
     available = date(2026, 1, 1)
     signals = [available + timedelta(days=190), available + timedelta(days=191)]
