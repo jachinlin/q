@@ -135,6 +135,12 @@ describe('strategy study detail', () => {
       : null
     expect(navOption.xAxis.data).toEqual(['2020-01-02', '2024-12-31'])
     expect(navOption.series.map((series: { name: string }) => series.name)).toEqual(['策略净值', '毛净值', '基准净值'])
+    const optionsWithLegend = wrapper.findAllComponents({ name: 'VChart' })
+      .map((chart) => chart.props('option'))
+      .filter((option) => option.legend)
+    expect(optionsWithLegend).toHaveLength(7)
+    expect(optionsWithLegend.every((option) => option.legend.top === 2 && option.legend.left === 'center')).toBe(true)
+    expect(optionsWithLegend.every((option) => option.grid.top >= 52 && option.grid.containLabel === true)).toBe(true)
     wrapper.unmount()
   })
 

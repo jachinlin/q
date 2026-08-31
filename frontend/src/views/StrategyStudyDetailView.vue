@@ -185,13 +185,14 @@ const majorDrawdownEpisodes = computed(() => [...(report.data.value?.drawdown_ep
   .sort((left, right) => left.max_drawdown - right.max_drawdown || left.episode_index - right.episode_index)
   .slice(0, 8))
 
+const topLegend = { top: 2, left: 'center' }
 const fullZoom = [{ type: 'inside' }, { type: 'slider', height: 16, bottom: 2 }]
 const navOption = computed(() => {
   const rows = report.data.value?.performance ?? []
   return {
     tooltip,
-    legend: { data: ['策略净值', '毛净值', '基准净值'] },
-    grid: { left: 54, right: 22, top: 38, bottom: 54 },
+    legend: { ...topLegend, data: ['策略净值', '毛净值', '基准净值'] },
+    grid: { left: 54, right: 22, top: 52, bottom: 72, containLabel: true },
     dataZoom: fullZoom,
     xAxis: { ...axis, type: 'category', data: rows.map((row) => row.trade_date), boundaryGap: false },
     yAxis: { ...axis, type: 'value', scale: true },
@@ -206,8 +207,8 @@ const drawdownOption = computed(() => {
   const rows = report.data.value?.performance ?? []
   return {
     tooltip,
-    legend: { data: ['策略回撤', '主动净值回撤'] },
-    grid: { left: 54, right: 20, top: 38, bottom: 45 },
+    legend: { ...topLegend, data: ['策略回撤', '主动净值回撤'] },
+    grid: { left: 54, right: 20, top: 52, bottom: 45, containLabel: true },
     dataZoom: [{ type: 'inside' }],
     xAxis: { ...axis, type: 'category', data: rows.map((row) => row.trade_date), boundaryGap: false },
     yAxis: { ...axis, type: 'value', axisLabel: { color: '#66778D', formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
@@ -221,8 +222,8 @@ const rollingReturnOption = computed(() => {
   const rows = report.data.value?.rolling_performance ?? []
   return {
     tooltip,
-    legend: { data: ['策略年化', '基准年化', '年化超额'] },
-    grid: { left: 54, right: 20, top: 38, bottom: 45 },
+    legend: { ...topLegend, data: ['策略年化', '基准年化', '年化超额'] },
+    grid: { left: 54, right: 20, top: 52, bottom: 45, containLabel: true },
     dataZoom: [{ type: 'inside' }],
     xAxis: { ...axis, type: 'category', data: rows.map((row) => row.trade_date), boundaryGap: false },
     yAxis: { ...axis, type: 'value', axisLabel: { color: '#66778D', formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
@@ -237,8 +238,8 @@ const rollingRiskOption = computed(() => {
   const rows = report.data.value?.rolling_performance ?? []
   return {
     tooltip,
-    legend: { data: ['Sharpe', '信息比率', 'Beta'] },
-    grid: { left: 48, right: 20, top: 38, bottom: 45 },
+    legend: { ...topLegend, data: ['Sharpe', '信息比率', 'Beta'] },
+    grid: { left: 48, right: 20, top: 52, bottom: 45, containLabel: true },
     dataZoom: [{ type: 'inside' }],
     xAxis: { ...axis, type: 'category', data: rows.map((row) => row.trade_date), boundaryGap: false },
     yAxis: { ...axis, type: 'value' },
@@ -253,8 +254,8 @@ const rollingRiskScaleOption = computed(() => {
   const rows = report.data.value?.rolling_performance ?? []
   return {
     tooltip,
-    legend: { data: ['年化波动率', '跟踪误差', '窗口最大回撤'] },
-    grid: { left: 54, right: 20, top: 38, bottom: 45 },
+    legend: { ...topLegend, data: ['年化波动率', '跟踪误差', '窗口最大回撤'] },
+    grid: { left: 54, right: 20, top: 52, bottom: 45, containLabel: true },
     dataZoom: [{ type: 'inside' }],
     xAxis: { ...axis, type: 'category', data: rows.map((row) => row.trade_date), boundaryGap: false },
     yAxis: { ...axis, type: 'value', axisLabel: { color: '#66778D', formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
@@ -283,8 +284,8 @@ const annualOption = computed(() => {
   const rows = report.data.value?.annual_returns ?? []
   return {
     tooltip,
-    legend: { data: ['策略', '基准', '超额'] },
-    grid: { left: 54, right: 18, top: 38, bottom: 34 },
+    legend: { ...topLegend, data: ['策略', '基准', '超额'] },
+    grid: { left: 54, right: 18, top: 52, bottom: 34, containLabel: true },
     xAxis: { ...axis, type: 'category', data: rows.map((row) => String(row.year)) },
     yAxis: { ...axis, type: 'value', axisLabel: { color: '#66778D', formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
     series: [
@@ -301,8 +302,8 @@ const exposureOption = computed(() => {
   const values = new Map(rows.map((row) => [`${row.trade_date}|${row.key}`, row.weight]))
   return {
     tooltip,
-    legend: { type: 'scroll', data: keys.map((key) => key === 'CASH' ? '现金' : key) },
-    grid: { left: 48, right: 18, top: 45, bottom: 48 },
+    legend: { ...topLegend, type: 'scroll', data: keys.map((key) => key === 'CASH' ? '现金' : key) },
+    grid: { left: 48, right: 18, top: 58, bottom: 48, containLabel: true },
     dataZoom: [{ type: 'inside' }],
     xAxis: { ...axis, type: 'category', data: dates, boundaryGap: false },
     yAxis: { ...axis, type: 'value', max: 1, axisLabel: { color: '#66778D', formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
