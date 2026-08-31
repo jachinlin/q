@@ -222,7 +222,7 @@ const error = computed(() => validate.error.value ?? submit.error.value ?? sourc
           <div v-if="selectedStrategyProfile" class="strategy-profile-summary" data-strategy-profile>
             <div><strong>{{ selectedStrategyProfile.display_name }}</strong><span>{{ selectedStrategyProfile.strategy_id }}</span></div>
             <p>{{ selectedStrategyProfile.summary }}</p>
-            <RouterLink :to="`/strategies/${selectedStrategyProfile.strategy_id}`">查看完整策略说明</RouterLink>
+            <RouterLink :to="`/strategies/${selectedStrategyProfile.strategy_id}`">查看说明</RouterLink>
           </div>
         </section>
 

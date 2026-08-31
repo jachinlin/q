@@ -53,7 +53,10 @@ async function deleteStudy(study: StrategyStudy) {
   <div class="page-stack">
     <section class="panel study-hero">
       <div><span class="eyebrow">ONE SUBMISSION · ONE RESULT</span><h2>策略研究</h2><p>每次提交只执行一次；需要调整参数时，复制原定义并创建一项独立研究。</p></div>
-      <RouterLink to="/strategy-studies/new"><el-button type="primary" size="large">创建策略研究</el-button></RouterLink>
+      <div class="study-hero-actions">
+        <RouterLink to="/strategies"><el-button size="large">策略库</el-button></RouterLink>
+        <RouterLink to="/strategy-studies/new"><el-button type="primary" size="large">创建策略研究</el-button></RouterLink>
+      </div>
     </section>
     <section class="metrics-grid">
       <article class="metric-card"><span class="metric-top">研究总数<i /></span><strong class="metric-value">{{ counts.total }}</strong><p>独立冻结配置</p></article>
@@ -80,5 +83,6 @@ async function deleteStudy(study: StrategyStudy) {
 <style scoped>
 .study-hero{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:26px;background:linear-gradient(120deg,#fff,#f1f6ff 60%,#eef9f7)}
 .study-hero h2{margin:9px 0 7px;font-size:25px}.study-hero p{margin:0;color:var(--muted)}
+.study-hero-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .study-link{display:flex;flex-direction:column;gap:4px;color:var(--text);text-decoration:none}.study-link small{color:var(--dim)}
 </style>

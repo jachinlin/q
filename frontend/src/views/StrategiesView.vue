@@ -23,7 +23,7 @@ const catalog = useQuery({
         <span class="strategy-card-id">{{ item.strategy_id }}</span>
         <h2>{{ item.display_name }}</h2>
         <p>{{ item.summary }}</p>
-        <strong>查看结构说明 <span>›</span></strong>
+        <strong>查看说明 <span>›</span></strong>
       </RouterLink>
     </section>
   </div>
