@@ -362,6 +362,13 @@ class BacktestEngine:
                     },
                     equity_fen=final.nav_fen,
                     available_margin_fen=0,
+                    mark_prices={
+                        item.instrument_id: (
+                            item.market_value_fen / item.total_quantity / 100
+                        )
+                        for item in final.positions
+                        if item.total_quantity > 0
+                    },
                 )
                 context = DecisionContext(trade_date, next_date, data, account_view)
                 if index == 0:

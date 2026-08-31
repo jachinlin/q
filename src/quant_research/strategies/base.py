@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
 from math import isfinite
@@ -58,9 +58,9 @@ class OrderIntent:
 
 @dataclass(frozen=True, slots=True)
 class AccountView:
-    """向策略暴露不可修改的现金、头寸、可卖数量和权益。
+    """向策略暴露不可修改的现金、头寸、可卖数量、权益和持仓估值价。
 
-    入参：分为单位的现金与权益、整数持仓、可卖数量和可用保证金。
+    入参：分为单位的现金与权益、整数持仓、可卖数量、可用保证金和持仓估值价。
     返回值：按证券稳定排序且不可修改的账户视图。
     异常：金额、证券键或数量不满足 P3 多头约束时抛出类型或值错误。
     """
@@ -70,21 +70,48 @@ class AccountView:
     sellable: Mapping[InstrumentId, int]
     equity_fen: int
     available_margin_fen: int = 0
+    mark_prices: Mapping[InstrumentId, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for value, field in (
+        for amount, field_name in (
             (self.cash_fen, "cash_fen"),
             (self.equity_fen, "equity_fen"),
             (self.available_margin_fen, "available_margin_fen"),
         ):
-            if type(value) is not int or value < 0:
-                raise ValueError(f"{field} must be a nonnegative integer")
+            if type(amount) is not int or amount < 0:
+                raise ValueError(f"{field_name} must be a nonnegative integer")
         positions = self._quantities(self.positions, "positions")
         sellable = self._quantities(self.sellable, "sellable")
         if any(value > positions.get(key, 0) for key, value in sellable.items()):
             raise ValueError("sellable quantity must not exceed position")
+        if not isinstance(self.mark_prices, Mapping):
+            raise TypeError("mark_prices must be a mapping")
+        mark_prices: dict[InstrumentId, float] = {}
+        for key, raw_price in self.mark_prices.items():
+            if not isinstance(key, InstrumentId):
+                raise TypeError("mark_prices keys must be InstrumentId")
+            if key not in positions or positions[key] <= 0:
+                raise ValueError("mark_prices must describe positive positions")
+            if isinstance(raw_price, bool) or not isinstance(raw_price, (int, float)):
+                raise TypeError("mark_prices values must be numbers")
+            price = float(raw_price)
+            if not isfinite(price) or price <= 0:
+                raise ValueError("mark_prices values must be finite and positive")
+            mark_prices[key] = price
         object.__setattr__(self, "positions", MappingProxyType(positions))
         object.__setattr__(self, "sellable", MappingProxyType(sellable))
+        object.__setattr__(
+            self,
+            "mark_prices",
+            MappingProxyType(
+                dict(
+                    sorted(
+                        mark_prices.items(),
+                        key=lambda item: item[0].canonical(),
+                    )
+                )
+            ),
+        )
 
     @staticmethod
     def _quantities(
@@ -390,7 +417,7 @@ class WeightTargetStrategy:
     def reference_prices(
         self, ctx: DecisionContext, instruments: Sequence[InstrumentId]
     ) -> Mapping[InstrumentId, float]:
-        """返回信号日未复权收盘价，供目标权重转换成整数订单。
+        """返回信号日收盘价，停牌持仓回退到账户最近估值价。
 
         入参：当前上下文和需要估值的证券序列。
         返回值：证券到正数收盘价的映射。
@@ -403,11 +430,14 @@ class WeightTargetStrategy:
             .group_by("instrument_id")
             .agg(pl.col("close").last())
         )
-        return {
+        current = {
             InstrumentId.parse(identifier): float(close)
             for identifier, close in latest.select("instrument_id", "close").iter_rows()
             if close is not None and float(close) > 0
         }
+        prices = dict(ctx.account.mark_prices)
+        prices.update(current)
+        return prices
 
     def on_event(self, ctx: DecisionContext) -> Sequence[OrderIntent]:
         """记录新目标并在未达到容差时持续生成剩余差额订单。

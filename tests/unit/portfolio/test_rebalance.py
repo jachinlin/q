@@ -57,6 +57,23 @@ def test_rebalance_caps_sales_at_sellable_quantity() -> None:
     assert result == (OrderIntent(_A, OrderSide.SELL, 100, "TARGET_REBALANCE"),)
 
 
+def test_rebalance_skips_target_without_reference_price() -> None:
+    account = AccountView(
+        cash_fen=250_000,
+        positions={},
+        sellable={},
+        equity_fen=250_000,
+    )
+
+    result = RebalancePlanner().plan(
+        _targets({_A: 0.5, _B: 0.5}),
+        account,
+        {_A: 10.0},
+    )
+
+    assert result == (OrderIntent(_A, OrderSide.BUY, 100, "TARGET_REBALANCE"),)
+
+
 @pytest.mark.parametrize("price", [0.0, -1.0, float("nan")])
 def test_rebalance_rejects_invalid_reference_price(price: float) -> None:
     account = AccountView(100_000, {_A: 100}, {_A: 100}, 100_000)

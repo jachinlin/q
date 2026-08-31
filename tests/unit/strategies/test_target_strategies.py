@@ -63,6 +63,19 @@ class _TurnoverData:
             }
         ).lazy()
 
+
+class _SuspendedData:
+    def bars(self, instruments: object, lookback_sessions: int) -> pl.LazyFrame:
+        del instruments
+        assert lookback_sessions == 1
+        return pl.DataFrame(
+            schema={
+                "trade_date": pl.Date,
+                "instrument_id": pl.String,
+                "close": pl.Float64,
+            }
+        ).lazy()
+
 def _context(prices: list[float]) -> DecisionContext:
     signal_date, execute_date = date(2024, 1, 4), date(2024, 1, 5)
     instrument = InstrumentId.parse("510300.SH")
@@ -92,6 +105,28 @@ def test_dual_ma_first_long_and_equal_flat_are_literal() -> None:
     )
     assert flat.on_event(_context([1.0, 1.0, 1.0])) == ()
     assert flat.signal_frame()["state"].to_list() == ["FLAT"]
+
+
+def test_reference_prices_fall_back_to_account_mark_during_suspension() -> None:
+    instrument = InstrumentId.parse("000932.SZ")
+    strategy = DualMATrendStrategy(
+        DualMAConfig(instrument, short_window=2, long_window=3),
+        RebalancePlanner(),
+    )
+    context = DecisionContext(
+        date(2018, 12, 7),
+        date(2018, 12, 10),
+        _SuspendedData(),  # type: ignore[arg-type]
+        AccountView(
+            cash_fen=0,
+            positions={instrument: 100},
+            sellable={instrument: 100},
+            equity_fen=65_000,
+            mark_prices={instrument: 6.5},
+        ),
+    )
+
+    assert strategy.reference_prices(context, (instrument,)) == {instrument: 6.5}
 
 
 def test_registry_and_five_module_catalog_are_stable() -> None:

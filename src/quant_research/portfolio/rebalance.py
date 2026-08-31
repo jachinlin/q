@@ -41,15 +41,18 @@ class RebalancePlanner:
         返回值：
             按证券稳定排序且卖单先于买单的 ``OrderIntent`` 元组。
         异常：
-            任一涉及证券缺少有效价格，或申报单位非法时抛出 ``ValueError``。
+            已提供的参考价无效，或申报单位非法时抛出 ``ValueError``；缺少参考价的
+            证券本次不生成订单，由上层活动目标在后续交易日重试。
         """
         identifiers = set(account.positions) | set(targets.weights)
         quantities: dict[InstrumentId, int] = {}
         for instrument in identifiers:
             price = reference_prices.get(instrument)
-            if price is None or not isfinite(price) or price <= 0:
+            if price is None:
+                continue
+            if not isfinite(price) or price <= 0:
                 raise ValueError(
-                    f"missing valid reference price: {instrument.canonical()}"
+                    f"invalid reference price: {instrument.canonical()}"
                 )
             desired = floor(
                 account.equity_fen
@@ -61,7 +64,7 @@ class RebalancePlanner:
                 raise ValueError("lot size must be a positive integer")
             quantities[instrument] = desired // lot * lot
         output: list[OrderIntent] = []
-        for instrument in sorted(identifiers, key=InstrumentId.canonical):
+        for instrument in sorted(quantities, key=InstrumentId.canonical):
             current, desired = (
                 account.positions.get(instrument, 0),
                 quantities[instrument],
@@ -74,7 +77,7 @@ class RebalancePlanner:
                             instrument, OrderSide.SELL, amount, "TARGET_REBALANCE"
                         )
                     )
-        for instrument in sorted(identifiers, key=InstrumentId.canonical):
+        for instrument in sorted(quantities, key=InstrumentId.canonical):
             current, desired = (
                 account.positions.get(instrument, 0),
                 quantities[instrument],
