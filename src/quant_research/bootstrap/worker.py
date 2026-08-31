@@ -304,6 +304,7 @@ class CanonicalStrategyStudyData:
         self._factor_engine = FactorEngine(
             registry, capabilities=ProviderCapabilities.complete()
         )
+        self._no_limit_through: dict[str, date] | None = None
 
     @staticmethod
     def _explicit_market_instruments(
@@ -347,34 +348,93 @@ class CanonicalStrategyStudyData:
         异常：
             ValueError：请求下一交易日但覆盖范围内不存在时抛出。
         """
+        listing_dates = tuple(
+            cast(date, row["list_date"])
+            for row in self._metadata.values()
+            if row.get("instrument_type") == "STOCK"
+            and isinstance(row.get("list_date"), date)
+        )
+        history_start = min((start, *listing_dates))
+        coverage_end = end + timedelta(days=14) if include_next_session else end
+        loaded = TradingCalendar.load(self._repository, history_start, coverage_end)
         if include_next_session:
-            sessions = self._sessions(end + timedelta(days=1), end + timedelta(days=14))
-            if not sessions:
-                raise ValueError("no later trading session in canonical coverage")
-            end = sessions[0]
-        return TradingCalendar.load(self._repository, start, end)
+            try:
+                end = loaded.next_session(end)
+            except ValueError as error:
+                raise ValueError(
+                    "no later trading session in canonical coverage"
+                ) from error
+        history_sessions = loaded.sessions(history_start, end)
+        self._prepare_no_limit_boundaries(history_sessions)
+        return TradingCalendar(start, end, loaded.sessions(start, end))
 
-    def market_slice(self, trade_date: date) -> BoundMarketSlice:
+    def _prepare_no_limit_boundaries(self, sessions: tuple[date, ...]) -> None:
+        """一次计算股票上市后前五个交易日的结束边界。"""
+        if not sessions:
+            self._no_limit_through = {}
+            return
+        boundaries: dict[str, date] = {}
+        for identifier, row in sorted(self._metadata.items()):
+            listing = row.get("list_date")
+            if row.get("instrument_type") != "STOCK" or not isinstance(
+                listing, date
+            ):
+                continue
+            index = bisect_left(sessions, listing)
+            if index >= len(sessions):
+                continue
+            boundaries[identifier] = sessions[min(index + 4, len(sessions) - 1)]
+        self._no_limit_through = boundaries
+
+    def market_slice(
+        self,
+        trade_date: date,
+        instruments: Sequence[InstrumentId],
+    ) -> BoundMarketSlice:
         """连接未复权行情、证券元数据和当日交易状态。
 
         入参：
-            trade_date：待撮合和估值的交易日。
+            trade_date：待撮合和估值的交易日；instruments：当日持仓与待执行
+            委托涉及的证券范围。
         返回值：
             返回按证券标识排序、严格绑定该日的未复权行情切片。
         异常：
             Canonical 数据缺失、Schema 不一致或 PIT 查询失败时传播数据异常。
         """
-        bar_frames = []
-        if self._stock_ids:
+        requested: set[InstrumentId] = set()
+        for instrument in instruments:
+            if not isinstance(instrument, InstrumentId):
+                raise TypeError("market instruments must contain InstrumentId")
+            requested.add(instrument)
+        ordered = tuple(sorted(requested, key=InstrumentId.canonical))
+        stock_ids = tuple(
+            instrument
+            for instrument in ordered
+            if self._metadata.get(instrument.canonical(), {}).get("instrument_type")
+            == "STOCK"
+        )
+        fund_ids = tuple(
+            instrument
+            for instrument in ordered
+            if self._metadata.get(instrument.canonical(), {}).get("instrument_type")
+            == "ETF"
+        )
+        market_ids = (*stock_ids, *fund_ids)
+        if not market_ids:
+            return BoundMarketSlice(
+                MarketSlice(trade_date, pl.DataFrame(schema=_MARKET_SCHEMA))
+            )
+        bar_frames: list[pl.DataFrame] = []
+        if stock_ids:
             bar_frames.append(
                 self._repository.stock_bars(
-                    self._stock_ids, trade_date, trade_date
+                    stock_ids, trade_date, trade_date
                 ).collect()
             )
-        if self._fund_ids:
+        if fund_ids:
             bar_frames.append(
                 self._repository.fund_bars(
-                    self._fund_ids, trade_date, trade_date
+                    fund_ids, trade_date, trade_date
                 ).collect()
             )
         bars = (
@@ -382,25 +442,25 @@ class CanonicalStrategyStudyData:
             if bar_frames
             else pl.DataFrame()
         )
-        suspended = set(
-            self._repository.stock_suspensions(
-                trade_date, trade_date, self._stock_ids
-            ).collect()["instrument_id"].to_list()
+        allowed = [instrument.canonical() for instrument in market_ids]
+        bars = bars.filter(pl.col("instrument_id").is_in(allowed))
+        suspended = (
+            set(
+                self._repository.stock_suspensions(
+                    trade_date, trade_date, stock_ids
+                ).collect()["instrument_id"].to_list()
+            )
+            if stock_ids
+            else set()
         )
-        warned = set(
-            self._repository.stock_risk_warnings(
-                trade_date, trade_date, self._stock_ids
-            ).collect()["instrument_id"].to_list()
-        )
-        listing_dates = [
-            cast(date, row["list_date"])
-            for row in self._metadata.values()
-            if row.get("instrument_type") == "STOCK"
-            and isinstance(row.get("list_date"), date)
-            and row["list_date"] <= trade_date
-        ]
-        trading_sessions = (
-            self._sessions(min(listing_dates), trade_date) if listing_dates else ()
+        warned = (
+            set(
+                self._repository.stock_risk_warnings(
+                    trade_date, trade_date, stock_ids
+                ).collect()["instrument_id"].to_list()
+            )
+            if stock_ids
+            else set()
         )
         rows: list[dict[str, object]] = []
         for row in bars.to_dicts():
@@ -418,12 +478,16 @@ class CanonicalStrategyStudyData:
             if board not in {"MAIN", "CHINEXT", "STAR", "BSE"}:
                 board = "MAIN"
             raw_volume = row.get("volume")
-            no_limit = (
-                metadata.get("instrument_type") == "STOCK"
-                and isinstance(listing, date)
-                and sum(listing <= session <= trade_date for session in trading_sessions)
-                <= 5
-            )
+            no_limit = False
+            if metadata.get("instrument_type") == "STOCK" and isinstance(
+                listing, date
+            ):
+                if self._no_limit_through is None:
+                    raise RuntimeError(
+                        "calendar must be loaded before stock market slices"
+                    )
+                boundary = self._no_limit_through.get(identifier)
+                no_limit = boundary is not None and trade_date <= boundary
             rows.append(
                 {
                     "instrument_id": identifier,

@@ -127,11 +127,16 @@ class BacktestMarketData(Protocol):
         """
         ...
 
-    def market_slice(self, trade_date: date) -> BoundMarketSlice:
+    def market_slice(
+        self,
+        trade_date: date,
+        instruments: Sequence[InstrumentId],
+    ) -> BoundMarketSlice:
         """读取单个交易日的未复权撮合行情。
 
         入参：
-            trade_date：待撮合和估值的交易日。
+            trade_date：待撮合和估值的交易日；instruments：当日持仓与待执行
+            委托涉及的确定性证券范围。
         返回值：
             返回严格绑定该日期的行情切片。
         异常：
@@ -318,7 +323,16 @@ class BacktestEngine:
             self._catalog_guard.assert_unchanged(request.catalog_hash)
             if cancellation.is_cancelled():
                 raise BacktestCancelled(f"backtest cancelled after {index} sessions")
-            bound = self._market_data.market_slice(trade_date)
+            account.begin_session(trade_date)
+            execution_view = account.execution_view()
+            market_instruments = tuple(
+                sorted(
+                    set(execution_view.total_quantities)
+                    | {intent.instrument_id for intent in pending},
+                    key=InstrumentId.canonical,
+                )
+            )
+            bound = self._market_data.market_slice(trade_date, market_instruments)
             if bound.market.trade_date != trade_date:
                 raise ValueError("market slice is bound to a different date")
             market = bound.market
@@ -326,8 +340,6 @@ class BacktestEngine:
             benchmark_close = self._market_data.benchmark_close(
                 request.benchmark, trade_date
             )
-            account.begin_session(trade_date)
-            execution_view = account.execution_view()
             execution = self._execution.execute(
                 pending,
                 market,
